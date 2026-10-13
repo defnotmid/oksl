@@ -17,16 +17,14 @@ env:
 
 # oksl imports no sibling repositories and no vendor C libraries. The tests
 # cover the compiler and the CPU interpreter; tools/gpu_parity needs a GPU and
-# is not run.
+# is not run. Linux only (no hosted macOS runner): the macOS target is
+# type-checked from Linux, and the Metal path is verified on a local Mac with
+# tools/gpu_parity.
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -40,10 +38,7 @@ jobs:
       - name: Install Odin
         if: steps.odin-cache.outputs.cache-hit != 'true'
         run: |
-          case "$RUNNER_OS" in
-            Linux) asset="odin-linux-amd64-$ODIN_VERSION.tar.gz" ;;
-            macOS) asset="odin-macos-arm64-$ODIN_VERSION.tar.gz" ;;
-          esac
+          asset="odin-linux-amd64-$ODIN_VERSION.tar.gz"
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/odin.tar.gz" \
             "https://github.com/odin-lang/Odin/releases/download/$ODIN_VERSION/$asset"
           mkdir -p ~/.odin
@@ -54,11 +49,10 @@ jobs:
           echo "$HOME/.odin" >> "$GITHUB_PATH"
           echo "ODIN_ROOT=$HOME/.odin" >> "$GITHUB_ENV"
 
-      - name: Install spirv-val (Linux)
-        if: runner.os == 'Linux'
+      - name: Install spirv-val
         run: |
           # test_corpus_spirv_val validates every corpus module with spirv-val
-          # and skips (with a message) where it is not installed, as on macOS.
+          # (and skips, with a message, where it is not installed).
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends spirv-tools
 
@@ -70,6 +64,5 @@ jobs:
       - name: Build okslc
         run: odin build tools/okslc -out:build/okslc
 
-      - name: Check the other desktop target
-        if: runner.os == 'Linux'
+      - name: Check the macOS target
         run: odin check . -no-entry-point -target:darwin_arm64
