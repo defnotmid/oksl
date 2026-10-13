@@ -55,8 +55,9 @@ including the synthesis, 186 MB peak RSS).
 
 ## Media
 
-- Shaders: written for this demo (`glitch.sksl` after onimite'
+- Shaders: written for this demo (`glitch.sksl` after onimite's
   `examples/why_onimite/scenes/title.lua`).
-- Fonts (OFL), copied from onimite' examples: Bebas Neue, Space Grotesk,
-  JetBrains Mono.
+- Fonts, copied from onimite's examples: Bebas Neue, Space Grotesk and
+  JetBrains Mono, under the SIL Open Font License 1.1
+  ([media/OFL.txt](media/OFL.txt), with their copyright notices).
 - The soundtrack is synthesized; there are no other media.
