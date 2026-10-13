@@ -1,0 +1,58 @@
+#include <metal_stdlib>
+#include <metal_math>
+#include <metal_texture>
+using namespace metal;
+
+#line 14 "layer.slang"
+struct vs_main_Result_0
+{
+    float4 position_0 [[position]];
+    float2 uv_0 [[user(locn0)]];
+};
+
+
+#line 14
+struct vertexInput_0
+{
+    float2 position_1 [[attribute(0)]];
+    float2 uv_1 [[attribute(1)]];
+};
+
+
+#line 8
+struct View_0
+{
+    float4 size_0;
+};
+
+
+#line 19
+struct VS_Out_0
+{
+    float4 position_2;
+    float2 uv_2;
+};
+
+
+#line 19
+[[vertex]] vs_main_Result_0 vs_main(vertexInput_0 _S1 [[stage_in]], View_0 constant* view_0 [[buffer(0)]])
+{
+
+#line 27
+    thread VS_Out_0 o_0;
+    (&o_0)->uv_2 = _S1.uv_1;
+    (&o_0)->position_2 = float4(2.0f * _S1.position_1.x / view_0->size_0.x - 1.0f, 1.0f - 2.0f * _S1.position_1.y / view_0->size_0.y, 0.0f, 1.0f);
+
+#line 29
+    thread vs_main_Result_0 _S2;
+
+#line 29
+    (&_S2)->position_0 = o_0.position_2;
+
+#line 29
+    (&_S2)->uv_0 = o_0.uv_2;
+
+#line 29
+    return _S2;
+}
+

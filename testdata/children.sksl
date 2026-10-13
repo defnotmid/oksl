@@ -1,0 +1,15 @@
+// A `uniform shader` child sampled with .eval in its own pixels: a blur of
+// three taps, and texel centres. The child is 64x64 in the tests.
+uniform float3 iResolution;
+uniform shader uTex;
+
+half4 main(float2 coord) {
+    float2 uv = coord / iResolution.xy;
+    half3 sum = half3(0.0);
+    for (int i = -1; i <= 1; i++) {
+        sum += uTex.eval(coord * 0.5 + float2(float(i), 0.0)).rgb;
+    }
+    half3 col = sum / 3.0;
+    half3 fetched = uTex.eval(floor(mod(coord, 64.0)) + 0.5).rgb;
+    return half4(mix(col, fetched, step(0.5, uv.x)), 1.0);
+}

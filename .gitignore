@@ -1,0 +1,15 @@
+parity_out/
+/okslc
+/golden
+/gpu_parity
+/cpu_render
+/mascot
+build/
+.work/
+perf.data*
+.claude/settings.local.json
+
+# Private: never commit.
+PERFORMANCE_METHODOLOGY.md
+PERFORMANCE_TRADEOFFS.md
+/demo/demo.mp4

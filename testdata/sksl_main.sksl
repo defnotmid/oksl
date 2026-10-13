@@ -1,0 +1,16 @@
+// SkSL: coordinates in layer pixels, origin top-left; built-in uniforms
+// are declared; half and float types, saturate, sk_FragCoord.
+uniform float3 iResolution;
+uniform float iTime;
+layout(color) uniform half4 uTint;
+uniform float uSpeed;
+
+half4 main(float2 coord) {
+    float2 uv = coord / iResolution.xy;
+    half band = half(step(0.5, fract(uv.y * 6.0 + iTime * uSpeed)));
+    float2x2 m = float2x2(0.8, 0.6, -0.6, 0.8);
+    float2 r = m * (uv - 0.5);
+    half3 c = half3(saturate(r.x + 0.5), band * 0.5, 1.0 - uv.y);
+    c *= step(0.0, sk_FragCoord.x - coord.x) * uTint.rgb;
+    return half4(c, 1.0);
+}

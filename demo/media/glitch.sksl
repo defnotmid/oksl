@@ -1,0 +1,29 @@
+// A text group read as a `uniform shader` child: a ripple ring from the
+// middle, sideways-pushed slices and a colour split (after
+// onimite/examples/why_onimite/scenes/title.lua).
+uniform float3 iResolution;
+uniform shader uText;
+uniform float uGlitch;  // 0..1
+uniform float uRipple;  // seconds since the ring started; negative: none
+uniform float uSeed;
+
+float hash(float n) { return fract(sin(n * 127.1 + 311.7) * 43758.547); }
+
+half4 main(float2 coord) {
+    float2 p = coord;
+    if (uRipple >= 0.0) {
+        float2 d = p - iResolution.xy * 0.5;
+        float r = length(d);
+        float x = (r - uRipple * 1400.0) / 100.0;
+        p -= d / (r + 0.001) * sin(x * 6.0) * 34.0 * exp(-x * x) * exp(-uRipple * 1.2);
+    }
+    float band = floor(coord.y / 14.0);
+    if (hash(band + uSeed * 13.0) > 1.0 - uGlitch * 0.6) {
+        p.x += (hash(band * 7.0 + uSeed) - 0.5) * 280.0 * uGlitch;
+    }
+    float split = 2.0 + 24.0 * uGlitch;
+    half4 r = uText.eval(p + float2(split, 0.0));
+    half4 g = uText.eval(p);
+    half4 b = uText.eval(p - float2(split, 0.0));
+    return half4(r.r, g.g, b.b, max(g.a, max(r.a, b.a)));
+}

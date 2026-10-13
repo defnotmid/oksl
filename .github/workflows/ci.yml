@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The Odin nightly oksl is developed against (same pin as onimite).
+  ODIN_VERSION: dev-2026-10
+
+# oksl imports no sibling repositories and no vendor C libraries. The tests
+# cover the compiler and the CPU interpreter; tools/gpu_parity needs a GPU and
+# is not run.
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Odin
+        id: odin-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.odin
+          key: odin-${{ runner.os }}-${{ runner.arch }}-${{ env.ODIN_VERSION }}-v1
+
+      - name: Install Odin
+        if: steps.odin-cache.outputs.cache-hit != 'true'
+        run: |
+          case "$RUNNER_OS" in
+            Linux) asset="odin-linux-amd64-$ODIN_VERSION.tar.gz" ;;
+            macOS) asset="odin-macos-arm64-$ODIN_VERSION.tar.gz" ;;
+          esac
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/odin.tar.gz" \
+            "https://github.com/odin-lang/Odin/releases/download/$ODIN_VERSION/$asset"
+          mkdir -p ~/.odin
+          tar -xzf "$RUNNER_TEMP/odin.tar.gz" -C ~/.odin --strip-components=1
+
+      - name: Set up Odin
+        run: |
+          echo "$HOME/.odin" >> "$GITHUB_PATH"
+          echo "ODIN_ROOT=$HOME/.odin" >> "$GITHUB_ENV"
+
+      - name: Install spirv-val (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # test_corpus_spirv_val validates every corpus module with spirv-val
+          # and skips (with a message) where it is not installed, as on macOS.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends spirv-tools
+
+      - name: Test
+        run: |
+          mkdir -p build
+          odin test . -vet -strict-style -out:build/oksl_test
+
+      - name: Build okslc
+        run: odin build tools/okslc -out:build/okslc
+
+      - name: Check the other desktop target
+        if: runner.os == 'Linux'
+        run: odin check . -no-entry-point -target:darwin_arm64

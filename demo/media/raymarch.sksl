@@ -1,0 +1,49 @@
+// A raymarched shape: a rounded box melting into a torus and back, lit
+// with a key light and a rim, pumped by the kick.
+uniform float3 iResolution;
+uniform float iTime;
+uniform float uKick;
+uniform float uMorph;
+
+float2x2 rot(float a) { float c = cos(a), s = sin(a); return float2x2(c, s, -s, c); }
+
+float sdf(float3 p) {
+    p.xz = rot(iTime * 0.9) * p.xz;
+    p.xy = rot(iTime * 0.6) * p.xy;
+    float3 q = abs(p) - float3(0.55);
+    float box = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - 0.18;
+    float torus = length(float2(length(p.xz) - 0.75, p.y)) - 0.28;
+    return mix(box, torus, uMorph) - 0.05 * uKick;
+}
+
+float3 normal(float3 p) {
+    float2 e = float2(0.001, 0.0);
+    return normalize(float3(sdf(p + e.xyy) - sdf(p - e.xyy), sdf(p + e.yxy) - sdf(p - e.yxy),
+                            sdf(p + e.yyx) - sdf(p - e.yyx)));
+}
+
+half4 main(float2 coord) {
+    float2 uv = (coord - 0.5 * iResolution.xy) / iResolution.y;
+    uv.y = -uv.y;
+    float3 ro = float3(0.0, 0.0, 3.2);
+    float3 rd = normalize(float3(uv, -1.6));
+    float t = 0.0;
+    float hit = 0.0;
+    for (int i = 0; i < 80; i++) {
+        float d = sdf(ro + rd * t);
+        if (d < 0.001) { hit = 1.0; break; }
+        t += d;
+        if (t > 8.0) { break; }
+    }
+    float3 bg = mix(float3(0.05, 0.02, 0.1), float3(0.18, 0.05, 0.25), 1.0 - length(uv));
+    if (hit < 0.5) { return half4(half3(bg), 1.0); }
+    float3 p = ro + rd * t;
+    float3 n = normal(p);
+    float3 l = normalize(float3(0.6, 0.8, 0.5));
+    float diff = max(dot(n, l), 0.0);
+    float rim = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+    float spec = pow(max(dot(reflect(-l, n), -rd), 0.0), 40.0);
+    float3 base = mix(float3(0.71, 1.0, 0.23), float3(1.0, 0.3, 0.7), uMorph);
+    float3 col = base * (0.15 + 0.85 * diff) + rim * float3(0.4, 0.8, 1.0) + spec;
+    return half4(half3(col), 1.0);
+}

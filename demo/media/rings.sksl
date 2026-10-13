@@ -1,0 +1,16 @@
+// rings.sksl: the shader shown on screen
+uniform float3 iResolution;
+uniform float iTime;
+uniform float uKick;
+
+half4 main(float2 coord) {
+    float2 uv = (coord - 0.5 * iResolution.xy) / iResolution.y;
+    float r = length(uv);
+    float a = atan(uv.y, uv.x);
+    float w = sin(18.0 * r - 4.0 * iTime + 3.0 * sin(3.0 * a));
+    float ring = 0.012 / abs(r - 0.3 - 0.04 * w - 0.06 * uKick);
+    half3 col = 0.5 + 0.5 * cos(iTime + 6.0 * r + half3(0, 2, 4));
+    col *= smoothstep(-0.3, 1.0, w) * (1.1 - r);
+    col += ring * half3(0.7, 1.0, 0.25);
+    return half4(col, 1.0);
+}
