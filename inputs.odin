@@ -86,8 +86,20 @@ input_at_offset :: proc "contextless" (offset: int) -> (Input, bool) {
 
 // Writes float components of uniform input `in_` (element `index` of the
 // arrays) into a block of at least `Module.block_size` bytes; iFrame takes
-// its value converted to int.
-write_input :: proc(block: []u8, in_: Input, values: []f32, index := 0) {
+// its value converted to int. With a module, only where its block has the
+// inputs (SkSL and Shadertoy; a GLSL module's block is its own uniforms).
+write_input :: proc {
+	write_input_block,
+	write_module_input,
+}
+
+write_module_input :: proc(m: ^Module, block: []u8, in_: Input, values: []f32, index := 0) {
+	if PROFILE_RULES[m.profile].header {
+		write_input_block(block, in_, values, index)
+	}
+}
+
+write_input_block :: proc(block: []u8, in_: Input, values: []f32, index := 0) {
 	if in_ not_in UNIFORM_INPUTS {
 		return
 	}
@@ -111,20 +123,32 @@ Builtins :: struct {
 }
 
 // Writes every built-in uniform into the start of a uniform block of at
-// least `m.block_size` bytes.
-write_builtins :: proc(block: []u8, b: Builtins) {
+// least `m.block_size` bytes. With a module, only where its block has the
+// inputs, so a host fills every pass's block the same way.
+write_builtins :: proc {
+	write_builtins_block,
+	write_module_builtins,
+}
+
+write_module_builtins :: proc(m: ^Module, block: []u8, b: Builtins) {
+	if PROFILE_RULES[m.profile].header {
+		write_builtins_block(block, b)
+	}
+}
+
+write_builtins_block :: proc(block: []u8, b: Builtins) {
 	b := b
-	write_input(block, .Resolution, b.resolution[:])
-	write_input(block, .Time, {b.time})
-	write_input(block, .Time_Delta, {b.time_delta})
-	write_input(block, .Frame, {f32(b.frame)})
-	write_input(block, .Frame_Rate, {b.frame_rate})
-	write_input(block, .Sample_Rate, {b.sample_rate})
-	write_input(block, .Mouse, b.mouse[:])
-	write_input(block, .Date, b.date[:])
+	write_input_block(block, .Resolution, b.resolution[:])
+	write_input_block(block, .Time, {b.time})
+	write_input_block(block, .Time_Delta, {b.time_delta})
+	write_input_block(block, .Frame, {f32(b.frame)})
+	write_input_block(block, .Frame_Rate, {b.frame_rate})
+	write_input_block(block, .Sample_Rate, {b.sample_rate})
+	write_input_block(block, .Mouse, b.mouse[:])
+	write_input_block(block, .Date, b.date[:])
 	for ch in 0 ..< CHANNEL_COUNT {
-		write_input(block, .Channel_Resolution, b.channel_resolution[ch][:], ch)
-		write_input(block, .Channel_Time, {b.channel_time[ch]}, ch)
+		write_input_block(block, .Channel_Resolution, b.channel_resolution[ch][:], ch)
+		write_input_block(block, .Channel_Time, {b.channel_time[ch]}, ch)
 	}
 }
 

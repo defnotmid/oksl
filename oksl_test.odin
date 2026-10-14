@@ -1329,3 +1329,128 @@ test_run_fragment_matches_layer :: proc(t: ^testing.T) {
 		compare(t, quads, want, j.out, j.shaded)
 	}
 }
+
+// ---- dialect-neutral pass graphs ----------------------------------------------------
+
+// Two SkSL passes, rendered as a host would: pass 0 into a float target,
+// pass 1 reading it through its child (channel 0) as this frame's output.
+@(test)
+test_make_program_sksl :: proc(t: ^testing.T) {
+	m0, e0, ok0 := compile("half4 main(float2 p) { return half4(p.x / 8.0, p.y / 4.0, 0.25, 1.0); }")
+	m1, e1, ok1 := compile("uniform shader prev;\nhalf4 main(float2 p) { half4 c = prev.eval(p); return half4(c.g, c.r, c.b * 2.0, 1.0); }")
+	testing.expectf(t, ok0 && ok1, "%s%s", format_errors(e0, context.temp_allocator), format_errors(e1, context.temp_allocator))
+	g, errs, ok := make_program({{module = m0, name = "first"}, {module = m1, name = "second", channels = {0 = {.Buffer, 0}}}})
+	defer destroy_program(g)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	testing.expect_value(t, g.output, 1)
+	testing.expect_value(t, len(g.edges), 1)
+	testing.expect(t, g.edges[0] == Edge{1, 0, .Buffer, 0})
+	testing.expect_value(t, g.passes[1].name, "second")
+	testing.expect_value(t, g.index[.Image], -1)
+
+	W, H :: 8, 4
+	first := make([][4]f32, W * H, context.temp_allocator)
+	for p in g.passes {
+		block := make([]u8, p.module.block_size, context.temp_allocator)
+		write_builtins(p.module, block, {resolution = {W, H, 1}, channel_resolution = {{W, H, 1}, {}, {}, {}}})
+		if p.name == "first" {
+			run_f32(&p.module.program, block, W, H, first)
+			continue
+		}
+		out := make([][4]f32, W * H, context.temp_allocator)
+		// The channel reads the first pass's target, nearest texel.
+		run_f32(&p.module.program, block, W, H, out, {user = raw_data(first), sampler = proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+			src := ([^][4]f32)(user)
+			x, y := clamp(int(uv.x * W), 0, W - 1), clamp(int(uv.y * H), 0, H - 1)
+			return src[y * W + x]
+		}})
+		for y in 0 ..< H {
+			for x in 0 ..< W {
+				c := first[y * W + x]
+				near(t, out[y * W + x], {c.g, c.r, c.b * 2, 1})
+			}
+		}
+	}
+}
+
+// Feedback: a pass reading its own previous frame, and an earlier pass's
+// previous frame (what Shadertoy's order rule can't say).
+@(test)
+test_make_program_feedback :: proc(t: ^testing.T) {
+	SRC :: "uniform shader a;\nuniform shader b;\nhalf4 main(float2 p) { return a.eval(p) * 0.5 + b.eval(p) * 0.5; }"
+	m0, _, _ := compile("half4 main(float2 p) { return half4(1); }")
+	m1, _, _ := compile(SRC)
+	g, errs, ok := make_program({{module = m0}, {module = m1, channels = {0 = {.Previous, 1}, 1 = {.Previous, 0}}}})
+	defer destroy_program(g)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	testing.expect_value(t, len(g.edges), 2)
+	testing.expect(t, g.edges[0] == Edge{1, 0, .Previous, 1} && g.edges[1] == Edge{1, 1, .Previous, 0})
+}
+
+// SkSL, GLSL and an unclamped Shadertoy pass in one graph; write_builtins
+// with the module writes the inputs only where the block has them.
+@(test)
+test_make_program_mixed :: proc(t: ^testing.T) {
+	sk, _, ok0 := compile("uniform float gain;\nhalf4 main(float2 p) { return half4(gain); }")
+	gl, _, ok1 := compile_glsl("in vec2 uv;\nout vec4 c;\nuniform float gain;\nuniform sampler2D src;\nvoid main() { c = texture(src, uv) * gain; }")
+	st, _, ok2 := compile_shadertoy("void mainImage(out vec4 c, in vec2 p) { c = vec4(3.0, 2.0, 1.0, 0.5); }", {unclamped = true})
+	testing.expect(t, ok0 && ok1 && ok2)
+	testing.expect(t, sk.profile == .Sksl && gl.profile == .Glsl && st.profile == .Shadertoy)
+	g, errs, ok := make_program({{module = st}, {module = sk}, {module = gl, channels = {0 = {.Buffer, 0}}}}, output = 2)
+	defer destroy_program(g)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	// The GLSL block is its own uniforms from offset 0: write_builtins
+	// leaves it alone.
+	off, _, found := uniform_offset(gl, "gain")
+	testing.expect(t, found && off == 0)
+	block := make([]u8, gl.block_size, context.temp_allocator)
+	set_uniform(gl, block, "gain", {0.75})
+	write_builtins(gl, block, {resolution = {9, 9, 1}, time = 5})
+	write_input(gl, block, .Time, {7})
+	testing.expect_value(t, (^f32)(&block[0])^, 0.75)
+	// The SkSL block has the inputs ahead of its uniforms.
+	sblock := make([]u8, sk.block_size, context.temp_allocator)
+	write_builtins(sk, sblock, {resolution = {9, 9, 1}})
+	testing.expect_value(t, (^f32)(&sblock[OFFSET_RESOLUTION])^, 9)
+	// Unclamped Shadertoy keeps mainImage's colour as it is.
+	sblock2 := make([]u8, st.block_size, context.temp_allocator)
+	write_builtins(st, sblock2, {resolution = {4, 2, 1}})
+	px := make([][4]f32, 8, context.temp_allocator)
+	run_f32(&st.program, sblock2, 4, 2, px)
+	near(t, px[0], {3, 2, 1, 0.5})
+}
+
+@(test)
+test_make_program_errors :: proc(t: ^testing.T) {
+	sampling :: proc() -> ^Module {
+		m, _, _ := compile("uniform shader s;\nhalf4 main(float2 p) { return s.eval(p); }")
+		return m
+	}
+	plain :: proc() -> ^Module {
+		m, _, _ := compile("half4 main(float2 p) { return half4(1); }")
+		return m
+	}
+	program_errors :: proc(passes: []Pass_Spec, output := -1) -> string {
+		g, errs, ok := make_program(passes, output)
+		defer destroy_program(g) // the graph owns the modules, also on failure
+		return "" if ok else strings.clone(format_errors(errs, context.temp_allocator), context.temp_allocator)
+	}
+	got := program_errors({{module = sampling(), name = "blur", channels = {0 = {.Buffer, 0}}}})
+	testing.expectf(t, strings.contains(got, "blur's channel 0 reads pass 0, which does not run before it"), "got %q", got)
+	got = program_errors({{module = plain()}, {module = sampling(), channels = {0 = {.Previous, 5}}}})
+	testing.expectf(t, strings.contains(got, "pass 1's channel 0 reads pass 5, which does not exist"), "got %q", got)
+	got = program_errors({{module = plain()}}, output = 3)
+	testing.expectf(t, strings.contains(got, "the output pass 3 is not one of the 1 passes"), "got %q", got)
+	many: [PASS_MAX + 1]Pass_Spec
+	for &p in many {
+		p.module = plain()
+	}
+	got = program_errors(many[:])
+	testing.expectf(t, strings.contains(got, "a program has 1 to 8 passes, not 9"), "got %q", got)
+}

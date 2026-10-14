@@ -222,12 +222,45 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   gl_FragCoord and gl_FrontFacing, and fragment-only features (`discard`,
   derivatives, gl_FragCoord) in vertex shaders.
 
-### Programs (multipass)
+### Pass graphs and programs (multipass)
+
+A `Pass_Graph` is passes (modules, in running order) and edges saying
+what each pass's channels read. Nothing in it depends on the dialect:
+`make_program` builds one from compiled modules of any profile, and
+`compile_program` builds Shadertoy's (below) on top of it.
+
+```odin
+blur, _, _ := oksl.compile(blur_sksl)                // any profile
+smooth, _, _ := oksl.compile_glsl(smooth_frag)
+g, errors, ok := oksl.make_program({
+	{module = blur, name = "blur", channels = {0 = {.External, 7}}},
+	{module = smooth, name = "smooth", channels = {0 = {.Buffer, 0}, 1 = {.Previous, 1}}},
+})
+defer oksl.destroy_program(g)                         // frees the modules too, also on failure
+for p in g.passes {
+	block := make([]u8, p.module.block_size)
+	oksl.write_builtins(p.module, block, builtins)  // the inputs only where the module has them
+	// ... render p.module into its target, binding channels from g.edges[p.edges]
+}
+```
+
+- A channel reads the host's input (`.External`, its id), this frame's
+  output of an earlier pass (`.Buffer`, pass index) or the previous frame
+  of any pass, itself included (`.Previous`; transparent black on the
+  first frame). `g.output` is the result's pass (the last by default);
+  at most `PASS_MAX` (8) passes.
+- Inputs appear per dialect: SkSL `uniform shader` children, Shadertoy
+  `iChannel0..3`, GLSL `uniform sampler2D`s, channels in declaration
+  order. A GLSL pass on the layer quad reads `in vec2 uv` at location 0.
+- A Shadertoy module compiled with `Options.unclamped` returns
+  mainImage's colour as it is, for a pass rendering into a float target.
 
 `compile_program` takes a `Program_Desc`: an optional Common source, up
 to four buffer passes (Buffer A-D, `""` for absent ones), the Image pass
 (required) and, per pass, what each channel reads (`Channel_Ref`: a
-buffer, one of the host's inputs by id, or nothing).
+buffer by its `Pass_Kind`, read as this frame's output when it runs
+earlier and as the previous frame otherwise (or explicitly `.Previous`),
+one of the host's inputs by id, or nothing).
 
 - **Common** is one shared unit, preprocessed and parsed once: its macros
   (a mark of the macro table) and its declarations (copies of its flat

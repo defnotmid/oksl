@@ -21,6 +21,10 @@ Options :: struct {
 	// Its errors are the Prelude's; uniforms and inputs it declares that
 	// the shader never uses are left out (GLSL profile).
 	prelude:  string,
+	// Shadertoy: return mainImage's colour as it is (unclamped, with its
+	// alpha) rather than clamped and opaque, for a pass that renders into a
+	// float target another pass reads (compile_program's buffers).
+	unclamped: bool,
 	// Skip outputs the host does not need.
 	no_spirv: bool,
 	no_msl:   bool,
@@ -74,6 +78,7 @@ Module :: struct {
 	channel_names: [CHANNEL_COUNT]string,
 	// Where the source first names each channel (for diagnostics).
 	channel_pos:   [CHANNEL_COUNT]Pos,
+	profile:       Profile,
 	stage:         Stage,
 	// Floats per vertex in the varyings' record (Stage_Var_Info.offset).
 	varying_floats: int,
@@ -107,7 +112,7 @@ compile :: proc(source: string, options := Options{}) -> (m: ^Module, errors: []
 @(private)
 module_front :: proc(source: string, options: Options, src, prelude_src: Source) -> (u: ^Unit, toks: []Token, ok: bool) {
 	u = new(Unit)
-	unit_init(u, options.profile, context.allocator, stage = options.stage)
+	unit_init(u, options.profile, context.allocator, buffer_pass = options.unclamped, stage = options.stage)
 	if options.stage not_in PROFILE_RULES[options.profile].stages {
 		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Stage_Unsupported, a = PROFILE_NAMES[options.profile], b = STAGE_NAMES[options.stage]})
 		return u, nil, false
@@ -231,6 +236,7 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 	if !options.no_cpu {
 		m.program = build_program(u, c)
 	}
+	m.profile = u.profile
 	m.stage = u.stage
 	m.varying_floats = c.varying_floats
 }

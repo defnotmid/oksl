@@ -158,6 +158,9 @@ Error_Code :: enum u8 {
 	// Programs (Common, Buffer A-D, Image).
 	No_Image_Pass,
 	Channel_No_Buffer,
+	Pass_Count,
+	Pass_Output,
+	Pass_Reference,
 }
 
 // A diagnostic at `pos` (the user's line and column: macro expansions keep
@@ -311,6 +314,9 @@ ERROR_TEXT := [Error_Code]string {
 	.Ctor_Components       = "{a} needs {n} components, got {m}",
 	.No_Image_Pass         = "a program needs an Image pass",
 	.Channel_No_Buffer     = "{name} reads {a}, which the program does not have",
+	.Pass_Count            = "a program has 1 to {n} passes, not {m}",
+	.Pass_Output           = "the output pass {n} is not one of the {m} passes",
+	.Pass_Reference        = "{name}'s channel {n} reads pass {m}, which {a}",
 }
 
 // The text of a diagnostic (without its position).
