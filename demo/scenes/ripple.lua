@@ -20,7 +20,7 @@ local function render(f, lb)
   local s = 1 + 0.03 * pulse(lb, 8)
   group({ transform = { scale = s, origin = { 960, 540 } } }, function()
     shader(f, { src = "glitch.sksl", x = 0, y = 180, w = 1920, h = 660,
-      uniforms = { uText = words, uGlitch = glitch, uSeed = math.floor(lb * 8), uRipple = (lb - last) * beat.BEAT } })
+      uniforms = { uText = words, uGlitch = glitch, uSeed = math.floor(lb * 8), uRipple = beat.seconds(lb - last) } })
   end)
   text { "uniform shader uText;  ·  uText = function() text{ … } end", x = 960, y = 900, align = "center",
     font = ui.MONO, size = 26, fill = ui.DIM }

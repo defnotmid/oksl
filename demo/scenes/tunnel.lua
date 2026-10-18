@@ -30,7 +30,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 local function render(f, lb)
   local s = 1 + 0.04 * pulse(lb, 7) + 0.3 * (1 - soft(lb))
   group({ transform = { scale = s, origin = { 960, 540 } } }, function()
-    shader(f, { shadertoy = TUNNEL, x = 0, y = 0, w = 1920, h = 1080, time = lb * beat.BEAT })
+    shader(f, { shadertoy = TUNNEL, x = 0, y = 0, w = 1920, h = 1080, time = beat.seconds(lb) })
   end)
   local p = snap(lb - 1)
   group({ opacity = prog(lb, 1, 1.2), transform = translate(0, (1 - p) * 30) }, function()

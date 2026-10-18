@@ -42,7 +42,7 @@ local OUTPUTS = {
 }
 
 local function rings(f, lb, x, y, w, h)
-  shader(f, { src = "rings.sksl", x = x, y = y, w = w, h = h, time = lb * beat.BEAT,
+  shader(f, { src = "rings.sksl", x = x, y = y, w = w, h = h, time = beat.seconds(lb),
     uniforms = { uKick = pulse(lb, 6) } })
 end
 

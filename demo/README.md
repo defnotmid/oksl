@@ -43,15 +43,14 @@ Every number is in `facts.lua` with its source:
 
 `video.lua` sets up the video, the beat-synced glitch cuts and the HUD;
 `scenes/` holds one file per scene; `media/*.sksl` are the shaders (the
-Shadertoy tunnel is inline in `scenes/tunnel.lua`); `timeline.lua` says on
-which beat everything happens; `beat.lua` is the clock and easing;
-`track.lua` synthesizes the soundtrack from the same timeline when the
-script loads (why_onimite' instruments, an F# minor breakbeat), once per
-render through `shared()`, registered with `audio_add("track.wav", ...)`.
+Shadertoy tunnel is inline in `scenes/tunnel.lua`); `track.lua` is the
+soundtrack, an odawg `song{}` (an F# minor breakbeat, its sections named
+after the scenes, its parts the pops and stutters the picture answers
+to); `timeline.lua` reads from it on which beat everything happens;
+`beat.lua` is the clock and easing on the song's beat.
 
-Mix (`onimite audio analyze`): -14.0 LUFS integrated, -2.1 dBTP true
-peak. Render with `build/onimite_speed`: 1632 frames in 3.7 s (5.0 s wall
-including the synthesis, 186 MB peak RSS).
+Mix (`onimite audio analyze`): -14.1 LUFS integrated, -1.5 dBTP true
+peak. Render: 1632 frames in 3.8 s wall, 165 MB peak RSS.
 
 ## Media
 
@@ -60,4 +59,4 @@ including the synthesis, 186 MB peak RSS).
 - Fonts, copied from onimite's examples: Bebas Neue, Space Grotesk and
   JetBrains Mono, under the SIL Open Font License 1.1
   ([media/OFL.txt](media/OFL.txt), with their copyright notices).
-- The soundtrack is synthesized; there are no other media.
+- The soundtrack is composed by odawg from `track.lua`; there are no other media.

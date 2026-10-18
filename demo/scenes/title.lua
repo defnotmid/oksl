@@ -32,7 +32,7 @@ local function render(f, lb)
   group({ opacity = opacity, transform = { scale = s, origin = { 960, BOX.y + 260 } } }, function()
     shader(f, { src = "glitch.sksl", x = BOX.x, y = BOX.y, w = BOX.w, h = BOX.h,
       uniforms = { uText = word, uGlitch = glitch, uSeed = math.floor(lb * 8),
-                   uRipple = lb >= slam and (lb - slam) * beat.BEAT or -1 } })
+                   uRipple = lb >= slam and beat.seconds(lb - slam) or -1 } })
   end)
   if lb >= slam + 1 then
     local p = snap(lb - slam - 1)

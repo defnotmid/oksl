@@ -18,7 +18,7 @@ local ROWS = {
 local function render(f, lb)
   rect { x = 0, y = 0, w = 1920, h = 1080, fill = ui.BG }
   group({ opacity = 0.25 }, function()
-    shader(f, { src = "rings.sksl", x = 0, y = 0, w = 1920, h = 1080, time = lb * beat.BEAT,
+    shader(f, { src = "rings.sksl", x = 0, y = 0, w = 1920, h = 1080, time = beat.seconds(lb),
       uniforms = { uKick = pulse(lb, 6) } })
   end)
   for i, r in ipairs(ROWS) do
