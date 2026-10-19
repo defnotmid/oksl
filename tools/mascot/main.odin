@@ -12,6 +12,10 @@
 //   eyes_open     big eyes with two shines (on)   eyes_closed  a happy blink
 //   eyes_o        round surprised eyes
 //   mouth_smile   a small smile (on)              mouth_o      a little "o"
+//   silhouette    every visible pixel as one outline (off): the shape to
+//                 morph, extrude or collide (onimite: outline{ svg = "logo.svg", id = "silhouette" })
+//
+// Each layer is one path per colour, its pixels traced into merged outlines.
 //
 // Also writes the project logo as PNGs, scaled without smoothing:
 //
@@ -227,21 +231,98 @@ Layer :: struct {
 	on:   bool,
 }
 
+// Each layer's pixels of one colour as one path, and the visible layers'
+// union as `silhouette` (off): the whole firefly as one outline, for
+// morphing, extruding or colliding.
 svg :: proc(layers: []Layer) -> string {
 	b := strings.builder_make()
 	fmt.sbprintf(&b, `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d" shape-rendering="crispEdges">`, W, H, W * 8, H * 8)
 	strings.write_byte(&b, '\n')
 	for l in layers {
 		fmt.sbprintf(&b, `<g id="%s"%s>`, l.name, "" if l.on else ` display="none"`)
+		done: [256]bool
 		for y in 0 ..< H do for x in 0 ..< W {
 			c := l.grid[y][x]
-			if c == '.' do continue
-			fmt.sbprintf(&b, `<rect x="%d" y="%d" width="1" height="1" fill="%s"/>`, x, y, color(c))
+			if c == '.' || done[c] do continue
+			done[c] = true
+			mask: Mask
+			for yy in 0 ..< H do for xx in 0 ..< W do mask[yy][xx] = l.grid[yy][xx] == c
+			fmt.sbprintf(&b, `<path fill="%s" d="`, color(c))
+			trace(&b, &mask)
+			strings.write_string(&b, `"/>`)
 		}
 		strings.write_string(&b, "</g>\n")
 	}
-	strings.write_string(&b, "</svg>\n")
+	all: Mask
+	for l in layers {
+		if !l.on do continue
+		for y in 0 ..< H do for x in 0 ..< W do all[y][x] ||= l.grid[y][x] != '.'
+	}
+	fmt.sbprintf(&b, `<g id="silhouette" display="none"><path fill="%s" d="`, color('O'))
+	trace(&b, &all)
+	strings.write_string(&b, "\"/></g>\n</svg>\n")
 	return strings.to_string(b)
+}
+
+Mask :: [H][W]bool
+
+// Writes the outline of the mask's pixels as path data: one closed loop per
+// boundary, the pixels on its right (clockwise on screen), so holes wind the
+// other way and fill as holes under either fill rule. Straight runs are
+// single segments; pixels touching only at a corner stay apart.
+trace :: proc(b: ^strings.Builder, m: ^Mask) {
+	V :: (W + 1) * (H + 1)
+	at :: proc(m: ^Mask, x, y: int) -> bool {return x >= 0 && y >= 0 && x < W && y < H && m[y][x]}
+	// Boundary edges by start vertex (at most two: pixels touching at a corner).
+	out: [V][2]i32
+	n: [V]int
+	add :: proc(out: ^[V][2]i32, n: ^[V]int, x0, y0, x1, y1: int) {
+		v := y0 * (W + 1) + x0
+		out[v][n[v]] = i32(y1 * (W + 1) + x1)
+		n[v] += 1
+	}
+	for y in 0 ..< H do for x in 0 ..< W {
+		if !m[y][x] do continue
+		if !at(m, x, y - 1) do add(&out, &n, x, y, x + 1, y)
+		if !at(m, x + 1, y) do add(&out, &n, x + 1, y, x + 1, y + 1)
+		if !at(m, x, y + 1) do add(&out, &n, x + 1, y + 1, x, y + 1)
+		if !at(m, x - 1, y) do add(&out, &n, x, y + 1, x, y)
+	}
+	xy :: proc(v: i32) -> [2]int {return {int(v) % (W + 1), int(v) / (W + 1)}}
+	for start in 0 ..< V {
+		for n[start] > 0 {
+			// Walk the loop, writing a point where the direction changes.
+			pts: [dynamic][2]int
+			defer delete(pts)
+			v := i32(start)
+			dir: [2]int
+			for {
+				k := 0
+				if n[v] == 2 {
+					// At a corner touch, turn right: keep to the pixels on the right.
+					right := [2]int{-dir.y, dir.x}
+					for j in 0 ..< 2 {
+						if len(pts) > 0 && xy(out[v][j]) - xy(v) == right do k = j
+					}
+				}
+				next := out[v][k]
+				out[v][k] = out[v][n[v] - 1]
+				n[v] -= 1
+				d := xy(next) - xy(v)
+				if len(pts) == 0 || d != dir do append(&pts, xy(v))
+				dir = d
+				v = next
+				if v == i32(start) do break
+			}
+			fmt.sbprintf(b, "M%d %d", pts[0].x, pts[0].y)
+			for p, i in pts[1:] {
+				prev := pts[i]
+				if p.y == prev.y do fmt.sbprintf(b, "H%d", p.x)
+				else do fmt.sbprintf(b, "V%d", p.y)
+			}
+			strings.write_byte(b, 'Z')
+		}
+	}
 }
 
 hex_byte :: proc(s: string) -> u8 {

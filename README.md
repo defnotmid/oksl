@@ -531,4 +531,6 @@ MIT, see [LICENSE](LICENSE).
 
 The mascot, a firefly whose lantern is the shader, is drawn by `tools/mascot`
 (`odin run tools/mascot -- assets`): `assets/logo.svg` keeps its lantern (lit or
-out), two glow halos, eyes and mouths as layers a script can switch by id.
+out), two glow halos, eyes and mouths as layers a script can switch by id,
+each one path per colour, and a hidden `silhouette`: the whole firefly as one
+outline, to morph, extrude or collide.
