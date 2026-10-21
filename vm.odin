@@ -112,6 +112,10 @@ VM_Op :: enum u8 {
 	Fwidth,
 	// dst vec4 = channel k sampled at uv a, explicit lod b.
 	Texture,
+	// The same at the lod a's quad derivatives pick, plus bias b.
+	Texture_Bias,
+	// dst ivec2 = channel k's size at lod a.
+	Texture_Size,
 	// Masks: dst = a.
 	Mask_Copy,
 	// dst = the lanes of a where cond slot b holds (k = 1: where it does not).
@@ -1173,6 +1177,10 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		return {vals[0].slot, t}
 	case .Texture_Lod:
 		emit(l, .Texture, k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
+	case .Texture:
+		emit(l, .Texture_Bias, k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
+	case .Texture_Size:
+		emit(l, .Texture_Size, k = int(vals[0].slot), dst = s, a = vals[1].slot)
 	}
 	return {s, t}
 }

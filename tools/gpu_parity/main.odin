@@ -26,9 +26,20 @@ H :: 144
 TIME :: 1.5
 TEX :: 64
 
-// The channel texture: a colour checker (8-bit, so both sides see the same
+// The channel texture: a colour checker and its mip chain, each level the
+// 2x2 box average of the one above, in 8 bits (so both sides see the same
 // values).
-texture_pixels: [TEX * TEX * 4]u8
+LEVELS :: 7
+texture_pixels: [(TEX * TEX * 4 * 4 - 4) / 3]u8
+
+// Where level l starts in texture_pixels.
+level_offset :: proc(l: int) -> int {
+	o := 0
+	for i in 0 ..< l {
+		o += (TEX >> uint(i)) * (TEX >> uint(i)) * 4
+	}
+	return o
+}
 
 make_texture :: proc() {
 	for y in 0 ..< TEX {
@@ -41,26 +52,55 @@ make_texture :: proc() {
 			texture_pixels[i + 3] = 255
 		}
 	}
+	for l in 1 ..< LEVELS {
+		src, dst := level_offset(l - 1), level_offset(l)
+		n := TEX >> uint(l)
+		for y in 0 ..< n {
+			for x in 0 ..< n {
+				for k in 0 ..< 4 {
+					sum := 2
+					for d in 0 ..< 4 {
+						sum += int(texture_pixels[src + ((2 * y + d / 2) * 2 * n + 2 * x + d % 2) * 4 + k])
+					}
+					texture_pixels[dst + (y * n + x) * 4 + k] = u8(sum / 4)
+				}
+			}
+		}
+	}
 }
 
-texel :: proc(x, y: int) -> [4]f32 {
-	xx := ((x % TEX) + TEX) % TEX
-	yy := ((y % TEX) + TEX) % TEX
-	i := (yy * TEX + xx) * 4
+texel :: proc(l, x, y: int) -> [4]f32 {
+	n := TEX >> uint(l)
+	xx := ((x % n) + n) % n
+	yy := ((y % n) + n) % n
+	i := level_offset(l) + (yy * n + xx) * 4
 	return {f32(texture_pixels[i]), f32(texture_pixels[i + 1]), f32(texture_pixels[i + 2]), f32(texture_pixels[i + 3])} / 255
 }
 
-// Bilinear, repeat, no mipmaps: what the GPU sampler below does.
-cpu_sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
-	fx := uv.x * TEX - 0.5
-	fy := uv.y * TEX - 0.5
+bilinear :: proc(l: int, uv: [2]f32) -> [4]f32 {
+	n := f32(int(TEX) >> uint(l))
+	fx := uv.x * n - 0.5
+	fy := uv.y * n - 0.5
 	x0 := int(fx) if fx >= 0 else int(fx) - 1
 	y0 := int(fy) if fy >= 0 else int(fy) - 1
 	tx := fx - f32(x0)
 	ty := fy - f32(y0)
-	a, b := texel(x0, y0), texel(x0 + 1, y0)
-	c, d := texel(x0, y0 + 1), texel(x0 + 1, y0 + 1)
+	a, b := texel(l, x0, y0), texel(l, x0 + 1, y0)
+	c, d := texel(l, x0, y0 + 1), texel(l, x0 + 1, y0 + 1)
 	return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
+}
+
+// Trilinear and repeating, the level clamped to the chain: what the GPU
+// sampler below does.
+cpu_sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+	if !(lod > 0) {
+		return bilinear(0, uv)
+	}
+	lod := min(lod, LEVELS - 1)
+	l0 := int(lod)
+	l1 := min(l0 + 1, LEVELS - 1)
+	t := lod - f32(l0)
+	return bilinear(l0, uv) * (1 - t) + bilinear(l1, uv) * t
 }
 
 uniform_block :: proc(m: ^oksl.Module) -> []u8 {
@@ -146,7 +186,8 @@ main :: proc() {
 		for i in 0 ..< W * H {
 			cpu_px[i * 4 + 3] = 255
 		}
-		oksl.run(&m.program, block, W, H, cpu_px, W * 4, {sampler = cpu_sampler})
+		sizes := [4][2]i32{TEX, TEX, TEX, TEX}
+		oksl.run(&m.program, block, W, H, cpu_px, W * 4, {sampler = cpu_sampler, channel_sizes = sizes[:]})
 
 		max_d, sum, over2, over8 := 0, 0, 0, 0
 		diff := make([]u8, W * H * 4)
@@ -240,14 +281,15 @@ gpu_init :: proc(g: ^Gpu, vertex_path: string) -> bool {
 	}
 	g.vert = sdl.CreateGPUShader(g.device, vert)
 	g.target = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET}, width = W, height = H, layer_count_or_depth = 1, num_levels = 1})
-	g.tex = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = TEX, height = TEX, layer_count_or_depth = 1, num_levels = 1})
+	g.tex = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = TEX, height = TEX, layer_count_or_depth = 1, num_levels = LEVELS})
 	g.sampler = sdl.CreateGPUSampler(g.device, {
 		min_filter = .LINEAR,
 		mag_filter = .LINEAR,
-		mipmap_mode = .NEAREST,
+		mipmap_mode = .LINEAR,
 		address_mode_u = .REPEAT,
 		address_mode_v = .REPEAT,
 		address_mode_w = .REPEAT,
+		max_lod = LEVELS - 1,
 	})
 	Vertex :: struct {
 		pos, uv: [2]f32,
@@ -268,7 +310,11 @@ gpu_init :: proc(g: ^Gpu, vertex_path: string) -> bool {
 	cmd := sdl.AcquireGPUCommandBuffer(g.device)
 	pass := sdl.BeginGPUCopyPass(cmd)
 	sdl.UploadToGPUBuffer(pass, {transfer_buffer = transfer}, {buffer = g.quad, size = size_of(quad)}, false)
-	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = size_of(quad), pixels_per_row = TEX, rows_per_layer = TEX}, {texture = g.tex, w = TEX, h = TEX, d = 1}, false)
+	for l in 0 ..< LEVELS {
+		n := u32(TEX >> uint(l))
+		src := sdl.GPUTextureTransferInfo{transfer_buffer = transfer, offset = u32(size_of(quad) + level_offset(l)), pixels_per_row = n, rows_per_layer = n}
+		sdl.UploadToGPUTexture(pass, src, {texture = g.tex, mip_level = u32(l), w = n, h = n, d = 1}, false)
+	}
 	sdl.EndGPUCopyPass(pass)
 	fence := sdl.SubmitGPUCommandBufferAndAcquireFence(cmd)
 	_ = sdl.WaitForGPUFences(g.device, true, &fence, 1)

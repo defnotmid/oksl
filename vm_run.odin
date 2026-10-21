@@ -7,7 +7,9 @@ import "core:math"
 // neighbours like a GPU's fine derivatives.
 
 // Samples channel `channel` at normalized `uv` (origin top-left) and mip
-// level `lod`; returns RGBA.
+// level `lod`; returns RGBA. The level texture() picks is fractional and
+// may be below 0 (magnified, -inf where uv is constant): clamp it to the
+// levels the channel has.
 Sampler_Proc :: #type proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32
 
 Run_Options :: struct {
@@ -19,6 +21,11 @@ Run_Options :: struct {
 	// The stage inputs by location. Absent ones are zero, except location
 	// 0, which is the layer's uv (what the layer vertex shader writes).
 	varyings: []Varying,
+	// Each channel's size in texels (level 0), for textureSize and
+	// texelFetch in GLSL shaders and the level texture() picks in fragment
+	// shaders. A channel without one is 0x0, and texture() samples it at
+	// its bias.
+	channel_sizes: [][2]i32,
 }
 
 // A stage input across the layer, as one triangle's rasterization gives
@@ -1196,8 +1203,17 @@ execute :: proc(r: ^Runner) {
 					}
 				}
 			}
-		case .Texture:
+		case .Texture, .Texture_Bias:
 			sample_texture(r, in_)
+		case .Texture_Size:
+			size := channel_size(r, int(in_.k))
+			for l in 0 ..< LANES {
+				// Negative lods shift everything out.
+				lod := regs[a][l]
+				for i in 0 ..< i32(2) {
+					regs[dst + i][l] = u32(max(size[i] >> lod, 1) if size[i] > 0 else 0)
+				}
+			}
 		case .Mask_Copy:
 			masks[dst] = masks[a]
 		case .Mask_Cond:
@@ -1231,22 +1247,42 @@ execute :: proc(r: ^Runner) {
 	}
 }
 
-// A child sample at an explicit level (`.eval` passes 0): dst = channel k
-// at uv a, lod b.
+// A sample: dst = channel k at uv a, lod b (Texture_Bias: b plus the
+// level the uv derivatives pick in the channel's texels, one per quad from
+// its top row and left column, as GPUs' texture units pick it).
 @(private)
 sample_texture :: proc(r: ^Runner, in_: Instr) {
 	regs := r.regs
 	ch := int(in_.k)
 	dst, a, b := in_.dst, in_.a, in_.b
+	lod := fl(&regs[b])^
+	if size := channel_size(r, ch); in_.op == .Texture_Bias && size != {} {
+		w, h := f32(size.x), f32(size.y)
+		u, v := fl(&regs[a]), fl(&regs[a + 1])
+		for o := 0; o < LANES; o += 4 {
+			dx := [2]f32{(u[o + 1] - u[o]) * w, (v[o + 1] - v[o]) * h}
+			dy := [2]f32{(u[o + 2] - u[o]) * w, (v[o + 2] - v[o]) * h}
+			level := 0.5 * math.log2(max(dx.x * dx.x + dx.y * dx.y, dy.x * dy.x + dy.y * dy.y))
+			for k in 0 ..< 4 {
+				lod[o + k] += level
+			}
+		}
+	}
 	for l in 0 ..< LANES {
 		c: [4]f32
 		if r.opts.sampler != nil && ch >= 0 {
-			c = r.opts.sampler(r.opts.user, ch, {fval(regs[a][l]), fval(regs[a + 1][l])}, fval(regs[b][l]))
+			c = r.opts.sampler(r.opts.user, ch, {fval(regs[a][l]), fval(regs[a + 1][l])}, lod[l])
 		}
 		for i in 0 ..< 4 {
 			regs[dst + i32(i)][l] = fbits(c[i])
 		}
 	}
+}
+
+// Channel ch's size from the host (0x0 without one).
+@(private)
+channel_size :: #force_inline proc "contextless" (r: ^Runner, ch: int) -> [2]i32 {
+	return r.opts.channel_sizes[ch] if ch >= 0 && ch < len(r.opts.channel_sizes) else {}
 }
 
 // Column-major dim x dim matrices.

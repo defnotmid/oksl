@@ -1008,6 +1008,12 @@ msl_builtin :: proc(m: ^Msl, id: Expr_Id) -> string {
 	case .Texture_Lod:
 		tex, smp := msl_sampler(m, args[0])
 		return fmt.aprintf("%s.sample(%s, %s, level(%s))", tex, smp, a[1], a[2])
+	case .Texture:
+		tex, smp := msl_sampler(m, args[0])
+		return fmt.aprintf("%s.sample(%s, %s, bias(%s))", tex, smp, a[1], a[2])
+	case .Texture_Size:
+		tex, _ := msl_sampler(m, args[0])
+		return fmt.aprintf("int2(%s.get_width(uint(%s)), %s.get_height(uint(%s)))", tex, a[1], tex, a[1])
 	}
 	return ""
 }

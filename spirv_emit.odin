@@ -726,7 +726,25 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		img := new_id(s)
 		inst(&s.body, .Load, sampled_image_type(s), img, args[0])
 		r := new_id(s)
-		inst(&s.body, .Image_Sample_Explicit_Lod, rt, r, img, args[1], 0x2, args[2])
+		inst(&s.body, .Image_Sample_Explicit_Lod, rt, r, img, args[1], 0x2, args[2]) // Lod
+		return r
+	case .Texture:
+		img := new_id(s)
+		inst(&s.body, .Load, sampled_image_type(s), img, args[0])
+		r := new_id(s)
+		inst(&s.body, .Image_Sample_Implicit_Lod, rt, r, img, args[1], 0x1, args[2]) // Bias
+		return r
+	case .Texture_Size:
+		if !s.image_query {
+			inst(&s.caps, .Capability, 50) // ImageQuery
+			s.image_query = true
+		}
+		sampled := new_id(s)
+		inst(&s.body, .Load, sampled_image_type(s), sampled, args[0])
+		img := new_id(s)
+		inst(&s.body, .Image, s.t_image, img, sampled)
+		r := new_id(s)
+		inst(&s.body, .Image_Query_Size_Lod, rt, r, img, args[1])
 		return r
 	}
 	return 0

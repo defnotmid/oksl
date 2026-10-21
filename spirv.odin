@@ -51,7 +51,10 @@ Op :: enum u32 {
 	Composite_Extract        = 81,
 	Composite_Insert         = 82,
 	Transpose                = 84,
+	Image_Sample_Implicit_Lod = 87,
 	Image_Sample_Explicit_Lod = 88,
+	Image                    = 100,
+	Image_Query_Size_Lod     = 103,
 	Convert_F_To_U           = 109,
 	Convert_F_To_S           = 110,
 	Convert_S_To_F           = 111,
@@ -264,6 +267,8 @@ Spv :: struct {
 	glsl:        u32,
 	t_image:     u32,
 	t_sampled:   u32,
+	// The ImageQuery capability is declared (textureSize).
+	image_query: bool,
 	block_var:   u32,
 	block_type:  u32,
 	// Member index of each user uniform symbol in the block.

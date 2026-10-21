@@ -904,6 +904,87 @@ void main() {
 	}
 }
 
+// texture() in a fragment shader samples at the level its uv derivatives
+// pick in the channel's texels (one per quad), plus the bias; a channel
+// without a size samples at the bias, and a vertex shader's texture() at
+// level 0. textureSize and texelFetch read the sizes the host gives.
+@(test)
+test_glsl_texture_lod :: proc(t: ^testing.T) {
+	src := `#version 300 es
+precision highp float;
+in vec2 st;
+uniform sampler2D a;
+uniform sampler2D b;
+uniform sampler2D c;
+layout(location = 0) out vec4 implicit;
+layout(location = 1) out vec4 biased;
+layout(location = 2) out vec4 unsized;
+layout(location = 3) out vec4 sized;
+layout(location = 4) out vec4 fetched;
+void main() {
+    implicit = texture(a, st);
+    biased = texture(b, st, 1.0);
+    unsized = texture(c, st, 0.5);
+    sized = vec4(textureSize(a, 0), textureSize(b, 2));
+    fetched = texelFetch(b, ivec2(3, 1), 2);
+}`
+	m, errs, ok := compile_glsl(src)
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	for want in ([]string{"ok_a_tex.sample(ok_a_smp, g.in_st, bias(0.0f))", "ok_b_tex.get_width(uint(2))"}) {
+		testing.expectf(t, strings.contains(m.msl, want), "MSL lacks %s", want)
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "test_glsl_texture_lod", m.spirv)
+	}
+	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+		return {uv.x, uv.y, lod, f32(channel)}
+	}
+	// st steps 1/16 across and 1/8 down a pixel: 4 x 4 texels of a
+	// (64x32, lod 2) and 1 x 2 of b (16x16, lod 1).
+	W, H :: 8, 2
+	targets: [5][W * H][4]f32
+	slices := [5][][4]f32{targets[0][:], targets[1][:], targets[2][:], targets[3][:], targets[4][:]}
+	varyings := []Varying{{dx = {1.0 / 16, 0, 0, 0}, dy = {0, 1.0 / 8, 0, 0}}}
+	sizes := [][2]i32{{64, 32}, {16, 16}}
+	block := make([]u8, m.block_size, context.temp_allocator)
+	run_targets(&m.program, block, W, H, slices[:], {sampler = sampler, varyings = varyings, channel_sizes = sizes})
+	for i in 0 ..< W * H {
+		st := [2]f32{(f32(i % W) + 0.5) / 16, (f32(i / W) + 0.5) / 8}
+		near(t, targets[0][i], {st.x, st.y, 2, 0})
+		near(t, targets[1][i], {st.x, st.y, 2, 1})
+		near(t, targets[2][i], {st.x, st.y, 0.5, 2})
+		near(t, targets[3][i], {64, 32, 4, 4})
+		near(t, targets[4][i], {3.5 / 4, 1.5 / 4, 2, 1})
+	}
+
+	vs := `#version 300 es
+in vec2 p;
+uniform sampler2D t;
+out vec4 v;
+void main() { v = texture(t, p); gl_Position = vec4(p, 0.0, 1.0); }`
+	vm, verrs, vok := compile_glsl(vs, {stage = .Vertex})
+	defer destroy(vm)
+	if !testing.expectf(t, vok, "%s", format_errors(verrs, context.temp_allocator)) {
+		return
+	}
+	testing.expectf(t, strings.contains(vm.msl, "level(0.0f)"), "vertex MSL samples level 0")
+	points := [2][2]f32{{0.25, 0.5}, {0.75, 0}}
+	attrs := []Attribute{{&points[0], size_of([2]f32), .Float2}}
+	positions: [2][4]f32
+	vary := make([]f32, 2 * vm.varying_floats, context.temp_allocator)
+	scratch: Scratch
+	defer scratch_destroy(&scratch)
+	vblock := make([]u8, max(vm.block_size, 16), context.temp_allocator)
+	run_vertex(&vm.program, vblock, attrs, 2, positions[:], vary, &scratch, {sampler = sampler, channel_sizes = sizes})
+	for i in 0 ..< 2 {
+		r := vary[i * vm.varying_floats:]
+		near(t, {r[0], r[1], r[2], r[3]}, {points[i].x, points[i].y, 0, 0})
+	}
+}
+
 @(test)
 test_glsl_fragment_errors :: proc(t: ^testing.T) {
 	glsl_errors :: proc(src: string) -> string {

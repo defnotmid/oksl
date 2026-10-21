@@ -147,9 +147,10 @@ GLSL ES 3, through the same parser, checker and backends as SkSL:
   allowed. A shader uses (and the host binds) only the ones it reads.
 - **Sampling:** `texture(iChannelN, uv)` takes 0..1 uv with the origin at
   the bottom left, like Shadertoy; `textureLod`, `texelFetch` (integer
-  texels from the bottom left) and `textureSize` work too. They lower onto
-  the explicit-lod sample SkSL's `.eval` uses (channels have no mipmaps;
-  the host sampler sees the lod). A `uniform sampler2D name;` takes a
+  texels from the bottom left) and `textureSize` work too. `texture`
+  samples at the level its uv derivatives pick (plus its bias), the others
+  at an explicit level, as SkSL's `.eval` does; on the CPU the host
+  sampler sees the level (see the CPU interpreter). A `uniform sampler2D name;` takes a
   channel the source doesn't name as `iChannelN`, and samplers can be
   function parameters (`texelFetch` and `textureSize` need the channel
   itself, for its size).
@@ -213,9 +214,9 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   declaration order (none: no block); `uniform_offset` and `set_uniform`
   find them by name, and unused or undeclared names are not found.
   `uniform sampler2D`s take channels in declaration order. `texture` uv
-  starts at the top left, as in Vulkan (no flip). `texelFetch` and
-  `textureSize` are not available yet (they read channel sizes from the
-  layer profiles' inputs header).
+  starts at the top left, as in Vulkan (no flip). `textureSize` queries
+  the image (on the CPU, the size the host gives) and `texelFetch` samples
+  the texel's centre at its level, so both take sampler parameters too.
 - **Diagnosed:** `varying` / `attribute` (unless a prelude defines them),
   duplicate or out-of-range locations, integer interpolated variables
   without `flat`, initializers on stage variables, writes to inputs,
@@ -349,7 +350,8 @@ set `iResolution` to the layer's size in the units `coord` should run in
 `run_f32` for float RGBA, from the output at location 0; `run_targets`
 writes every output, one float target per location. `Run_Options` takes a
 sampler callback (`proc(user, channel, uv, lod) -> [4]f32`; `.eval` passes
-lod 0), an optional sub-rectangle and the stage inputs by location
+lod 0), the channels' sizes in texels, an optional sub-rectangle and the
+stage inputs by location
 (`Varying`: per component `a + dx * x + dy * y` at pixel centres, what one
 triangle's rasterization gives). An input without one is zero, except
 location 0, which gets the layer's uv as the layer vertex shader writes it.
@@ -372,6 +374,17 @@ oksl.run_fragment(&p.fragment.program, fblock, {count = n, origin = origins, fro
 
 `run_fragment` shades four quads at a time in the order the layer runner
 does, so derivatives and results match it bit for bit (a test checks).
+
+`texture` in a fragment shader passes the sampler the level a GPU picks:
+`0.5 * log2(max(|duv/dx|², |duv/dy|²))` in the channel's texels
+(`Run_Options.channel_sizes`), one per quad from its top row and left
+column, plus the bias. It is fractional and below 0 where magnified (-inf
+where uv is constant), so the sampler clamps it to the levels it has; a
+channel without a size samples at the bias. GPUs approximate the level
+differently (on a bent mapping radv and Apple pick up to 0.17 levels
+higher), and where uv jumps inside a quad (a `fract` seam) which pixels
+they difference decides it; `tools/gpu_parity` samples a mip chain to
+show both.
 
 - **Inlining:** every function is inlined into one flat `[]Instr` program
   over SoA registers. A slot is one scalar component for 16 lanes, which
@@ -500,9 +513,8 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 - **No DXIL:** on Windows, run SDL_GPU's Vulkan driver.
 - **Not supported:** struct uniforms, arrays of arrays,
   `colorFilter` / `blender` children; in GLSL, cubemap / 3D / array
-  samplers, Shadertoy's keyboard, sound and webcam inputs, and mipmapped
-  sampling (`texture` samples level 0, its bias and `textureLod`'s level
-  go to the host sampler). Children and channels are images bound by the
+  samplers and Shadertoy's keyboard, sound and webcam inputs. Children
+  and channels are images bound by the
   host (no shader trees); `sk_FragCoord` is layer-local.
 - **MSL out arguments:** out arguments that are swizzles (`f(v.xy)`)
   work on SPIR-V and the CPU, but not in MSL (Metal can't bind a reference
@@ -518,8 +530,6 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 What would make oksl useful well beyond onimite:
 
 - **DXIL / HLSL output** for D3D12, SDL_GPU's preferred driver on Windows.
-- **texelFetch / textureSize in GLSL shaders** (size queries on the GPU,
-  sizes from the host on the CPU) and implicit-LOD (mipmapped) `texture()`.
 - **Compute shaders.**
 - **WGSL output** for WebGPU and browsers.
 - **A loop iteration cap** (and SkSL's ES2 loop rules enforced) so untrusted

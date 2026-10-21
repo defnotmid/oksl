@@ -1676,20 +1676,23 @@ check_eval :: proc(c: ^Checker, id: Expr_Id) -> Type {
 	return check_builtin(c, id, .Texture_Lod)
 }
 
-// GLSL's sampling, lowered onto the explicit-lod sample `.eval` uses. In
-// Shadertoy code uv (0..1) and texel coordinates start at the bottom left
-// and are flipped to the backends' top-left origin as uv * (1, -1) + (0, 1),
-// which evaluates uv once (a GLSL fragment shader's start at the top left,
-// as Vulkan's do, and are not flipped):
+// GLSL's sampling, lowered onto the explicit-lod sample `.eval` uses and,
+// for texture() in a fragment shader, the implicit-lod one (the level its
+// uv derivatives pick, plus the bias; a vertex shader's samples level 0).
+// In Shadertoy code uv (0..1) and texel coordinates start at the bottom
+// left and are flipped to the backends' top-left origin as
+// uv * (1, -1) + (0, 1), which evaluates uv once (a GLSL fragment shader's
+// start at the top left, as Vulkan's do, and are not flipped):
 //
-//     texture(s, uv [, bias])  ->  sample(s, flip(uv), bias or 0)
+//     texture(s, uv [, bias])  ->  sample(s, flip(uv), implicit + bias)
 //     textureLod(s, uv, lod)   ->  sample(s, flip(uv), lod)
 //     texelFetch(s, p, lod)    ->  sample(s, flip((vec2(p) + 0.5) / size), lod)
 //     textureSize(s, lod)      ->  ivec2(size)
 //
-// `size` is the channel's iChannelResolution.xy, so texelFetch and
-// textureSize take a channel itself rather than a sampler parameter.
-// Channels have no mipmaps: a host sampler sees lod and may ignore it.
+// With the inputs header (Shadertoy) `size` is the channel's
+// iChannelResolution.xy, so texelFetch and textureSize take a channel
+// itself rather than a sampler parameter; without it (GLSL shaders) it is
+// the image's own size at lod.
 @(private)
 check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 	u := c.u
@@ -1726,12 +1729,21 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		append(&c.u.exprs, Expr{kind = .Binary, op = op, pos = c.u.exprs[a].pos, a = a, b = b, type = intern(c.u, t)})
 		return id
 	}
-	// iChannelResolution[n].xy of the channel sampled.
-	channel_size :: proc(c: ^Checker, e: Expr, sampler: Expr_Id) -> (Expr_Id, bool) {
+	// textureSize(sampler, lod) as the image reports it.
+	image_size :: proc(c: ^Checker, e: Expr, sampler, lod: Expr_Id) -> Expr_Id {
+		u := c.u
+		args := push_ids(u, {u32(sampler), u32(lod)})
+		id := Expr_Id(len(u.exprs))
+		append(&u.exprs, Expr{kind = .Call, pos = e.pos, name = "textureSize", args = args, call = .Builtin})
+		u.exprs[id].type = intern(u, check_builtin(c, id, .Texture_Size))
+		return id
+	}
+	// The channel's size in texels at `lod` as a vec2: the image's, or
+	// with the inputs header iChannelResolution[n].xy of the channel.
+	channel_size :: proc(c: ^Checker, e: Expr, sampler, lod: Expr_Id) -> (Expr_Id, bool) {
 		u := c.u
 		if !c.rules.header {
-			add_error(c, e.pos, .Texture_Size_Header, e.name)
-			return 0, false
+			return make_convert(c, image_size(c, e, sampler, lod), vec_type(.Float, 2)), true
 		}
 		s := u.exprs[sampler]
 		if s.kind != .Ident || s.sym == 0 || u.syms[s.sym].storage != .Channel {
@@ -1754,7 +1766,11 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		if lt := expr_type(u, args[1]); lt != T_INT && lt != T_UINT {
 			return no_overload(c, e, args)
 		}
-		size, ok := channel_size(c, e, args[0])
+		if !c.rules.header {
+			u.exprs[id].call = .Builtin
+			return check_builtin(c, id, .Texture_Size)
+		}
+		size, ok := channel_size(c, e, args[0], args[1])
 		if !ok {
 			return T_ERROR
 		}
@@ -1775,7 +1791,7 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 			return no_overload(c, e, args)
 		}
 		size: Expr_Id
-		if size, ok = channel_size(c, e, sampler); !ok {
+		if size, ok = channel_size(c, e, sampler, lod); !ok {
 			return T_ERROR
 		}
 		centre := binary(c, .Plus, make_convert(c, p, v2), add_lit(c, 0.5, e.pos), v2)
@@ -1795,11 +1811,13 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 	if lod == 0 {
 		lod = add_lit(c, 0, e.pos)
 	}
+	// texture()'s lod is a bias on the level its derivatives pick, in the
+	// stages that have them.
+	b := Builtin.Texture if e.name == "texture" && .Derivatives in c.u.features else Builtin.Texture_Lod
 	sample_args := push_ids(u, {u32(sampler), u32(uv), u32(lod)})
 	u.exprs[id].args = sample_args
 	u.exprs[id].call = .Builtin
-	u.exprs[id].builtin = .Texture_Lod
-	return check_builtin(c, id, .Texture_Lod)
+	return check_builtin(c, id, b)
 }
 
 @(private)
@@ -2015,6 +2033,8 @@ check_builtin :: proc(c: ^Checker, id: Expr_Id, b: Builtin) -> Type {
 		return mat_type(int(last.rows), int(t0.rows))
 	case .Transposed:
 		return mat_type(int(t0.rows), int(t0.cols))
+	case .Ivec2:
+		return vec_type(.Int, 2)
 	}
 	return T_ERROR
 }
@@ -2190,6 +2210,8 @@ builtin_args_ok :: proc(c: ^Checker, info: Builtin_Info, args: []Expr_Id) -> boo
 		return is_vector(at(c, args, 0)) && at(c, args, 0).base == .Bool
 	case .Texture_Lod:
 		return at(c, args, 0) == T_SAMPLER && at(c, args, 1) == vec_type(.Float, 2) && to_float(c, args, 2) && at(c, args, 2) == T_FLOAT
+	case .Texture_Size:
+		return at(c, args, 0) == T_SAMPLER && (at(c, args, 1) == T_INT || at(c, args, 1) == T_UINT)
 	}
 	return false
 }
