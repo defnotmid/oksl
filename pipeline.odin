@@ -49,6 +49,8 @@ compile_pipeline :: proc(desc: Pipeline_Desc, options := Options{}) -> (p: ^Pipe
 	for st, i in stages {
 		m, made := module_new()
 		if !made {
+			// destroy_pipeline frees the stage made already.
+			p.vertex = modules[0]
 			return p, p.errors[:], false
 		}
 		modules[i] = m
@@ -121,7 +123,7 @@ link_stages :: proc(vu: ^Unit, vc: ^Checked, fu: ^Unit, fc: ^Checked, errors: ^[
 			explicit := fu.vars[fs.decl].location
 			switch {
 			case ft != vt:
-				report(errors, fs, .Varying_Type, a = type_name(vu, vt), b = type_name(fu, ft))
+				report(errors, fs, .Varying_Type, a = type_name(vu, vt, fu.allocator), b = type_name(fu, ft, fu.allocator))
 			case out.flat != row.flat:
 				report(errors, fs, .Varying_Flat)
 			case explicit >= 0 && explicit != out.binding:

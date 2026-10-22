@@ -165,7 +165,9 @@ cpu_hash :: proc(m: ^oksl.Module) -> string {
 	block := make([]u8, m.block_size, context.temp_allocator)
 	oksl.write_builtins(block, {resolution = {8, 2, 1}, time = 1.25})
 	px := make([][4]f32, 16, context.temp_allocator)
-	oksl.run_f32(&m.program, block, 8, 2, px)
+	scratch: oksl.Scratch
+	defer oksl.scratch_destroy(&scratch)
+	oksl.run_f32(&m.program, block, 8, 2, px, &scratch)
 	return fmt.tprintf("%x", hash.fnv64a(slice.to_bytes(px)))
 }
 
@@ -338,7 +340,9 @@ files :: proc(dir: string) {
 		for &p in px {
 			p = {-7, -7, -7, -7}
 		}
-		oksl.run_f32(&m.program, block, W, H, px, {sampler = sampler})
+		scratch: oksl.Scratch
+		oksl.run_f32(&m.program, block, W, H, px, &scratch, {sampler = sampler})
+		oksl.scratch_destroy(&scratch)
 		_ = os.write_entire_file(fmt.tprintf("%s.f32", base), slice.to_bytes(px))
 		oksl.destroy(m)
 	}

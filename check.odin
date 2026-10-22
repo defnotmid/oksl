@@ -216,7 +216,7 @@ use_input :: proc(c: ^Checker, s: Sym_Id) {
 
 @(private)
 tn :: proc(c: ^Checker, t: Type) -> string {
-	return type_name(c.u, t)
+	return type_name(c.u, t, c.u.allocator)
 }
 
 @(private)
@@ -662,7 +662,7 @@ order_functions :: proc(c: ^Checker, entry: Func_Id) -> []Func_Id {
 		case .Done:
 			return true
 		case .Active:
-			b := strings.builder_make(context.temp_allocator)
+			b := strings.builder_make(u.allocator)
 			started := false
 			for g in w.stack {
 				if g == f {started = true}
@@ -1858,7 +1858,7 @@ pick_overload :: proc(c: ^Checker, id: Expr_Id, report: bool) -> Func_Id {
 	if !report {
 		return 0
 	}
-	b := strings.builder_make(context.temp_allocator)
+	b := strings.builder_make(u.allocator)
 	for a, i in args {
 		if i > 0 {strings.write_string(&b, ", ")}
 		strings.write_string(&b, tn(c, expr_type(u, a)))
@@ -2060,7 +2060,7 @@ layout_used_uniforms :: proc(c: ^Checker) {
 // "no overload of f takes (types)", with the arguments' current types.
 @(private)
 no_overload :: proc(c: ^Checker, e: Expr, args: []Expr_Id) -> Type {
-	sb := strings.builder_make(context.temp_allocator)
+	sb := strings.builder_make(c.u.allocator)
 	for a, i in args {
 		if i > 0 {strings.write_string(&sb, ", ")}
 		strings.write_string(&sb, tn(c, expr_type(c.u, a)))

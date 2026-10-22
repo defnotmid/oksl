@@ -59,7 +59,9 @@ block := make([]u8, m.block_size)
 oksl.write_builtins(block, {resolution = {f32(w), f32(h), 1}, time = t, channel_resolution = {{tw, th, 1}, {}, {}, {}}})
 // or one input at a time: oksl.write_input(block, .Channel_Time, {clip_seconds}, 0)
 oksl.set_uniform(m, block, "uSpeed", {0.5})
-oksl.run(&m.program, block, w, h, pixels, w * 4, {sampler = my_sampler})
+scratch: oksl.Scratch                      // working memory, one per thread
+defer oksl.scratch_destroy(&scratch)
+oksl.run(&m.program, block, w, h, pixels, w * 4, &scratch, {sampler = my_sampler})
 ```
 
 A Shadertoy multipass program (Common, Buffer A-D, Image) compiles into a
@@ -346,9 +348,11 @@ set `iResolution` to the layer's size in the units `coord` should run in
 ## CPU interpreter
 
 `compile` also builds `Module.program`. Run it with
-`run(&m.program, block, width, height, out, stride, opts)` for RGBA8, or
-`run_f32` for float RGBA, from the output at location 0; `run_targets`
-writes every output, one float target per location. `Run_Options` takes a
+`run(&m.program, block, width, height, out, stride, &scratch, opts)` for
+RGBA8, or `run_f32` for float RGBA, from the output at location 0;
+`run_targets` writes every output, one float target per location. A
+`Scratch` (registers and masks) grows to the largest program it has run,
+so runs that reuse one allocate nothing. `Run_Options` takes a
 sampler callback (`proc(user, channel, uv, lod) -> [4]f32`; `.eval` passes
 lod 0), the channels' sizes in texels, an optional sub-rectangle and the
 stage inputs by location

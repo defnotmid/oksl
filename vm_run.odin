@@ -38,23 +38,24 @@ Varying :: struct {
 // Shades a `width x height` layer into `out` (RGBA8, `stride` bytes per
 // row, top-down) from the output at location 0. `uniforms` is the block
 // (`Module.block_size` bytes, with iResolution set to the layer size).
-// Discarded pixels are left untouched.
-run :: proc(p: ^Program, uniforms: []u8, width, height: int, out: []u8, stride: int, opts := Run_Options{}) {
-	runner_run(p, uniforms, width, height, opts, out, stride, nil)
+// Discarded pixels are left untouched. `scratch` is the caller's working
+// memory (one per thread running at once).
+run :: proc(p: ^Program, uniforms: []u8, width, height: int, out: []u8, stride: int, scratch: ^Scratch, opts := Run_Options{}) {
+	runner_run(p, uniforms, width, height, opts, out, stride, nil, scratch)
 }
 
 // Like `run`, writing unclamped float RGBA (`out` has width * height
 // entries, row-major).
-run_f32 :: proc(p: ^Program, uniforms: []u8, width, height: int, out: [][4]f32, opts := Run_Options{}) {
+run_f32 :: proc(p: ^Program, uniforms: []u8, width, height: int, out: [][4]f32, scratch: ^Scratch, opts := Run_Options{}) {
 	targets := [1][][4]f32{out}
-	runner_run(p, uniforms, width, height, opts, nil, 0, targets[:])
+	runner_run(p, uniforms, width, height, opts, nil, 0, targets[:], scratch)
 }
 
 // Like `run_f32` for every output: `targets[n]` (width * height entries,
 // nil to skip) receives the output at location n, integer outputs
 // converted to float, missing components 0 (alpha 1).
-run_targets :: proc(p: ^Program, uniforms: []u8, width, height: int, targets: [][][4]f32, opts := Run_Options{}) {
-	runner_run(p, uniforms, width, height, opts, nil, 0, targets)
+run_targets :: proc(p: ^Program, uniforms: []u8, width, height: int, targets: [][][4]f32, scratch: ^Scratch, opts := Run_Options{}) {
+	runner_run(p, uniforms, width, height, opts, nil, 0, targets, scratch)
 }
 
 @(private)
@@ -154,9 +155,8 @@ float_of :: #force_inline proc "contextless" (bits: u32, base: Base) -> f32 {
 }
 
 @(private)
-runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32) {
-	scratch := Scratch{make([dynamic]Reg, context.temp_allocator), make([dynamic]Lane_Mask, context.temp_allocator)}
-	r := runner_begin(p, &scratch, uniforms, opts)
+runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) {
+	r := runner_begin(p, scratch, uniforms, opts)
 	x0, y0 := opts.x, opts.y
 	w, h := opts.w, opts.h
 	if w <= 0 || h <= 0 {
@@ -823,11 +823,15 @@ execute :: proc(r: ^Runner) {
 				}
 			}
 		case .Store_Zero:
+			if exec == ALL_LANES {
+				for i in 0 ..< i32(n) {
+					regs[dst + i] = {}
+				}
+				break
+			}
 			for i in 0 ..< i32(n) {
 				for l in 0 ..< LANES {
-					if l in exec {
-						regs[dst + i][l] = 0
-					}
+					regs[dst + i][l] &= u32(0) - u32(l not_in exec)
 				}
 			}
 		case .Load_Dyn:

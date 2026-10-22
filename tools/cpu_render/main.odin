@@ -81,8 +81,10 @@ main :: proc() {
 	for i in 0 ..< w * h {
 		pixels[i * 4 + 3] = 255
 	}
+	scratch: oksl.Scratch
+	defer oksl.scratch_destroy(&scratch)
 	start := time.tick_now()
-	oksl.run(&m.program, block, w, h, pixels, w * 4, {sampler = sampler})
+	oksl.run(&m.program, block, w, h, pixels, w * 4, &scratch, {sampler = sampler})
 	fmt.printfln("%s: %d instructions, %d slots, %.1f ms", os.args[1], len(m.program.code), m.program.num_slots, time.duration_milliseconds(time.tick_since(start)))
 	stbi.write_png(strings.clone_to_cstring(os.args[2]), i32(w), i32(h), 4, raw_data(pixels), i32(w * 4))
 }

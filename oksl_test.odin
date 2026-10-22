@@ -39,13 +39,19 @@ eval_at :: proc(t: ^testing.T, body: string, x := 0, y := 0, prelude := "", loc 
 	block := make([]u8, m.block_size, context.temp_allocator)
 	write_builtins(block, {resolution = {4, 2, 1}, time = 2})
 	out := make([][4]f32, 8, context.temp_allocator)
-	run_f32(&m.program, block, 4, 2, out)
+	run_f32(&m.program, block, 4, 2, out, temp_scratch())
 	return out[y * 4 + x]
 }
 
 @(private = "file")
 eval :: proc(t: ^testing.T, body: string, prelude := "", loc := #caller_location) -> [4]f32 {
 	return eval_at(t, body, prelude = prelude, loc = loc)
+}
+
+// Working memory for one run, freed with the temp allocator.
+@(private = "file")
+temp_scratch :: proc() -> ^Scratch {
+	return new_clone(Scratch{make([dynamic]Reg, context.temp_allocator), make([dynamic]Lane_Mask, context.temp_allocator)}, context.temp_allocator)
 }
 
 @(private = "file")
@@ -166,7 +172,7 @@ run_shadertoy :: proc(t: ^testing.T, src: string, b: Builtins = {resolution = {4
 	for &px in out {
 		px = {-1, -1, -1, -1}
 	}
-	run_f32(&m.program, block, 4, 2, out, {sampler = sampler})
+	run_f32(&m.program, block, 4, 2, out, temp_scratch(), {sampler = sampler})
 	return out, m
 }
 
@@ -281,9 +287,9 @@ void mainImage(out vec4 c, in vec2 p) {
 	block := make([]u8, 1024, context.temp_allocator)
 	write_builtins(block, {resolution = {4, 2, 1}})
 	out := make([][4]f32, 8, context.temp_allocator)
-	run_f32(&g.passes[0].module.program, block, 4, 2, out)
+	run_f32(&g.passes[0].module.program, block, 4, 2, out, temp_scratch())
 	near(t, out[0], {3, -1, 0, 0.25})
-	run_f32(&g.passes[2].module.program, block, 4, 2, out)
+	run_f32(&g.passes[2].module.program, block, 4, 2, out, temp_scratch())
 	near(t, out[0], {1, 1, 1, 1})
 
 	program_errors :: proc(desc: Program_Desc) -> string {
@@ -394,7 +400,7 @@ void mainImage(out vec4 c, in vec2 p) { clip(p.x); c = vec4(1.0); }`
 	for &b in px {
 		b = 9
 	}
-	run(&m.program, block, 4, 2, px, 16)
+	run(&m.program, block, 4, 2, px, 16, temp_scratch())
 	testing.expect_value(t, px[1 * 4], 9)
 	testing.expect_value(t, px[2 * 4], 255)
 	testing.expect_value(t, px[(4 + 3) * 4 + 3], 255)
@@ -480,6 +486,39 @@ test_errors :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(many, "x1") && strings.contains(many, "x2"))
 }
 
+// Errors' text lives with the module (or pipeline), not in the temp
+// allocator: hosts keep errors across frames that free it.
+@(test)
+test_errors_outlive_temp :: proc(t: ^testing.T) {
+	sources := [?]string {
+		"half4 main(float2 p) {\n  float f = float2(1.0);\n  return half4(f);\n}",
+		"float f(float x) { return x; }\nhalf4 main(float2 p) { return half4(f(true)); }",
+		"float f(float x) { return g(x); }\nfloat g(float x) { return f(x); }\nhalf4 main(float2 p) { return half4(f(1.0)); }",
+	}
+	wants := [?]string{"can not initialize float f with float2", "no overload of f takes (bool)", "f -> g -> f"}
+	modules: [len(sources)]^Module
+	errors: [len(sources)][]Error
+	for src, i in sources {
+		modules[i], errors[i], _ = compile(src)
+	}
+	defer for m in modules {destroy(m)}
+	p, perrs, _ := compile_pipeline({vertex = "out vec2 a;\nvoid main() { a = vec2(0); }", fragment = "in vec3 a;\nout vec4 c;\nvoid main() { c = vec4(a, 1); }"})
+	defer destroy_pipeline(p)
+	free_all(context.temp_allocator)
+	junk := make([]u8, 1 << 16, context.temp_allocator)
+	for &b in junk {
+		b = '#'
+	}
+	for want, i in wants {
+		got := format_errors(errors[i], context.allocator)
+		defer delete(got)
+		testing.expectf(t, strings.contains(got, want), "%q: got errors %q", want, got)
+	}
+	got := format_errors(perrs, context.allocator)
+	defer delete(got)
+	testing.expectf(t, strings.contains(got, "a is vec2 in the vertex shader and vec3 in the fragment shader"), "got errors %q", got)
+}
+
 // ---- SkSL ----------------------------------------------------------------------------
 
 @(test)
@@ -528,7 +567,7 @@ half4 main(float2 coord) {
 		return {uv.x, uv.y, lod, f32(channel)}
 	}
 	out := make([][4]f32, 8, context.temp_allocator)
-	run_f32(&m.program, block, 4, 2, out, {sampler = sampler})
+	run_f32(&m.program, block, 4, 2, out, temp_scratch(), {sampler = sampler})
 	// Pixel (1, 1): coord (1.5, 1.5), uImage at (3, 3) / (16, 8); uOther at (1, 3) / (4, 4) on channel 1.
 	near(t, out[5], {3.0 / 16, 3.0 / 8, 2.75, 1})
 }
@@ -556,7 +595,7 @@ half4 main(float2 coord) {
 		return {uv.x, uv.y, lod, f32(channel)}
 	}
 	out := make([][4]f32, 8, context.temp_allocator)
-	run_f32(&m.program, block, 4, 2, out, {sampler = sampler})
+	run_f32(&m.program, block, 4, 2, out, temp_scratch(), {sampler = sampler})
 	// Pixel (0, 1): coord (0.5, 1.5), mirrored to (3.5, 1.5) / (4, 2).
 	near(t, out[4], {3.5 / 4, 1.5 / 2, 0, 0})
 }
@@ -589,7 +628,7 @@ half4 main(float2 coord) {
 		return {uv.x, uv.y, lod, f32(channel)}
 	}
 	out := make([][4]f32, 8, context.temp_allocator)
-	run_f32(&m.program, block, 4, 2, out, {sampler = sampler})
+	run_f32(&m.program, block, 4, 2, out, temp_scratch(), {sampler = sampler})
 	// Pixel (1, 0): a = 0.5 + 1 * eval((1.5, 0.5)).x; eval((1, 0)).xy = (1, 0) / (4, 2).
 	near(t, out[1], {0.5 + 1.5 / 4, 0.25, 1.0 / 4, 0})
 }
@@ -653,7 +692,7 @@ test_derivatives :: proc(t: ^testing.T) {
 	block := make([]u8, m.block_size, context.temp_allocator)
 	write_builtins(block, {resolution = {4, 2, 1}})
 	out := make([][4]f32, 8, context.temp_allocator)
-	run_f32(&m.program, block, 4, 2, out)
+	run_f32(&m.program, block, 4, 2, out, temp_scratch())
 	near(t, out[5], {1, 1, 0, 1})
 }
 
@@ -745,13 +784,13 @@ half4 main(float2 p) {
 	for &b in px {
 		b = 9
 	}
-	run(&m.program, block, 4, 2, px, 16)
+	run(&m.program, block, 4, 2, px, 16, temp_scratch())
 	// x = 0: (1 + 3, 5, 8, 1) clamped to bytes; x = 3: transparent.
 	testing.expect_value(t, px[0], 255)
 	testing.expect_value(t, px[3], 255)
 	testing.expect_value(t, px[3 * 4 + 3], 0)
 	f := make([][4]f32, 8, context.temp_allocator)
-	run_f32(&m.program, block, 4, 2, f)
+	run_f32(&m.program, block, 4, 2, f, temp_scratch())
 	near(t, f[0], {4, 5, 8, 1})
 	// The MSL struct carries the same layout.
 	testing.expect(t, strings.contains(m.msl, "packed_float3 ok_uB;"))
@@ -798,7 +837,7 @@ test_corpus :: proc(t: ^testing.T) {
 				block := make([]u8, m.block_size, context.temp_allocator)
 				write_builtins(block, {resolution = {32, 16, 1}, time = 1, channel_resolution = {{8, 8, 1}, {8, 8, 1}, {8, 8, 1}, {8, 8, 1}}})
 				px := make([]u8, 32 * 16 * 4, context.temp_allocator)
-				run(&m.program, block, 32, 16, px, 32 * 4)
+				run(&m.program, block, 32, 16, px, 32 * 4, temp_scratch())
 			}
 		}
 		destroy(m)
@@ -892,7 +931,7 @@ void main() {
 	slices := [3][][4]f32{targets[0][:], targets[1][:], targets[2][:]}
 	varyings := []Varying{{a = {3, 4, 0, 0}}, {dx = {1, 0, 0, 0}, dy = {0, 2, 0, 0}}}
 	block := make([]u8, m.block_size, context.temp_allocator)
-	run_targets(&m.program, block, W, H, slices[:], {varyings = varyings})
+	run_targets(&m.program, block, W, H, slices[:], temp_scratch(), {varyings = varyings})
 	for y in 0 ..< H {
 		for x in 0 ..< W {
 			i := y * W + x
@@ -950,7 +989,7 @@ void main() {
 	varyings := []Varying{{dx = {1.0 / 16, 0, 0, 0}, dy = {0, 1.0 / 8, 0, 0}}}
 	sizes := [][2]i32{{64, 32}, {16, 16}}
 	block := make([]u8, m.block_size, context.temp_allocator)
-	run_targets(&m.program, block, W, H, slices[:], {sampler = sampler, varyings = varyings, channel_sizes = sizes})
+	run_targets(&m.program, block, W, H, slices[:], temp_scratch(), {sampler = sampler, varyings = varyings, channel_sizes = sizes})
 	for i in 0 ..< W * H {
 		st := [2]f32{(f32(i % W) + 0.5) / 16, (f32(i / W) + 0.5) / 8}
 		near(t, targets[0][i], {st.x, st.y, 2, 0})
@@ -1346,7 +1385,7 @@ test_run_fragment_matches_layer :: proc(t: ^testing.T) {
 	set_uniform(m, block, "uSpeed", {0.5})
 	want := make([][4]f32, W * H, context.temp_allocator)
 	for &p in want {p = {-1, -1, -1, -1}}
-	run_f32(&m.program, block, W, H, want, {sampler = sampler})
+	run_f32(&m.program, block, W, H, want, temp_scratch(), {sampler = sampler})
 
 	Q :: (W / 2) * (H / 2)
 	origin := make([][2]i32, Q, context.temp_allocator)
@@ -1437,12 +1476,12 @@ test_make_program_sksl :: proc(t: ^testing.T) {
 		block := make([]u8, p.module.block_size, context.temp_allocator)
 		write_builtins(p.module, block, {resolution = {W, H, 1}, channel_resolution = {{W, H, 1}, {}, {}, {}}})
 		if p.name == "first" {
-			run_f32(&p.module.program, block, W, H, first)
+			run_f32(&p.module.program, block, W, H, first, temp_scratch())
 			continue
 		}
 		out := make([][4]f32, W * H, context.temp_allocator)
 		// The channel reads the first pass's target, nearest texel.
-		run_f32(&p.module.program, block, W, H, out, {user = raw_data(first), sampler = proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+		run_f32(&p.module.program, block, W, H, out, temp_scratch(), {user = raw_data(first), sampler = proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
 			src := ([^][4]f32)(user)
 			x, y := clamp(int(uv.x * W), 0, W - 1), clamp(int(uv.y * H), 0, H - 1)
 			return src[y * W + x]
@@ -1503,7 +1542,7 @@ test_make_program_mixed :: proc(t: ^testing.T) {
 	sblock2 := make([]u8, st.block_size, context.temp_allocator)
 	write_builtins(st, sblock2, {resolution = {4, 2, 1}})
 	px := make([][4]f32, 8, context.temp_allocator)
-	run_f32(&st.program, sblock2, 4, 2, px)
+	run_f32(&st.program, sblock2, 4, 2, px, temp_scratch())
 	near(t, px[0], {3, 2, 1, 0.5})
 }
 

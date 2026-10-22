@@ -96,10 +96,10 @@ cpu_sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 
 	if !(lod > 0) {
 		return bilinear(0, uv)
 	}
-	lod := min(lod, LEVELS - 1)
-	l0 := int(lod)
+	level := min(lod, LEVELS - 1)
+	l0 := int(level)
 	l1 := min(l0 + 1, LEVELS - 1)
-	t := lod - f32(l0)
+	t := level - f32(l0)
 	return bilinear(l0, uv) * (1 - t) + bilinear(l1, uv) * t
 }
 
@@ -161,6 +161,8 @@ main :: proc() {
 	slice.sort(names[:])
 
 	failed := 0
+	scratch: oksl.Scratch
+	defer oksl.scratch_destroy(&scratch)
 	for path in names {
 		name := filepath.stem(path)
 		src, _ := os.read_entire_file(path, context.allocator)
@@ -187,7 +189,7 @@ main :: proc() {
 			cpu_px[i * 4 + 3] = 255
 		}
 		sizes := [4][2]i32{TEX, TEX, TEX, TEX}
-		oksl.run(&m.program, block, W, H, cpu_px, W * 4, {sampler = cpu_sampler, channel_sizes = sizes[:]})
+		oksl.run(&m.program, block, W, H, cpu_px, W * 4, &scratch, {sampler = cpu_sampler, channel_sizes = sizes[:]})
 
 		max_d, sum, over2, over8 := 0, 0, 0, 0
 		diff := make([]u8, W * H * 4)
