@@ -5,8 +5,10 @@ import "core:strings"
 
 // Diagnostics are plain values: a code and its operands. Text is made only
 // at the edge (`error_message`, `format_errors`) from ERROR_TEXT, where
-// `{name}`, `{a}`, `{b}`, `{c}`, `{n}` and `{m}` stand for the fields and
-// `{q:name}`, `{q:a}`, `{q:b}` for quoted ones.
+// `{name}`, `{a}`, `{b}`, `{c}`, `{n}` and `{m}` stand for the fields,
+// `{q:name}`, `{q:a}`, `{q:b}` for quoted ones and `{f:a}`, `{f:b}` for a
+// token found (quoted; empty: the end of the file). Operands are names,
+// types and source text, never prose: a different wording is another code.
 
 Error_Code :: enum u8 {
 	None,
@@ -23,12 +25,19 @@ Error_Code :: enum u8 {
 	Else_After_Else,
 	If_Unterminated,
 	If_Expression,
+	If_Incomplete,
 	If_Undefined,
 	If_Divide,
 	Line_Number,
 	Error_Directive,
 	// Syntax.
 	Expected,
+	Expected_Field,
+	Expected_Variable,
+	Expected_Case_Colon,
+	Expected_Default_Colon,
+	Expected_Ctor_Paren,
+	Expected_Switch_Body,
 	Expected_Name,
 	Expected_Type,
 	Expected_Expression,
@@ -159,7 +168,8 @@ Error_Code :: enum u8 {
 	Channel_No_Buffer,
 	Pass_Count,
 	Pass_Output,
-	Pass_Reference,
+	Pass_Not_Before,
+	Pass_Missing,
 }
 
 // A diagnostic at `pos` (the user's line and column: macro expansions keep
@@ -188,14 +198,21 @@ ERROR_TEXT := [Error_Code]string {
 	.Else_After_Else       = "#{name} after #else",
 	.If_Unterminated       = "#{name} without #endif",
 	.If_Expression         = "invalid #{name} expression near {q:a}",
+	.If_Incomplete         = "#{name} expression ends early",
 	.If_Undefined          = "{q:a} is not a macro (#{name} expressions see only macros)",
 	.If_Divide             = "division by zero in #{name}",
 	.Line_Number           = "#line needs a line number",
 	.Error_Directive       = "#error {a}",
-	.Expected              = "expected {a}, found {q:b}",
+	.Expected              = "expected '{a}', found {f:b}",
+	.Expected_Field        = "expected a field name, found {f:b}",
+	.Expected_Variable     = "expected a variable name, found {f:b}",
+	.Expected_Case_Colon   = "expected ':' after the case value, found {f:b}",
+	.Expected_Default_Colon = "expected ':' after default, found {f:b}",
+	.Expected_Ctor_Paren   = "expected '(' after a type name, found {f:b}",
+	.Expected_Switch_Body  = "expected '{' after switch (...), found {f:b}",
 	.Expected_Name         = "expected a name after {q:a}",
-	.Expected_Type         = "expected a type, found {q:a}",
-	.Expected_Expression   = "expected an expression, found {q:a}",
+	.Expected_Type         = "expected a type, found {f:a}",
+	.Expected_Expression   = "expected an expression, found {f:a}",
 	.Expected_Body         = "expected '{' or ';' after the parameters of {name}",
 	.Expected_While        = "expected 'while' after do-block",
 	.Global_In_Out         = "global '{name}' variables are not supported; the entry point takes the coordinate and returns the colour",
@@ -314,7 +331,8 @@ ERROR_TEXT := [Error_Code]string {
 	.Channel_No_Buffer     = "{name} reads {a}, which the program does not have",
 	.Pass_Count            = "a program has 1 to {n} passes, not {m}",
 	.Pass_Output           = "the output pass {n} is not one of the {m} passes",
-	.Pass_Reference        = "{name}'s channel {n} reads pass {m}, which {a}",
+	.Pass_Not_Before       = "{name}'s channel {n} reads pass {m}, which does not run before it (read its last frame with .Previous)",
+	.Pass_Missing          = "{name}'s channel {n} reads pass {m}, which does not exist",
 }
 
 // The text of a diagnostic (without its position).
@@ -355,7 +373,8 @@ write_error_message :: proc(b: ^strings.Builder, e: Error) {
 		}
 		field := text[i + 1:i + end]
 		quoted := strings.has_prefix(field, "q:")
-		if quoted {
+		found := strings.has_prefix(field, "f:")
+		if quoted || found {
 			field = field[2:]
 		}
 		value: string
@@ -382,7 +401,9 @@ write_error_message :: proc(b: ^strings.Builder, e: Error) {
 			i += 1
 			continue
 		}
-		if quoted {
+		if found && value == "" {
+			strings.write_string(b, "end of file")
+		} else if quoted || found {
 			fmt.sbprintf(b, "%q", value)
 		} else {
 			strings.write_string(b, value)

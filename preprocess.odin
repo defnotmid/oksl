@@ -441,7 +441,7 @@ if_fail :: proc(e: ^If_Eval) {
 			pp_error(e.pp, t.pos, .If_Expression, e.directive, a = t.text)
 		}
 	} else {
-		pp_error(e.pp, e.pos, .If_Expression, e.directive, a = "end of line")
+		pp_error(e.pp, e.pos, .If_Incomplete, e.directive)
 	}
 }
 

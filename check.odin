@@ -1320,8 +1320,24 @@ token_text :: proc(k: Token_Kind) -> string {
 		return "||"
 	case .Xor_Xor:
 		return "^^"
+	case .Colon:
+		return ":"
+	case .Semicolon:
+		return ";"
+	case .L_Paren:
+		return "("
+	case .R_Paren:
+		return ")"
+	case .L_Bracket:
+		return "["
+	case .R_Bracket:
+		return "]"
+	case .L_Brace:
+		return "{"
+	case .R_Brace:
+		return "}"
 	}
-	return "?"
+	return ""
 }
 
 @(private)

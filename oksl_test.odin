@@ -140,6 +140,7 @@ test_preprocessor_conditionals :: proc(t: ^testing.T) {
 	expect_err(t, "#if 1\n#else\n#else\n#endif", "3:1: #else after #else")
 	expect_err(t, "#if FOO\n#endif", "1:5: \"FOO\" is not a macro")
 	expect_err(t, "#if 1 / 0\n#endif", "division by zero in #if")
+	expect_err(t, "#if 1 +\n#endif", "1:1: #if expression ends early")
 	expect_err(t, "#define SQ(x) x*x\nSQ(1, 2)", "2:1: macro SQ takes 1 arguments, got 2")
 	expect_err(t, "#define SQ(x) x*x\nSQ(1", "2:1: unterminated argument list for macro SQ")
 	expect_err(t, "#error stop here", "1:1: #error stop here")
@@ -469,6 +470,11 @@ test_errors :: proc(t: ^testing.T) {
 		{"void mainImage(out vec4 c, in vec2 p) { c = vec4(1); }", "mainImage is Shadertoy's entry point"},
 		{"half4 main(float2 p) {\n  float3 v = float3(1.0);\n  v.xx = float2(2.0);\n  return half4(v, 1.0);\n}", "repeats a component"},
 		{"half4 main(float2 p) {\n  break;\n  return half4(1);\n}", "2:3: break outside a loop"},
+		// The parser: what it expected and found (operands, not prose).
+		{"half4 main(float2 p) {\n  return half4(1)", "2:18: expected ';', found end of file"},
+		{"half4 main(float2 p) {\n  float2 v = p.;\n  return half4(1);\n}", "2:16: expected a field name, found \";\""},
+		{"half4 main(float2 p) {\n  switch (1) { case 1 return half4(1); }\n  return half4(0);\n}", "2:23: expected ':' after the case value, found \"return\""},
+		{"half4 main(float2 p) {\n  switch (1) return half4(1);\n  return half4(0);\n}", "2:14: expected '{' after switch (...), found \"return\""},
 		{"half4 main(float2 p) {\n  float a[3];\n  return half4(a[3]);\n}", "3:18: index 3 is out of range"},
 		// SkSL restrictions (GLSL's features: test_dialect_errors).
 		{"uniform colorFilter f;\nhalf4 main(float2 p) { return half4(1); }", "only `uniform shader` children are supported"},

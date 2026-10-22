@@ -73,11 +73,6 @@ error_at :: proc(p: ^Parser, pos: Pos, code: Error_Code, name := "", a := "", b 
 }
 
 @(private = "file")
-tok_text :: proc(t: Token) -> string {
-	return t.text if t.kind != .EOF else "end of file"
-}
-
-@(private = "file")
 accept :: proc(p: ^Parser, k: Token_Kind) -> bool {
 	if peek(p) == k {
 		p.i += 1
@@ -87,13 +82,13 @@ accept :: proc(p: ^Parser, k: Token_Kind) -> bool {
 }
 
 @(private = "file")
-expect :: proc(p: ^Parser, k: Token_Kind, what: string) -> bool {
+expect :: proc(p: ^Parser, k: Token_Kind, code := Error_Code.Expected) -> bool {
 	if peek(p) == k {
 		p.i += 1
 		return true
 	}
 	t := tok(p)
-	error_at(p, t.pos, .Expected, a = what, b = tok_text(t))
+	error_at(p, t.pos, code, a = token_text(k), b = t.text)
 	return false
 }
 
@@ -244,7 +239,7 @@ parse_top :: proc(p: ^Parser) {
 	if ok {
 		append(&u.tops, Top{kind = .Vars, vars = vars})
 	}
-	expect(p, .Semicolon, "';'")
+	expect(p, .Semicolon)
 }
 
 @(private = "file")
@@ -253,7 +248,7 @@ parse_type_spec :: proc(p: ^Parser) -> Spec_Id {
 	skip_precision(p)
 	t := tok(p)
 	if t.kind != .Ident {
-		error_at(p, t.pos, .Expected_Type, a = tok_text(t))
+		error_at(p, t.pos, .Expected_Type, a = t.text)
 		return 0
 	}
 	if t.text == "struct" {
@@ -266,7 +261,7 @@ parse_type_spec :: proc(p: ^Parser) -> Spec_Id {
 		sd.name = tok(p).text
 		p.i += 1
 		p.struct_names[sd.name] = true
-		if !expect(p, .L_Brace, "'{'") {
+		if !expect(p, .L_Brace) {
 			return 0
 		}
 		// Fields are parsed first (their array sizes may add expressions),
@@ -279,22 +274,22 @@ parse_type_spec :: proc(p: ^Parser) -> Spec_Id {
 			}
 			for {
 				ft := tok(p)
-				if !expect(p, .Ident, "a field name") {
+				if !expect(p, .Ident, .Expected_Field) {
 					return 0
 				}
 				f := Var_Decl{pos = ft.pos, name = ft.text, spec = fspec}
 				if accept(p, .L_Bracket) {
 					f.array_size = parse_expr(p)
-					expect(p, .R_Bracket, "']'")
+					expect(p, .R_Bracket)
 				}
 				append(&fields, f)
 				if !accept(p, .Comma) {break}
 			}
-			if !expect(p, .Semicolon, "';'") {
+			if !expect(p, .Semicolon) {
 				return 0
 			}
 		}
-		expect(p, .R_Brace, "'}'")
+		expect(p, .R_Brace)
 		sd.fields = {u32(len(u.vars)), u32(len(fields))}
 		append(&u.vars, ..fields[:])
 		sid := Struct_Decl_Id(len(u.struct_decls))
@@ -324,7 +319,7 @@ parse_type_spec :: proc(p: ^Parser) -> Spec_Id {
 			spec.unsized = true
 		} else {
 			spec.array_size = parse_expr(p)
-			expect(p, .R_Bracket, "']'")
+			expect(p, .R_Bracket)
 		}
 	}
 	return add_spec(p, spec)
@@ -335,7 +330,7 @@ parse_declarators :: proc(p: ^Parser, spec: Spec_Id, is_const, is_uniform: bool)
 	ids := make([dynamic]u32, context.temp_allocator)
 	for {
 		t := tok(p)
-		if !expect(p, .Ident, "a variable name") {
+		if !expect(p, .Ident, .Expected_Variable) {
 			return {}, false
 		}
 		v := Var_Decl{pos = t.pos, name = t.text, spec = spec, is_const = is_const, is_uniform = is_uniform}
@@ -344,7 +339,7 @@ parse_declarators :: proc(p: ^Parser, spec: Spec_Id, is_const, is_uniform: bool)
 				v.unsized = true
 			} else {
 				v.array_size = parse_expr(p)
-				expect(p, .R_Bracket, "']'")
+				expect(p, .R_Bracket)
 			}
 		}
 		if accept(p, .Eq) {
@@ -393,14 +388,14 @@ parse_function :: proc(p: ^Parser, ret: Spec_Id, name: Token) -> Func_Decl_Id {
 		}
 		if accept(p, .L_Bracket) {
 			prm.array_size = parse_expr(p)
-			expect(p, .R_Bracket, "']'")
+			expect(p, .R_Bracket)
 		}
 		append(&params, prm)
 		if !accept(p, .Comma) {
 			break
 		}
 	}
-	if !expect(p, .R_Paren, "')'") {
+	if !expect(p, .R_Paren) {
 		return 0
 	}
 	fn.params = {u32(len(u.params)), u32(len(params))}
@@ -422,7 +417,7 @@ parse_function :: proc(p: ^Parser, ret: Spec_Id, name: Token) -> Func_Decl_Id {
 @(private = "file")
 parse_block :: proc(p: ^Parser) -> Stmt_Id {
 	pos := tok(p).pos
-	expect(p, .L_Brace, "'{'")
+	expect(p, .L_Brace)
 	body := make([dynamic]u32, context.temp_allocator)
 	for peek(p) != .R_Brace && peek(p) != .EOF {
 		start := p.i
@@ -451,7 +446,7 @@ parse_block :: proc(p: ^Parser) -> Stmt_Id {
 			p.i += 1
 		}
 	}
-	expect(p, .R_Brace, "'}'")
+	expect(p, .R_Brace)
 	return add_stmt(p, Stmt{kind = .Block, pos = pos, body = push_ids(p.u, body[:])})
 }
 
@@ -503,9 +498,9 @@ parse_stmt :: proc(p: ^Parser) -> Stmt_Id {
 		case "if":
 			p.i += 1
 			s := Stmt{kind = .If, pos = t.pos}
-			expect(p, .L_Paren, "'('")
+			expect(p, .L_Paren)
 			s.expr = parse_expr(p)
-			expect(p, .R_Paren, "')'")
+			expect(p, .R_Paren)
 			s.then_ = parse_stmt(p)
 			if is_ident(p, "else") {
 				p.i += 1
@@ -515,33 +510,33 @@ parse_stmt :: proc(p: ^Parser) -> Stmt_Id {
 		case "for":
 			p.i += 1
 			s := Stmt{kind = .For, pos = t.pos}
-			expect(p, .L_Paren, "'('")
+			expect(p, .L_Paren)
 			if !accept(p, .Semicolon) {
 				if starts_declaration(p) {
 					s.init = parse_decl_stmt(p)
 				} else {
 					pos := tok(p).pos
 					e := parse_expr(p)
-					expect(p, .Semicolon, "';'")
+					expect(p, .Semicolon)
 					s.init = add_stmt(p, Stmt{kind = .Expr, pos = pos, expr = e})
 				}
 			}
 			if peek(p) != .Semicolon {
 				s.expr = parse_expr(p)
 			}
-			expect(p, .Semicolon, "';'")
+			expect(p, .Semicolon)
 			if peek(p) != .R_Paren {
 				s.step = parse_expr(p)
 			}
-			expect(p, .R_Paren, "')'")
+			expect(p, .R_Paren)
 			s.then_ = parse_stmt(p)
 			return add_stmt(p, s)
 		case "while":
 			p.i += 1
 			s := Stmt{kind = .While, pos = t.pos}
-			expect(p, .L_Paren, "'('")
+			expect(p, .L_Paren)
 			s.expr = parse_expr(p)
-			expect(p, .R_Paren, "')'")
+			expect(p, .R_Paren)
 			s.then_ = parse_stmt(p)
 			return add_stmt(p, s)
 		case "do":
@@ -553,25 +548,25 @@ parse_stmt :: proc(p: ^Parser) -> Stmt_Id {
 				return 0
 			}
 			p.i += 1
-			expect(p, .L_Paren, "'('")
+			expect(p, .L_Paren)
 			s.expr = parse_expr(p)
-			expect(p, .R_Paren, "')'")
-			expect(p, .Semicolon, "';'")
+			expect(p, .R_Paren)
+			expect(p, .Semicolon)
 			return add_stmt(p, s)
 		case "break", "continue", "discard":
 			// The checker rejects discard where the dialect has none.
 			p.i += 1
 			kind := Stmt_Kind.Break if t.text == "break" else (.Continue if t.text == "continue" else .Discard)
-			expect(p, .Semicolon, "';'")
+			expect(p, .Semicolon)
 			return add_stmt(p, Stmt{kind = kind, pos = t.pos})
 		case "switch":
 			p.i += 1
 			s := Stmt{kind = .Switch, pos = t.pos}
-			expect(p, .L_Paren, "'('")
+			expect(p, .L_Paren)
 			s.expr = parse_expr(p)
-			expect(p, .R_Paren, "')'")
+			expect(p, .R_Paren)
 			if peek(p) != .L_Brace {
-				error_at(p, tok(p).pos, .Expected, a = "'{' after switch (...)", b = tok_text(tok(p)))
+				error_at(p, tok(p).pos, .Expected_Switch_Body, a = token_text(.L_Brace), b = tok(p).text)
 				return 0
 			}
 			// The labels are statements of the body (parse_stmt below).
@@ -582,11 +577,11 @@ parse_stmt :: proc(p: ^Parser) -> Stmt_Id {
 			p.i += 1
 			s := Stmt{kind = .Case, pos = t.pos}
 			s.expr = parse_ternary(p)
-			expect(p, .Colon, "':' after the case value")
+			expect(p, .Colon, .Expected_Case_Colon)
 			return add_stmt(p, s)
 		case "default":
 			p.i += 1
-			expect(p, .Colon, "':' after default")
+			expect(p, .Colon, .Expected_Default_Colon)
 			return add_stmt(p, Stmt{kind = .Default, pos = t.pos})
 		case "return":
 			p.i += 1
@@ -594,7 +589,7 @@ parse_stmt :: proc(p: ^Parser) -> Stmt_Id {
 			if peek(p) != .Semicolon {
 				s.expr = parse_expr(p)
 			}
-			expect(p, .Semicolon, "';'")
+			expect(p, .Semicolon)
 			return add_stmt(p, s)
 		case "precision":
 			for peek(p) != .Semicolon && peek(p) != .EOF {
@@ -608,7 +603,7 @@ parse_stmt :: proc(p: ^Parser) -> Stmt_Id {
 		return parse_decl_stmt(p)
 	}
 	e := parse_expr(p)
-	expect(p, .Semicolon, "';'")
+	expect(p, .Semicolon)
 	return add_stmt(p, Stmt{kind = .Expr, pos = t.pos, expr = e})
 }
 
@@ -633,7 +628,7 @@ parse_decl_stmt :: proc(p: ^Parser) -> Stmt_Id {
 		return 0
 	}
 	decls, ok := parse_declarators(p, spec, is_const, false)
-	expect(p, .Semicolon, "';'")
+	expect(p, .Semicolon)
 	if !ok {
 		return 0
 	}
@@ -682,7 +677,7 @@ parse_ternary :: proc(p: ^Parser) -> Expr_Id {
 		t := tok(p)
 		p.i += 1
 		b := parse_expr(p)
-		expect(p, .Colon, "':'")
+		expect(p, .Colon)
 		e := parse_assignment(p)
 		return add_expr(p, Expr{kind = .Ternary, pos = t.pos, a = c, b = b, c = e})
 	}
@@ -759,17 +754,17 @@ parse_postfix :: proc(p: ^Parser) -> Expr_Id {
 		case .L_Bracket:
 			p.i += 1
 			ix := parse_expr(p)
-			expect(p, .R_Bracket, "']'")
+			expect(p, .R_Bracket)
 			e = add_expr(p, Expr{kind = .Index, pos = t.pos, a = e, b = ix})
 		case .Dot:
 			p.i += 1
 			name := tok(p)
-			if !expect(p, .Ident, "a field name") {
+			if !expect(p, .Ident, .Expected_Field) {
 				return e
 			}
 			if name.text == "length" && peek(p) == .L_Paren {
 				p.i += 1
-				expect(p, .R_Paren, "')'")
+				expect(p, .R_Paren)
 				e = add_expr(p, Expr{kind = .Length, pos = name.pos, a = e})
 				continue
 			}
@@ -807,7 +802,7 @@ parse_args :: proc(p: ^Parser) -> Range {
 			break
 		}
 	}
-	expect(p, .R_Paren, "')'")
+	expect(p, .R_Paren)
 	return push_ids(p.u, args[:])
 }
 
@@ -829,7 +824,7 @@ parse_primary :: proc(p: ^Parser) -> Expr_Id {
 	case .L_Paren:
 		p.i += 1
 		e := parse_expr(p)
-		expect(p, .R_Paren, "')'")
+		expect(p, .R_Paren)
 		return e
 	case .Ident:
 		if t.text == "true" || t.text == "false" {
@@ -841,7 +836,7 @@ parse_primary :: proc(p: ^Parser) -> Expr_Id {
 			if spec == 0 {
 				return 0
 			}
-			if !expect(p, .L_Paren, "'(' after a type name") {
+			if !expect(p, .L_Paren, .Expected_Ctor_Paren) {
 				return 0
 			}
 			args := parse_args(p)
@@ -855,7 +850,7 @@ parse_primary :: proc(p: ^Parser) -> Expr_Id {
 		}
 		return add_expr(p, Expr{kind = .Ident, pos = t.pos, name = t.text})
 	}
-	error_at(p, t.pos, .Expected_Expression, a = tok_text(t))
+	error_at(p, t.pos, .Expected_Expression, a = t.text)
 	return 0
 }
 

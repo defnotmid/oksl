@@ -183,24 +183,17 @@ make_program :: proc(passes: []Pass_Spec, output := -1) -> (g: ^Pass_Graph, erro
 	for p, pi in passes {
 		refs[pi] = p.channels
 		for ref, ch in p.channels {
-			bad := ""
-			switch ref.source {
-			case .None, .External:
-			case .Buffer:
-				if int(ref.id) >= pi {
-					bad = "does not run before it (read its last frame with .Previous)"
-				}
-			case .Previous:
-				if int(ref.id) >= len(passes) {
-					bad = "does not exist"
-				}
+			code := Error_Code.None
+			switch {
+			case (ref.source == .Buffer || ref.source == .Previous) && int(ref.id) >= len(passes):
+				code = .Pass_Missing
+			case ref.source == .Buffer && int(ref.id) >= pi:
+				code = .Pass_Not_Before
 			}
-			if ref.source == .Buffer && int(ref.id) >= len(passes) {
-				bad = "does not exist"
-			}
-			if bad != "" {
+			if code != .None {
+				// An unnamed pass by its index.
 				name := p.name if p.name != "" else fmt.tprintf("pass %d", pi)
-				append(&errs, Error{pos = {line = 1, col = 1}, code = .Pass_Reference, name = strings.clone(name), a = bad, n = i64(ch), m = i64(ref.id)})
+				append(&errs, Error{pos = {line = 1, col = 1}, code = code, name = strings.clone(name), n = i64(ch), m = i64(ref.id)})
 			}
 		}
 	}
