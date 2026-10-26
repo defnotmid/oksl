@@ -1,15 +1,15 @@
 # oksl demo
 
-A 27 second showcase of oksl, music included: 1920x1080, 60 fps, 150 BPM.
+A 32 second showcase of oksl, music included: 1920x1080, 60 fps, electro at 128 BPM.
 It is an [onimite](../../onimite) script (Odin + Lua video framework,
 whose shader layers are compiled by oksl), not part of oksl's build.
 `demo.mp4` is the render.
 
+With onimite's release binary (`onimite update` keeps it current):
+
 ```sh
-cd ../../onimite
-odin build . -collection:deps=.. -o:speed -out:build/onimite_speed
-build/onimite_speed render ../oksl/demo/video.lua -o ../oksl/demo/demo.mp4   # re-render
-build/onimite_speed preview ../oksl/demo/video.lua                          # play, hot reload on save
+onimite render demo/video.lua -o demo/demo.mp4 --qp 22   # re-render
+onimite preview demo/video.lua                           # play, hot reload on save
 ```
 
 | bars | scene | what |
@@ -44,13 +44,17 @@ Every number is in `facts.lua` with its source:
 `video.lua` sets up the video, the beat-synced glitch cuts and the HUD;
 `scenes/` holds one file per scene; `media/*.sksl` are the shaders (the
 Shadertoy tunnel is inline in `scenes/tunnel.lua`); `track.lua` is the
-soundtrack, an odawg `song{}` (an F# minor breakbeat, its sections named
-after the scenes, its parts the pops and stutters the picture answers
-to); `timeline.lua` reads from it on which beat everything happens;
+soundtrack, an odawg `song{}`: electro after Drexciya and Kraftwerk (the
+Numbers scene is a nod) in F# phrygian, an 808 on a broken electro beat with
+cowbell and congas, a square bass sequence on the phrygian half step, a
+robot arpeggio, a string machine and a lead of its own, a `role` on every
+part; its sections are named after the scenes, its parts carry the pops,
+stutters and booms the picture answers to; `timeline.lua` reads from it on
+which beat everything happens;
 `beat.lua` is the clock and easing on the song's beat.
 
-Mix (`onimite audio analyze`): -14.1 LUFS integrated, -1.5 dBTP true
-peak. Render: 1632 frames in 3.8 s wall, 165 MB peak RSS.
+Mix (`onimite audio analyze`): -14.8 LUFS integrated, -2.0 dBTP true
+peak; -20 in the raymarcher's breakdown.
 
 ## Media
 
@@ -59,4 +63,6 @@ peak. Render: 1632 frames in 3.8 s wall, 165 MB peak RSS.
 - Fonts, copied from onimite's examples: Bebas Neue, Space Grotesk and
   JetBrains Mono, under the SIL Open Font License 1.1
   ([media/OFL.txt](media/OFL.txt), with their copyright notices).
-- The soundtrack is composed by odawg from `track.lua`; there are no other media.
+- The soundtrack is composed by odawg from `track.lua`, on rows copied
+  from onimite's skill library into `media/` (`machines/808.json`,
+  `instruments/808_bass.json`, `instruments/sfx.json`); there are no other media.

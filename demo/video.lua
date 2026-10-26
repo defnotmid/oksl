@@ -1,7 +1,7 @@
--- oksl in 27 seconds: an onimite script (Odin + Lua video framework,
+-- oksl in 32 seconds: an onimite script (Odin + Lua video framework,
 -- ../../onimite) showing the SkSL compiler its shader layers run through.
--- Music included: the soundtrack is an odawg song (track.lua), 150 BPM,
--- and every cut and pop sits on its grid (beat.lua, timeline.lua): the
+-- Music included: the soundtrack is an odawg song (track.lua), electro at
+-- 128 BPM, and every cut and pop sits on its grid (beat.lua, timeline.lua): the
 -- picture pumps on the kicks the drums really play and flashes on the
 -- impacts. Numbers on screen: facts.lua says where each
 -- comes from.
@@ -29,10 +29,10 @@ local SECTIONS = { "01 / TITLE", "02 / ONE SOURCE, THREE OUTPUTS", "03 / RIPPLE 
 -- Cuts that glitch for three frames. The impacts flash; inspect checks the
 -- song really hits there.
 local GLITCH_CUTS = { T.SOURCE, T.RIPPLE, T.RAY, T.TUNNEL, T.NUMBERS, T.OUTRO }
-cue("impact", score.hits { part = "fx", note = "C2" }, { hit = "score" })
+cue("impact", score.hits { part = "fx", note = "F#1" }, { hit = "score" })
 
 local KICK = { part = "drums", note = "kick", decay = 9 }
-local IMPACT = { part = "fx", note = "C2", decay = 5 }
+local IMPACT = { part = "fx", note = "F#1", decay = 5 }
 
 local function energy(f, b)
   local s = 1 + score.pulse(f, KICK) * 0.008
@@ -80,7 +80,6 @@ video {
   -- the song mixes near -21 LUFS: lifted to about -14 under the limiter
   -- (audio analyze in README.md)
   master_gain_db = 7,
-  limiter = { ceiling_db = -1.5 },
   render = function(f)
     local b = beat.gbeat(f)
     rect { x = 0, y = 0, w = 1920, h = 1080, fill = ui.BG }
