@@ -160,7 +160,7 @@ code_hashes :: proc(m: ^oksl.Module) -> string {
 	return fmt.tprintf("%x\t%x\t%x", spv, msl, vm)
 }
 
-// Runs one 8x2 batch (two rows of four quads) and hashes the colours.
+// Runs an 8x2 layer (two rows of four quads) and hashes the colours.
 cpu_hash :: proc(m: ^oksl.Module) -> string {
 	block := make([]u8, m.block_size, context.temp_allocator)
 	oksl.write_builtins(block, {resolution = {8, 2, 1}, time = 1.25})

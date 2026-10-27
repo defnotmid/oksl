@@ -3,8 +3,9 @@ package oksl
 import "core:math"
 
 // CPU backend, part 2: the interpreter. Pixels run in batches of LANES:
-// four 2x2 quads side by side (an 8x2 block), so derivatives use the quad
-// neighbours like a GPU's fine derivatives.
+// 2x2 quads in a BATCH_W x BATCH_H block, so derivatives use the quad
+// neighbours like a GPU's fine derivatives, and a block of neighbouring
+// pixels diverges little.
 
 // Samples channel `channel` at normalized `uv` (origin top-left) and mip
 // level `lod`; returns RGBA. The level texture() picks is fractional and
@@ -154,6 +155,10 @@ float_of :: #force_inline proc "contextless" (bits: u32, base: Base) -> f32 {
 	return fval(bits)
 }
 
+// The layer runner's batch: the lanes' quads in rows of BATCH_W / 2.
+BATCH_W :: 8
+BATCH_H :: LANES / BATCH_W
+
 @(private)
 runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) {
 	r := runner_begin(p, scratch, uniforms, opts)
@@ -163,14 +168,21 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 		x0, y0, w, h = 0, 0, width, height
 	}
 	fw, fh := f32(width), f32(height)
-	for by := y0; by < y0 + h; by += 2 {
-		for bx := x0; bx < x0 + w; bx += 8 {
+	// Each lane's pixel in the batch.
+	lx, ly: [LANES]int
+	for lane in 0 ..< LANES {
+		q := lane >> 2
+		lx[lane] = q % (BATCH_W / 2) * 2 + (lane & 1)
+		ly[lane] = q / (BATCH_W / 2) * 2 + ((lane >> 1) & 1)
+	}
+	for by := y0; by < y0 + h; by += BATCH_H {
+		for bx := x0; bx < x0 + w; bx += BATCH_W {
 			// Pixel centres of the batch's lanes, then each input a whole
 			// register at a time.
 			px, py: F_Lanes
 			for lane in 0 ..< LANES {
-				px[lane] = f32(bx + (lane >> 2) * 2 + (lane & 1)) + 0.5
-				py[lane] = f32(by + ((lane >> 1) & 1)) + 0.5
+				px[lane] = f32(bx + lx[lane]) + 0.5
+				py[lane] = f32(by + ly[lane]) + 0.5
 			}
 			for v in p.inputs {
 				for k in 0 ..< int(v.n) {
@@ -204,8 +216,8 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 					continue
 				}
 				for lane in 0 ..< LANES {
-					x := bx + (lane >> 2) * 2 + (lane & 1)
-					y := by + ((lane >> 1) & 1)
+					x := bx + lx[lane]
+					y := by + ly[lane]
 					if x >= x0 + w || y >= y0 + h || x >= width || y >= height || lane not_in alive {
 						continue
 					}
@@ -285,7 +297,7 @@ run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: 
 				}
 			}
 		}
-		r.masks[MASK_EXEC] = transmute(Lane_Mask)u16((1 << uint(lanes)) - 1)
+		r.masks[MASK_EXEC] = transmute(Lane_Mask)Lane_Bits((1 << uint(lanes)) - 1)
 		r.masks[MASK_DISCARD] = {}
 		execute(&r)
 		for v in p.outputs {
@@ -361,7 +373,7 @@ run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, out: []
 				fill_reg(&r.regs[v.slot + i32(k)], col, v.base)
 			}
 		}
-		r.masks[MASK_EXEC] = transmute(Lane_Mask)u16((1 << uint(lanes)) - 1)
+		r.masks[MASK_EXEC] = transmute(Lane_Mask)Lane_Bits((1 << uint(lanes)) - 1)
 		r.masks[MASK_DISCARD] = {}
 		execute(&r)
 		alive := ~r.masks[MASK_DISCARD]
@@ -787,8 +799,11 @@ fn3 :: #force_inline proc "contextless" (x, y, z: f32, $B: Builtin) -> f32 {
 	}
 }
 
+// Unchecked: every slot and mask an instruction names was allocated by the
+// lowering (dynamic offsets are clamped there), within num_slots and
+// num_masks, which runner_begin sizes the scratch to.
 @(private)
-execute :: proc(r: ^Runner) {
+execute :: proc(r: ^Runner) #no_bounds_check {
 	code := r.p.code
 	regs := r.regs
 	masks := r.masks
@@ -809,6 +824,11 @@ execute :: proc(r: ^Runner) {
 			for i in 0 ..< i32(n) {
 				regs[dst + i] = regs[a]
 			}
+		case .Gather:
+			regs[dst] = regs[a]
+			if n > 1 {regs[dst + 1] = regs[b]}
+			if n > 2 {regs[dst + 2] = regs[c]}
+			if n > 3 {regs[dst + 3] = regs[in_.d]}
 		case .Store:
 			if exec == ALL_LANES {
 				for i in 0 ..< i32(n) {
@@ -852,21 +872,26 @@ execute :: proc(r: ^Runner) {
 				}
 			}
 		// Whole-register array ops: no per-lane branches, vectorized.
+		// A scalar operand (k) has stride 0.
 		case .F_Add:
+			sa, sb := 1 - i32(in_.k & 1), 1 - i32(in_.k >> 1)
 			for i in 0 ..< i32(n) {
-				fl(&regs[dst + i])^ = fl(&regs[a + i])^ + fl(&regs[b + i])^
+				fl(&regs[dst + i])^ = fl(&regs[a + i * sa])^ + fl(&regs[b + i * sb])^
 			}
 		case .F_Sub:
+			sa, sb := 1 - i32(in_.k & 1), 1 - i32(in_.k >> 1)
 			for i in 0 ..< i32(n) {
-				fl(&regs[dst + i])^ = fl(&regs[a + i])^ - fl(&regs[b + i])^
+				fl(&regs[dst + i])^ = fl(&regs[a + i * sa])^ - fl(&regs[b + i * sb])^
 			}
 		case .F_Mul:
+			sa, sb := 1 - i32(in_.k & 1), 1 - i32(in_.k >> 1)
 			for i in 0 ..< i32(n) {
-				fl(&regs[dst + i])^ = fl(&regs[a + i])^ * fl(&regs[b + i])^
+				fl(&regs[dst + i])^ = fl(&regs[a + i * sa])^ * fl(&regs[b + i * sb])^
 			}
 		case .F_Div:
+			sa, sb := 1 - i32(in_.k & 1), 1 - i32(in_.k >> 1)
 			for i in 0 ..< i32(n) {
-				fl(&regs[dst + i])^ = fl(&regs[a + i])^ / fl(&regs[b + i])^
+				fl(&regs[dst + i])^ = fl(&regs[a + i * sa])^ / fl(&regs[b + i * sb])^
 			}
 		case .F_Neg:
 			for i in 0 ..< i32(n) {

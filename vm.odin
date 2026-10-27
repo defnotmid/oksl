@@ -7,9 +7,10 @@ package oksl
 // temporaries are computed for all lanes (helper lanes keep derivatives
 // right).
 
-LANES :: 16
+LANES :: 64
 // A set of lanes (execution, discard, break, ... masks).
-Lane_Mask :: bit_set[0 ..< LANES;u16]
+Lane_Bits :: u16 when LANES <= 16 else (u32 when LANES <= 32 else u64)
+Lane_Mask :: bit_set[0 ..< LANES;Lane_Bits]
 ALL_LANES :: ~Lane_Mask{}
 
 // Mask registers 0 and 1: the execution mask and the discarded lanes.
@@ -21,12 +22,17 @@ VM_Op :: enum u8 {
 	// Unmasked moves into temporaries.
 	Mov,
 	Splat,
+	// dst + i = slot a, b, c or d for i < n (n <= 4): swizzles and
+	// constructors from scattered components.
+	Gather,
 	// Masked stores into variables: dst = a for the lanes in exec.
 	Store,
 	Store_Zero,
 	// Per-lane offsets in slot b (components): dst = a[off], a[off] = src.
 	Load_Dyn,
 	Store_Dyn,
+	// k marks an operand that is a scalar, read for every component (1: a,
+	// 2: b), instead of broadcast into a temporary.
 	F_Add,
 	F_Sub,
 	F_Mul,
@@ -210,7 +216,17 @@ Lower :: struct {
 	// Kill masks of the innermost loop and inlined function (-1: none).
 	brk, cont: i32,
 	ret:       i32,
+	// Where a framed function's returns store (-1: unframed, or void).
 	ret_slot:  i32,
+	// An unframed function's value, from its only return (-1: none yet),
+	// and the first slot made during its call.
+	ret_val:   i32,
+	ret_mark:  i32,
+	// The symbols the program writes (assigned, incremented or passed out).
+	written:   []bool,
+	// The slots of the outputs and globals, [lo, hi): what an inlined
+	// function can write besides its own variables.
+	globals:   [2]i32,
 }
 
 build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
@@ -228,26 +244,31 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 		cont      = -1,
 		ret       = -1,
 		ret_slot  = -1,
+		ret_val   = -1,
 	}
 	for &ch in l.sym_chan {
 		ch = -1
 	}
+	l.written = written_syms(u)
 	p: Program
 	inputs := make([dynamic]Program_Var)
 	outputs := make([dynamic]Program_Var)
+	stage_var :: proc(l: ^Lower, row: Interface_Var) -> Program_Var {
+		t := sym_type(l.u, row.sym)
+		v := Program_Var{row.kind, row.binding, alloc_slots(l, cc(l, t)), i32(cc(l, t)), t.base, row.offset}
+		l.sym_slot[row.sym] = v.slot
+		return v
+	}
+	// The inputs, the uniforms, then the outputs and globals in one range.
 	for row in c.interface {
 		#partial switch row.kind {
 		case .Channel:
 			l.sym_chan[row.sym] = row.binding
-		case .Stage_In, .Frag_Coord, .Front_Facing, .Stage_Out, .Position:
-			t := sym_type(u, row.sym)
-			v := Program_Var{row.kind, row.binding, alloc_slots(&l, cc(&l, t)), i32(cc(&l, t)), t.base, row.offset}
-			l.sym_slot[row.sym] = v.slot
-			append(&outputs if row.kind == .Stage_Out || row.kind == .Position else &inputs, v)
+		case .Stage_In, .Frag_Coord, .Front_Facing:
+			append(&inputs, stage_var(&l, row))
 		}
 	}
 	p.inputs = inputs[:]
-	p.outputs = outputs[:]
 	p.varying_floats = c.varying_floats
 	// Uniform slots, filled from the block before each run.
 	for sym, i in u.syms {
@@ -275,6 +296,13 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 
 	// Outputs and globals start at zero; the entry runs the globals'
 	// initializers.
+	l.globals[0] = l.next_slot
+	for row in c.interface {
+		if row.kind == .Stage_Out || row.kind == .Position {
+			append(&outputs, stage_var(&l, row))
+		}
+	}
+	p.outputs = outputs[:]
 	for v in p.outputs {
 		emit(&l, .Store_Zero, n = int(v.n), dst = v.slot)
 	}
@@ -283,6 +311,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 		l.sym_slot[g] = alloc_slots(&l, component_count(u, t))
 		emit(&l, .Store_Zero, n = component_count(u, t), dst = l.sym_slot[g])
 	}
+	l.globals[1] = l.next_slot
 	inline_call(&l, c.entry, nil, nil)
 
 	p.code = l.code[:]
@@ -291,6 +320,38 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	p.consts = l.const_list[:]
 	p.fills = l.fills[:]
 	return p
+}
+
+// The symbols some expression writes: the targets of assignments and
+// increments and the arguments of out and inout parameters (each the
+// variable at the root of its swizzles, fields and indices).
+@(private)
+written_syms :: proc(u: ^Unit) -> []bool {
+	written := make([]bool, len(u.syms))
+	root :: proc(u: ^Unit, id: Expr_Id) -> Sym_Id {
+		id := id
+		for u.exprs[id].kind == .Index || u.exprs[id].kind == .Field {
+			id = u.exprs[id].a
+		}
+		return u.exprs[id].sym if u.exprs[id].kind == .Ident else 0
+	}
+	for e, id in u.exprs {
+		#partial switch e.kind {
+		case .Assign, .Pre_Inc, .Pre_Dec, .Post_Inc, .Post_Dec:
+			written[root(u, e.a)] = true
+		case .Call:
+			if e.call != .User {
+				continue
+			}
+			ps := fparams(u, e.func)
+			for a, i in args_of(u, Expr_Id(id)) {
+				if i < len(ps) && ps[i].qual != .In {
+					written[root(u, a)] = true
+				}
+			}
+		}
+	}
+	return written
 }
 
 // ---- helpers ----------------------------------------------------------------------------
@@ -331,6 +392,52 @@ const_slot :: proc(l: ^Lower, bits: u32) -> i32 {
 	return s
 }
 
+// The bits slot `s` holds when it is a constant. Slots are allocated in
+// increasing order, so const_list is in slot order: a binary search.
+@(private)
+slot_const :: proc(l: ^Lower, s: i32) -> (bits: u32, ok: bool) {
+	lo, hi := 0, len(l.const_list)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if l.const_list[mid][0] < u32(s) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == len(l.const_list) || l.const_list[lo][0] != u32(s) {
+		return 0, false
+	}
+	return l.const_list[lo][1], true
+}
+
+// Consecutive slots holding `bits`, written once per run like any constant
+// (a broadcast or a constructor of constants costs nothing per batch).
+@(private)
+const_vec :: proc(l: ^Lower, bits: []u32) -> i32 {
+	if len(bits) == 1 {
+		return const_slot(l, bits[0])
+	}
+	s := alloc_slots(l, len(bits))
+	for b, i in bits {
+		append(&l.const_list, [2]u32{u32(s + i32(i)), b})
+	}
+	return s
+}
+
+// The constants these slots hold, when every one is a constant.
+@(private)
+consts_of :: proc(l: ^Lower, slots: []i32) -> (bits: []u32, ok: bool) {
+	for s in slots {
+		slot_const(l, s) or_return
+	}
+	bits = make([]u32, len(slots), context.temp_allocator)
+	for s, i in slots {
+		bits[i], _ = slot_const(l, s)
+	}
+	return bits, true
+}
+
 @(private)
 const_val :: proc(l: ^Lower, base: Base, v: f64) -> Val {
 	bits: u32
@@ -356,6 +463,13 @@ cc :: proc(l: ^Lower, t: Type) -> int {
 widen :: proc(l: ^Lower, v: Val, n: int) -> i32 {
 	if cc(l, v.t) == n || n == 1 {
 		return v.slot
+	}
+	if bits, ok := slot_const(l, v.slot); ok {
+		splat := make([]u32, n, context.temp_allocator)
+		for &b in splat {
+			b = bits
+		}
+		return const_vec(l, splat)
 	}
 	s := alloc_slots(l, n)
 	emit(l, .Splat, n = n, dst = s, a = v.slot)
@@ -455,13 +569,16 @@ load_lv :: proc(l: ^Lower, lv: LV) -> Val {
 			return {lv.base + i32(lv.swz[0]), rt}
 		}
 		s := alloc_slots(l, n)
-		for i in 0 ..< n {
-			src := lv.base + i32(lv.swz[i])
-			if lv.dyn >= 0 {
-				emit(l, .Load_Dyn, n = 1, dst = s + i32(i), a = src, b = lv.dyn)
-			} else {
-				emit(l, .Mov, n = 1, dst = s + i32(i), a = src)
+		if lv.dyn < 0 {
+			srcs: [4]i32
+			for i in 0 ..< n {
+				srcs[i] = lv.base + i32(lv.swz[i])
 			}
+			gather(l, s, srcs[:n])
+			return {s, rt}
+		}
+		for i in 0 ..< n {
+			emit(l, .Load_Dyn, n = 1, dst = s + i32(i), a = lv.base + i32(lv.swz[i]), b = lv.dyn)
 		}
 		return {s, rt}
 	}
@@ -537,14 +654,22 @@ lower_stmt :: proc(l: ^Lower, id: Stmt_Id) {
 			v := u.vars[d]
 			t := sym_type(u, v.sym)
 			n := cc(l, t)
-			slot := alloc_slots(l, n)
-			l.sym_slot[v.sym] = slot
-			if v.init != 0 {
-				val := lower_expr(l, v.init)
-				emit(l, .Store, n = n, dst = slot, a = val.slot)
-			} else {
-				emit(l, .Store_Zero, n = n, dst = slot)
+			if v.init == 0 {
+				l.sym_slot[v.sym] = alloc_slots(l, n)
+				emit(l, .Store_Zero, n = n, dst = l.sym_slot[v.sym])
+				continue
 			}
+			// The checker resolves the initializer before declaring the
+			// variable, so it never reads the variable's slot.
+			mark := l.next_slot
+			val := lower_expr(l, v.init)
+			// A value made for this initializer alone is the variable.
+			if owned(l, val, mark) {
+				l.sym_slot[v.sym] = val.slot
+				continue
+			}
+			l.sym_slot[v.sym] = alloc_slots(l, n)
+			emit(l, .Store, n = n, dst = l.sym_slot[v.sym], a = val.slot)
 		}
 	case .Expr:
 		lower_expr(l, st.expr)
@@ -579,7 +704,16 @@ lower_stmt :: proc(l: ^Lower, id: Stmt_Id) {
 	case .Return:
 		if st.expr != 0 {
 			v := lower_expr(l, st.expr)
-			store_val(l, l.ret_slot, v)
+			if l.ret_slot >= 0 {
+				store_val(l, l.ret_slot, v)
+			} else if owned(l, v, l.ret_mark) {
+				// An unframed function's only return, at its end: a value
+				// made during the call is the call's value.
+				l.ret_val = v.slot
+			} else {
+				l.ret_val = alloc_slots(l, cc(l, v.t))
+				store_val(l, l.ret_val, v)
+			}
 		}
 		// Without a return mask the return is the function's last
 		// statement: nothing follows it.
@@ -720,6 +854,7 @@ lower_switch :: proc(l: ^Lower, st: Stmt) {
 @(private)
 inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args: []i32 = nil) -> Val {
 	u := l.u
+	mark := l.next_slot
 	ps := fparams(u, f)
 	for p, i in ps {
 		if p.sym == 0 {
@@ -731,11 +866,22 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args:
 			continue
 		}
 		n := cc(l, t)
+		if p.qual == .In {
+			arg := widen(l, vals[i], n)
+			// A parameter the function never writes reads its argument in
+			// place, unless that is an output or a global, which the
+			// function could write meanwhile.
+			if !l.written[p.sym] && (arg < l.globals[0] || arg >= l.globals[1]) {
+				l.sym_slot[p.sym] = arg
+				continue
+			}
+			l.sym_slot[p.sym] = alloc_slots(l, n)
+			emit(l, .Store, n = n, dst = l.sym_slot[p.sym], a = arg)
+			continue
+		}
 		slot := alloc_slots(l, n)
 		l.sym_slot[p.sym] = slot
-		switch p.qual {
-		case .In:
-			emit(l, .Store, n = n, dst = slot, a = widen(l, vals[i], n))
+		#partial switch p.qual {
 		case .Inout:
 			emit(l, .Store, n = n, dst = slot, a = load_lv(l, lvs[i]).slot)
 		case .Out:
@@ -744,14 +890,14 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args:
 	}
 	ret_t := ty(u, u.funcs[f].ret)
 	result := Val{-1, ret_t}
-	outer := [4]i32{l.brk, l.cont, l.ret, l.ret_slot}
+	outer := [6]i32{l.brk, l.cont, l.ret, l.ret_slot, l.ret_val, l.ret_mark}
 	body := u.func_decls[u.funcs[f].decl].body
 	// A return mask only when a return can leave early.
 	framed := returns_early(u, body)
 	l.brk, l.cont = -1, -1
 	l.ret = alloc_mask(l) if framed else -1
-	l.ret_slot = -1
-	if ret_t != T_VOID {
+	l.ret_slot, l.ret_val, l.ret_mark = -1, -1, mark
+	if ret_t != T_VOID && framed {
 		result.slot = alloc_slots(l, cc(l, ret_t))
 		l.ret_slot = result.slot
 	}
@@ -762,7 +908,11 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args:
 		emit(l, .Mask_Clear, dst = l.ret)
 	}
 	lower_stmt(l, body)
-	l.brk, l.cont, l.ret, l.ret_slot = outer[0], outer[1], outer[2], outer[3]
+	if ret_t != T_VOID && !framed {
+		// Its only return's value (none: whatever its slot holds).
+		result.slot = l.ret_val if l.ret_val >= 0 else alloc_slots(l, cc(l, ret_t))
+	}
+	l.brk, l.cont, l.ret, l.ret_slot, l.ret_val, l.ret_mark = outer[0], outer[1], outer[2], outer[3], outer[4], outer[5]
 	if framed {
 		b, cn, r := kills(l)
 		emit(l, .Mask_Restore, dst = MASK_EXEC, a = save, b = b, c = cn, d = r)
@@ -900,9 +1050,7 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 			lv := LV{base = base.slot, dyn = -1, t = base.t, swz = e.swizzle, swz_len = int(e.swizzle_len)}
 			if is_scalar(base.t) {
 				// Swizzling a scalar repeats it.
-				s := alloc_slots(l, int(e.swizzle_len))
-				emit(l, .Splat, n = int(e.swizzle_len), dst = s, a = base.slot)
-				return {s, t}
+				return {widen(l, base, int(e.swizzle_len)), t}
 			}
 			return load_lv(l, lv)
 		}
@@ -952,9 +1100,43 @@ convert_val :: proc(l: ^Lower, v: Val, to: Type) -> Val {
 		return {v.slot, to}
 	}
 	n := cc(l, to)
+	op := VM_CONVERT[to.base][v.t.base]
+	slots: [16]i32
+	for i in 0 ..< n {
+		slots[i] = v.slot + i32(i)
+	}
+	if bits, ok := consts_of(l, slots[:n]); ok {
+		for &b in bits {
+			b = convert_const(b, op)
+		}
+		return {const_vec(l, bits), to}
+	}
 	s := alloc_slots(l, n)
-	emit(l, VM_CONVERT[to.base][v.t.base], n = n, dst = s, a = v.slot)
+	emit(l, op, n = n, dst = s, a = v.slot)
 	return {s, to}
+}
+
+// A constant's conversion, made by the instruction's own lane function.
+@(private)
+convert_const :: proc(bits: u32, op: VM_Op) -> u32 {
+	#partial switch op {
+	case .I_To_F:
+		return un_lane(bits, .I_To_F)
+	case .U_To_F:
+		return un_lane(bits, .U_To_F)
+	case .B_To_F:
+		return un_lane(bits, .B_To_F)
+	case .F_To_I:
+		return un_lane(bits, .F_To_I)
+	case .F_To_U:
+		return un_lane(bits, .F_To_U)
+	case .F_To_B:
+		return un_lane(bits, .F_To_B)
+	case .I_To_B:
+		return un_lane(bits, .I_To_B)
+	}
+	// Mov: ints, uints and bools share their bits.
+	return bits
 }
 
 // Base conversions, [to][from]. Bools are 0 or 1 and ints and uints share
@@ -998,10 +1180,13 @@ binop_vm :: proc(l: ^Lower, op: Token_Kind, a, b: Val, result: Type) -> Val {
 		return {s, T_BOOL}
 	}
 	n := cc(l, result)
-	sa := widen(l, a, n)
-	sb := widen(l, b, n)
 	s := alloc_slots(l, n)
-	emit(l, vop, n = n, dst = s, a = sa, b = sb)
+	if vop == .F_Add || vop == .F_Sub || vop == .F_Mul || vop == .F_Div {
+		k := (1 if cc(l, ta) == 1 && n > 1 else 0) | (2 if cc(l, tb) == 1 && n > 1 else 0)
+		emit(l, vop, n = n, k = k, dst = s, a = a.slot, b = b.slot)
+		return {s, result}
+	}
+	emit(l, vop, n = n, dst = s, a = widen(l, a, n), b = widen(l, b, n))
 	return {s, result}
 }
 
@@ -1076,62 +1261,157 @@ lower_constructor :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	t := expr_type(u, id)
 	args := args_of(u, id)
 	vals := make([]Val, len(args), context.temp_allocator)
+	// Each argument's instruction when it was made for this constructor
+	// alone (producer), and where its components start in the result.
+	made := make([]int, len(args), context.temp_allocator)
+	start := make([]int, len(args), context.temp_allocator)
 	for a, i in args {
+		mark := l.next_slot
 		vals[i] = lower_expr(l, a)
+		made[i] = producer(l, vals[i], mark)
 	}
 	n := cc(l, t)
+	// Each component's source slot.
+	comps := make([dynamic]i32, 0, n, context.temp_allocator)
+	whole := t.array > 0 || t.base == .Struct
+	splat := false
+	// Each argument's components are consecutive in the result (not a
+	// matrix's diagonal or a matrix resized).
+	in_order := true
+	switch {
+	case whole:
+		for v, i in vals {
+			start[i] = len(comps)
+			for k in 0 ..< cc(l, v.t) {
+				append(&comps, v.slot + i32(k))
+			}
+		}
+	case len(vals) == 1 && is_matrix(t) && is_matrix(vals[0].t):
+		in_order = false
+		v := vals[0]
+		one := const_val(l, .Float, 1).slot
+		zero := const_val(l, .Float, 0).slot
+		for c in 0 ..< int(t.cols) {
+			for r in 0 ..< int(t.rows) {
+				if c < int(v.t.cols) && r < int(v.t.rows) {
+					append(&comps, v.slot + i32(c * int(v.t.rows) + r))
+				} else {
+					append(&comps, one if c == r else zero)
+				}
+			}
+		}
+	case len(vals) == 1 && is_scalar(vals[0].t):
+		sv := convert_val(l, vals[0], scalar_of(t))
+		if !is_matrix(t) {
+			splat = true
+			for _ in 0 ..< n {
+				append(&comps, sv.slot)
+			}
+			break
+		}
+		in_order = false
+		zero := const_val(l, .Float, 0).slot
+		for c in 0 ..< int(t.cols) {
+			for r in 0 ..< int(t.rows) {
+				append(&comps, sv.slot if c == r else zero)
+			}
+		}
+	case:
+		for v, i in vals {
+			start[i] = len(comps)
+			mark := l.next_slot
+			flatten(l, v, t.base, &comps)
+			if v.t.base != t.base {
+				// Converted: the conversion made it.
+				made[i] = producer(l, {comps[start[i]], with_base(v.t, t.base)}, mark)
+			}
+		}
+	}
+	// Of constants: a constant, written once per run.
+	if bits, ok := consts_of(l, comps[:n]); ok {
+		return {const_vec(l, bits), t}
+	}
 	s := alloc_slots(l, n)
-	if t.array > 0 || t.base == .Struct {
-		off := i32(0)
-		for v in vals {
+	if splat {
+		emit(l, .Splat, n = n, dst = s, a = comps[0])
+		return {s, t}
+	}
+	// An argument made for this constructor is made in place; the others'
+	// components are moved there.
+	placed := make([]bool, n, context.temp_allocator)
+	if in_order {
+		for v, i in vals {
 			k := cc(l, v.t)
-			emit(l, .Mov, n = k, dst = s + off, a = v.slot)
-			off += i32(k)
+			if made[i] < 0 || start[i] + k > n {
+				continue
+			}
+			l.code[made[i]].dst = s + i32(start[i])
+			for j in start[i] ..< start[i] + k {
+				placed[j] = true
+			}
+		}
+	}
+	if whole {
+		for v, i in vals {
+			if !placed[start[i]] {
+				emit(l, .Mov, n = cc(l, v.t), dst = s + i32(start[i]), a = v.slot)
+			}
 		}
 		return {s, t}
 	}
-	if len(vals) == 1 {
-		v := vals[0]
-		at := v.t
-		if is_matrix(t) && is_matrix(at) {
-			one := const_val(l, .Float, 1).slot
-			zero := const_val(l, .Float, 0).slot
-			for c in 0 ..< int(t.cols) {
-				for r in 0 ..< int(t.rows) {
-					dst := s + i32(c * int(t.rows) + r)
-					if c < int(at.cols) && r < int(at.rows) {
-						emit(l, .Mov, dst = dst, a = v.slot + i32(c * int(at.rows) + r))
-					} else {
-						emit(l, .Mov, dst = dst, a = one if c == r else zero)
-					}
-				}
-			}
-			return {s, t}
+	for i := 0; i < n; {
+		if placed[i] {
+			i += 1
+			continue
 		}
-		if is_scalar(at) {
-			sv := convert_val(l, v, scalar_of(t))
-			if is_matrix(t) {
-				zero := const_val(l, .Float, 0).slot
-				for c in 0 ..< int(t.cols) {
-					for r in 0 ..< int(t.rows) {
-						emit(l, .Mov, dst = s + i32(c * int(t.rows) + r), a = sv.slot if c == r else zero)
-					}
-				}
-				return {s, t}
-			}
-			emit(l, .Splat, n = n, dst = s, a = sv.slot)
-			return {s, t}
+		end := i
+		for end < n && !placed[end] {
+			end += 1
 		}
-	}
-	comps := make([dynamic]i32, context.temp_allocator)
-	for v in vals {
-		flatten(l, v, t.base, &comps)
-	}
-	for i in 0 ..< n {
-		emit(l, .Mov, dst = s + i32(i), a = comps[i])
+		gather(l, s + i32(i), comps[i:end])
+		i = end
 	}
 	return {s, t}
 }
+
+// Copies these slots into consecutive slots from dst, up to four per
+// instruction.
+@(private)
+gather :: proc(l: ^Lower, dst: i32, srcs: []i32) {
+	for first := 0; first < len(srcs); first += 4 {
+		k := min(len(srcs) - first, 4)
+		src: [4]i32
+		copy(src[:], srcs[first:][:k])
+		emit(l, .Gather, n = k, dst = dst + i32(first), a = src[0], b = src[1], c = src[2], d = src[3])
+	}
+}
+
+// Whether `v` was made after slot `mark` and is no constant: a temporary
+// nothing else reads (or a variable of a call that has ended), which its
+// consumer can keep instead of copying.
+@(private)
+owned :: proc(l: ^Lower, v: Val, mark: i32) -> bool {
+	_, is_const := slot_const(l, v.slot)
+	return v.slot >= mark && !is_const
+}
+
+// The instruction that has just made `v`, owned: the last one, writing
+// every lane of v's slots, which are the last allocated (so v is not part
+// of a larger value). It can write where the value is going instead (-1:
+// none).
+@(private)
+producer :: proc(l: ^Lower, v: Val, mark: i32) -> int {
+	i := len(l.code) - 1
+	if i < 0 || !owned(l, v, mark) || l.code[i].dst != v.slot || v.slot + i32(cc(l, v.t)) != l.next_slot || l.code[i].op in MASKED_OPS {
+		return -1
+	}
+	return i
+}
+
+// Instructions whose dst is not a value they make whole: masked stores,
+// masks and jumps.
+@(private)
+MASKED_OPS :: bit_set[VM_Op;u128]{.Nop, .Store, .Store_Zero, .Store_Dyn, .Mask_Copy, .Mask_Cond, .Mask_Restore, .Mask_Or, .Mask_Clear, .Mask_Kill, .Jump, .Jump_If_None}
 
 @(private)
 lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {

@@ -749,6 +749,29 @@ void split(vec3 v, out float a, out vec2 b) { a = v.x; b = v.yz; }
 `), {6, 10, 12, 4})
 }
 
+// The CPU lowering reads values in place where it can (an unwritten
+// parameter, a variable initialized from a value made for it); where the
+// source would see a difference it copies.
+@(test)
+test_values_in_place :: proc(t: ^testing.T) {
+	// A global the function writes, passed to it: the parameter keeps the
+	// value at the call.
+	near(t, eval(t, "float r = keep(g); fragColor = vec4(r, g, 0.0, 0.0);", prelude = `
+float g = 1.0;
+float keep(float x) { g = 5.0; return x; }
+`), {1, 5, 0, 0})
+	// A parameter the function writes is its own; a variable initialized from
+	// a constant does not change the constant.
+	near(t, eval(t, "float a = 2.0; float b = bump(a); float c = 2.0; c += 1.0; fragColor = vec4(a, b, c, 2.0);", prelude = `
+float bump(float x) { x += 1.0; return x; }
+`), {2, 3, 3, 2})
+	// A returned parameter is the argument's value at the call, though the
+	// caller assigns the argument before using it.
+	near(t, eval(t, "float a = 1.0; float r = same(a) + (a = 5.0); fragColor = vec4(r, a, 0.0, 0.0);", prelude = `
+float same(float x) { return x; }
+`), {6, 5, 0, 0})
+}
+
 @(test)
 test_uniforms :: proc(t: ^testing.T) {
 	src := `

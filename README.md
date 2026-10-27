@@ -376,8 +376,9 @@ oksl.run_vertex(&p.vertex.program, vblock, attrs, count, positions, varyings, &s
 oksl.run_fragment(&p.fragment.program, fblock, {count = n, origin = origins, front_facing = facing, helpers = helpers, varyings = soa}, colours, shaded, &scratch)
 ```
 
-`run_fragment` shades four quads at a time in the order the layer runner
-does, so derivatives and results match it bit for bit (a test checks).
+`run_fragment` shades `LANES / 4` (16) quads at a time, each quad's
+derivatives from its own lanes as in the layer runner, so its results
+match the layer runner's bit for bit (a test checks).
 
 `texture` in a fragment shader passes the sampler the level a GPU picks:
 `0.5 * log2(max(|duv/dx|², |duv/dy|²))` in the channel's texels
@@ -391,8 +392,10 @@ they difference decides it; `tools/gpu_parity` samples a mip chain to
 show both.
 
 - **Inlining:** every function is inlined into one flat `[]Instr` program
-  over SoA registers. A slot is one scalar component for 16 lanes, which
-  are four 2x2 quads. Variables and consecutive swizzles of them (`.xy`,
+  over SoA registers. A slot is one scalar component for `LANES` (64)
+  lanes: 16 2x2 quads, an 8x8 block of the layer, so each instruction
+  dispatched works on 64 pixels and neighbouring pixels diverge little.
+  Variables and consecutive swizzles of them (`.xy`,
   `.rgb`) are read in place; a call keeps a return mask only when a
   `return` can leave the function early.
 - **Dispatch:** one switch per instruction, never per lane. Arithmetic,
