@@ -281,19 +281,23 @@ run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: 
 	n := p.varying_floats
 	for first := 0; first < count; first += LANES {
 		lanes := min(count - first, LANES)
+		// Per component, one of: absent (0, 0, 0, 1), as stored, converted.
 		for v in p.inputs {
 			a := attributes[v.location] if int(v.location) < len(attributes) else Attribute{}
 			comps := int(a.format) % 4 + 1
 			from := FORMAT_BASES[int(a.format) / 4]
 			for k in 0 ..< int(v.n) {
 				reg := &r.regs[v.slot + i32(k)]
-				for l in 0 ..< lanes {
-					if a.data == nil || k >= comps {
-						reg[l] = convert_bits(1 if k == 3 else 0, .Int, v.base)
-						continue
-					}
-					word := ([^]u32)(rawptr(uintptr(a.data) + uintptr((first + l) * a.stride)))[k]
-					reg[l] = convert_bits(word, from, v.base)
+				if a.data == nil || k >= comps {
+					fill := convert_bits(1 if k == 3 else 0, .Int, v.base)
+					for l in 0 ..< lanes {reg[l] = fill}
+					continue
+				}
+				words := uintptr(a.data) + uintptr(first * a.stride + k * 4)
+				if from == v.base {
+					for l in 0 ..< lanes {reg[l] = (^u32)(words + uintptr(l * a.stride))^}
+				} else {
+					for l in 0 ..< lanes {reg[l] = convert_bits((^u32)(words + uintptr(l * a.stride))^, from, v.base)}
 				}
 			}
 		}
@@ -301,16 +305,20 @@ run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: 
 		r.masks[MASK_DISCARD] = {}
 		execute(&r)
 		for v in p.outputs {
-			for l in 0 ..< lanes {
-				i := first + l
-				if v.kind == .Position {
-					for k in 0 ..< 4 {
-						position[i][k] = fval(r.regs[v.slot + i32(k)][l])
-					}
-					continue
+			if v.kind == .Position {
+				for k in 0 ..< 4 {
+					reg := fl(&r.regs[v.slot + i32(k)])
+					for l in 0 ..< lanes {position[first + l][k] = reg[l]}
 				}
-				for k in 0 ..< int(v.n) {
-					varyings[i * n + int(v.offset) + k] = float_of(r.regs[v.slot + i32(k)][l], v.base)
+				continue
+			}
+			for k in 0 ..< int(v.n) {
+				reg := &r.regs[v.slot + i32(k)]
+				out := varyings[first * n + int(v.offset) + k:]
+				if v.base == .Float {
+					for l in 0 ..< lanes {out[l * n] = fval(reg[l])}
+				} else {
+					for l in 0 ..< lanes {out[l * n] = float_of(reg[l], v.base)}
 				}
 			}
 		}
@@ -1090,108 +1098,101 @@ execute :: proc(r: ^Runner) #no_bounds_check {
 			}
 			fl(&regs[dst])^ = sum
 		case .Distance:
-			for l in 0 ..< LANES {
-				sum: f32 = 0
-				for i in 0 ..< i32(n) {
-					d := fval(regs[a + i][l]) - fval(regs[b + i][l])
-					sum += d * d
-				}
-				regs[dst][l] = fbits(math.sqrt(sum))
+			sum: F_Lanes
+			for i in 0 ..< i32(n) {
+				d := fl(&regs[a + i])^ - fl(&regs[b + i])^
+				sum += d * d
 			}
-		case .Normalize:
 			for l in 0 ..< LANES {
-				sum: f32 = 0
-				for i in 0 ..< i32(n) {
-					x := fval(regs[a + i][l])
-					sum += x * x
-				}
-				inv := 1 / math.sqrt(sum)
-				for i in 0 ..< i32(n) {
-					regs[dst + i][l] = fbits(fval(regs[a + i][l]) * inv)
-				}
+				sum[l] = math.sqrt(sum[l])
+			}
+			fl(&regs[dst])^ = sum
+		case .Normalize:
+			sum: F_Lanes
+			for i in 0 ..< i32(n) {
+				x := fl(&regs[a + i])^
+				sum += x * x
+			}
+			for l in 0 ..< LANES {
+				sum[l] = 1 / math.sqrt(sum[l])
+			}
+			for i in 0 ..< i32(n) {
+				fl(&regs[dst + i])^ = fl(&regs[a + i])^ * sum
 			}
 		case .Cross:
-			for l in 0 ..< LANES {
-				x0, x1, x2 := fval(regs[a][l]), fval(regs[a + 1][l]), fval(regs[a + 2][l])
-				y0, y1, y2 := fval(regs[b][l]), fval(regs[b + 1][l]), fval(regs[b + 2][l])
-				regs[dst][l] = fbits(x1 * y2 - y1 * x2)
-				regs[dst + 1][l] = fbits(x2 * y0 - y2 * x0)
-				regs[dst + 2][l] = fbits(x0 * y1 - y0 * x1)
-			}
+			x0, x1, x2 := fl(&regs[a])^, fl(&regs[a + 1])^, fl(&regs[a + 2])^
+			y0, y1, y2 := fl(&regs[b])^, fl(&regs[b + 1])^, fl(&regs[b + 2])^
+			fl(&regs[dst])^ = x1 * y2 - y1 * x2
+			fl(&regs[dst + 1])^ = x2 * y0 - y2 * x0
+			fl(&regs[dst + 2])^ = x0 * y1 - y0 * x1
 		case .Faceforward, .Reflect, .Refract:
-			for l in 0 ..< LANES {
-				// N/I in a, I/N in b (GLSL argument order).
-				d: f32 = 0
+			// N/I in a, I/N in b (GLSL argument order); faceforward's
+			// dot is Nref's (c) with I.
+			d: F_Lanes
+			x := c if in_.op == .Faceforward else a
+			for i in 0 ..< i32(n) {
+				d += fl(&regs[x + i])^ * fl(&regs[b + i])^
+			}
+			#partial switch in_.op {
+			case .Faceforward:
 				for i in 0 ..< i32(n) {
-					#partial switch in_.op {
-					case .Faceforward:
-						d += fval(regs[c + i][l]) * fval(regs[b + i][l])
-					case:
-						d += fval(regs[a + i][l]) * fval(regs[b + i][l])
+					v := fl(&regs[a + i])^
+					for l in 0 ..< LANES {
+						v[l] = v[l] if d[l] < 0 else -v[l]
 					}
+					fl(&regs[dst + i])^ = v
 				}
-				#partial switch in_.op {
-				case .Faceforward:
-					for i in 0 ..< i32(n) {
-						x := fval(regs[a + i][l])
-						regs[dst + i][l] = fbits(x if d < 0 else -x)
+			case .Reflect:
+				for i in 0 ..< i32(n) {
+					fl(&regs[dst + i])^ = fl(&regs[a + i])^ - 2 * d * fl(&regs[b + i])^
+				}
+			case:
+				eta := fl(&regs[c])^
+				k := 1 - eta * eta * (1 - d * d)
+				s: F_Lanes
+				for l in 0 ..< LANES {
+					s[l] = eta[l] * d[l] + math.sqrt(k[l])
+				}
+				for i in 0 ..< i32(n) {
+					v := eta * fl(&regs[a + i])^ - s * fl(&regs[b + i])^
+					for l in 0 ..< LANES {
+						v[l] = v[l] if k[l] >= 0 else 0
 					}
-				case .Reflect:
-					for i in 0 ..< i32(n) {
-						regs[dst + i][l] = fbits(fval(regs[a + i][l]) - 2 * d * fval(regs[b + i][l]))
-					}
-				case:
-					eta := fval(regs[c][l])
-					k := 1 - eta * eta * (1 - d * d)
-					for i in 0 ..< i32(n) {
-						v: f32 = 0
-						if k >= 0 {
-							v = eta * fval(regs[a + i][l]) - (eta * d + math.sqrt(k)) * fval(regs[b + i][l])
-						}
-						regs[dst + i][l] = fbits(v)
-					}
+					fl(&regs[dst + i])^ = v
 				}
 			}
 		case .Mat_Mul:
 			rows, inner, cols := n, int(in_.k), int(in_.d)
-			for l in 0 ..< LANES {
-				for col in 0 ..< cols {
-					for row in 0 ..< rows {
-						sum: f32 = 0
-						for k in 0 ..< inner {
-							sum += fval(regs[a + i32(k * rows + row)][l]) * fval(regs[b + i32(col * inner + k)][l])
-						}
-						regs[dst + i32(col * rows + row)][l] = fbits(sum)
+			for col in 0 ..< cols {
+				for row in 0 ..< rows {
+					sum: F_Lanes
+					for k in 0 ..< inner {
+						sum += fl(&regs[a + i32(k * rows + row)])^ * fl(&regs[b + i32(col * inner + k)])^
 					}
+					fl(&regs[dst + i32(col * rows + row)])^ = sum
 				}
 			}
 		case .Vec_Mat:
 			rows, cols := n, int(in_.k)
-			for l in 0 ..< LANES {
-				for col in 0 ..< cols {
-					sum: f32 = 0
-					for row in 0 ..< rows {
-						sum += fval(regs[a + i32(row)][l]) * fval(regs[b + i32(col * rows + row)][l])
-					}
-					regs[dst + i32(col)][l] = fbits(sum)
+			for col in 0 ..< cols {
+				sum: F_Lanes
+				for row in 0 ..< rows {
+					sum += fl(&regs[a + i32(row)])^ * fl(&regs[b + i32(col * rows + row)])^
 				}
+				fl(&regs[dst + i32(col)])^ = sum
 			}
 		case .Transpose:
 			rows, cols := n, int(in_.k)
-			for l in 0 ..< LANES {
-				for col in 0 ..< cols {
-					for row in 0 ..< rows {
-						regs[dst + i32(row * cols + col)][l] = regs[a + i32(col * rows + row)][l]
-					}
+			for col in 0 ..< cols {
+				for row in 0 ..< rows {
+					regs[dst + i32(row * cols + col)] = regs[a + i32(col * rows + row)]
 				}
 			}
 		case .Outer:
 			rows, cols := n, int(in_.k)
-			for l in 0 ..< LANES {
-				for col in 0 ..< cols {
-					for row in 0 ..< rows {
-						regs[dst + i32(col * rows + row)][l] = fbits(fval(regs[a + i32(row)][l]) * fval(regs[b + i32(col)][l]))
-					}
+			for col in 0 ..< cols {
+				for row in 0 ..< rows {
+					fl(&regs[dst + i32(col * rows + row)])^ = fl(&regs[a + i32(row)])^ * fl(&regs[b + i32(col)])^
 				}
 			}
 		case .Determinant, .Inverse:
