@@ -29,6 +29,25 @@ Options :: struct {
 	no_spirv: bool,
 	no_msl:   bool,
 	no_cpu:   bool,
+	// Vertex shaders: runs of main for other environments, each giving the
+	// vertex's position there (a motion blur's shutter opening). In
+	// compile_pipeline, the vertex stage's.
+	taps:     []Tap,
+}
+
+// One more run of what a vertex shader's main does toward gl_Position,
+// before main itself, as a copy of the statements the position depends on
+// (in main, the functions it reaches and the globals' initializers): in tap
+// N each uniform reads at its offset plus (N + 1) * `Module.block_stride`,
+// the attributes listed read their twins, gl_Position goes to `position`,
+// and the shader's own outputs and globals are private to the copy.
+Tap :: struct {
+	// An `out vec4` (declared in the prelude) the run's gl_Position goes to.
+	position:   string,
+	// Attributes the run reads from twins, `in` variables of the same type:
+	// {"position", "o3dOpenPosition"}. A twin the copy never reads is no
+	// input.
+	attributes: [][2]string,
 }
 
 // A user uniform in the block (after the built-ins at OFFSET_USER).
@@ -65,9 +84,13 @@ Module :: struct {
 	spirv:         []u32,
 	// Metal source; entry point MSL_ENTRY.
 	msl:           string,
+	// The uniforms of the block's first environment.
 	uniforms:      []Uniform_Info,
-	// Size of the uniform block in bytes (a multiple of 16).
+	// Size of the uniform block in bytes (a multiple of 16): (1 + taps)
+	// environments of `block_stride` bytes, each laid out as `uniforms`.
 	block_size:    int,
+	block_stride:  int,
+	taps:          int,
 	// The inputs (INPUTS rows) the shader reads.
 	inputs_used:   Inputs,
 	// Channels the shader samples; bind at least `num_samplers` samplers.
@@ -112,9 +135,13 @@ compile :: proc(source: string, options := Options{}) -> (m: ^Module, errors: []
 @(private)
 module_front :: proc(source: string, options: Options, src, prelude_src: Source) -> (u: ^Unit, toks: []Token, ok: bool) {
 	u = new(Unit)
-	unit_init(u, options.profile, context.allocator, buffer_pass = options.unclamped, stage = options.stage)
+	unit_init(u, options.profile, context.allocator, buffer_pass = options.unclamped, stage = options.stage, taps = options.taps)
 	if options.stage not_in PROFILE_RULES[options.profile].stages {
 		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Stage_Unsupported, a = PROFILE_NAMES[options.profile], b = STAGE_NAMES[options.stage]})
+		return u, nil, false
+	}
+	if len(options.taps) > 0 && options.stage != .Vertex {
+		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Tap_Stage, a = STAGE_NAMES[options.stage]})
 		return u, nil, false
 	}
 	pp: Preprocessor
@@ -186,10 +213,16 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 	context.allocator = u.allocator
 
 	m.block_size = c.block_size
+	m.block_stride = c.block_stride
+	m.taps = c.taps
 	m.inputs_used = c.inputs_used
-	uniforms := make([]Uniform_Info, len(c.uniforms))
-	for sid, i in c.uniforms {
+	// The taps' copies follow the first environment's uniforms.
+	uniforms := make([dynamic]Uniform_Info)
+	for sid in c.uniforms {
 		s := u.syms[sid]
+		if s.index >= c.block_stride {
+			break
+		}
 		t := ty(u, s.type)
 		_, size := std140(t)
 		info := Uniform_Info{name = s.name, type = t, offset = s.index, size = size}
@@ -197,9 +230,9 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 			info.count = int(t.array)
 			info.stride = std140_array_stride(t)
 		}
-		uniforms[i] = info
+		append(&uniforms, info)
 	}
-	m.uniforms = uniforms
+	m.uniforms = uniforms[:]
 	for ch, i in c.channels {
 		if ch == 0 {
 			continue

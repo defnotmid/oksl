@@ -5,7 +5,9 @@
 // the colour at location 0.
 //
 // `-oksl-vertex` draws with testdata/layer.vert compiled by oksl (its GLSL
-// vertex stage) instead of the committed layer vertex shader.
+// vertex stage) instead of the committed layer vertex shader, and checks a
+// tap of it (Options.taps): its position, drawn as colour, against
+// run_vertex's.
 // Writes <name>_gpu.png, <name>_cpu.png and <name>_diff.png.
 //
 //     odin run tools/gpu_parity -- [out_dir] [testdata_dir]
@@ -223,7 +225,16 @@ main :: proc() {
 		write_png(fmt.tprintf("%s/%s_diff.png", out_dir, name), diff)
 		oksl.destroy(m)
 	}
-	fmt.printfln("%d/%d shaders match (images in %s)", len(names) - failed, len(names), out_dir)
+	checks := len(names)
+	if oksl_vertex {
+		checks += 1
+		max_d, ok := tap_check(&g, fmt.tprintf("%s/layer.vert", data_dir))
+		if !ok || max_d > 2 {
+			failed += 1
+		}
+		fmt.printfln("%-16s max diff %d  %s", "layer.vert tap", max_d, "ok" if ok && max_d <= 2 else "MISMATCH")
+	}
+	fmt.printfln("%d/%d shaders match (images in %s)", checks - failed, checks, out_dir)
 	if failed > 0 {
 		os.exit(1)
 	}
@@ -380,7 +391,11 @@ gpu_render :: proc(g: ^Gpu, m: ^oksl.Module, block: []u8) -> ([]u8, bool) {
 	sdl.PushGPUFragmentUniformData(cmd, 0, raw_data(block), u32(len(block)))
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 	sdl.EndGPURenderPass(pass)
+	return download(g, cmd), true
+}
 
+// Submits `cmd` with a copy of the target and returns its pixels.
+download :: proc(g: ^Gpu, cmd: ^sdl.GPUCommandBuffer) -> []u8 {
 	transfer := sdl.CreateGPUTransferBuffer(g.device, {usage = .DOWNLOAD, size = W * H * 4})
 	defer sdl.ReleaseGPUTransferBuffer(g.device, transfer)
 	copy_pass := sdl.BeginGPUCopyPass(cmd)
@@ -393,5 +408,121 @@ gpu_render :: proc(g: ^Gpu, m: ^oksl.Module, block: []u8) -> ([]u8, bool) {
 	px := make([]u8, W * H * 4)
 	copy(px, mapped[:W * H * 4])
 	sdl.UnmapGPUTransferBuffer(g.device, transfer)
-	return px, true
+	return px
+}
+
+TAP_PRELUDE :: "in vec2 openPosition;\nout vec4 openClip;\n"
+TAP_FRAGMENT :: "layout(location = 1) in vec4 openClip;\nout vec4 c;\nvoid main() { c = vec4(openClip.xy * 0.5 + 0.5, 0.0, 1.0); }"
+
+// The layer vertex shader with one tap, whose twin of position reads uv
+// and whose environment is a 1x1 target, so its position spans clip space:
+// the GPU draws it as colour, and run_vertex gives it at every pixel centre
+// (it is affine in the pixel, so interpolation agrees). The largest
+// difference in 8 bits.
+tap_check :: proc(g: ^Gpu, vertex_path: string) -> (max_d: int, ok: bool) {
+	src, err := os.read_entire_file(vertex_path, context.allocator)
+	if err != nil {
+		return 0, false
+	}
+	options, _ := oksl.options_of_path(vertex_path)
+	options.prelude = TAP_PRELUDE
+	options.taps = {{position = "openClip", attributes = {{"position", "openPosition"}}}}
+	vm, verrors, vok := oksl.compile(string(src), options)
+	defer oksl.destroy(vm)
+	fm, ferrors, fok := oksl.compile(TAP_FRAGMENT, {profile = .Glsl})
+	defer oksl.destroy(fm)
+	if !vok || !fok {
+		fmt.eprint(oksl.format_errors(verrors), oksl.format_errors(ferrors))
+		return 0, false
+	}
+	shader :: proc(g: ^Gpu, m: ^oksl.Module, stage: sdl.GPUShaderStage, buffers: u32) -> ^sdl.GPUShader {
+		info := sdl.GPUShaderCreateInfo {
+			code_size = len(m.spirv) * 4,
+			code = ([^]u8)(raw_data(m.spirv)),
+			entrypoint = oksl.SPIRV_ENTRY,
+			format = {.SPIRV},
+			stage = stage,
+			num_uniform_buffers = buffers,
+		}
+		if g.msl {
+			info.code_size = len(m.msl)
+			info.code = raw_data(m.msl)
+			info.entrypoint = oksl.MSL_ENTRY
+			info.format = {.MSL}
+		}
+		return sdl.CreateGPUShader(g.device, info)
+	}
+	vert := shader(g, vm, .VERTEX, 1)
+	frag := shader(g, fm, .FRAGMENT, 0)
+	defer sdl.ReleaseGPUShader(g.device, vert)
+	defer sdl.ReleaseGPUShader(g.device, frag)
+	// The twin reads the quad's uv.
+	buffer := sdl.GPUVertexBufferDescription{slot = 0, pitch = 16, input_rate = .VERTEX}
+	attrs: [3]sdl.GPUVertexAttribute
+	for a, i in vm.stage_inputs {
+		attrs[i] = {location = u32(a.location), buffer_slot = 0, format = .FLOAT2, offset = 0 if a.name == "position" else 8}
+	}
+	color := sdl.GPUColorTargetDescription{format = .R8G8B8A8_UNORM}
+	pipeline := sdl.CreateGPUGraphicsPipeline(g.device, {
+		vertex_shader = vert,
+		fragment_shader = frag,
+		vertex_input_state = {vertex_buffer_descriptions = &buffer, num_vertex_buffers = 1, vertex_attributes = &attrs[0], num_vertex_attributes = u32(len(vm.stage_inputs))},
+		primitive_type = .TRIANGLELIST,
+		rasterizer_state = {fill_mode = .FILL, cull_mode = .NONE},
+		multisample_state = {sample_count = ._1},
+		target_info = {color_target_descriptions = &color, num_color_targets = 1},
+	})
+	if vert == nil || frag == nil || pipeline == nil {
+		return 0, false
+	}
+	defer sdl.ReleaseGPUGraphicsPipeline(g.device, pipeline)
+	block := make([]u8, vm.block_size)
+	defer delete(block)
+	oksl.set_uniform(vm, block, "size", {W, H, 0, 0})
+	oksl.set_uniform(vm, block[vm.block_stride:], "size", {1, 1, 0, 0})
+
+	cmd := sdl.AcquireGPUCommandBuffer(g.device)
+	target := sdl.GPUColorTargetInfo{texture = g.target, load_op = .CLEAR, store_op = .STORE, clear_color = {0, 0, 0, 1}}
+	pass := sdl.BeginGPURenderPass(cmd, &target, 1, nil)
+	sdl.BindGPUGraphicsPipeline(pass, pipeline)
+	binding := sdl.GPUBufferBinding{buffer = g.quad}
+	sdl.BindGPUVertexBuffers(pass, 0, &binding, 1)
+	sdl.PushGPUVertexUniformData(cmd, 0, raw_data(block), u32(len(block)))
+	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+	sdl.EndGPURenderPass(pass)
+	gpu_px := download(g, cmd)
+	defer delete(gpu_px)
+
+	// A vertex at every pixel centre.
+	centres := make([][2][2]f32, W * H)
+	defer delete(centres)
+	for y in 0 ..< H {
+		for x in 0 ..< W {
+			p := [2]f32{f32(x) + 0.5, f32(y) + 0.5}
+			centres[y * W + x] = {p, p / {W, H}}
+		}
+	}
+	cpu_attrs: [3]oksl.Attribute
+	for a in vm.stage_inputs {
+		cpu_attrs[a.location] = {&centres[0][1] if a.name != "position" else &centres[0][0], size_of([2][2]f32), .Float2}
+	}
+	positions := make([][4]f32, W * H)
+	defer delete(positions)
+	varyings := make([]f32, W * H * vm.varying_floats)
+	defer delete(varyings)
+	at := 0
+	for o in vm.stage_outputs {
+		if o.name == "openClip" {at = o.offset}
+	}
+	scratch: oksl.Scratch
+	defer oksl.scratch_destroy(&scratch)
+	oksl.run_vertex(&vm.program, block, cpu_attrs[:], W * H, positions, varyings, &scratch)
+	for i in 0 ..< W * H {
+		clip := varyings[i * vm.varying_floats + at:]
+		for k in 0 ..< 2 {
+			want := int(clamp(clip[k] * 0.5 + 0.5, 0, 1) * 255 + 0.5)
+			max_d = max(max_d, abs(want - int(gpu_px[i * 4 + k])))
+		}
+	}
+	return max_d, true
 }

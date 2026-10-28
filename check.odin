@@ -25,7 +25,11 @@ Checked :: struct {
 	inputs_used:   Inputs,
 	// The sampler symbol bound to each channel the shader uses.
 	channels:      [CHANNEL_COUNT]Sym_Id,
+	// (1 + taps) environments of block_stride bytes: `uniforms` holds the
+	// first's, then each tap's copies (stage.odin).
 	block_size:    int,
+	block_stride:  int,
+	taps:          int,
 	// The block starts with the inputs (PROFILE_RULES' header).
 	header:        bool,
 	// Floats in the varyings' record (Interface_Var.offset).
@@ -127,18 +131,24 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 		layout_used_uniforms(&c)
 	}
 	if main != 0 && len(u.errors) == error_count {
-		out.entry, out.interface = stage_entry(&c, main)
+		// What main and the globals' initializers reach, callees first: the
+		// taps copy it (when it is sound), the entry comes last.
+		reached := order_functions(&c, main)
+		out.entry, out.interface = stage_entry(&c, main, &reached if len(u.errors) == error_count else nil)
+		if len(u.errors) == error_count && out.entry != 0 {
+			append(&reached, out.entry)
+			out.funcs = reached[:]
+		}
 	}
 	out.globals = c.globals[:]
 	out.uniforms = c.uniforms[:]
 	out.inputs_used = c.inputs_used
 	out.channels = c.channels
-	out.block_size = round_up(c.next_offset, 16)
+	out.block_stride = round_up(c.next_offset, 16)
+	out.taps = len(u.taps)
+	out.block_size = out.block_stride * (1 + out.taps)
 	out.header = c.rules.header
 	out.varying_floats = c.varying_floats
-	if len(u.errors) == error_count && out.entry != 0 {
-		out.funcs = order_functions(&c, out.entry)
-	}
 	return out, len(u.errors) == error_count
 }
 
@@ -638,10 +648,10 @@ check_body :: proc(c: ^Checker, f: Func_Id, fd_id: Func_Decl_Id) {
 	}
 }
 
-// Callees before callers, from the entry and the global initializers;
+// Callees before callers, from `entry` and the global initializers;
 // recursion is an error.
 @(private)
-order_functions :: proc(c: ^Checker, entry: Func_Id) -> []Func_Id {
+order_functions :: proc(c: ^Checker, entry: Func_Id) -> [dynamic]Func_Id {
 	u := c.u
 	order := make([dynamic]Func_Id)
 	State :: enum u8 {
@@ -700,7 +710,7 @@ order_functions :: proc(c: ^Checker, entry: Func_Id) -> []Func_Id {
 		}
 	}
 	visit(&w, entry)
-	return order[:]
+	return order
 }
 
 // ---- statements ----------------------------------------------------------------------

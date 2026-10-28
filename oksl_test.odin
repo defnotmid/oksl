@@ -1284,8 +1284,8 @@ test_run_vertex :: proc(t: ^testing.T) {
 		return
 	}
 	vm := p.vertex
-	// 19 vertices: a full batch of 16 and a partial one.
-	N :: 19
+	// A full batch and a partial one.
+	N :: LANES + 3
 	verts: [N]Test_Vertex
 	for &v, i in verts {
 		f := f32(i)
@@ -1341,6 +1341,316 @@ test_run_vertex :: proc(t: ^testing.T) {
 	}
 }
 
+// A vertex shader for a tap: a helper that counts its calls in a global,
+// a global with an initializer, and an output.
+@(private = "file")
+TAP_VS :: `in vec3 position;
+in vec3 normal;
+out vec3 vNormal;
+uniform mat4 mvp;
+uniform float scale;
+float calls = 0.0;
+float base = 2.0;
+float bump(float x) {
+    calls += 1.0;
+    return x * scale;
+}
+void main() {
+    base += 1.0;
+    float s = bump(1.0);
+    vNormal = normal * s + vec3(calls, base, 0.0);
+    float b = bump(1.0);
+    gl_Position = mvp * vec4(position * b * calls, 1.0);
+}`
+
+@(private = "file")
+TAP_PRELUDE :: "in vec3 openPosition;\nin vec3 openNormal;\nout vec4 openClip;\n"
+
+@(private = "file")
+TAP_FS :: "in vec3 vNormal;\nout vec4 c;\nvoid main() { c = vec4(vNormal, 1.0); }"
+
+// A tap runs what main does toward the position again with the next
+// environment's uniforms and its twins, into its position, and leaves
+// main's own run alone; given the first environment and the same
+// attributes it writes gl_Position bit for bit, and it equals a run of the
+// untapped shader in its environment.
+@(test)
+test_vertex_taps :: proc(t: ^testing.T) {
+	taps := []Tap{{position = "openClip", attributes = {{"position", "openPosition"}, {"normal", "openNormal"}}}}
+	p, errs, ok := compile_pipeline({vertex = TAP_VS, fragment = TAP_FS, vertex_prelude = TAP_PRELUDE}, {taps = taps})
+	defer destroy_pipeline(p)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	vm := p.vertex
+	testing.expect_value(t, vm.taps, 1)
+	testing.expect_value(t, vm.block_size, 2 * vm.block_stride)
+	testing.expect_value(t, len(vm.uniforms), 2)
+	// bump's call counts for the position, the normal does not: its twin
+	// is no input.
+	for want in ([]string{"ok_1_main(", "ok_1_bump(", "ok_1_mvp", "g.ok_1_calls"}) {
+		testing.expectf(t, strings.contains(vm.msl, want), "tapped MSL lacks %s", want)
+	}
+	for dead in ([]string{"ok_1_vNormal", "ok_1_base", "openNormal"}) {
+		testing.expectf(t, !strings.contains(vm.msl, dead), "tapped MSL has %s", dead)
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "tapped vertex", vm.spirv)
+	}
+
+	N :: LANES + 3
+	verts: [N]Test_Vertex
+	open: [N][3]f32
+	for &v, i in verts {
+		f := f32(i)
+		v = {{f, f * 0.5, -f}, {0.1 * f, 0.2, 0.3}, {}}
+		open[i] = {f - 1, f * 0.25, 2 - f}
+	}
+	mvps := [2]matrix[4, 4]f32 {
+		{2, 0, 0, 1, 0, 3, 0, -1, 0, 0, 0.5, 0.25, 0, 0, -1, 0},
+		{1, 0, 0, 0.5, 0, 2, 0, 0, 0, 0, 1, -0.5, 0, 0, -1, 1},
+	}
+	scales := [2]f32{1.5, 0.75}
+	block := make([]u8, vm.block_size, context.temp_allocator)
+	for e in 0 ..< 2 {
+		env := block[e * vm.block_stride:]
+		m := transmute([16]f32)mvps[e]
+		testing.expect(t, set_uniform(vm, env, "mvp", m[:]))
+		testing.expect(t, set_uniform(vm, env, "scale", {scales[e]}))
+	}
+	attrs: [3]Attribute
+	twin := -1
+	for a in vm.stage_inputs {
+		switch a.name {
+		case "position":
+			attrs[a.location] = {&verts[0].position, size_of(Test_Vertex), .Float3}
+		case "normal":
+			attrs[a.location] = {&verts[0].normal, size_of(Test_Vertex), .Float3}
+		case "openPosition":
+			attrs[a.location] = {&open[0], size_of([3]f32), .Float3}
+			twin = a.location
+		}
+	}
+	testing.expect(t, twin >= 0)
+	offsets: map[string]int
+	defer delete(offsets)
+	for o in vm.stage_outputs {
+		offsets[o.name] = o.offset
+	}
+	clip_at :: proc(varyings: []f32, record, at, i: int) -> [4]f32 {
+		r := varyings[i * record + at:]
+		return {r[0], r[1], r[2], r[3]}
+	}
+	record := vm.varying_floats
+	positions: [N][4]f32
+	varyings := make([]f32, N * record, context.temp_allocator)
+	scratch: Scratch
+	defer scratch_destroy(&scratch)
+	run_vertex(&vm.program, block, attrs[:], N, positions[:], varyings, &scratch)
+	for v, i in verts {
+		// Two calls of bump when the position is made.
+		p := v.position * scales[0] * 2
+		near(t, positions[i], mvps[0] * [4]f32{p.x, p.y, p.z, 1})
+		o := open[i] * scales[1] * 2
+		near(t, clip_at(varyings, record, offsets["openClip"], i), mvps[1] * [4]f32{o.x, o.y, o.z, 1})
+		// The tap's globals are its own: main sees one call of bump and base 3.
+		n := varyings[i * record + offsets["vNormal"]:]
+		near(t, {n[0], n[1], n[2], 0}, {v.normal.x * scales[0] + 1, v.normal.y * scales[0] + 3, v.normal.z * scales[0], 0})
+	}
+
+	// The untapped shader in the second environment, on the twins.
+	plain, plain_errs, plain_ok := compile_pipeline({vertex = TAP_VS, fragment = TAP_FS, vertex_prelude = TAP_PRELUDE})
+	defer destroy_pipeline(plain)
+	if !testing.expectf(t, plain_ok, "%s", format_errors(plain_errs, context.temp_allocator)) {
+		return
+	}
+	pv := plain.vertex
+	testing.expect_value(t, pv.block_size, vm.block_stride)
+	plain_attrs: [2]Attribute
+	for a in pv.stage_inputs {
+		switch a.name {
+		case "position":
+			plain_attrs[a.location] = {&open[0], size_of([3]f32), .Float3}
+		case "normal":
+			plain_attrs[a.location] = {&verts[0].normal, size_of(Test_Vertex), .Float3}
+		}
+	}
+	plain_positions: [N][4]f32
+	plain_varyings := make([]f32, N * pv.varying_floats, context.temp_allocator)
+	run_vertex(&pv.program, block[vm.block_stride:], plain_attrs[:], N, plain_positions[:], plain_varyings, &scratch)
+	for i in 0 ..< N {
+		got := clip_at(varyings, record, offsets["openClip"], i)
+		testing.expectf(t, transmute([4]u32)got == transmute([4]u32)plain_positions[i], "vertex %d: tap %v, untapped %v", i, got, plain_positions[i])
+	}
+
+	// The first environment twice, the twins the attributes themselves.
+	copy(block[vm.block_stride:], block[:vm.block_stride])
+	attrs[twin] = {&verts[0].position, size_of(Test_Vertex), .Float3}
+	run_vertex(&vm.program, block, attrs[:], N, positions[:], varyings, &scratch)
+	for i in 0 ..< N {
+		got := clip_at(varyings, record, offsets["openClip"], i)
+		testing.expectf(t, transmute([4]u32)got == transmute([4]u32)positions[i], "vertex %d: tap %v, gl_Position %v", i, got, positions[i])
+	}
+}
+
+// Every tap, given the first environment and the attributes themselves as
+// twins, writes gl_Position bit for bit: over loops whose breaks and
+// continues the position depends on, early returns, inout and out
+// parameters, a switch and initializers that call functions.
+@(test)
+test_taps_match :: proc(t: ^testing.T) {
+	LOOPS :: `in vec3 position;
+in vec3 normal;
+out float vDead;
+uniform float limit;
+float acc = 0.0;
+void grow(inout float h, out float d) {
+    h += 0.5;
+    d = h * 3.0;
+}
+float shape(float x) {
+    if (x < 0.0) return -x;
+    vDead = x;
+    return x * 2.0;
+}
+void place(vec3 p) {
+    if (p.x < 0.0) {
+        gl_Position = vec4(-p, 1.0);
+        return;
+    }
+    gl_Position = vec4(p, 1.0);
+}
+void main() {
+    float h = 0.0;
+    float dead;
+    for (int i = 0; i < 8; i++) {
+        if (h > limit * 8.0) break;
+        if (i == 2) continue;
+        grow(h, dead);
+        h += float(i);
+        acc += dead;
+    }
+    switch (int(limit)) {
+    case 0: h += 1.0; break;
+    case 1: h += 2.0; break;
+    default: vDead = 1.0;
+    }
+    place(position * shape(h - 20.0));
+}`
+	INIT :: `in vec3 position;
+in vec3 normal;
+out vec4 vColor;
+uniform float u;
+float k = 2.0;
+float helper(float x) {
+    vColor = vec4(x);
+    return x * k + u;
+}
+float g = helper(1.0);
+void main() {
+    gl_Position = vec4(position * g, 1.0);
+}`
+	PRELUDE :: "in vec3 open0;\nin vec3 open1;\nin vec3 openNormal;\nout vec4 tap0;\nout vec4 tap1;\n"
+	taps := []Tap {
+		{position = "tap0", attributes = {{"position", "open0"}}},
+		{position = "tap1", attributes = {{"position", "open1"}, {"normal", "openNormal"}}},
+	}
+	// No position at all: the taps' stay zero too.
+	SILENT :: "in vec3 position;\nin vec3 normal;\nout vec3 vNormal;\nvoid main() { vNormal = normal; }"
+	for src in ([]string{TAP_VS, LOOPS, INIT, SILENT}) {
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Vertex, prelude = PRELUDE, taps = taps})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		// One copy per tap of what the position needs.
+		testing.expectf(t, !strings.contains(m.msl, "2_1_") && !strings.contains(m.msl, "ok_1_vDead"), "copies of copies or dead outputs:\n%s", m.msl)
+		block := make([]u8, m.block_size, context.temp_allocator)
+		for u, k in m.uniforms {
+			values := [16]f32{}
+			for &v, i in values {
+				v = 0.75 + f32(k) * 0.5 + f32(i) * 0.125
+			}
+			set_uniform(m, block, u.name, values[:min(u.size / 4, 16)])
+		}
+		for e in 1 ..= m.taps {
+			copy(block[e * m.block_stride:], block[:m.block_stride])
+		}
+		N :: LANES + 3
+		verts: [N]Test_Vertex
+		for &v, i in verts {
+			f := f32(i)
+			v = {{f * 0.25 - 4, 1 - f * 0.125, f * 0.5}, {0.1 * f, 0.2, 0.3}, {}}
+		}
+		attrs: [8]Attribute
+		for a in m.stage_inputs {
+			testing.expectf(t, a.name != "openNormal", "the twin of an unused attribute is an input")
+			field := &verts[0].normal if a.name == "normal" else &verts[0].position
+			attrs[a.location] = {field, size_of(Test_Vertex), .Float3}
+		}
+		positions: [N][4]f32
+		varyings := make([]f32, N * m.varying_floats, context.temp_allocator)
+		scratch: Scratch
+		defer scratch_destroy(&scratch)
+		run_vertex(&m.program, block, attrs[:], N, positions[:], varyings, &scratch)
+		for o in m.stage_outputs {
+			if o.name != "tap0" && o.name != "tap1" {
+				continue
+			}
+			for i in 0 ..< N {
+				r := varyings[i * m.varying_floats + o.offset:]
+				got := [4]f32{r[0], r[1], r[2], r[3]}
+				if got != positions[i] {
+					testing.expectf(t, false, "%s, vertex %d: %v, gl_Position %v", o.name, i, got, positions[i])
+					break
+				}
+			}
+		}
+	}
+}
+
+@(test)
+test_tap_errors :: proc(t: ^testing.T) {
+	VS :: "in vec3 position;\nvoid main() { gl_Position = vec4(position, 1.0); }"
+	Case :: struct {
+		prelude: string,
+		tap:     Tap,
+		want:    string,
+	}
+	cases := [?]Case {
+		{"", {position = "openClip"}, "a tap's position openClip must be declared `out vec4`"},
+		{"out vec3 openClip;\n", {position = "openClip"}, "Prelude:1:10: a tap's position openClip must be declared `out vec4`"},
+		{"out vec4 openClip;\n", {position = "openClip", attributes = {{"normal", "openNormal"}}}, "a tap's attribute normal must be an `in` variable"},
+		{"out vec4 openClip;\nin vec2 openPosition;\n", {position = "openClip", attributes = {{"position", "openPosition"}}}, "the tap twin openPosition must be declared `in vec3`, like position"},
+		{"out vec4 openClip;\nvoid touch() { openClip = vec4(0.0); }\n", {position = "openClip"}, "the shader uses openClip, a tap's position"},
+	}
+	for c in cases {
+		m, errs, ok := compile(VS, {profile = .Glsl, stage = .Vertex, prelude = c.prelude, taps = []Tap{c.tap}})
+		got := format_errors(errs, context.temp_allocator)
+		testing.expectf(t, !ok && strings.contains(got, c.want), "%q: got errors %q", c.want, got)
+		destroy(m)
+	}
+	{
+		twice := []Tap{{position = "openClip"}, {position = "openClip"}}
+		m, errs, ok := compile(VS, {profile = .Glsl, stage = .Vertex, prelude = "out vec4 openClip;\n", taps = twice})
+		got := format_errors(errs, context.temp_allocator)
+		testing.expectf(t, !ok && strings.contains(got, "two taps write openClip"), "got errors %q", got)
+		destroy(m)
+	}
+	{
+		// Recursion is the source's error, once, about the source's names.
+		src := "in vec3 position;\nfloat f(float x) { return f(x); }\nfloat g = f(1.0);\nvoid main() { gl_Position = vec4(position * g, 1.0); }"
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Vertex, prelude = "out vec4 openClip;\n", taps = []Tap{{position = "openClip"}}})
+		got := format_errors(errs, context.temp_allocator)
+		testing.expectf(t, !ok && strings.count(got, "recursion") == 1 && !strings.contains(got, "1_f"), "got errors %q", got)
+		destroy(m)
+	}
+	m, errs, ok := compile("out vec4 c;\nvoid main() { c = vec4(1.0); }", {profile = .Glsl, taps = []Tap{{position = "c"}}})
+	defer destroy(m)
+	got := format_errors(errs, context.temp_allocator)
+	testing.expectf(t, !ok && strings.contains(got, "taps are for vertex shaders, not fragment shaders"), "got errors %q", got)
+}
+
 @(test)
 test_run_fragment :: proc(t: ^testing.T) {
 	p, errs, ok := compile_pipeline({vertex = CPU_VS, fragment = CPU_FS})
@@ -1349,8 +1659,8 @@ test_run_fragment :: proc(t: ^testing.T) {
 		return
 	}
 	fm := p.fragment
-	// 5 quads in a row (crossing the batch of 4), alternately facing.
-	Q :: 5
+	// A row of quads crossing a batch, alternately facing.
+	Q :: LANES / 4 + 1
 	record := fm.varying_floats
 	origin: [Q][2]i32
 	facing: [Q]bool

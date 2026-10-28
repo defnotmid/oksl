@@ -219,11 +219,31 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   starts at the top left, as in Vulkan (no flip). `textureSize` queries
   the image (on the CPU, the size the host gives) and `texelFetch` samples
   the texel's centre at its level, so both take sampler parameters too.
+- **Taps:** `Options.taps` (in a pipeline, the vertex stage's) runs what
+  a vertex shader's `main` does toward `gl_Position` again for other
+  environments, such as a motion blur's shutter opening, once per tap and
+  before `main` itself. Tap N copies the statements the position depends
+  on (in `main`, the functions it reaches and the globals' initializers):
+  each uniform reads at its offset plus (N + 1) × `Module.block_stride`,
+  the attributes the tap lists read their twins
+  (`{"position", "o3dOpenPosition"}`), `gl_Position` goes to the tap's
+  `position`, and the shader's own outputs and globals are private to the
+  copy. Twins and positions are ordinary `in` and `out vec4` declarations,
+  usually the prelude's, so locations, reflection and linking treat them
+  like any other; a twin the copy never reads is no input, and a position
+  takes a location like any output, so a prelude declares it only for a
+  pipeline with taps. The block holds `1 + taps` environments of
+  `block_stride` bytes, each laid out as `Module.uniforms`
+  (`set_uniform(m, block[n * m.block_stride:], ...)` fills environment n).
+  `run_vertex` runs the taps too, their positions ordinary varyings; each
+  tap costs another run of the arithmetic the position depends on.
 - **Diagnosed:** `varying` / `attribute` (unless a prelude defines them),
   duplicate or out-of-range locations, integer interpolated variables
   without `flat`, initializers on stage variables, writes to inputs,
-  gl_FragCoord and gl_FrontFacing, and fragment-only features (`discard`,
-  derivatives, gl_FragCoord) in vertex shaders.
+  gl_FragCoord and gl_FrontFacing, fragment-only features (`discard`,
+  derivatives, gl_FragCoord) in vertex shaders, taps outside a vertex
+  shader, a tap position, attribute or twin not declared as one, a
+  position the shader uses itself, and two taps writing one position.
 
 ### Pass graphs and programs (multipass)
 
@@ -304,8 +324,9 @@ The inputs come first, at fixed offsets, whether or not they are used:
 The rows are one table, `INPUTS` (indexed by `Input`: name, type, offset;
 the channel rows give the sampler binding). `Module.uniforms` reflects each
 user uniform (offset, size, count, stride) and `Module.block_size` gives
-the total size. Bools are stored as 4-byte uints. `write_builtins`,
-`write_input` (one row, by index) and `set_uniform` fill a block.
+the total size (with vertex taps, `block_stride` is one environment's).
+Bools are stored as 4-byte uints. `write_builtins`, `write_input` (one
+row, by index) and `set_uniform` fill a block.
 `inputs_used` and `channels_used`/`num_samplers` say what the shader
 reads, and `channel_names[n]` names what channel n binds (a `uniform
 shader`, `iChannelN` or a `uniform sampler2D`).
@@ -399,9 +420,11 @@ show both.
   `.rgb`) are read in place; a call keeps a return mask only when a
   `return` can leave the function early.
 - **Dispatch:** one switch per instruction, never per lane. Arithmetic,
-  comparisons, conversions and the float built-ins run as whole-register
-  loops, each specialized at compile time (`$` parameters and `when`), so
-  no lane loop branches on the operation. Execution masks are
+  comparisons, conversions, the float built-ins and the vector and matrix
+  ones (`dot`, `normalize`, `cross`, `reflect`, products; not
+  `determinant` and `inverse`) run as whole-register loops, each
+  specialized at compile time (`$` parameters and `when`), so no lane loop
+  branches on the operation. Execution masks are
   `bit_set`s of lanes. Masked stores and selects are branchless, and
   `floor` avoids `core:math`'s modf.
 - **Divergence:** divergent control flow runs every path under execution
@@ -448,10 +471,12 @@ Data-oriented throughout:
   one instruction or call.
 - **The stage is IR plus a table:** the checker synthesizes the entry
   point (`stage.odin`: the layer coordinate, `sk_FragCoord`, global
-  initializers, the call to `main`) as ordinary IR and lists what it reads
-  and writes in `Checked.interface` (stage inputs and outputs, the uniform
-  block, the channels, with locations, sets and bindings). Backends declare
-  those rows and emit the entry like any other function.
+  initializers, a vertex shader's taps, the call to `main`) as ordinary IR,
+  a tap being a copy of the statements its position depends on, and lists
+  what it reads and writes in `Checked.interface` (stage inputs and
+  outputs, the uniform block, the channels, with locations, sets and
+  bindings). Backends declare those rows and emit the entry like any other
+  function.
 - **Errors are values:** `Error` is a position, an `Error_Code` and plain
   operands; `ERROR_TEXT` makes the message only in `format_errors` /
   `error_message`.
@@ -488,7 +513,7 @@ odin test . -vet -strict-style                      # SkSL, GLSL/Shadertoy, the 
                                                     # uniforms, children and channels, programs, corpus
                                                     # (+ spirv-val when installed)
 odin run tools/gpu_parity -- out_dir                # SDL_GPU vs CPU interpreter on testdata/
-odin run tools/gpu_parity -- -oksl-vertex out_dir   # the same, drawn through testdata/layer.vert compiled by oksl
+odin run tools/gpu_parity -- -oksl-vertex out_dir   # the same, drawn through testdata/layer.vert compiled by oksl, and a tap of it
 odin run tools/okslc -- a.sksl b.glsl ...           # compile (by extension: SOURCE_EXTENSIONS); -o prefix writes .spv / .metal
 odin run tools/cpu_render -- shader.sksl out.png    # CPU render
 odin run tools/golden -- snapshot ref                # before a refactor: ~95k generated cases + every shader

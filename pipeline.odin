@@ -56,6 +56,7 @@ compile_pipeline :: proc(desc: Pipeline_Desc, options := Options{}) -> (p: ^Pipe
 		modules[i] = m
 		o := options
 		o.profile, o.stage, o.prelude = .Glsl, st.stage, st.prelude
+		o.taps = o.taps if st.stage == .Vertex else nil
 		{
 			context.allocator = virtual.arena_allocator(&m.arena)
 			u, toks, front_ok := module_front(st.source, o, st.src, st.pre_src)

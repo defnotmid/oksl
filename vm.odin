@@ -328,17 +328,10 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 @(private)
 written_syms :: proc(u: ^Unit) -> []bool {
 	written := make([]bool, len(u.syms))
-	root :: proc(u: ^Unit, id: Expr_Id) -> Sym_Id {
-		id := id
-		for u.exprs[id].kind == .Index || u.exprs[id].kind == .Field {
-			id = u.exprs[id].a
-		}
-		return u.exprs[id].sym if u.exprs[id].kind == .Ident else 0
-	}
 	for e, id in u.exprs {
 		#partial switch e.kind {
 		case .Assign, .Pre_Inc, .Pre_Dec, .Post_Inc, .Post_Dec:
-			written[root(u, e.a)] = true
+			written[target_sym(u, e.a)] = true
 		case .Call:
 			if e.call != .User {
 				continue
@@ -346,7 +339,7 @@ written_syms :: proc(u: ^Unit) -> []bool {
 			ps := fparams(u, e.func)
 			for a, i in args_of(u, Expr_Id(id)) {
 				if i < len(ps) && ps[i].qual != .In {
-					written[root(u, a)] = true
+					written[target_sym(u, a)] = true
 				}
 			}
 		}

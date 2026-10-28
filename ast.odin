@@ -273,6 +273,9 @@ Unit :: struct {
 	features:     Features,
 	// A Shadertoy buffer pass: the entry adapter keeps mainImage's colour.
 	buffer_pass:  bool,
+	// A vertex shader's taps (Options.taps): the entry runs a copy of main
+	// for each.
+	taps:         []Tap,
 	errors:       [dynamic]Error,
 	// Syntax.
 	exprs:        [dynamic]Expr,
@@ -296,7 +299,7 @@ Unit :: struct {
 	calls:        [dynamic][2]Func_Id,
 }
 
-unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass := false, stage := Stage.Fragment) {
+unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass := false, stage := Stage.Fragment, taps: []Tap = nil) {
 	context.allocator = allocator
 	u.allocator = allocator
 	u.profile = profile
@@ -304,6 +307,7 @@ unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass 
 	u.stage = stage
 	u.features = profile_features(profile, stage)
 	u.buffer_pass = buffer_pass
+	u.taps = taps
 	u.errors = make([dynamic]Error)
 	u.exprs = make([dynamic]Expr)
 	u.stmts = make([dynamic]Stmt)
@@ -401,6 +405,16 @@ push_ids :: proc(u: ^Unit, ids: []u32) -> Range {
 	r := Range{u32(len(u.ids)), u32(len(ids))}
 	append(&u.ids, ..ids)
 	return r
+}
+
+// The variable an assignment target or `out` argument writes: `v`, `v[i]`
+// and `v.xy` write v (0 for any other expression).
+target_sym :: proc "contextless" (u: ^Unit, id: Expr_Id) -> Sym_Id {
+	id := id
+	for u.exprs[id].kind == .Index || u.exprs[id].kind == .Field {
+		id = u.exprs[id].a
+	}
+	return u.exprs[id].sym if u.exprs[id].kind == .Ident else 0
 }
 
 lit_f64 :: #force_inline proc "contextless" (e: Expr) -> f64 {

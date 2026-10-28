@@ -1,6 +1,7 @@
 package oksl
 
 import "core:container/bit_array"
+import "core:fmt"
 
 // The stage's interface and entry point. The checker lists what a shader
 // exchanges with the pipeline in `Checked.interface` (stage inputs and
@@ -28,6 +29,9 @@ import "core:container/bit_array"
 //         <global> = <initializer>;
 //         main();
 //     }
+//
+// A vertex shader's taps (Options.taps; "taps" below) run between the
+// initializers and main: each tap's own initializers, then its copy of main.
 
 Interface_Kind :: enum u8 {
 	// A value from the vertex stage, at location `binding`.
@@ -275,7 +279,7 @@ stage_var_rows :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 // Synthesizes the entry around `main` and returns it with the interface it
 // reads and writes.
 @(private)
-stage_entry :: proc(c: ^Checker, main: Func_Id) -> (entry: Func_Id, iface: []Interface_Var) {
+stage_entry :: proc(c: ^Checker, main: Func_Id, funcs: ^[dynamic]Func_Id) -> (entry: Func_Id, iface: []Interface_Var) {
 	u := c.u
 	pos := u.func_decls[u.funcs[main].decl].pos
 	b := Node_Builder{u, pos}
@@ -284,7 +288,6 @@ stage_entry :: proc(c: ^Checker, main: Func_Id) -> (entry: Func_Id, iface: []Int
 	// `$` names are out of the source's reach.
 	hidden := make(map[string]Sym_Id, context.temp_allocator)
 	if c.rules.entry == .Void_Main {
-		stage_var_rows(c, &rows)
 		append(&body, u32(stmt_expr(&b, node_call(&b, "main"))))
 	} else {
 		uv := add_sym(c, Symbol{name = "uv", type = intern(u, vec_type(.Float, 2)), storage = .Stage_In, pos = pos, is_const = true})
@@ -346,9 +349,22 @@ stage_entry :: proc(c: ^Checker, main: Func_Id) -> (entry: Func_Id, iface: []Int
 		assign := node_expr(&b, {kind = .Assign, op = .Eq, a = target, b = init, type = t})
 		append(&stmts, u32(stmt_expr(&b, assign)))
 	}
+	// The taps run after the initializers, before main. They copy what
+	// main reaches (`funcs`, nil when it is unsound) and add the copies.
+	if funcs != nil && len(u.taps) > 0 {
+		live := tap_live(c, funcs[:], main)
+		reached := len(funcs)
+		for n in 0 ..< len(u.taps) {
+			tap_run(c, &b, &stmts, &live, funcs, reached, main, n)
+		}
+	}
 	append(&stmts, body[len(body) - 1])
 	u.stmts[block].body = push_ids(u, stmts[:])
 
+	// After the taps, which read their twins.
+	if c.rules.entry == .Void_Main {
+		stage_var_rows(c, &rows)
+	}
 	append_resources(c, &rows)
 	return entry, rows[:]
 }
@@ -376,3 +392,447 @@ compile_glsl :: proc(source: string, options := Options{}) -> (m: ^Module, error
 	return compile(source, o)
 }
 
+
+// ---- taps -----------------------------------------------------------------------------
+//
+// A tap (Options.taps) is a copy of what main does toward gl_Position: of
+// the statements of main, of the functions it reaches and of the globals'
+// initializers that the position depends on (tap_live), made from the
+// checked statements and expressions. In the copy each uniform reads its
+// copy in environment N + 1 of the block, the listed attributes read their
+// twins, gl_Position is the tap's position, the shader's outputs and
+// globals are private globals, and locals and parameters are the copy's
+// own. Copies are named "<N + 1>_<name>", which no source name can be.
+
+// What the position depends on, by original symbol, statement and function.
+// Flow-insensitive: a symbol is live if a live statement reads it, and a
+// statement is live if it writes a live symbol, calls a function that
+// does, or decides whether live statements run (the loops, branches,
+// breaks and returns around them).
+@(private)
+Tap_Live :: struct {
+	u:       ^Unit,
+	syms:    []bool,
+	stmts:   []bool,
+	// Functions whose run a live statement uses (main's always), and that
+	// write a live global or output.
+	results: []bool,
+	effects: []bool,
+	// The function being visited (0: the initializers).
+	f:       Func_Id,
+	changed: bool,
+}
+
+// Visits `funcs` and the initializers until nothing more becomes live.
+@(private)
+tap_live :: proc(c: ^Checker, funcs: []Func_Id, main: Func_Id) -> Tap_Live {
+	u := c.u
+	l := Tap_Live {
+		u       = u,
+		syms    = make([]bool, len(u.syms), context.temp_allocator),
+		stmts   = make([]bool, len(u.stmts), context.temp_allocator),
+		results = make([]bool, len(u.funcs), context.temp_allocator),
+		effects = make([]bool, len(u.funcs), context.temp_allocator),
+	}
+	l.results[main] = true
+	if c.gl_position == 0 {
+		return l
+	}
+	l.syms[c.gl_position] = true
+	for l.changed = true; l.changed; {
+		l.changed = false
+		for f in funcs {
+			l.f = f
+			live_stmt(&l, u.func_decls[u.funcs[f].decl].body, false, false)
+		}
+		// An initializer runs when its global is live or it writes one.
+		l.f = 0
+		for g in c.globals {
+			init := u.vars[u.syms[g].decl].init
+			if init != 0 && (l.syms[g] || live_writes(&l, init)) {
+				live_set(&l, &l.syms[g])
+				live_reads(&l, init)
+			}
+		}
+	}
+	return l
+}
+
+@(private)
+live_set :: proc(l: ^Tap_Live, b: ^bool) {
+	if !b^ {
+		b^ = true
+		l.changed = true
+	}
+}
+
+// Whether statement `id` runs in the copy, marking it and what it reads;
+// `breaks` and `continues` say whether the loop or switch they leave does.
+// True if anything in it is live.
+@(private)
+live_stmt :: proc(l: ^Tap_Live, id: Stmt_Id, breaks, continues: bool) -> bool {
+	if id == 0 {
+		return false
+	}
+	u := l.u
+	s := u.stmts[id]
+	live := false
+	switch s.kind {
+	case .Empty, .Case, .Default:
+	case .Block:
+		for b in list(u, s.body) {
+			live |= live_stmt(l, Stmt_Id(b), breaks, continues)
+		}
+	case .Decl:
+		for d in list(u, s.decls) {
+			live |= l.syms[u.vars[d].sym] || live_writes(l, u.vars[d].init)
+		}
+	case .Expr:
+		live = live_writes(l, s.expr)
+	case .If:
+		then_ := live_stmt(l, s.then_, breaks, continues)
+		else_ := live_stmt(l, s.else_, breaks, continues)
+		live = then_ || else_ || live_writes(l, s.expr)
+	case .For, .While, .Do_While:
+		// Its jumps matter once the loop runs (an earlier visit found it).
+		body := live_stmt(l, s.then_, l.stmts[id], l.stmts[id])
+		init := live_stmt(l, s.init, breaks, continues)
+		live = body || init || live_writes(l, s.expr) || live_writes(l, s.step)
+	case .Switch:
+		for b in list(u, s.body) {
+			live |= live_stmt(l, Stmt_Id(b), l.stmts[id], continues)
+		}
+		live ||= live_writes(l, s.expr)
+	case .Break:
+		live = breaks
+	case .Continue:
+		live = continues
+	case .Return, .Discard:
+		live = l.results[l.f]
+	}
+	if live {
+		live_set(l, &l.stmts[id])
+		live_reads(l, s.expr)
+		live_reads(l, s.step)
+		for d in list(u, s.decls) {
+			live_reads(l, u.vars[d].init)
+		}
+	}
+	return live
+}
+
+// Whether evaluating `id` writes a live symbol, directly or by a call. A
+// live global or output written makes the function one with effects.
+@(private)
+live_writes :: proc(l: ^Tap_Live, id: Expr_Id) -> bool {
+	if id == 0 {
+		return false
+	}
+	u := l.u
+	e := u.exprs[id]
+	w := live_writes(l, e.a) | live_writes(l, e.b) | live_writes(l, e.c)
+	for a in args_of(u, id) {
+		w |= live_writes(l, a)
+	}
+	writes :: proc(l: ^Tap_Live, target: Expr_Id) -> bool {
+		s := target_sym(l.u, target)
+		if s == 0 || !l.syms[s] {
+			return false
+		}
+		if storage := l.u.syms[s].storage; storage == .Global || storage == .Stage_Out {
+			live_set(l, &l.effects[l.f])
+		}
+		return true
+	}
+	#partial switch e.kind {
+	case .Assign, .Pre_Inc, .Pre_Dec, .Post_Inc, .Post_Dec:
+		w |= writes(l, e.a)
+	case .Call:
+		if e.call != .User {
+			break
+		}
+		if l.effects[e.func] {
+			live_set(l, &l.effects[l.f])
+			w = true
+		}
+		ps := fparams(u, e.func)
+		for a, i in args_of(u, id) {
+			if ps[i].qual != .In {
+				w |= writes(l, a)
+			}
+		}
+	}
+	return w
+}
+
+// Marks what evaluating `id` reads live: its symbols, the results of the
+// functions it calls and their `out` parameters.
+@(private)
+live_reads :: proc(l: ^Tap_Live, id: Expr_Id) {
+	if id == 0 {
+		return
+	}
+	u := l.u
+	e := u.exprs[id]
+	live_reads(l, e.a)
+	live_reads(l, e.b)
+	live_reads(l, e.c)
+	for a in args_of(u, id) {
+		live_reads(l, a)
+	}
+	if e.sym != 0 {
+		live_set(l, &l.syms[e.sym])
+	}
+	if e.kind == .Call && e.call == .User {
+		live_set(l, &l.results[e.func])
+		for p in fparams(u, e.func) {
+			if p.qual != .In && p.sym != 0 {
+				live_set(l, &l.syms[p.sym])
+			}
+		}
+	}
+}
+
+@(private)
+Tap_Copy :: struct {
+	c:     ^Checker,
+	live:  ^Tap_Live,
+	n:     int,
+	// Each original symbol's in the copy (0: not made yet) and each copied
+	// function's copy.
+	syms:  []Sym_Id,
+	funcs: []Func_Id,
+}
+
+// Appends tap `n` to the entry's statements (its live globals'
+// initializers, then its copy of main) and the copies of the functions in
+// `funcs[:reached]` that it calls to `funcs`.
+@(private)
+tap_run :: proc(c: ^Checker, b: ^Node_Builder, stmts: ^[dynamic]u32, live: ^Tap_Live, funcs: ^[dynamic]Func_Id, reached: int, main: Func_Id, n: int) {
+	u := c.u
+	t := Tap_Copy{c = c, live = live, n = n, syms = make([]Sym_Id, len(u.syms), context.temp_allocator), funcs = make([]Func_Id, len(u.funcs), context.temp_allocator)}
+	if !tap_bind(&t, u.taps[n]) {
+		return
+	}
+	// Every copy exists before any body is copied, so calls can name them.
+	for i in 0 ..< reached {
+		f := funcs[i]
+		if !live.results[f] {
+			continue
+		}
+		fn := u.funcs[f]
+		params := make([]Func_Param, fn.params.count, context.temp_allocator)
+		copy(params, fparams(u, f))
+		for &p in params {
+			p.sym = tap_sym(&t, p.sym)
+		}
+		fn.name = tap_name(&t, fn.name)
+		fn.params = {u32(len(u.func_params)), fn.params.count}
+		append(&u.func_params, ..params)
+		fd := u.func_decls[fn.decl]
+		fd.name = fn.name
+		fn.decl = Func_Decl_Id(len(u.func_decls))
+		append(&u.func_decls, fd)
+		t.funcs[f] = Func_Id(len(u.funcs))
+		append(&u.funcs, fn)
+		append(funcs, t.funcs[f])
+	}
+	for i in 0 ..< reached {
+		f := funcs[i]
+		if t.funcs[f] == 0 {
+			continue
+		}
+		body := tap_stmt(&t, u.func_decls[u.funcs[f].decl].body)
+		if body == 0 {
+			body = add_node_stmt(b, {kind = .Block})
+		}
+		u.func_decls[u.funcs[t.funcs[f]].decl].body = body
+	}
+	// Copying an initializer can add private globals: the originals'.
+	for i, globals := 0, len(c.globals); i < globals; i += 1 {
+		g := c.globals[i]
+		init := u.vars[u.syms[g].decl].init
+		if init == 0 || !live.syms[g] {
+			continue
+		}
+		target := node_expr(b, {kind = .Ident, name = u.syms[g].name, sym = tap_sym(&t, g), type = u.syms[g].type})
+		assign := node_expr(b, {kind = .Assign, op = .Eq, a = target, b = tap_expr(&t, init), type = u.syms[g].type})
+		append(stmts, u32(stmt_expr(b, assign)))
+	}
+	run := t.funcs[main]
+	call := node_expr(b, {kind = .Call, call = .User, name = u.funcs[run].name, func = run, type = u.funcs[main].ret})
+	append(stmts, u32(stmt_expr(b, call)))
+}
+
+// Binds the symbols a tap replaces up front: the uniforms (copied in block
+// order), the twins and the position. False when the tap names them wrong.
+@(private)
+tap_bind :: proc(t: ^Tap_Copy, tap: Tap) -> bool {
+	c := t.c
+	u := c.u
+	error_count := len(u.errors)
+	declared :: proc(c: ^Checker, name: string, storage: Storage) -> (s: Sym_Id, pos: Pos) {
+		s = c.scopes[0][name]
+		if s == 0 {
+			return 0, {line = 1, col = 1}
+		}
+		return s if c.u.syms[s].storage == storage else 0, c.u.syms[s].pos
+	}
+	pos, at := declared(c, tap.position, .Stage_Out)
+	switch {
+	case pos == 0 || ty(u, u.syms[pos].type) != vec_type(.Float, 4):
+		add_error(c, at, .Tap_Position, tap.position)
+	case bit_array.get(&c.used, int(pos)):
+		add_error(c, at, .Tap_Position_Used, tap.position)
+	case c.gl_position != 0:
+		t.syms[c.gl_position] = pos
+	}
+	for other in u.taps[:t.n] {
+		if other.position == tap.position {
+			add_error(c, at, .Tap_Position_Taken, tap.position)
+			break
+		}
+	}
+	for pair in tap.attributes {
+		attr, attr_at := declared(c, pair[0], .Stage_In)
+		if attr == 0 {
+			add_error(c, attr_at, .Tap_Attribute, pair[0])
+			continue
+		}
+		twin, twin_at := declared(c, pair[1], .Stage_In)
+		if twin == 0 || u.syms[twin].type != u.syms[attr].type {
+			add_error(c, twin_at, .Tap_Twin, pair[1], a = tn(c, sym_type(u, attr)), b = pair[0])
+			continue
+		}
+		t.syms[attr] = twin
+	}
+	if len(u.errors) > error_count {
+		return false
+	}
+	// The first environment's uniforms lead the list; earlier taps' copies
+	// follow.
+	stride := round_up(c.next_offset, 16)
+	for i, uniforms := 0, len(c.uniforms); i < uniforms; i += 1 {
+		s := c.uniforms[i]
+		if u.syms[s].index >= stride {
+			break
+		}
+		dup := u.syms[s]
+		dup.name = tap_name(t, dup.name)
+		dup.index += (t.n + 1) * stride
+		t.syms[s] = add_sym(c, dup)
+		append(&c.uniforms, t.syms[s])
+	}
+	return true
+}
+
+// A symbol's in the copy: made on first use for locals and parameters (the
+// copy's own) and for outputs and globals (private globals); the rest are
+// shared.
+@(private)
+tap_sym :: proc(t: ^Tap_Copy, s: Sym_Id) -> Sym_Id {
+	if s == 0 || t.syms[s] != 0 {
+		return t.syms[s]
+	}
+	sym := t.c.u.syms[s]
+	#partial switch sym.storage {
+	case .Local, .Param:
+		t.syms[s] = add_sym(t.c, sym)
+	case .Global, .Stage_Out:
+		sym.name = tap_name(t, sym.name)
+		sym.storage = .Global
+		sym.decl = 0
+		t.syms[s] = add_sym(t.c, sym)
+		append(&t.c.globals, t.syms[s])
+	case:
+		t.syms[s] = s
+	}
+	return t.syms[s]
+}
+
+@(private)
+tap_name :: proc(t: ^Tap_Copy, name: string) -> string {
+	return fmt.aprintf("%d_%s", t.n + 1, name)
+}
+
+// Copies statement `id` if the position needs it (0 if not); labels and
+// empty statements go with their parent.
+@(private)
+tap_stmt :: proc(t: ^Tap_Copy, id: Stmt_Id) -> Stmt_Id {
+	if id == 0 {
+		return 0
+	}
+	u := t.c.u
+	s := u.stmts[id]
+	if s.kind != .Case && s.kind != .Default && s.kind != .Empty && !t.live.stmts[id] {
+		return 0
+	}
+	if s.body.count > 0 {
+		body := make([dynamic]u32, 0, s.body.count, context.temp_allocator)
+		for b in list(u, s.body) {
+			if k := tap_stmt(t, Stmt_Id(b)); k != 0 {
+				append(&body, u32(k))
+			}
+		}
+		s.body = push_ids(u, body[:])
+	}
+	if s.decls.count > 0 {
+		decls := make([]u32, s.decls.count, context.temp_allocator)
+		copy(decls, list(u, s.decls))
+		for &d in decls {
+			v := u.vars[d]
+			v.init = tap_expr(t, v.init)
+			v.sym = tap_sym(t, v.sym)
+			d = u32(len(u.vars))
+			u.syms[v.sym].decl = Var_Id(d)
+			append(&u.vars, v)
+		}
+		s.decls = push_ids(u, decls)
+	}
+	s.expr, s.step = tap_expr(t, s.expr), tap_expr(t, s.step)
+	s.init, s.else_ = tap_stmt(t, s.init), tap_stmt(t, s.else_)
+	if s.then_ != 0 {
+		// A branch or loop body with nothing live runs nothing.
+		then_ := tap_stmt(t, s.then_)
+		if then_ == 0 {
+			then_ = Stmt_Id(len(u.stmts))
+			append(&u.stmts, Stmt{kind = .Empty, pos = s.pos})
+		}
+		s.then_ = then_
+	}
+	out := Stmt_Id(len(u.stmts))
+	append(&u.stmts, s)
+	return out
+}
+
+@(private)
+tap_expr :: proc(t: ^Tap_Copy, id: Expr_Id) -> Expr_Id {
+	if id == 0 {
+		return 0
+	}
+	u := t.c.u
+	e := u.exprs[id]
+	e.a, e.b, e.c = tap_expr(t, e.a), tap_expr(t, e.b), tap_expr(t, e.c)
+	if e.sym != 0 {
+		// A twin is an input once the copy reads it.
+		s := tap_sym(t, e.sym)
+		if s != e.sym && u.syms[s].storage == .Stage_In {
+			bit_array.set(&t.c.used, int(s))
+		}
+		e.sym = s
+	}
+	if e.call == .User {
+		e.func = t.funcs[e.func]
+	}
+	if e.args.count > 0 {
+		args := make([]u32, e.args.count, context.temp_allocator)
+		copy(args, list(u, e.args))
+		for &a in args {
+			a = u32(tap_expr(t, Expr_Id(a)))
+		}
+		e.args = push_ids(u, args)
+	}
+	out := Expr_Id(len(u.exprs))
+	append(&u.exprs, e)
+	return out
+}
