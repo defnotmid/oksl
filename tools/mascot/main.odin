@@ -1,5 +1,5 @@
 // The oksl mascot: a 32x32 pixel-art firefly, in the family of onimite's Pip,
-// odecs' turntable, ottis' Ottis and ovg's chameleon. A firefly because oksl
+// oicut's hedgehog, ottis' Ottis and ovg's chameleon. A firefly because oksl
 // is light made by a program: its lantern is the shader. Writes an SVG whose
 // parts are groups a script shows or hides by id (onimite:
 // svg{ overrides = { glow_b = { visible = true } } }), so the glow can pulse:
