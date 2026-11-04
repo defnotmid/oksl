@@ -116,7 +116,6 @@ tokenize :: proc(src: string, allocator := context.allocator) -> [dynamic]Token 
 				advance(&l)
 				if l.src[l.i] == '\r' {advance(&l)}
 				if l.i < len(l.src) && l.src[l.i] == '\n' {advance(&l)}
-				space = true
 			} else if c == '/' && l.i + 1 < len(l.src) && l.src[l.i + 1] == '/' {
 				for l.i < len(l.src) && l.src[l.i] != '\n' {
 					advance(&l)
@@ -126,7 +125,6 @@ tokenize :: proc(src: string, allocator := context.allocator) -> [dynamic]Token 
 				advance(&l)
 				advance(&l)
 				for l.i < len(l.src) && !(l.src[l.i] == '*' && l.i + 1 < len(l.src) && l.src[l.i + 1] == '/') {
-					if l.src[l.i] == '\n' {line_start = true}
 					advance(&l)
 				}
 				if l.i < len(l.src) {

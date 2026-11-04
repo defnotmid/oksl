@@ -233,6 +233,7 @@ BUILTIN_FRONT_FACING :: 17
 Loop_Target :: struct {
 	merge, cont: u32,
 	broke:       bool,
+	continued:   bool,
 }
 
 // A place values can be loaded from or stored to.

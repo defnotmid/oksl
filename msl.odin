@@ -18,9 +18,12 @@ Msl :: struct {
 	c:       ^Checked,
 	b:       strings.Builder,
 	helpers: strings.Builder,
+	// The current function's temporaries, declared ahead of its body.
+	fn_vars: strings.Builder,
 	// Constructors that need a helper function, by signature.
 	ctor_helpers: map[string]string,
 	indent:  int,
+	temp_id: int,
 	// Extra parameters/arguments every user function takes.
 	params:  string,
 	args:    string,
@@ -32,6 +35,7 @@ emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
 		c            = c,
 		b            = strings.builder_make(),
 		helpers      = strings.builder_make(),
+		fn_vars      = strings.builder_make(),
 		ctor_helpers = make(map[string]string),
 	}
 	// Shared parameters: uniforms, globals and the channels in use.
@@ -348,7 +352,7 @@ component_view :: proc(ref: string, t: Type, wide: bool) -> string {
 uniform_helpers :: proc(m: ^Msl) {
 	syms := make([dynamic]Sym_Id, context.temp_allocator)
 	for s, i in m.u.syms {
-		if i > 0 && (s.storage == .Uniform || s.storage == .Builtin_Uniform) && ty(m.u, s.type).array > 0 {
+		if i > 0 && s.index >= 0 && (s.storage == .Uniform || s.storage == .Builtin_Uniform) && ty(m.u, s.type).array > 0 {
 			append(&syms, Sym_Id(i))
 		}
 	}
@@ -387,6 +391,8 @@ emit_msl_function :: proc(m: ^Msl, f: Func_Id) {
 	u := m.u
 	fn := u.funcs[f]
 	ps := fparams(u, f)
+	m.temp_id = 0
+	strings.builder_reset(&m.fn_vars)
 	w(m, "%s ok_%s(", msl_type(m, ty(u, fn.ret)), fn.name)
 	for p, i in ps {
 		if i > 0 {
@@ -407,11 +413,21 @@ emit_msl_function :: proc(m: ^Msl, f: Func_Id) {
 		w(m, ", ")
 	}
 	w(m, "%s) {{\n", m.params)
+	outer := m.b
+	m.b = strings.builder_make()
 	m.indent = 1
-	for st in list(u, u.stmts[u.func_decls[fn.decl].body].body) {
+	body := u.func_decls[fn.decl].body
+	for st in list(u, body != 0 ? u.stmts[body].body : {}) {
 		msl_stmt(m, Stmt_Id(st))
 	}
+	if ty(u, fn.ret) != T_VOID && !always_returns(u, body) {
+		w(m, "\treturn {{}};\n")
+	}
 	m.indent = 0
+	fn_body := strings.to_string(m.b)
+	m.b = outer
+	strings.write_string(&m.b, strings.to_string(m.fn_vars))
+	strings.write_string(&m.b, fn_body)
 	w(m, "}\n\n")
 }
 
@@ -488,9 +504,17 @@ emit_msl_entry :: proc(m: ^Msl) {
 			w(m, "\tg.in_%s = oksl_in.in_%s;\n", n, n)
 		}
 	}
+	m.temp_id = 0
+	strings.builder_reset(&m.fn_vars)
+	outer := m.b
+	m.b = strings.builder_make()
 	for st in list(u, u.stmts[u.func_decls[u.funcs[c.entry].decl].body].body) {
 		msl_stmt(m, Stmt_Id(st))
 	}
+	entry_body := strings.to_string(m.b)
+	m.b = outer
+	strings.write_string(&m.b, strings.to_string(m.fn_vars))
+	strings.write_string(&m.b, entry_body)
 	w(m, "\tOksl_Out oksl_out;\n")
 	for row in c.interface {
 		#partial switch row.kind {
@@ -759,24 +783,7 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
 		}
 		return fmt.aprintf("%s[%s]", msl_expr(m, e.a), msl_expr(m, e.b))
 	case .Field:
-		base := msl_expr(m, e.a)
-		if e.swizzle_len > 0 {
-			bt := expr_type(u, e.a)
-			if is_scalar(bt) {
-				if e.swizzle_len == 1 {
-					return base
-				}
-				return fmt.aprintf("%s(%s)", msl_type(m, t), base)
-			}
-			comps := "xyzw"
-			b := strings.builder_make(context.temp_allocator)
-			for i in 0 ..< int(e.swizzle_len) {
-				strings.write_byte(&b, comps[e.swizzle[i]])
-			}
-			return fmt.aprintf("%s.%s", base, strings.to_string(b))
-		}
-		at := expr_type(u, e.a)
-		return fmt.aprintf("%s.ok_%s", base, struct_fields(u, at.strukt)[e.field].name)
+		return msl_field(m, id, msl_expr(m, e.a))
 	case .Call:
 		switch e.call {
 		case .User:
@@ -830,27 +837,125 @@ msl_binary :: proc(m: ^Msl, op: Token_Kind, a: string, ta: Type, b: string, tb: 
 }
 
 @(private)
+msl_temp :: proc(m: ^Msl, t: Type) -> string {
+	tmp := fmt.aprintf("_t%d", m.temp_id)
+	m.temp_id += 1
+	fmt.sbprintf(&m.fn_vars, "\t%s %s = {{}};\n", msl_type(m, t), tmp)
+	return tmp
+}
+
+// Field or swizzle `id` applied to `base`, its operand already emitted.
+@(private)
+msl_field :: proc(m: ^Msl, id: Expr_Id, base: string) -> string {
+	u := m.u
+	e := u.exprs[id]
+	at := expr_type(u, e.a)
+	if e.swizzle_len == 0 {
+		return fmt.aprintf("%s.ok_%s", base, struct_fields(u, at.strukt)[e.field].name)
+	}
+	if is_scalar(at) {
+		if e.swizzle_len == 1 {
+			return base
+		}
+		return fmt.aprintf("%s(%s)", msl_type(m, ty(u, e.type)), base)
+	}
+	comps := "xyzw"
+	b := strings.builder_make(context.temp_allocator)
+	for i in 0 ..< int(e.swizzle_len) {
+		strings.write_byte(&b, comps[e.swizzle[i]])
+	}
+	return fmt.aprintf("%s.%s", base, strings.to_string(b))
+}
+
+// An out/inout argument with its dynamic indices captured into `pre`, so
+// copying it in and back evaluates them once, before the call.
+@(private)
+msl_lvalue :: proc(m: ^Msl, id: Expr_Id, pre: ^[dynamic]string) -> string {
+	u := m.u
+	e := u.exprs[id]
+	#partial switch e.kind {
+	case .Index:
+		base := msl_lvalue(m, e.a, pre)
+		ix := u.exprs[e.b]
+		if ix.kind == .Int_Lit || ix.kind == .Uint_Lit {
+			return fmt.aprintf("%s[%s]", base, msl_expr(m, e.b))
+		}
+		idx := msl_temp(m, expr_type(u, e.b))
+		append(pre, fmt.aprintf("(%s = %s)", idx, msl_expr(m, e.b)))
+		return fmt.aprintf("%s[%s]", base, idx)
+	case .Field:
+		return msl_field(m, id, msl_lvalue(m, e.a, pre))
+	}
+	return msl_expr(m, id)
+}
+
+// Out and inout arguments pass through temporaries, as in SPIR-V: zeroed
+// (out) or copied in (inout) before the call and copied back after it, so
+// Metal never binds a reference to a swizzle or to storage the callee also
+// reaches.
+@(private)
 msl_user_call :: proc(m: ^Msl, id: Expr_Id) -> string {
 	u := m.u
 	f := u.exprs[id].func
+	ps := fparams(u, f)
+	args := args_of(u, id)
+	pre := make([dynamic]string, context.temp_allocator)
+	post := make([dynamic]string, context.temp_allocator)
 	b := strings.builder_make()
 	fmt.sbprintf(&b, "ok_%s(", u.funcs[f].name)
-	for a, i in args_of(u, id) {
+	for a, i in args {
 		if i > 0 {
 			strings.write_string(&b, ", ")
 		}
 		if expr_type(u, a).base == .Sampler {
 			tex, smp := msl_sampler(m, a)
 			fmt.sbprintf(&b, "%s, %s", tex, smp)
-		} else {
-			strings.write_string(&b, msl_expr(m, a))
+			continue
 		}
+		// Review: in arguments are evaluated in the call, after every copy-in,
+		// so an in argument that writes a later out/inout argument of the same
+		// call differs from the CPU and SPIR-V (`f((v.x = 0.3), v)` copies v
+		// in first). Staging them too would fix that (e86014d did) at a temp
+		// per in argument in every call with an out parameter.
+		if ps[i].qual == .In {
+			strings.write_string(&b, msl_expr(m, a))
+			continue
+		}
+		pt := ty(u, ps[i].type)
+		lv := msl_lvalue(m, a, &pre)
+		tmp := msl_temp(m, pt)
+		if ps[i].qual == .Inout {
+			append(&pre, fmt.aprintf("(%s = %s)", tmp, lv))
+		} else {
+			// Review: zeroed on every call, as the CPU and SPIR-V do; without
+			// it a call in a loop sees the previous call's value wherever the
+			// callee leaves its out parameter unwritten.
+			append(&pre, fmt.aprintf("(%s = %s{{}})", tmp, msl_type(m, pt)))
+		}
+		append(&post, fmt.aprintf("(%s = %s)", lv, tmp))
+		strings.write_string(&b, tmp)
 	}
-	if args_of(u, id) != nil && len(args_of(u, id)) > 0 {
+	if len(args) > 0 {
 		strings.write_string(&b, ", ")
 	}
 	fmt.sbprintf(&b, "%s)", m.args)
-	return strings.to_string(b)
+	call := strings.to_string(b)
+	if len(post) == 0 {
+		return call
+	}
+	parts := make([dynamic]string, context.temp_allocator)
+	append(&parts, ..pre[:])
+	ret_t := ty(u, u.funcs[f].ret)
+	if ret_t != T_VOID {
+		rt := msl_temp(m, ret_t)
+		append(&parts, fmt.aprintf("(%s = %s)", rt, call))
+		append(&parts, ..post[:])
+		append(&parts, rt)
+	} else {
+		append(&parts, call)
+		append(&parts, ..post[:])
+	}
+	return fmt.aprintf("(%s)", strings.join(parts[:], ", "))
 }
 
 @(private)

@@ -1913,3 +1913,183 @@ test_make_program_errors :: proc(t: ^testing.T) {
 	got = program_errors(many[:])
 	testing.expectf(t, strings.contains(got, "a program has 1 to 8 passes, not 9"), "got %q", got)
 }
+
+@(test)
+test_audit_regressions :: proc(t: ^testing.T) {
+	// 1. Nested composite constructors where the inner argument emits a
+	// trailing Gather/Mov for its first component after placing later ones.
+	near(t, eval(t, "float a = 2.0, b = 5.0; fragColor = float4(float2(b, a + 1.0), 7.0, 9.0);"), {5, 3, 7, 9})
+	near(t, eval(t, "float a = 4.0; fragColor = float4(pair(a), 7.0, 9.0);", prelude = `
+float2 pair(float x) { return float2(x, x + 1.0); }
+`), {4, 5, 7, 9})
+	near(t, eval(t, "float a = 2.0, b = 6.0; Outer o = Outer(Inner(b, a + 3.0), 8.0); fragColor = float4(o.p.x, o.p.y, o.z, 1.0);", prelude = `
+struct Inner { float x; float y; };
+struct Outer { Inner p; float z; };
+`), {6, 5, 8, 1})
+
+	// 2. Unused uniform arrays in GLSL profile must not emit broken MSL helpers.
+	{
+		m, errs, ok := compile_glsl("uniform vec4 unused_v[4];\nuniform mat4 unused_m[2];\nout vec4 c;\nvoid main() { c = vec4(1.0); }")
+		defer destroy(m)
+		testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator))
+		testing.expect(t, !strings.contains(m.msl, "unused_v") && !strings.contains(m.msl, "unused_m"))
+		if have_spirv_val() {
+			expect_valid_spirv(t, "unused_uniform_arrays", m.spirv)
+		}
+	}
+
+	// 3. Preprocessor: token pasting with empty left/middle arguments,
+	// leading ## error, multiline comments inside #define, and backslash-newline before '('.
+	{
+		got, errs := pp_text("#define P(a, b) x + a ## b\n#define P3(a, b, c) x + a ## b ## c\nP(, y) P3(, , z) P3(, y, z) P3(y, , z)")
+		testing.expectf(t, got == "x + y x + z x + yz x + yz" && errs == "", "got %q, errs %q", got, errs)
+		got, errs = pp_text("#define FOO /*\n*/ 123\n#define FN\\\n(x) ((x) + FOO)\nFN(4)")
+		testing.expectf(t, got == "( ( 4 ) + 123 )" && errs == "", "got %q, errs %q", got, errs)
+		bad_m, _, bad_ok := compile_shadertoy("#define F(x) ## x\nvoid mainImage(out vec4 c, in vec2 p) { float y = F(1.0); c = vec4(y); }")
+		defer destroy(bad_m)
+		testing.expect(t, !bad_ok)
+	}
+
+	// 4. Non-void functions that fall off the end without returning:
+	// deterministic zero in CPU VM (even with dirty scratch), valid SPIR-V and MSL.
+	{
+		src := `
+float empty_fn(float x) { float y = x + 1.0; }
+float partial_fn(float x) { if (x > 10.0) return 9.0; }
+half4 main(float2 p) {
+    return half4(empty_fn(p.x), partial_fn(p.x), partial_fn(20.0), 1.0);
+}`
+		m, errs, ok := compile(src)
+		defer destroy(m)
+		testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator))
+		if ok {
+			testing.expect(t, strings.contains(m.msl, "return {};"))
+			if have_spirv_val() {
+				expect_valid_spirv(t, "non_void_falloff", m.spirv)
+			}
+			scratch := temp_scratch()
+			resize(&scratch.regs, max(m.program.num_slots, 16))
+			for &r in scratch.regs {
+				r = ~u32(0)
+			}
+			block := make([]u8, m.block_size, context.temp_allocator)
+			write_builtins(block, {resolution = {4, 2, 1}})
+			out := make([][4]f32, 8, context.temp_allocator)
+			run_f32(&m.program, block, 4, 2, out, scratch)
+			near(t, out[0], {0, 0, 9, 1})
+		}
+	}
+
+	// 5. SPIR-V structured CFG: loops with unconditional break/return and
+	// short-circuit step/condition, and switch fallthrough with declarations.
+	{
+		src := `#version 300 es
+precision highp float;
+uniform int uSel;
+out vec4 c;
+float early_do(bool a, bool b) {
+    do {
+        return 2.0;
+    } while (a && b);
+}
+void main() {
+    float v = early_do(true, false);
+    for (int i = 0; i < 4; i += (uSel > 0 && v > 0.0 ? 1 : 2)) {
+        v += 1.0;
+        break;
+    }
+    switch (uSel) {
+    case 0:
+        int x = 3;
+        v += float(x);
+    case 1:
+        int y = 4;
+        v += float(y);
+        break;
+    default:
+        v = -1.0;
+        break;
+    }
+    c = vec4(v, 0.0, 0.0, 1.0);
+}`
+		m, errs, ok := compile_glsl(src)
+		defer destroy(m)
+		testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator))
+		if ok {
+			if have_spirv_val() {
+				expect_valid_spirv(t, "loop_and_switch_cfg", m.spirv)
+			}
+			block := make([]u8, m.block_size, context.temp_allocator)
+			set_uniform(m, block, "uSel", {0})
+			out := make([][4]f32, 4, context.temp_allocator)
+			run_f32(&m.program, block, 2, 2, out, temp_scratch())
+			near(t, out[0], {10, 0, 0, 1})
+		}
+	}
+
+	// 6. Copy-in / copy-out for out/inout parameters in MSL and VM: swizzles,
+	// aliased arguments, an index evaluated once and before the call (a side
+	// effect; a global the callee changes), an unwritten out.
+	{
+		src := `
+float g = 3.0;
+int k = 0;
+float swap_add(inout float2 v, inout float a, out float b) {
+    v = v.yx + float2(1.0, 2.0);
+    a += g;
+    return b + a;
+}
+void bump_elem(inout float x) {
+    k = 1;
+    x += 10.0;
+}
+void unwritten(out float y) {
+}
+half4 main(float2 p) {
+    float4 q = float4(1.0, 2.0, 3.0, 4.0);
+    float x = 5.0;
+    float r = swap_add(q.zw, x, x);
+    float a[2];
+    a[0] = 1.0;
+    a[1] = 2.0;
+    int i = 0;
+    bump_elem(a[i++]);
+    k = 0;
+    bump_elem(a[k]);
+    float z = 7.0;
+    unwritten(z);
+    return half4(a[0] + float(i), a[1], z, r);
+}`
+		m, errs, ok := compile(src)
+		defer destroy(m)
+		testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator))
+		if ok {
+			testing.expect(t, strings.contains(m.msl, "(ok_q.zw = _t0)"))
+			testing.expect(t, strings.count(m.msl, "ok_i++") == 1)
+			testing.expect(t, strings.contains(m.msl, "((_t6 = g.ok_k), (_t7 = ok_a[_t6]), ok_bump_elem(_t7, u, g), (ok_a[_t6] = _t7))"))
+			testing.expect(t, strings.contains(m.msl, "(_t8 = float{}), ok_unwritten(_t8"))
+			if have_spirv_val() {
+				expect_valid_spirv(t, "copy_in_out_swizzle", m.spirv)
+			}
+			block := make([]u8, m.block_size, context.temp_allocator)
+			write_builtins(block, {resolution = {4, 2, 1}})
+			out := make([][4]f32, 8, context.temp_allocator)
+			run_f32(&m.program, block, 4, 2, out, temp_scratch())
+			near(t, out[0], {22, 2, 0, 8})
+		}
+	}
+
+	// 7. set_uniform array index bounds checking.
+	{
+		m, _, ok := compile("uniform float uScalar;\nuniform float2 uArr[2];\nhalf4 main(float2 p) { return half4(uScalar + uArr[0].x); }")
+		defer destroy(m)
+		testing.expect(t, ok)
+		block := make([]u8, m.block_size, context.temp_allocator)
+		testing.expect(t, set_uniform(m, block, "uScalar", {1}, 0))
+		testing.expect(t, !set_uniform(m, block, "uScalar", {1}, 1))
+		testing.expect(t, !set_uniform(m, block, "uScalar", {1}, -1))
+		testing.expect(t, set_uniform(m, block, "uArr", {1, 2}, 1))
+		testing.expect(t, !set_uniform(m, block, "uArr", {1, 2}, 2))
+		testing.expect(t, !set_uniform(m, block, "uArr", {1, 2}, -1))
+	}
+}

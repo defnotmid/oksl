@@ -168,22 +168,24 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 		x0, y0, w, h = 0, 0, width, height
 	}
 	fw, fh := f32(width), f32(height)
+	end_x := min(x0 + w, width)
+	end_y := min(y0 + h, height)
 	// Each lane's pixel in the batch.
 	lx, ly: [LANES]int
+	lxf, lyf: F_Lanes
 	for lane in 0 ..< LANES {
 		q := lane >> 2
 		lx[lane] = q % (BATCH_W / 2) * 2 + (lane & 1)
 		ly[lane] = q / (BATCH_W / 2) * 2 + ((lane >> 1) & 1)
+		lxf[lane] = f32(lx[lane]) + 0.5
+		lyf[lane] = f32(ly[lane]) + 0.5
 	}
 	for by := y0; by < y0 + h; by += BATCH_H {
 		for bx := x0; bx < x0 + w; bx += BATCH_W {
 			// Pixel centres of the batch's lanes, then each input a whole
 			// register at a time.
-			px, py: F_Lanes
-			for lane in 0 ..< LANES {
-				px[lane] = f32(bx + lx[lane]) + 0.5
-				py[lane] = f32(by + ly[lane]) + 0.5
-			}
+			px := f32(bx) + lxf
+			py := f32(by) + lyf
 			for v in p.inputs {
 				for k in 0 ..< int(v.n) {
 					col: F_Lanes
@@ -206,6 +208,7 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 			r.masks[MASK_DISCARD] = {}
 			execute(&r)
 			alive := ~r.masks[MASK_DISCARD]
+			full_tile := bx + BATCH_W <= end_x && by + BATCH_H <= end_y && alive == ALL_LANES
 			for v in p.outputs {
 				if v.kind != .Stage_Out {
 					continue
@@ -215,10 +218,33 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 				if target == nil && bytes == nil {
 					continue
 				}
+				if full_tile && v.base == .Float && v.n == 4 {
+					r0 := &r.regs[v.slot]
+					r1 := &r.regs[v.slot + 1]
+					r2 := &r.regs[v.slot + 2]
+					r3 := &r.regs[v.slot + 3]
+					if target != nil {
+						for lane in 0 ..< LANES {
+							target[(by + ly[lane]) * width + bx + lx[lane]] = {fval(r0[lane]), fval(r1[lane]), fval(r2[lane]), fval(r3[lane])}
+						}
+					}
+					if bytes != nil {
+						for lane in 0 ..< LANES {
+							o := (by + ly[lane]) * stride + (bx + lx[lane]) * 4
+							c := [4]f32{fval(r0[lane]), fval(r1[lane]), fval(r2[lane]), fval(r3[lane])}
+							for k in 0 ..< 4 {
+								cv := c[k]
+								if !(cv > 0) {cv = 0}
+								bytes[o + k] = u8(min(cv, 1) * 255 + 0.5)
+							}
+						}
+					}
+					continue
+				}
 				for lane in 0 ..< LANES {
 					x := bx + lx[lane]
 					y := by + ly[lane]
-					if x >= x0 + w || y >= y0 + h || x >= width || y >= height || lane not_in alive {
+					if x >= end_x || y >= end_y || lane not_in alive {
 						continue
 					}
 					c := [4]f32{0, 0, 0, 1}
@@ -352,31 +378,39 @@ Fragment_Quads :: struct {
 run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, out: [][4]f32, shaded: []Quad_Lanes, scratch: ^Scratch, opts := Run_Options{}) {
 	r := runner_begin(p, scratch, uniforms, opts)
 	total := quads.count * 4
+	out_v: Program_Var
+	has_out := false
+	for v in p.outputs {
+		if v.kind == .Stage_Out && v.location == 0 {
+			out_v = v
+			has_out = true
+		}
+	}
 	for first := 0; first < quads.count; first += LANES / 4 {
 		nq := min(quads.count - first, LANES / 4)
 		lanes := nq * 4
 		for v in p.inputs {
 			for k in 0 ..< int(v.n) {
 				col: F_Lanes
-				for l in 0 ..< lanes {
-					q := first + l / 4
-					switch v.kind {
-					case .Frag_Coord:
-						o := quads.origin[q]
-						switch k {
-						case 0:
-							col[l] = f32(o.x + i32(l & 1)) + 0.5
-						case 1:
-							col[l] = f32(o.y + i32((l >> 1) & 1)) + 0.5
-						case 3:
-							col[l] = 1
-						}
-					case .Front_Facing:
-						col[l] = 1 if quads.front_facing == nil || quads.front_facing[q] else 0
-					case .Stage_In:
-						col[l] = quads.varyings[(int(v.offset) + k) * total + first * 4 + l]
-					case .Stage_Out, .Position, .Uniform_Block, .Channel:
+				#partial switch v.kind {
+				case .Frag_Coord:
+					switch k {
+					case 0:
+						for l in 0 ..< lanes {col[l] = f32(quads.origin[first + l / 4].x + i32(l & 1)) + 0.5}
+					case 1:
+						for l in 0 ..< lanes {col[l] = f32(quads.origin[first + l / 4].y + i32((l >> 1) & 1)) + 0.5}
+					case 3:
+						for l in 0 ..< lanes {col[l] = 1}
 					}
+				case .Front_Facing:
+					if quads.front_facing == nil {
+						for l in 0 ..< lanes {col[l] = 1}
+					} else {
+						for l in 0 ..< lanes {col[l] = 1 if quads.front_facing[first + l / 4] else 0}
+					}
+				case .Stage_In:
+					src := quads.varyings[(int(v.offset) + k) * total + first * 4:]
+					for l in 0 ..< lanes {col[l] = src[l]}
 				}
 				fill_reg(&r.regs[v.slot + i32(k)], col, v.base)
 			}
@@ -396,11 +430,9 @@ run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, out: []
 				}
 				lanes_out += {i}
 				c := [4]f32{0, 0, 0, 1}
-				for v in p.outputs {
-					if v.kind == .Stage_Out && v.location == 0 {
-						for k in 0 ..< int(v.n) {
-							c[k] = float_of(r.regs[v.slot + i32(k)][l], v.base)
-						}
+				if has_out {
+					for k in 0 ..< int(out_v.n) {
+						c[k] = float_of(r.regs[out_v.slot + i32(k)][l], out_v.base)
 					}
 				}
 				out[q * 4 + i] = c
@@ -844,6 +876,9 @@ execute :: proc(r: ^Runner) #no_bounds_check {
 				}
 				break
 			}
+			if exec == {} {
+				break
+			}
 			for i in 0 ..< i32(n) {
 				for l in 0 ..< LANES {
 					keep := u32(0) - u32(l in exec)
@@ -857,12 +892,30 @@ execute :: proc(r: ^Runner) #no_bounds_check {
 				}
 				break
 			}
+			if exec == {} {
+				break
+			}
 			for i in 0 ..< i32(n) {
 				for l in 0 ..< LANES {
 					regs[dst + i][l] &= u32(0) - u32(l not_in exec)
 				}
 			}
 		case .Load_Dyn:
+			off0 := regs[b][0]
+			uniform := true
+			for l in 1 ..< LANES {
+				if regs[b][l] != off0 {
+					uniform = false
+					break
+				}
+			}
+			if uniform {
+				off := i32(off0)
+				for i in 0 ..< i32(n) {
+					regs[dst + i] = regs[a + off + i]
+				}
+				break
+			}
 			for l in 0 ..< LANES {
 				off := i32(regs[b][l])
 				for i in 0 ..< i32(n) {
@@ -870,6 +923,26 @@ execute :: proc(r: ^Runner) #no_bounds_check {
 				}
 			}
 		case .Store_Dyn:
+			if exec == {} {
+				break
+			}
+			if exec == ALL_LANES {
+				off0 := regs[b][0]
+				uniform := true
+				for l in 1 ..< LANES {
+					if regs[b][l] != off0 {
+						uniform = false
+						break
+					}
+				}
+				if uniform {
+					off := i32(off0)
+					for i in 0 ..< i32(n) {
+						regs[dst + off + i] = regs[a + i]
+					}
+					break
+				}
+			}
 			for l in 0 ..< LANES {
 				if l not_in exec {
 					continue

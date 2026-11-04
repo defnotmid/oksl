@@ -296,7 +296,7 @@ find_uniform :: proc(m: ^Module, name: string) -> (Uniform_Info, bool) {
 // Matrices take their columns in order; ints and bools are converted.
 set_uniform :: proc(m: ^Module, block: []u8, name: string, values: []f32, index := 0) -> bool {
 	u, ok := find_uniform(m, name)
-	if !ok {
+	if !ok || index < 0 || index > max(u.count - 1, 0) {
 		return false
 	}
 	write_values(block, u.offset + index * u.stride, elem_type(u.type), values)

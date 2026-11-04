@@ -31,8 +31,7 @@ emit_stmt :: proc(s: ^Spv, id: Stmt_Id) {
 		for d in list(u, st.decls) {
 			v := u.vars[d]
 			t := sym_type(u, v.sym)
-			ptr := local_var(s, t, v.name)
-			s.sym_ids[v.sym] = ptr
+			ptr := local_sym(s, v.sym)
 			if v.init != 0 {
 				inst(&s.body, .Store, ptr, emit_expr(s, v.init))
 			} else {
@@ -82,7 +81,7 @@ emit_stmt :: proc(s: ^Spv, id: Stmt_Id) {
 		inst(&s.body, .Loop_Merge, merge, cont, 0)
 		terminate(s, .Branch, cond_l)
 		label(s, cond_l)
-		append(&s.loops, Loop_Target{merge, cont, st.expr != 0})
+		append(&s.loops, Loop_Target{merge = merge, cont = cont, broke = st.expr != 0})
 		if st.expr != 0 {
 			c := emit_expr(s, st.expr)
 			terminate(s, .Branch_Conditional, c, body_l, merge)
@@ -92,14 +91,15 @@ emit_stmt :: proc(s: ^Spv, id: Stmt_Id) {
 		label(s, body_l)
 		emit_stmt(s, st.then_)
 		if !s.terminated {
+			s.loops[len(s.loops) - 1].continued = true
 			terminate(s, .Branch, cont)
 		}
+		target := pop(&s.loops)
 		label(s, cont)
-		if st.step != 0 {
+		if target.continued && st.step != 0 {
 			emit_expr(s, st.step)
 		}
 		terminate(s, .Branch, header)
-		target := pop(&s.loops)
 		label(s, merge)
 		if !target.broke {
 			terminate(s, .Unreachable)
@@ -114,22 +114,32 @@ emit_stmt :: proc(s: ^Spv, id: Stmt_Id) {
 		inst(&s.body, .Loop_Merge, merge, cont, 0)
 		terminate(s, .Branch, body_l)
 		label(s, body_l)
-		append(&s.loops, Loop_Target{merge, cont, true})
+		append(&s.loops, Loop_Target{merge = merge, cont = cont})
 		emit_stmt(s, st.then_)
 		if !s.terminated {
+			s.loops[len(s.loops) - 1].continued = true
 			terminate(s, .Branch, cont)
 		}
+		target := pop(&s.loops)
 		label(s, cont)
-		c := emit_expr(s, st.expr)
-		terminate(s, .Branch_Conditional, c, header, merge)
-		pop(&s.loops)
+		if target.continued {
+			c := emit_expr(s, st.expr)
+			terminate(s, .Branch_Conditional, c, header, merge)
+		} else {
+			terminate(s, .Branch, header)
+		}
 		label(s, merge)
+		if !target.broke && !target.continued {
+			terminate(s, .Unreachable)
+		}
 	case .Break:
 		l := &s.loops[len(s.loops) - 1]
 		l.broke = true
 		terminate(s, .Branch, l.merge)
 	case .Continue:
-		terminate(s, .Branch, s.loops[len(s.loops) - 1].cont)
+		l := &s.loops[len(s.loops) - 1]
+		l.continued = true
+		terminate(s, .Branch, l.cont)
 	case .Discard:
 		terminate(s, .Kill)
 	case .Switch:
@@ -184,7 +194,7 @@ emit_switch :: proc(s: ^Spv, st: Stmt) {
 	inst(&s.body, .Selection_Merge, merge, 0)
 	terminate(s, .Switch, ..words[:])
 	cont := s.loops[len(s.loops) - 1].cont if len(s.loops) > 0 else 0
-	append(&s.loops, Loop_Target{merge, cont, false})
+	append(&s.loops, Loop_Target{merge = merge, cont = cont})
 	reaches_merge := default_l == merge
 	for start in starts {
 		label(s, blocks[start])
@@ -204,6 +214,9 @@ emit_switch :: proc(s: ^Spv, st: Stmt) {
 		}
 	}
 	target := pop(&s.loops)
+	if target.continued && len(s.loops) > 0 {
+		s.loops[len(s.loops) - 1].continued = true
+	}
 	label(s, merge)
 	if !reaches_merge && !target.broke {
 		terminate(s, .Unreachable)
@@ -228,6 +241,14 @@ addressable :: proc(u: ^Unit, id: Expr_Id) -> bool {
 }
 
 @(private)
+local_sym :: proc(s: ^Spv, sym: Sym_Id) -> u32 {
+	if s.sym_ids[sym] == 0 {
+		s.sym_ids[sym] = local_var(s, sym_type(s.u, sym), s.u.syms[sym].name)
+	}
+	return s.sym_ids[sym]
+}
+
+@(private)
 emit_lvalue :: proc(s: ^Spv, id: Expr_Id) -> LValue {
 	u := s.u
 	e := u.exprs[id]
@@ -249,7 +270,7 @@ emit_lvalue :: proc(s: ^Spv, id: Expr_Id) -> LValue {
 		case .Stage_Out:
 			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_OUTPUT}
 		case .Local, .Param:
-			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_FUNCTION}
+			return {ptr = local_sym(s, e.sym), type = t, storage = SC_FUNCTION}
 		case .Channel:
 		}
 	case .Index:

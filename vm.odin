@@ -757,6 +757,27 @@ has_return :: proc(u: ^Unit, id: Stmt_Id) -> bool {
 }
 
 @(private)
+always_returns :: proc(u: ^Unit, id: Stmt_Id) -> bool {
+	if id == 0 {
+		return false
+	}
+	st := u.stmts[id]
+	#partial switch st.kind {
+	case .Return:
+		return true
+	case .Block:
+		for s in list(u, st.body) {
+			if always_returns(u, Stmt_Id(s)) {
+				return true
+			}
+		}
+	case .If:
+		return st.else_ != 0 && always_returns(u, st.then_) && always_returns(u, st.else_)
+	}
+	return false
+}
+
+@(private)
 lower_loop :: proc(l: ^Lower, st: Stmt) {
 	lower_stmt(l, st.init)
 	entry := alloc_mask(l)
@@ -892,6 +913,9 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args:
 	l.ret_slot, l.ret_val, l.ret_mark = -1, -1, mark
 	if ret_t != T_VOID && framed {
 		result.slot = alloc_slots(l, cc(l, ret_t))
+		if !always_returns(u, body) {
+			emit(l, .Store_Zero, n = cc(l, ret_t), dst = result.slot)
+		}
 		l.ret_slot = result.slot
 	}
 	save: i32
@@ -902,8 +926,13 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args:
 	}
 	lower_stmt(l, body)
 	if ret_t != T_VOID && !framed {
-		// Its only return's value (none: whatever its slot holds).
-		result.slot = l.ret_val if l.ret_val >= 0 else alloc_slots(l, cc(l, ret_t))
+		// Its only return's value (none: zero).
+		if l.ret_val >= 0 {
+			result.slot = l.ret_val
+		} else {
+			result.slot = alloc_slots(l, cc(l, ret_t))
+			emit(l, .Store_Zero, n = cc(l, ret_t), dst = result.slot)
+		}
 	}
 	l.brk, l.cont, l.ret, l.ret_slot, l.ret_val, l.ret_mark = outer[0], outer[1], outer[2], outer[3], outer[4], outer[5]
 	if framed {
@@ -1395,7 +1424,11 @@ owned :: proc(l: ^Lower, v: Val, mark: i32) -> bool {
 @(private)
 producer :: proc(l: ^Lower, v: Val, mark: i32) -> int {
 	i := len(l.code) - 1
-	if i < 0 || !owned(l, v, mark) || l.code[i].dst != v.slot || v.slot + i32(cc(l, v.t)) != l.next_slot || l.code[i].op in MASKED_OPS {
+	n := cc(l, v.t)
+	if i < 0 || !owned(l, v, mark) || l.code[i].dst != v.slot || v.slot + i32(n) != l.next_slot || l.code[i].op in MASKED_OPS {
+		return -1
+	}
+	if (l.code[i].op == .Gather || l.code[i].op == .Mov) && int(l.code[i].n) != n {
 		return -1
 	}
 	return i

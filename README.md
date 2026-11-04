@@ -548,9 +548,6 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
   samplers and Shadertoy's keyboard, sound and webcam inputs. Children
   and channels are images bound by the
   host (no shader trees); `sk_FragCoord` is layer-local.
-- **MSL out arguments:** out arguments that are swizzles (`f(v.xy)`)
-  work on SPIR-V and the CPU, but not in MSL (Metal can't bind a reference
-  to a swizzle).
 - **Precision:** transcendental functions differ by a few ulps between
   GPU and CPU, and thresholds (`step`, comparisons) right at such values
   can flip. `tools/gpu_parity` reports these as threshold edges.

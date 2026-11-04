@@ -13,7 +13,7 @@ concurrency:
 
 env:
   # The Odin nightly oksl is developed against (same pin as onimite).
-  ODIN_VERSION: dev-2026-10
+  ODIN_VERSION: dev-2026-11a
 
 # oksl imports no sibling repositories and no vendor C libraries. The tests
 # cover the compiler and the CPU interpreter; tools/gpu_parity needs a GPU and

@@ -697,27 +697,32 @@ substitute :: proc(pp: ^Preprocessor, m: Macro, pos: Pos, args: [][]Token) -> []
 		}
 		return -1
 	}
+	empty_lhs := false
 	for k := 0; k < len(body); k += 1 {
 		t := body[k]
-		if t.kind == .Hash_Hash && len(out) > 0 && k + 1 < len(body) {
+		if t.kind == .Hash_Hash && (len(out) > 0 || empty_lhs) && k + 1 < len(body) {
 			k += 1
 			next := body[k]
 			next.pos = pos
+			next.flags -= {.Line_Start}
 			rhs := ([^]Token)(&next)[:1]
 			if p := param(params, body[k]); p >= 0 {
 				rhs = args[p]
 			}
-			if len(rhs) == 0 {
-				continue
+			if empty_lhs {
+				append(&out, ..rhs)
+				empty_lhs = len(rhs) == 0
+			} else if len(rhs) > 0 {
+				lhs := pop(&out)
+				append(&out, paste(pp, lhs, rhs[0]))
+				append(&out, ..rhs[1:])
 			}
-			lhs := pop(&out)
-			append(&out, paste(pp, lhs, rhs[0]))
-			append(&out, ..rhs[1:])
 			continue
 		}
 		if p := param(params, t); p >= 0 {
 			if k + 1 < len(body) && body[k + 1].kind == .Hash_Hash {
 				append(&out, ..args[p])
+				empty_lhs = len(args[p]) == 0
 				continue
 			}
 			if !done[p] {
@@ -729,11 +734,13 @@ substitute :: proc(pp: ^Preprocessor, m: Macro, pos: Pos, args: [][]Token) -> []
 				done[p] = true
 			}
 			append(&out, ..expanded[p])
+			empty_lhs = false
 			continue
 		}
 		t.pos = pos
 		t.flags -= {.Line_Start}
 		append(&out, t)
+		empty_lhs = false
 	}
 	return out[:]
 }
