@@ -159,6 +159,9 @@ Uniform_Fill :: struct {
 
 Program :: struct {
 	code:       []Instr,
+	// code[:init_len] computes what is the same in every lane and batch
+	// (from constants and uniforms alone): runner_begin runs it once.
+	init_len:   int,
 	num_slots:  int,
 	num_masks:  int,
 	// (slot, bits) constants written once per run.
@@ -319,6 +322,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	p.num_masks = int(l.next_mask)
 	p.consts = l.const_list[:]
 	p.fills = l.fills[:]
+	hoist_uniform(&p)
 	return p
 }
 
@@ -656,8 +660,10 @@ lower_stmt :: proc(l: ^Lower, id: Stmt_Id) {
 			// variable, so it never reads the variable's slot.
 			mark := l.next_slot
 			val := lower_expr(l, v.init)
-			// A value made for this initializer alone is the variable.
-			if owned(l, val, mark) {
+			// A value made for this initializer alone is the variable,
+			// unless the variable is written: variables are written only by
+			// stores, so an instruction's registers are its own.
+			if !l.written[v.sym] && owned(l, val, mark) {
 				l.sym_slot[v.sym] = val.slot
 				continue
 			}
@@ -1453,6 +1459,165 @@ producer :: proc(l: ^Lower, v: Val, mark: i32) -> int {
 // masks and jumps.
 @(private)
 MASKED_OPS :: bit_set[VM_Op;u128]{.Nop, .Store, .Store_Zero, .Store_Dyn, .Mask_Copy, .Mask_Cond, .Mask_Restore, .Mask_Or, .Mask_Clear, .Mask_Kill, .Jump, .Jump_If_None}
+
+// A run of registers.
+@(private)
+Slots :: struct {
+	start, n: i32,
+}
+
+// The registers an instruction writes and, when `pure` (an op that reads
+// only its operand registers and writes only its own: no masks, jumps,
+// samplers, neighbour lanes or dynamic offsets), the ones it reads, as
+// execute reads them.
+@(private)
+instr_slots :: proc(in_: Instr) -> (writes: Slots, reads: [4]Slots, pure: bool) {
+	n, k := i32(in_.n), i32(in_.k)
+	a, b, c, d := in_.a, in_.b, in_.c, in_.d
+	writes = {in_.dst, n}
+	pure = true
+	#partial switch in_.op {
+	case .Mov, .F_Neg, .I_Neg, .Bit_Not, .B_Not, .F_To_I, .F_To_U, .I_To_F, .U_To_F, .B_To_F, .F_To_B, .I_To_B, .F_Fn1, .I_Fn1, .Normalize:
+		reads[0] = {a, n}
+	case .Splat:
+		reads[0] = {a, 1}
+	case .Gather:
+		ops := [4]i32{a, b, c, d}
+		for i in 0 ..< n {
+			reads[i] = {ops[i], 1}
+		}
+	case .F_Add, .F_Sub, .F_Mul, .F_Div:
+		// k: a scalar operand (1: a, 2: b).
+		reads[0] = {a, 1 if k & 1 != 0 else n}
+		reads[1] = {b, 1 if k & 2 != 0 else n}
+	case .I_Add, .I_Sub, .I_Mul, .I_Div, .U_Div, .I_Rem, .U_Rem, .Bit_And, .Bit_Or, .Bit_Xor, .Shl, .Shr_I, .Shr_U, .F_Lt, .F_Le, .F_Gt, .F_Ge, .F_Eq, .F_Ne, .I_Lt, .I_Le, .I_Gt, .I_Ge, .U_Lt, .U_Le, .U_Gt, .U_Ge, .I_Eq, .I_Ne, .B_And, .B_Or, .F_Fn2, .I_Fn2, .U_Fn2, .Reflect:
+		reads[0], reads[1] = {a, n}, {b, n}
+	case .Select, .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward:
+		reads[0], reads[1], reads[2] = {a, n}, {b, n}, {c, n}
+	case .Refract:
+		reads[0], reads[1], reads[2] = {a, n}, {b, n}, {c, 1}
+	case .All, .Any, .Length:
+		reads[0], writes.n = {a, n}, 1
+	case .Dot, .Distance:
+		reads[0], reads[1], writes.n = {a, n}, {b, n}, 1
+	case .Cross:
+		reads[0], reads[1], writes.n = {a, 3}, {b, 3}, 3
+	case .Mat_Mul:
+		reads[0], reads[1], writes.n = {a, n * k}, {b, k * d}, n * d
+	case .Vec_Mat:
+		reads[0], reads[1], writes.n = {a, n}, {b, n * k}, k
+	case .Transpose:
+		reads[0], writes.n = {a, n * k}, n * k
+	case .Outer:
+		reads[0], reads[1], writes.n = {a, n}, {b, k}, n * k
+	case .Determinant:
+		reads[0], writes.n = {a, k * k}, 1
+	case .Inverse:
+		reads[0], writes.n = {a, k * k}, k * k
+	case .Texture_Size:
+		// The run's channel sizes at lod a: no sampler.
+		reads[0], writes.n = {a, 1}, 2
+	case .Texture, .Texture_Bias:
+		writes.n, pure = 4, false
+	case .Store, .Store_Zero, .Store_Dyn, .Load_Dyn, .Deriv_X, .Deriv_Y, .Fwidth:
+		pure = false
+	case:
+		// Masks, jumps and Nop write no registers.
+		writes.n, pure = 0, false
+	}
+	return
+}
+
+// Moves the instructions whose result is the same in every lane and batch
+// to the front of the code (Program.init_len), which runner_begin runs once
+// per run: a pure op that reads only constants, uniforms and such results,
+// writing registers nothing else writes. Temporaries run in every lane
+// whatever the masks, and integer ops cannot trap, so moving one out of a
+// loop or a branch gives what it gave there. Jumps in the rest are
+// renumbered.
+@(private)
+hoist_uniform :: proc(p: ^Program) {
+	// Writers per register, 2 for many: the run's constants, uniforms and
+	// inputs, and every instruction.
+	writers := make([]u8, p.num_slots, context.temp_allocator)
+	add :: proc(writers: []u8, s: Slots) {
+		for i in s.start ..< s.start + s.n {
+			writers[i] = min(writers[i], 1) + 1
+		}
+	}
+	for c in p.consts {
+		add(writers, {i32(c[0]), 1})
+	}
+	for f in p.fills {
+		add(writers, {f.slot, 1})
+	}
+	for v in p.inputs {
+		add(writers, {v.slot, v.n})
+	}
+	for in_ in p.code {
+		w, _, _ := instr_slots(in_)
+		add(writers, w)
+	}
+	uniform := make([]bool, p.num_slots, context.temp_allocator)
+	for c in p.consts {
+		uniform[c[0]] = writers[c[0]] == 1
+	}
+	for f in p.fills {
+		uniform[f.slot] = writers[f.slot] == 1
+	}
+	hoisted := make([]bool, len(p.code), context.temp_allocator)
+	count := 0
+	next: for in_, i in p.code {
+		w, reads, pure := instr_slots(in_)
+		if !pure {
+			continue
+		}
+		for s in w.start ..< w.start + w.n {
+			if writers[s] != 1 {
+				continue next
+			}
+		}
+		for r in reads {
+			for s in r.start ..< r.start + r.n {
+				if !uniform[s] {
+					continue next
+				}
+			}
+		}
+		for s in w.start ..< w.start + w.n {
+			uniform[s] = true
+		}
+		hoisted[i] = true
+		count += 1
+	}
+	if count == 0 {
+		return
+	}
+	// Each instruction's index among the rest (a jump may target the end).
+	rest := make([]i32, len(p.code) + 1, context.temp_allocator)
+	in_rest := i32(0)
+	for h, i in hoisted {
+		rest[i] = in_rest
+		in_rest += 0 if h else 1
+	}
+	rest[len(p.code)] = in_rest
+	old := make([]Instr, len(p.code), context.temp_allocator)
+	copy(old, p.code)
+	front, back := 0, count
+	for in_, i in old {
+		if hoisted[i] {
+			p.code[front] = in_
+			front += 1
+			continue
+		}
+		p.code[back] = in_
+		if in_.op == .Jump || in_.op == .Jump_If_None {
+			p.code[back].a = rest[in_.a]
+		}
+		back += 1
+	}
+	p.init_len = count
+}
 
 @(private)
 lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {

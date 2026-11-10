@@ -427,6 +427,14 @@ show both.
   branches on the operation. Execution masks are
   `bit_set`s of lanes. Masked stores and selects are branchless, and
   `floor` avoids `core:math`'s modf.
+- **Uniform work:** what follows from constants and uniforms alone moves
+  to the front of the program and runs once per run, before the batches,
+  even from inside loops and branches: a raymarcher's `rot(iTime)` is
+  computed once rather than at every step of every batch. An instruction
+  moves when its op reads only its operands (not texture samples,
+  derivatives or dynamic indexing), its operands are such values, and
+  nothing else writes its registers; variables are written only by
+  stores, so their registers are never a moved instruction's.
 - **Divergence:** divergent control flow runs every path under execution
   masks (break, continue, return and discard masks per construct; a
   `switch` lets each label's lanes join the running ones). Only stores to

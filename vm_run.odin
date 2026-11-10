@@ -87,7 +87,8 @@ Runner :: struct {
 	opts:     Run_Options,
 }
 
-// A runner over `scratch` with the program's constants and uniforms loaded.
+// A runner over `scratch` with the program's constants and uniforms loaded,
+// and what follows from them alone computed.
 @(private)
 runner_begin :: proc(p: ^Program, scratch: ^Scratch, uniforms: []u8, opts: Run_Options) -> Runner {
 	if len(scratch.regs) < max(p.num_slots, 1) {
@@ -110,6 +111,8 @@ runner_begin :: proc(p: ^Program, scratch: ^Scratch, uniforms: []u8, opts: Run_O
 		}
 		r.regs[f.slot] = bits
 	}
+	// What is the same in every lane and batch, once.
+	execute(&r, p.code[:p.init_len])
 	return r
 }
 
@@ -163,7 +166,6 @@ BATCH_H :: LANES / BATCH_W
 
 @(private)
 runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) {
-	r := runner_begin(p, scratch, uniforms, opts)
 	x0, y0 := opts.x, opts.y
 	w, h := opts.w, opts.h
 	if w <= 0 || h <= 0 {
@@ -178,6 +180,7 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 	if start_x >= end_x || start_y >= end_y {
 		return
 	}
+	r := runner_begin(p, scratch, uniforms, opts)
 	// Each lane's pixel in the batch.
 	lx, ly: [LANES]int
 	lxf, lyf: F_Lanes
@@ -214,7 +217,7 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 			}
 			r.masks[MASK_EXEC] = ALL_LANES
 			r.masks[MASK_DISCARD] = {}
-			execute(&r)
+			execute(&r, p.code[p.init_len:])
 			alive := ~r.masks[MASK_DISCARD]
 			full_tile := bx >= start_x && by >= start_y && bx + BATCH_W <= end_x && by + BATCH_H <= end_y && alive == ALL_LANES
 			for v in p.outputs {
@@ -337,7 +340,7 @@ run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: 
 		}
 		r.masks[MASK_EXEC] = transmute(Lane_Mask)Lane_Bits((1 << uint(lanes)) - 1)
 		r.masks[MASK_DISCARD] = {}
-		execute(&r)
+		execute(&r, p.code[p.init_len:])
 		for v in p.outputs {
 			if v.kind == .Position {
 				for k in 0 ..< 4 {
@@ -425,7 +428,7 @@ run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, out: []
 		}
 		r.masks[MASK_EXEC] = transmute(Lane_Mask)Lane_Bits((1 << uint(lanes)) - 1)
 		r.masks[MASK_DISCARD] = {}
-		execute(&r)
+		execute(&r, p.code[p.init_len:])
 		alive := ~r.masks[MASK_DISCARD]
 		for qi in 0 ..< nq {
 			q := first + qi
@@ -851,8 +854,7 @@ fn3 :: #force_inline proc "contextless" (x, y, z: f32, $B: Builtin) -> f32 {
 // lowering (dynamic offsets are clamped there), within num_slots and
 // num_masks, which runner_begin sizes the scratch to.
 @(private)
-execute :: proc(r: ^Runner) #no_bounds_check {
-	code := r.p.code
+execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 	regs := r.regs
 	masks := r.masks
 	pc := 0

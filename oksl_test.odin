@@ -1818,6 +1818,99 @@ test_run_regions :: proc(t: ^testing.T) {
 	}
 }
 
+// What follows from uniforms and constants alone runs once per run, before
+// the batches (code[:init_len]), and gives what it gave in place, inside a
+// loop or a branch. A variable written later, here through a dynamic index
+// whose element changes between batches, keeps registers of its own, so no
+// batch reads another's stores.
+@(test)
+test_uniform_hoisting :: proc(t: ^testing.T) {
+	src := `
+uniform float uT;
+float2x2 rot(float a) { float c = cos(a), s = sin(a); return float2x2(c, s, -s, c); }
+half4 main(float2 p) {
+    float2 q = float2(1.0, 0.0);
+    float acc = 0.0;
+    for (int i = 0; i < 3; i++) {
+        q = rot(uT) * q;
+        acc += q.x;
+    }
+    if (p.x > 9.0) {
+        acc += sin(uT * 2.0);
+    }
+    float2 v = float2(uT, uT + 1.0);
+    v[int(p.x) / 8] = 0.0;
+    float w = uT * 2.0;
+    if (p.x > 9.0) {
+        w += 1.0;
+    }
+    return half4(acc, v.x + 10.0 * v.y, w, q.y);
+}`
+	m, errs, ok := compile(src)
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	trig :: proc(in_: Instr) -> bool {
+		return in_.op == .F_Fn1 && (Builtin(in_.k) == .Sin || Builtin(in_.k) == .Cos)
+	}
+	early, late := 0, 0
+	for in_, i in m.program.code {
+		if trig(in_) {
+			if i < m.program.init_len {
+				early += 1
+			} else {
+				late += 1
+			}
+		}
+	}
+	testing.expectf(t, early == 3 && late == 0, "sin and cos: %d run once, %d per batch", early, late)
+	W, H :: 16, 16
+	T :: 0.7
+	block := make([]u8, m.block_size, context.temp_allocator)
+	write_builtins(block, {resolution = {W, H, 1}})
+	set_uniform(m, block, "uT", {T})
+	out := make([][4]f32, W * H, context.temp_allocator)
+	run_f32(&m.program, block, W, H, out, temp_scratch())
+	for y in 0 ..< H {
+		for x in 0 ..< W {
+			acc := math.cos(f32(T)) + math.cos(f32(2 * T)) + math.cos(f32(3 * T))
+			w := f32(2 * T)
+			if x >= 9 {
+				acc += math.sin(f32(2 * T))
+				w += 1
+			}
+			v := f32(10 * (T + 1)) if x < 8 else f32(T)
+			want := [4]f32{acc, v, w, math.sin(f32(3 * T))}
+			got := out[y * W + x]
+			for k in 0 ..< 4 {
+				if abs(got[k] - want[k]) > 1e-5 {
+					testing.expectf(t, false, "pixel (%d, %d): got %v, want %v", x, y, got, want)
+					return
+				}
+			}
+		}
+	}
+	// textureSize of a sampler reads only the run's channel sizes, so it
+	// runs once too.
+	sm, serrs, sok := compile_glsl("#version 300 es\nprecision highp float;\nuniform sampler2D tex;\nout vec4 c;\nvoid main() { c = vec4(vec2(textureSize(tex, 0)) / 64.0, 0.0, 1.0); }")
+	defer destroy(sm)
+	if !testing.expectf(t, sok, "%s", format_errors(serrs, context.temp_allocator)) {
+		return
+	}
+	sized := false
+	for in_ in sm.program.code[:sm.program.init_len] {
+		sized ||= in_.op == .Texture_Size
+	}
+	testing.expect(t, sized)
+	sblock := make([]u8, sm.block_size, context.temp_allocator)
+	write_builtins(sblock, {resolution = {4, 2, 1}})
+	px := make([][4]f32, 8, context.temp_allocator)
+	sizes := [][2]i32{{32, 16}}
+	run_f32(&sm.program, sblock, 4, 2, px, temp_scratch(), {channel_sizes = sizes})
+	testing.expectf(t, px[7] == {0.5, 0.25, 0, 1}, "got %v", px[7])
+}
+
 // Shading a layer's pixels as quads, with uv supplied as a varying, gives
 // what the layer runner gives, bit for bit; and so do threads sharing the
 // program, each with its own scratch.
