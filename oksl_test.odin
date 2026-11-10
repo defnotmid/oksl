@@ -366,6 +366,37 @@ void mainImage(out vec4 c, in vec2 p) { c = vec4(pick(int(p.x)), 0.0, 0.0, 1.0);
 		testing.expect(t, strings.contains(m.msl, "switch (") && strings.contains(m.msl, "case 1:"))
 		destroy(m)
 	}
+	// Cases no lane reaches do not run: their texture reads call no sampler.
+	{
+		dm, errs, ok := compile_shadertoy(`
+void mainImage(out vec4 c, in vec2 p) {
+    c = vec4(0.25);
+    switch (int(iTime)) {
+    case 0:
+        c = texture(iChannel0, p / iResolution.xy);
+        break;
+    case 2:
+        c = vec4(0.5);
+        break;
+    default:
+        c = texelFetch(iChannel0, ivec2(0), 0);
+    }
+}`)
+		defer destroy(dm)
+		testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator))
+		if ok {
+			count := 0
+			sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+				(^int)(user)^ += 1
+				return {1, 0, 0, 1}
+			}
+			block := make([]u8, dm.block_size, context.temp_allocator)
+			write_builtins(block, {resolution = {4, 2, 1}, time = 2})
+			px := make([][4]f32, 8, context.temp_allocator)
+			run_f32(&dm.program, block, 4, 2, px, temp_scratch(), {sampler = sampler, user = &count})
+			testing.expectf(t, px[0] == {0.5, 0.5, 0.5, 1} && count == 0, "got %v after %d samples", px[0], count)
+		}
+	}
 	cases := [?][2]string {
 		{"half4 main(float2 p) {\n  switch (p.x) { case 1: break; }\n  return half4(1);\n}", "2:13: switch needs an int or uint, not float"},
 		{"half4 main(float2 p) {\n  int k = int(p.x);\n  switch (1) { case k: break; }\n  return half4(1);\n}", "3:21: case label must be a constant integer expression"},
@@ -1268,6 +1299,46 @@ void main() {
     c = vec4(vUv.x, gl_FragCoord.y, dFdx(vUv.x), gl_FrontFacing ? 1.0 : 0.5);
 }`
 
+// The layer vertex shader hosts compile (LAYER_VERTEX_GLSL): position and
+// uv at locations 0 and 1, uv out at location 0, the target size alone in
+// the block, and target pixels (y down) to clip space.
+@(test)
+test_layer_vertex :: proc(t: ^testing.T) {
+	m, errs, ok := compile(LAYER_VERTEX_GLSL, {profile = .Glsl, stage = .Vertex})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	locations := [2]int{-1, -1}
+	for a in m.stage_inputs {
+		switch a.name {
+		case "position":
+			locations[0] = a.location
+		case "uv":
+			locations[1] = a.location
+		}
+	}
+	testing.expect_value(t, locations, [2]int{0, 1})
+	testing.expect(t, len(m.stage_outputs) == 1 && m.stage_outputs[0].location == 0)
+	size, found := find_uniform(m, "size")
+	testing.expect(t, found && size.offset == 0 && m.block_size == 16)
+	Layer_Vertex :: struct {
+		position, uv: [2]f32,
+	}
+	verts := [2]Layer_Vertex{{{0, 0}, {0, 0}}, {{320, 180}, {1, 1}}}
+	attrs := [2]Attribute{{&verts[0].position, size_of(Layer_Vertex), .Float2}, {&verts[0].uv, size_of(Layer_Vertex), .Float2}}
+	block := make([]u8, m.block_size, context.temp_allocator)
+	set_uniform(m, block, "size", {320, 180, 0, 0})
+	positions: [2][4]f32
+	varyings := make([]f32, 2 * m.varying_floats, context.temp_allocator)
+	scratch: Scratch
+	defer scratch_destroy(&scratch)
+	run_vertex(&m.program, block, attrs[:], 2, positions[:], varyings, &scratch)
+	testing.expectf(t, positions == {{-1, 1, 0, 1}, {1, -1, 0, 1}}, "positions %v", positions)
+	uv := varyings[m.varying_floats + m.stage_outputs[0].offset:][:2]
+	testing.expectf(t, uv[0] == 1 && uv[1] == 1, "second vertex's uv %v", uv)
+}
+
 // o3d's interleaved vertex: stride 32.
 @(private = "file")
 Test_Vertex :: struct {
@@ -1701,6 +1772,48 @@ test_run_fragment :: proc(t: ^testing.T) {
 			x := f32(q * 2 + (i & 1))
 			y := f32(4 + (i >> 1)) + 0.5
 			near(t, out[q * 4 + i], {x * 0.25, y, 0.25, 1 if q % 2 == 0 else 0.5})
+		}
+	}
+}
+
+// A layer shaded in regions, starting on odd pixels or before the layer
+// and running past it, is the layer shaded whole: the quads (and so the
+// derivatives) stay the layer's, and each region writes only its pixels.
+@(test)
+test_run_regions :: proc(t: ^testing.T) {
+	m, errs, ok := compile_shadertoy("void mainImage(out vec4 c, in vec2 f) { float v = f.x * f.x + f.y * f.y; c = vec4(dFdx(v), -dFdy(v), 0.0, 1.0) / 64.0; }")
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	W, H :: 16, 16
+	block := make([]u8, m.block_size, context.temp_allocator)
+	write_builtins(block, {resolution = {W, H, 1}})
+	whole := make([][4]f32, W * H, context.temp_allocator)
+	run_f32(&m.program, block, W, H, whole, temp_scratch())
+	parts := make([][4]f32, W * H, context.temp_allocator)
+	UNSET :: [4]f32{-1, -1, -1, -1}
+	for &px in parts {
+		px = UNSET
+	}
+	run_f32(&m.program, block, W, H, parts, temp_scratch(), {x = 3, y = 5, w = 9, h = 7})
+	for y in 0 ..< H {
+		for x in 0 ..< W {
+			want := whole[y * W + x] if x >= 3 && x < 12 && y >= 5 && y < 12 else UNSET
+			if parts[y * W + x] != want {
+				testing.expectf(t, false, "region at (3, 5): pixel (%d, %d) is %v, want %v", x, y, parts[y * W + x], want)
+				return
+			}
+		}
+	}
+	regions := [?]Run_Options{{x = -3, y = -1, w = W + 6, h = 6}, {x = -1, y = 5, w = 4, h = 7}, {x = 12, y = 5, w = 9, h = 7}, {x = 0, y = 12, w = W, h = 9}}
+	for r in regions {
+		run_f32(&m.program, block, W, H, parts, temp_scratch(), r)
+	}
+	for i in 0 ..< W * H {
+		if parts[i] != whole[i] {
+			testing.expectf(t, false, "pixel (%d, %d) is %v in regions, %v whole", i % W, i / W, parts[i], whole[i])
+			return
 		}
 	}
 }

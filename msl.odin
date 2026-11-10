@@ -5,7 +5,7 @@ import "core:strings"
 
 // Metal Shading Language emission for SDL_GPU on macOS. The fragment entry
 // MSL_ENTRY declares what Checked.interface lists: stage inputs at location
-// N as [[user(locnN)]] (LAYER_VERTEX_MSL writes uv as locn0), gl_FragCoord
+// N as [[user(locnN)]] (layer.vert writes uv as locn0), gl_FragCoord
 // as [[position]], outputs as [[color(N)]] of the returned Oksl_Out, the
 // uniform block at [[buffer(0)]] and channel n at [[texture(n)]] /
 // [[sampler(n)]]. User names get an `ok_` prefix so they never collide with

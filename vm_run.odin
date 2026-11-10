@@ -1,6 +1,7 @@
 package oksl
 
 import "core:math"
+import "core:math/linalg"
 
 // CPU backend, part 2: the interpreter. Pixels run in batches of LANES:
 // 2x2 quads in a BATCH_W x BATCH_H block, so derivatives use the quad
@@ -16,7 +17,8 @@ Sampler_Proc :: #type proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> 
 Run_Options :: struct {
 	sampler:  Sampler_Proc,
 	user:     rawptr,
-	// Region to shade in layer pixels; zero means the whole layer.
+	// Region to shade in layer pixels, clipped to the layer; zero means
+	// the whole layer. Its pixels come out as a whole-layer run's do.
 	x, y:     int,
 	w, h:     int,
 	// The stage inputs by location. Absent ones are zero, except location
@@ -168,8 +170,14 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 		x0, y0, w, h = 0, 0, width, height
 	}
 	fw, fh := f32(width), f32(height)
+	// The region within the layer. Batches start on even pixels, so a
+	// region's quads, and so its derivatives, are the whole layer's.
+	start_x, start_y := max(x0, 0), max(y0, 0)
 	end_x := min(x0 + w, width)
 	end_y := min(y0 + h, height)
+	if start_x >= end_x || start_y >= end_y {
+		return
+	}
 	// Each lane's pixel in the batch.
 	lx, ly: [LANES]int
 	lxf, lyf: F_Lanes
@@ -180,8 +188,8 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 		lxf[lane] = f32(lx[lane]) + 0.5
 		lyf[lane] = f32(ly[lane]) + 0.5
 	}
-	for by := y0; by < y0 + h; by += BATCH_H {
-		for bx := x0; bx < x0 + w; bx += BATCH_W {
+	for by := start_y &~ 1; by < end_y; by += BATCH_H {
+		for bx := start_x &~ 1; bx < end_x; bx += BATCH_W {
 			// Pixel centres of the batch's lanes, then each input a whole
 			// register at a time.
 			px := f32(bx) + lxf
@@ -208,7 +216,7 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 			r.masks[MASK_DISCARD] = {}
 			execute(&r)
 			alive := ~r.masks[MASK_DISCARD]
-			full_tile := bx + BATCH_W <= end_x && by + BATCH_H <= end_y && alive == ALL_LANES
+			full_tile := bx >= start_x && by >= start_y && bx + BATCH_W <= end_x && by + BATCH_H <= end_y && alive == ALL_LANES
 			for v in p.outputs {
 				if v.kind != .Stage_Out {
 					continue
@@ -244,7 +252,7 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 				for lane in 0 ..< LANES {
 					x := bx + lx[lane]
 					y := by + ly[lane]
-					if x >= end_x || y >= end_y || lane not_in alive {
+					if x < start_x || y < start_y || x >= end_x || y >= end_y || lane not_in alive {
 						continue
 					}
 					c := [4]f32{0, 0, 0, 1}
@@ -1269,20 +1277,13 @@ execute :: proc(r: ^Runner) #no_bounds_check {
 				}
 			}
 		case .Determinant, .Inverse:
-			dim := int(in_.k)
-			for l in 0 ..< LANES {
-				m: [16]f32
-				for i in 0 ..< dim * dim {
-					m[i] = fval(regs[a + i32(i)][l])
-				}
-				if in_.op == .Determinant {
-					regs[dst][l] = fbits(mat_det(m, dim))
-				} else {
-					inv := mat_inverse(m, dim)
-					for i in 0 ..< dim * dim {
-						regs[dst + i32(i)][l] = fbits(inv[i])
-					}
-				}
+			switch in_.k {
+			case 2:
+				lane_matrices(regs, in_, 2)
+			case 3:
+				lane_matrices(regs, in_, 3)
+			case:
+				lane_matrices(regs, in_, 4)
 			}
 		case .Deriv_X, .Deriv_Y, .Fwidth:
 			for i in 0 ..< i32(n) {
@@ -1388,66 +1389,26 @@ channel_size :: #force_inline proc "contextless" (r: ^Runner, ch: int) -> [2]i32
 	return r.opts.channel_sizes[ch] if ch >= 0 && ch < len(r.opts.channel_sizes) else {}
 }
 
-// Column-major dim x dim matrices.
+// The determinant or the inverse of each lane's N x N matrix, read from
+// column-major registers at `a`.
 @(private)
-mat_det :: proc(m: [16]f32, dim: int) -> f32 {
-	switch dim {
-	case 2:
-		return m[0] * m[3] - m[2] * m[1]
-	case 3:
-		return m[0] * (m[4] * m[8] - m[7] * m[5]) - m[3] * (m[1] * m[8] - m[7] * m[2]) + m[6] * (m[1] * m[5] - m[4] * m[2])
-	}
-	// 4x4 by cofactors of the first column.
-	det: f32 = 0
-	for i in 0 ..< 4 {
-		det += m[i] * cofactor4(m, 0, i)
-	}
-	return det
-}
-
-// Cofactor of element (col, row) of a 4x4 column-major matrix.
-@(private)
-cofactor4 :: proc(m: [16]f32, col, row: int) -> f32 {
-	sub: [9]f32
-	k := 0
-	for c in 0 ..< 4 {
-		if c == col {continue}
-		for r in 0 ..< 4 {
-			if r == row {continue}
-			sub[k] = m[c * 4 + r]
-			k += 1
-		}
-	}
-	d := sub[0] * (sub[4] * sub[8] - sub[7] * sub[5]) - sub[3] * (sub[1] * sub[8] - sub[7] * sub[2]) + sub[6] * (sub[1] * sub[5] - sub[4] * sub[2])
-	return d if (col + row) % 2 == 0 else -d
-}
-
-@(private)
-mat_inverse :: proc(m: [16]f32, dim: int) -> (inv: [16]f32) {
-	det := mat_det(m, dim)
-	id := 1 / det
-	switch dim {
-	case 2:
-		inv[0] = m[3] * id
-		inv[1] = -m[1] * id
-		inv[2] = -m[2] * id
-		inv[3] = m[0] * id
-	case 3:
-		// inverse = adjugate / det; adj[c][r] = cofactor(r, c).
-		at :: proc(m: [16]f32, c, r: int) -> f32 {return m[c * 3 + r]}
-		for c in 0 ..< 3 {
-			for r in 0 ..< 3 {
-				c1, c2 := (r + 1) % 3, (r + 2) % 3
-				r1, r2 := (c + 1) % 3, (c + 2) % 3
-				inv[c * 3 + r] = (at(m, c1, r1) * at(m, c2, r2) - at(m, c2, r1) * at(m, c1, r2)) * id
+lane_matrices :: proc "contextless" (regs: []Reg, in_: Instr, $N: int) #no_bounds_check {
+	for l in 0 ..< LANES {
+		m: matrix[N, N]f32
+		for c in 0 ..< N {
+			for r in 0 ..< N {
+				m[r, c] = fval(regs[in_.a + i32(c * N + r)][l])
 			}
 		}
-	case 4:
-		for c in 0 ..< 4 {
-			for r in 0 ..< 4 {
-				inv[c * 4 + r] = cofactor4(m, r, c) * id
+		if in_.op == .Determinant {
+			regs[in_.dst][l] = fbits(linalg.determinant(m))
+			continue
+		}
+		inv := linalg.inverse(m)
+		for c in 0 ..< N {
+			for r in 0 ..< N {
+				regs[in_.dst + i32(c * N + r)][l] = fbits(inv[r, c])
 			}
 		}
 	}
-	return
 }

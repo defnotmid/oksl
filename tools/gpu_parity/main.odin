@@ -1,12 +1,9 @@
 // Renders every shader in testdata/ (.sksl, .glsl Shadertoy code and .frag
 // GLSL fragment shaders, by oksl.SOURCE_EXTENSIONS) with SDL_GPU (the
-// generated SPIR-V, or MSL on Metal, and the layer vertex shader, whose uv
-// a .frag reads at location 0) and with the CPU interpreter, and compares
-// the colour at location 0.
-//
-// `-oksl-vertex` draws with testdata/layer.vert compiled by oksl (its GLSL
-// vertex stage) instead of the committed layer vertex shader, and checks a
-// tap of it (Options.taps): its position, drawn as colour, against
+// generated SPIR-V, or MSL on Metal, drawn through oksl.LAYER_VERTEX_GLSL,
+// whose uv a .frag reads at location 0) and with the CPU interpreter, and
+// compares the colour at location 0. It also checks a tap of the layer
+// vertex shader (Options.taps): its position, drawn as colour, against
 // run_vertex's.
 // Writes <name>_gpu.png, <name>_cpu.png and <name>_diff.png.
 //
@@ -132,22 +129,14 @@ Gpu :: struct {
 }
 
 main :: proc() {
-	args := make([dynamic]string)
-	oksl_vertex := false
-	for a in os.args[1:] {
-		if a == "-oksl-vertex" {
-			oksl_vertex = true
-		} else {
-			append(&args, a)
-		}
-	}
+	args := os.args[1:]
 	out_dir := args[0] if len(args) > 0 else "parity_out"
 	data_dir := args[1] if len(args) > 1 else "testdata"
 	os.make_directory_all(out_dir)
 	make_texture()
 
 	g: Gpu
-	if !gpu_init(&g, fmt.tprintf("%s/layer.vert", data_dir) if oksl_vertex else "") {
+	if !gpu_init(&g) {
 		fmt.eprintln("no SDL_GPU device:", sdl.GetError())
 		os.exit(2)
 	}
@@ -225,15 +214,12 @@ main :: proc() {
 		write_png(fmt.tprintf("%s/%s_diff.png", out_dir, name), diff)
 		oksl.destroy(m)
 	}
-	checks := len(names)
-	if oksl_vertex {
-		checks += 1
-		max_d, ok := tap_check(&g, fmt.tprintf("%s/layer.vert", data_dir))
-		if !ok || max_d > 2 {
-			failed += 1
-		}
-		fmt.printfln("%-16s max diff %d  %s", "layer.vert tap", max_d, "ok" if ok && max_d <= 2 else "MISMATCH")
+	max_d, tap_ok := tap_check(&g)
+	if !tap_ok || max_d > 2 {
+		failed += 1
 	}
+	fmt.printfln("%-16s max diff %d  %s", "layer.vert tap", max_d, "ok" if tap_ok && max_d <= 2 else "MISMATCH")
+	checks := len(names) + 1
 	fmt.printfln("%d/%d shaders match (images in %s)", checks - failed, checks, out_dir)
 	if failed > 0 {
 		os.exit(1)
@@ -244,7 +230,7 @@ write_png :: proc(path: string, px: []u8) {
 	stbi.write_png(strings.clone_to_cstring(path, context.temp_allocator), W, H, 4, raw_data(px), W * 4)
 }
 
-gpu_init :: proc(g: ^Gpu, vertex_path: string) -> bool {
+gpu_init :: proc(g: ^Gpu) -> bool {
 	if !sdl.Init({.VIDEO}) {
 		sdl.SetHint(sdl.HINT_VIDEO_DRIVER, "offscreen")
 		if !sdl.Init({.VIDEO}) {
@@ -256,41 +242,25 @@ gpu_init :: proc(g: ^Gpu, vertex_path: string) -> bool {
 		return false
 	}
 	g.msl = .SPIRV not_in sdl.GetGPUShaderFormats(g.device)
+	m, errors, ok := oksl.compile(oksl.LAYER_VERTEX_GLSL, {profile = .Glsl, stage = .Vertex})
+	defer oksl.destroy(m)
+	if !ok {
+		fmt.eprint(oksl.format_errors(errors))
+		return false
+	}
 	vert := sdl.GPUShaderCreateInfo {
-		code_size = len(oksl.LAYER_VERTEX_SPIRV),
-		code = raw_data(oksl.LAYER_VERTEX_SPIRV),
-		entrypoint = oksl.LAYER_VERTEX_SPIRV_ENTRY,
+		code_size = len(m.spirv) * 4,
+		code = ([^]u8)(raw_data(m.spirv)),
+		entrypoint = oksl.SPIRV_ENTRY,
 		format = {.SPIRV},
 		stage = .VERTEX,
 		num_uniform_buffers = 1,
 	}
 	if g.msl {
-		vert.code_size = len(oksl.LAYER_VERTEX_MSL)
-		vert.code = raw_data(oksl.LAYER_VERTEX_MSL)
-		vert.entrypoint = oksl.LAYER_VERTEX_MSL_ENTRY
+		vert.code_size = len(m.msl)
+		vert.code = raw_data(m.msl)
+		vert.entrypoint = oksl.MSL_ENTRY
 		vert.format = {.MSL}
-	}
-	if vertex_path != "" {
-		src, err := os.read_entire_file(vertex_path, context.allocator)
-		if err != nil {
-			fmt.eprintln("can not read", vertex_path)
-			return false
-		}
-		options, _ := oksl.options_of_path(vertex_path)
-		m, errors, ok := oksl.compile(string(src), options)
-		if !ok {
-			fmt.eprint(oksl.format_errors(errors))
-			return false
-		}
-		fmt.println("vertex shader:", vertex_path, "(oksl)")
-		vert.code_size = len(m.spirv) * 4
-		vert.code = ([^]u8)(raw_data(m.spirv))
-		vert.entrypoint = oksl.SPIRV_ENTRY
-		if g.msl {
-			vert.code_size = len(m.msl)
-			vert.code = raw_data(m.msl)
-			vert.entrypoint = oksl.MSL_ENTRY
-		}
 	}
 	g.vert = sdl.CreateGPUShader(g.device, vert)
 	g.target = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET}, width = W, height = H, layer_count_or_depth = 1, num_levels = 1})
@@ -419,15 +389,10 @@ TAP_FRAGMENT :: "layout(location = 1) in vec4 openClip;\nout vec4 c;\nvoid main(
 // the GPU draws it as colour, and run_vertex gives it at every pixel centre
 // (it is affine in the pixel, so interpolation agrees). The largest
 // difference in 8 bits.
-tap_check :: proc(g: ^Gpu, vertex_path: string) -> (max_d: int, ok: bool) {
-	src, err := os.read_entire_file(vertex_path, context.allocator)
-	if err != nil {
-		return 0, false
-	}
-	options, _ := oksl.options_of_path(vertex_path)
-	options.prelude = TAP_PRELUDE
+tap_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
+	options := oksl.Options{profile = .Glsl, stage = .Vertex, prelude = TAP_PRELUDE}
 	options.taps = {{position = "openClip", attributes = {{"position", "openPosition"}}}}
-	vm, verrors, vok := oksl.compile(string(src), options)
+	vm, verrors, vok := oksl.compile(oksl.LAYER_VERTEX_GLSL, options)
 	defer oksl.destroy(vm)
 	fm, ferrors, fok := oksl.compile(TAP_FRAGMENT, {profile = .Glsl})
 	defer oksl.destroy(fm)

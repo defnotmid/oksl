@@ -53,7 +53,7 @@ if !ok {
 }
 // GPU: SDL_CreateGPUShader with m.spirv (entry oksl.SPIRV_ENTRY) or m.msl
 // (entry oksl.MSL_ENTRY), num_samplers = m.num_samplers, num_uniform_buffers = 1;
-// vertex shader oksl.LAYER_VERTEX_SPIRV / LAYER_VERTEX_MSL.
+// Vertex shader: oksl.compile(oksl.LAYER_VERTEX_GLSL, {profile = .Glsl, stage = .Vertex}), once.
 // CPU:
 block := make([]u8, m.block_size)
 oksl.write_builtins(block, {resolution = {f32(w), f32(h), 1}, time = t, channel_resolution = {{tw, th, 1}, {}, {}, {}}})
@@ -352,15 +352,15 @@ shader`, `iChannelN` or a `uniform sampler2D`).
   of a `[[stage_in]]` struct, varyings as `[[user(locnN)]]` and the
   position as `[[position]]`; the block at `[[buffer(0)]]`. One vertex
   uniform block (`num_uniform_buffers` 1, or 0 when `block_size` is 0).
-- **Layer vertex shader** (`shaders/layer.slang`, committed as
-  `layer.vert.spv` / `.msl`): position (vec2, target pixels, y down) at
-  location 0, uv (vec2) at location 1, and a vertex uniform buffer at
-  set 1 holding the target size (`vec4`, xy used). Positions map to NDC
-  like ovg's SDL_GPU backend. It writes uv at location 0 (in MSL as
-  `[[user(locn0)]]`, which `shaders/build.sh` renames from slangc's
-  semantic). `shaders/build.sh` regenerates it with slangc; nothing else
-  needs slangc. A GLSL fragment shader reading `layout(location = 0) in
-  vec2` can run on it too.
+- **Layer vertex shader** (`LAYER_VERTEX_GLSL`, the source of
+  `testdata/layer.vert`, which a host compiles once like any vertex
+  shader: `compile(LAYER_VERTEX_GLSL, {profile = .Glsl, stage =
+  .Vertex})`): position (vec2, target pixels, y down) at location 0, uv
+  (vec2) at location 1, and its uniform block holding the target size
+  (`size`, `vec4`, xy used). Positions map to NDC like ovg's SDL_GPU
+  backend. It writes uv at location 0 (in MSL as `[[user(locn0)]]`). A
+  GLSL fragment shader reading `layout(location = 0) in vec2` can run on
+  it too.
 
 The generated fragment code derives `coord` from `uv * iResolution.xy`, so
 set `iResolution` to the layer's size in the units `coord` should run in
@@ -512,8 +512,7 @@ odin test . -vet -strict-style                      # SkSL, GLSL/Shadertoy, the 
                                                     # built-ins on the CPU, control flow and switch, discard,
                                                     # uniforms, children and channels, programs, corpus
                                                     # (+ spirv-val when installed)
-odin run tools/gpu_parity -- out_dir                # SDL_GPU vs CPU interpreter on testdata/
-odin run tools/gpu_parity -- -oksl-vertex out_dir   # the same, drawn through testdata/layer.vert compiled by oksl, and a tap of it
+odin run tools/gpu_parity -- out_dir                # SDL_GPU vs CPU interpreter on testdata/ through the layer vertex shader, and a tap of it
 odin run tools/okslc -- a.sksl b.glsl ...           # compile (by extension: SOURCE_EXTENSIONS); -o prefix writes .spv / .metal
 odin run tools/cpu_render -- shader.sksl out.png    # CPU render
 odin run tools/golden -- snapshot ref                # before a refactor: ~95k generated cases + every shader

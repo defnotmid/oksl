@@ -303,10 +303,9 @@ set_uniform :: proc(m: ^Module, block: []u8, name: string, values: []f32, index 
 	return true
 }
 
-// The vertex shader hosts draw oksl layers with (shaders/layer.slang): a
-// quad in target pixels (location 0, vec2) with uvs (location 1, vec2) and
-// a vertex uniform buffer holding the target size (vec4, xy used).
-LAYER_VERTEX_SPIRV :: #load("shaders/layer.vert.spv")
-LAYER_VERTEX_SPIRV_ENTRY :: "main"
-LAYER_VERTEX_MSL :: #load("shaders/layer.vert.msl", string)
-LAYER_VERTEX_MSL_ENTRY :: "vs_main"
+// The vertex shader hosts draw oksl layers with, in GLSL: a quad in target
+// pixels (location 0, vec2, y down) with uvs (location 1, vec2), which it
+// writes at location 0 for the layer profiles' fragment shaders, and the
+// target size in its block (`size`, vec4, xy used). A host compiles it
+// once: compile(LAYER_VERTEX_GLSL, {profile = .Glsl, stage = .Vertex}).
+LAYER_VERTEX_GLSL :: #load("testdata/layer.vert", string)

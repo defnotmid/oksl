@@ -847,8 +847,20 @@ lower_switch :: proc(l: ^Lower, st: Stmt) {
 	emit(l, .Mask_Clear, dst = MASK_EXEC)
 	outer_brk := l.brk
 	l.brk = brk
+	// Lanes join only at labels, so the statements after a run of labels
+	// are skipped when none runs them.
+	skip := -1
 	for b, i in body {
-		#partial switch u.stmts[b].kind {
+		kind := u.stmts[b].kind
+		if kind == .Case || kind == .Default {
+			if skip >= 0 {
+				l.code[skip].a = here(l)
+				skip = -1
+			}
+		} else if skip < 0 {
+			skip = emit(l, .Jump_If_None)
+		}
+		#partial switch kind {
 		case .Case:
 			emit(l, .Mask_Cond, dst = joining, a = entry, b = conds[i])
 			emit(l, .Mask_Or, dst = MASK_EXEC, a = MASK_EXEC, b = joining)
@@ -858,6 +870,9 @@ lower_switch :: proc(l: ^Lower, st: Stmt) {
 		case:
 			lower_stmt(l, Stmt_Id(b))
 		}
+	}
+	if skip >= 0 {
+		l.code[skip].a = here(l)
 	}
 	l.brk = outer_brk
 	b, cn, r := kills(l)

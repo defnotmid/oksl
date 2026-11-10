@@ -1,8 +1,8 @@
 #version 300 es
-// The layer vertex shader (shaders/layer.slang) in GLSL: a quad in target
+// The layer vertex shader (oksl.LAYER_VERTEX_GLSL): a quad in target
 // pixels (y down) with a uv per vertex, which the layer profiles' fragment
-// shaders read at location 0. `odin run tools/gpu_parity -- -oksl-vertex`
-// draws every testdata shader with it instead of the committed one.
+// shaders read at location 0. `odin run tools/gpu_parity` draws every
+// testdata shader with it.
 precision highp float;
 
 layout(location = 0) in vec2 position;
