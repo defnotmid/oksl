@@ -146,7 +146,7 @@ Pass_Graph :: struct {
 Pass_Spec :: struct {
 	module:   ^Module,
 	name:     string,
-	channels: [CHANNEL_COUNT]Channel_Ref,
+	channels: [SAMPLER_COUNT]Channel_Ref,
 }
 
 // Builds a pass graph from compiled modules, in running order: a channel
@@ -179,7 +179,7 @@ make_program :: proc(passes: []Pass_Spec, output := -1) -> (g: ^Pass_Graph, erro
 	case g.output >= len(passes):
 		append(&errs, Error{pos = {line = 1, col = 1}, code = .Pass_Output, n = i64(g.output), m = i64(len(passes))})
 	}
-	refs := make([][CHANNEL_COUNT]Channel_Ref, len(passes))
+	refs := make([][SAMPLER_COUNT]Channel_Ref, len(passes))
 	for p, pi in passes {
 		refs[pi] = p.channels
 		for ref, ch in p.channels {
@@ -207,7 +207,7 @@ make_program :: proc(passes: []Pass_Spec, output := -1) -> (g: ^Pass_Graph, erro
 // The edges of the graph's passes from what each channel reads (pass ids
 // as indices), for the channels each module samples.
 @(private)
-program_edges :: proc(g: ^Pass_Graph, refs: [][CHANNEL_COUNT]Channel_Ref) {
+program_edges :: proc(g: ^Pass_Graph, refs: [][SAMPLER_COUNT]Channel_Ref) {
 	edges := make([dynamic]Edge)
 	for &p, pi in g.passes {
 		start := u32(len(edges))
@@ -271,7 +271,7 @@ compile_program :: proc(desc: Program_Desc, options := Options{}) -> (g: ^Pass_G
 	mark := preprocess_mark(&pp)
 
 	passes := make([]Pass, n)
-	refs := make([][CHANNEL_COUNT]Channel_Ref, n)
+	refs := make([][SAMPLER_COUNT]Channel_Ref, n)
 	for kind in Pass_Kind {
 		pi := int(g.index[kind])
 		if pi < 0 {

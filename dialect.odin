@@ -54,6 +54,13 @@ Feature :: enum u8 {
 	Gl_Position,
 	// gl_FrontFacing: whether the fragment's triangle faces the camera.
 	Gl_Front_Facing,
+	// gl_VertexID: the vertex's index in the draw.
+	Gl_Vertex_ID,
+	// `readonly buffer Block { T name[]; } instance;`: read-only storage
+	// buffers (GLSL ES 3.1).
+	Storage_Buffers,
+	// gl_SampleMask[0]: the fragment's samples a shader keeps.
+	Gl_Sample_Mask,
 }
 Features :: bit_set[Feature;u16]
 
@@ -77,7 +84,7 @@ DIALECT_RULES := [Dialect]Dialect_Rules {
 		missing = #partial {.Preprocessor = .No_Preprocessor, .Samplers = .Sksl_Texture_Call, .Discard = .Sksl_Discard, .Sampler_Params = .Sampler_Param, .Stage_Variables = .Global_In_Out},
 	},
 	.GLSL = {
-		has = {.Preprocessor, .Samplers, .Discard, .Gl_Frag_Coord, .Sampler_Params, .Stage_Variables, .Derivatives, .Gl_Position, .Gl_Front_Facing},
+		has = {.Preprocessor, .Samplers, .Discard, .Gl_Frag_Coord, .Sampler_Params, .Stage_Variables, .Derivatives, .Gl_Position, .Gl_Front_Facing, .Gl_Vertex_ID, .Storage_Buffers, .Gl_Sample_Mask},
 		missing = #partial {.Children = .Glsl_Eval},
 		predefined = {{"GL_ES", "1"}, {"__VERSION__", "300"}},
 	},
@@ -137,7 +144,7 @@ PROFILE_RULES := [Profile]Profile_Rules {
 		stages = {.Fragment},
 		entry = .Main_Image,
 		header = true,
-		lacks = {.Stage_Variables, .Gl_Front_Facing},
+		lacks = {.Stage_Variables, .Gl_Front_Facing, .Storage_Buffers, .Gl_Sample_Mask},
 		missing = #partial {.Stage_Variables = .Global_In_Out},
 		inputs = UNIFORM_INPUTS | CHANNEL_INPUTS,
 		flip_y = true,

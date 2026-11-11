@@ -166,7 +166,7 @@ run_shadertoy :: proc(t: ^testing.T, src: string, b: Builtins = {resolution = {4
 	}
 	block := make([]u8, m.block_size, context.temp_allocator)
 	write_builtins(block, b)
-	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 		return {uv.x, uv.y, lod, f32(channel)}
 	}
 	out = make([][4]f32, 8, context.temp_allocator)
@@ -386,7 +386,7 @@ void mainImage(out vec4 c, in vec2 p) {
 		testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator))
 		if ok {
 			count := 0
-			sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+			sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 				(^int)(user)^ += 1
 				return {1, 0, 0, 1}
 			}
@@ -600,7 +600,7 @@ half4 main(float2 coord) {
 	write_builtins(block, {resolution = {4, 2, 1}, time = 0.5, frame = 2, channel_resolution = {{16, 8, 1}, {4, 4, 1}, {}, {}}})
 	set_uniform(m, block, "uColor", {0, 0, 0.25, 1})
 	// The sampler sees uv = coord / child size: report it back.
-	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 		return {uv.x, uv.y, lod, f32(channel)}
 	}
 	out := make([][4]f32, 8, context.temp_allocator)
@@ -628,7 +628,7 @@ half4 main(float2 coord) {
 	}
 	block := make([]u8, m.block_size, context.temp_allocator)
 	write_builtins(block, {resolution = {4, 2, 1}, channel_resolution = {{4, 2, 1}, {}, {}, {}}})
-	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 		return {uv.x, uv.y, lod, f32(channel)}
 	}
 	out := make([][4]f32, 8, context.temp_allocator)
@@ -661,7 +661,7 @@ half4 main(float2 coord) {
 	}
 	block := make([]u8, m.block_size, context.temp_allocator)
 	write_builtins(block, {resolution = {4, 2, 1}, channel_resolution = {{4, 2, 1}, {}, {}, {}}})
-	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 		return {uv.x, uv.y, lod, f32(channel)}
 	}
 	out := make([][4]f32, 8, context.temp_allocator)
@@ -1038,7 +1038,7 @@ void main() {
 	if have_spirv_val() {
 		expect_valid_spirv(t, "test_glsl_texture_lod", m.spirv)
 	}
-	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 		return {uv.x, uv.y, lod, f32(channel)}
 	}
 	// st steps 1/16 across and 1/8 down a pixel: 4 x 4 texels of a
@@ -1047,7 +1047,7 @@ void main() {
 	targets: [5][W * H][4]f32
 	slices := [5][][4]f32{targets[0][:], targets[1][:], targets[2][:], targets[3][:], targets[4][:]}
 	varyings := []Varying{{dx = {1.0 / 16, 0, 0, 0}, dy = {0, 1.0 / 8, 0, 0}}}
-	sizes := [][2]i32{{64, 32}, {16, 16}}
+	sizes := [][3]i32{{64, 32, 1}, {16, 16, 1}}
 	block := make([]u8, m.block_size, context.temp_allocator)
 	run_targets(&m.program, block, W, H, slices[:], temp_scratch(), {sampler = sampler, varyings = varyings, channel_sizes = sizes})
 	for i in 0 ..< W * H {
@@ -1403,7 +1403,8 @@ test_run_vertex :: proc(t: ^testing.T) {
 		r := varyings[i * record:]
 		near(t, {r[offsets["vUv"]], r[offsets["vUv"] + 1], 0, 0}, {v.uv.x * 2, v.uv.y * 2, 0, 0})
 		near(t, {r[offsets["vNormal"]], r[offsets["vNormal"] + 1], r[offsets["vNormal"] + 2], 0}, {v.normal.x, v.normal.y, v.normal.z, 0})
-		near(t, {r[offsets["id"]], r[offsets["id"] + 1], 0, 0}, {7, -3, 0, 0})
+		// Integers travel as their bits.
+		testing.expect_value(t, transmute([2]i32)[2]f32{r[offsets["id"]], r[offsets["id"] + 1]}, [2]i32{7, -3})
 	}
 	// The fragment stage reads the vertex shader's record.
 	testing.expect_value(t, p.fragment.varying_floats, record)
@@ -1759,7 +1760,8 @@ test_run_fragment :: proc(t: ^testing.T) {
 	scratch: Scratch
 	defer scratch_destroy(&scratch)
 	block := make([]u8, max(fm.block_size, 16), context.temp_allocator)
-	run_fragment(&fm.program, block, {count = Q, origin = origin[:], front_facing = facing[:], helpers = helpers[:], varyings = varyings}, out[:], shaded[:], &scratch)
+	targets := [1][][4]f32{out[:]}
+	run_fragment(&fm.program, block, {count = Q, origin = origin[:], front_facing = facing[:], helpers = helpers[:], varyings = varyings}, targets[:], shaded[:], &scratch)
 	for q in 0 ..< Q {
 		want_lanes := Quad_Lanes{0, 1, 2, 3}
 		if q == 1 {want_lanes -= {2}}
@@ -1906,7 +1908,7 @@ half4 main(float2 p) {
 	sblock := make([]u8, sm.block_size, context.temp_allocator)
 	write_builtins(sblock, {resolution = {4, 2, 1}})
 	px := make([][4]f32, 8, context.temp_allocator)
-	sizes := [][2]i32{{32, 16}}
+	sizes := [][3]i32{{32, 16, 1}}
 	run_f32(&sm.program, sblock, 4, 2, px, temp_scratch(), {channel_sizes = sizes})
 	testing.expectf(t, px[7] == {0.5, 0.25, 0, 1}, "got %v", px[7])
 }
@@ -1923,7 +1925,7 @@ test_run_fragment_matches_layer :: proc(t: ^testing.T) {
 		return
 	}
 	W, H :: 16, 8
-	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 		return {uv.x, uv.y, 0.5, 1}
 	}
 	block := make([]u8, m.block_size, context.temp_allocator)
@@ -1947,7 +1949,8 @@ test_run_fragment_matches_layer :: proc(t: ^testing.T) {
 	shade :: proc(m: ^Module, block: []u8, quads: Fragment_Quads, out: [][4]f32, shaded: []Quad_Lanes) {
 		scratch: Scratch
 		defer scratch_destroy(&scratch)
-		run_fragment(&m.program, block, quads, out, shaded, &scratch, {sampler = proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {return {uv.x, uv.y, 0.5, 1}}})
+		targets := [1][][4]f32{out}
+		run_fragment(&m.program, block, quads, targets[:], shaded, &scratch, {sampler = proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {return {uv.x, uv.y, 0.5, 1}}})
 	}
 	compare :: proc(t: ^testing.T, quads: Fragment_Quads, want, out: [][4]f32, shaded: []Quad_Lanes) {
 		for q in 0 ..< quads.count {
@@ -2026,7 +2029,7 @@ test_make_program_sksl :: proc(t: ^testing.T) {
 		}
 		out := make([][4]f32, W * H, context.temp_allocator)
 		// The channel reads the first pass's target, nearest texel.
-		run_f32(&p.module.program, block, W, H, out, temp_scratch(), {user = raw_data(first), sampler = proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+		run_f32(&p.module.program, block, W, H, out, temp_scratch(), {user = raw_data(first), sampler = proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 			src := ([^][4]f32)(user)
 			x, y := clamp(int(uv.x * W), 0, W - 1), clamp(int(uv.y * H), 0, H - 1)
 			return src[y * W + x]
@@ -2297,5 +2300,444 @@ half4 main(float2 p) {
 		testing.expect(t, set_uniform(m, block, "uArr", {1, 2}, 1))
 		testing.expect(t, !set_uniform(m, block, "uArr", {1, 2}, 2))
 		testing.expect(t, !set_uniform(m, block, "uArr", {1, 2}, -1))
+	}
+}
+
+// ---- storage buffers, gl_VertexID, array textures, textureGrad ---------------------
+
+// Read-only storage buffers: struct elements at their std430 offsets, a
+// per-lane loop whose trip count is a buffer word, a read from a helper,
+// a uniform index, and reads past the host's words (0).
+@(test)
+test_storage_buffers :: proc(t: ^testing.T) {
+	src := `#version 310 es
+precision highp float;
+struct Row { vec4 color; vec3 probe; float w; ivec2 m; };
+layout(std430) readonly buffer Rows { Row rows[]; } rowBuf;
+readonly buffer Words { uint words[]; };
+uniform int uPick;
+out vec4 o;
+uint word(uint i) { return words[i]; }
+void main() {
+    int i = int(gl_FragCoord.x);
+    Row r = rowBuf.rows[i];
+    uint sum = 0u;
+    for (uint k = 0u; k < word(uint(i)); k++) {
+        sum += words[8u + k];
+    }
+    o = vec4(r.color.x + r.probe.z, float(r.m.y), float(sum), rowBuf.rows[uPick].w + float(words[1000]) + float(rowBuf.rows[-i - 1].m.x));
+}`
+	m, errs, ok := compile_glsl(src)
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	// vec4, vec3 and float, then ivec2 at 32: 40 bytes, 48 with the
+	// struct's 16-byte alignment.
+	testing.expect_value(t, len(m.storage_buffers), 2)
+	testing.expect_value(t, m.storage_buffers[0].name, "Rows")
+	testing.expect_value(t, m.storage_buffers[0].stride, 48)
+	testing.expect_value(t, m.storage_buffers[1].name, "Words")
+	testing.expect_value(t, m.storage_buffers[1].stride, 4)
+	testing.expect_value(t, m.num_uniform_buffers, 1)
+	for want in ([]string{"const device uint* oksl_buf_rowBuf [[buffer(1)]]", "const device uint* oksl_buf_words [[buffer(2)]]", "ok_Row{float4(as_type<float>(w[b + 0u])", "as_type<int>(w[b + 9u])"}) {
+		testing.expectf(t, strings.contains(m.msl, want), "MSL lacks %s", want)
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "test_storage_buffers", m.spirv)
+	}
+	ROWS :: 4
+	rows := make([]u32, ROWS * 12, context.temp_allocator)
+	for i in 0 ..< ROWS {
+		r := rows[i * 12:]
+		for k in 0 ..< 4 {r[k] = transmute(u32)f32(10 * i + k)}
+		for k in 0 ..< 3 {r[4 + k] = transmute(u32)f32(100 + i)}
+		r[7] = transmute(u32)(0.5 * f32(i))
+		r[8], r[9] = u32(i32(-i)), u32(i32(-2 * i))
+	}
+	words := make([]u32, 16, context.temp_allocator)
+	for i in 0 ..< 4 {
+		words[i] = u32(i)
+		words[8 + i] = 1 << uint(i)
+	}
+	block := make([]u8, m.block_size, context.temp_allocator)
+	testing.expect(t, set_uniform(m, block, "uPick", {2}))
+	out := make([][4]f32, 4, context.temp_allocator)
+	run_f32(&m.program, block, 4, 1, out, temp_scratch(), {buffers = {rows, words}})
+	sums := [4]f32{0, 1, 3, 7}
+	for i in 0 ..< 4 {
+		near(t, out[i], {f32(11 * i + 100), f32(-2 * i), sums[i], 1})
+	}
+	// Word addresses wrap at 32 bits, as SPIR-V's and Metal's do: element
+	// 2^30 of a 12-word element is element 0.
+	wm, werrs, wok := compile_glsl("struct Row { vec4 color; vec3 probe; float w; ivec2 m; };\nreadonly buffer Rows { Row rows[]; };\nuniform uint uWrap;\nout vec4 o;\nvoid main() { o = rows[uWrap].color; }")
+	defer destroy(wm)
+	if testing.expectf(t, wok, "%s", format_errors(werrs, context.temp_allocator)) {
+		wblock := make([]u8, wm.block_size, context.temp_allocator)
+		testing.expect(t, set_uniform(wm, wblock, "uWrap", {1 << 30}))
+		run_f32(&wm.program, wblock, 4, 1, out, temp_scratch(), {buffers = {rows}})
+		near(t, out[0], {0, 1, 2, 3})
+	}
+	// No buffers bound: every read is 0.
+	run_f32(&m.program, block, 4, 1, out, temp_scratch())
+	for i in 0 ..< 4 {
+		near(t, out[i], {0, 0, 0, 0})
+	}
+
+	cases := [?][2]string {
+		{"buffer B { uint w[]; } b;\nvoid main() {}", "buffer B is not readonly: buffers are read-only"},
+		{"layout(std140) readonly buffer B { uint w[]; } b;\nvoid main() {}", "buffer B is std140: buffers are laid out std430"},
+		{"readonly buffer B { uint w[]; uint x[]; } b;\nvoid main() {}", "buffer B holds one runtime-sized array"},
+		{"readonly buffer B { uint w[4]; } b;\nvoid main() {}", "buffer B holds one runtime-sized array"},
+		{"readonly buffer B { mat4 w[]; } b;\nvoid main() {}", "mat4x4 is not a buffer element"},
+		{"readonly buffer B { bool w[]; } b;\nvoid main() {}", "bool is not a buffer element"},
+		{"readonly buffer B { uint w[]; } b;\nout vec4 c;\nvoid main() { b.w[0] = 1u; }", "is read-only"},
+		{"readonly buffer B { uint w[]; } b;\nout vec4 c;\nvoid main() { uint x = b.w.length(); }", "b.w is a buffer: read an element, b.w[i]"},
+		{"readonly buffer B { uint w[]; };\nout vec4 c;\nvoid main() { uint x = w; }", "w is a buffer: read an element, w[i]"},
+		{"readonly buffer B { uint w[]; };\nout vec4 c;\nvoid main() { uint x = w[-1]; }", "out of range"},
+	}
+	for c in cases {
+		em, eerrs, eok := compile_glsl(c[0])
+		got := "" if eok else format_errors(eerrs, context.temp_allocator)
+		destroy(em)
+		testing.expectf(t, strings.contains(got, c[1]), "%q: got errors %q", c[1], got)
+	}
+	// SkSL and Shadertoy have no buffers.
+	testing.expect(t, errors_of("readonly buffer B { uint w[]; } b;\nhalf4 main(float2 p) { return half4(1); }") != "")
+	sm, _, sok := compile_shadertoy("readonly buffer B { uint w[]; } b;\nvoid mainImage(out vec4 o, in vec2 p) { o = vec4(1); }")
+	destroy(sm)
+	testing.expect(t, !sok)
+}
+
+// gl_VertexID counts from Run_Options.first_vertex, as a draw's first
+// vertex counts on the GPU, and indexes a buffer of morph deltas.
+@(test)
+test_vertex_id :: proc(t: ^testing.T) {
+	vs := `#version 310 es
+struct Delta { vec4 position; vec4 normal; };
+readonly buffer Morph { Delta d[]; } morph;
+uniform int uBase;
+in vec3 position;
+out vec4 n;
+flat out int vid;
+void main() {
+    Delta d = morph.d[uBase + gl_VertexID];
+    n = d.normal;
+    vid = gl_VertexID;
+    gl_Position = vec4(position, 1.0) + d.position;
+}`
+	m, errs, ok := compile_glsl(vs, {stage = .Vertex})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	testing.expect_value(t, len(m.stage_inputs), 1)
+	for want in ([]string{"uint oksl_vertex_id [[vertex_id]]", "g.in_gl_VertexID = int(oksl_vertex_id);", "const device uint* oksl_buf_morph [[buffer(1)]]"}) {
+		testing.expectf(t, strings.contains(m.msl, want), "MSL lacks %s", want)
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "test_vertex_id", m.spirv)
+	}
+	// A full batch and a partial one; the deltas end before the last
+	// vertices, which read 0.
+	N :: LANES + 3
+	FIRST, BASE, DELTAS :: 5, 2, LANES + 4
+	pos := make([][3]f32, N, context.temp_allocator)
+	for &p, i in pos {
+		p = {f32(i), 0, 0}
+	}
+	deltas := make([]u32, DELTAS * 8, context.temp_allocator)
+	for i in 0 ..< DELTAS {
+		for k in 0 ..< 8 {deltas[i * 8 + k] = transmute(u32)f32(1000 * i + k)}
+	}
+	block := make([]u8, m.block_size, context.temp_allocator)
+	testing.expect(t, set_uniform(m, block, "uBase", {BASE}))
+	positions := make([][4]f32, N, context.temp_allocator)
+	record := m.varying_floats
+	vary := make([]f32, N * record, context.temp_allocator)
+	attrs := []Attribute{{raw_data(pos), size_of([3]f32), .Float3}}
+	scratch: Scratch
+	defer scratch_destroy(&scratch)
+	run_vertex(&m.program, block, attrs, N, positions, vary, &scratch, {buffers = {deltas}, first_vertex = FIRST})
+	offsets: map[string]int
+	defer delete(offsets)
+	for o in m.stage_outputs {
+		offsets[o.name] = o.offset
+	}
+	for i in 0 ..< N {
+		d := BASE + FIRST + i
+		delta := [4]f32{f32(1000 * d), f32(1000 * d + 1), f32(1000 * d + 2), f32(1000 * d + 3)} if d < DELTAS else {}
+		near(t, positions[i], [4]f32{f32(i), 0, 0, 1} + delta)
+		r := vary[i * record:]
+		testing.expect_value(t, transmute(i32)r[offsets["vid"]], i32(FIRST + i))
+		normal := [4]f32{f32(1000 * d + 4), f32(1000 * d + 5), f32(1000 * d + 6), f32(1000 * d + 7)} if d < DELTAS else {}
+		near(t, {r[offsets["n"]], r[offsets["n"] + 1], r[offsets["n"] + 2], r[offsets["n"] + 3]}, normal)
+	}
+	// Vertex shaders only.
+	fm, ferrs, fok := compile_glsl("out vec4 c;\nvoid main() { c = vec4(float(gl_VertexID)); }")
+	defer destroy(fm)
+	testing.expect(t, !fok && strings.contains(format_errors(ferrs, context.temp_allocator), "gl_VertexID"))
+}
+
+// sampler2DArray: texture, textureLod and textureSize, the layer rounded
+// to nearest even for the host's sampler; textureGrad picks the level
+// texture() picks from the same derivatives.
+@(test)
+test_sampler_array :: proc(t: ^testing.T) {
+	src := `#version 300 es
+precision highp float;
+in vec2 st;
+uniform sampler2DArray layers;
+uniform sampler2D flat2d;
+uniform float uLayer;
+layout(location = 0) out vec4 implicit;
+layout(location = 1) out vec4 explicit;
+layout(location = 2) out vec4 size;
+layout(location = 3) out vec4 grad;
+layout(location = 4) out vec4 grad2d;
+vec4 pick(sampler2DArray s, vec3 c) { return textureLod(s, c, 1.0); }
+void main() {
+    implicit = texture(layers, vec3(st, uLayer));
+    explicit = pick(layers, vec3(st, uLayer + 1.0));
+    size = vec4(textureSize(layers, 1), 0.0);
+    grad = textureGrad(layers, vec3(st, 0.0), dFdx(st), dFdy(st)) - texture(layers, vec3(st, 0.0));
+    grad2d = textureGrad(flat2d, st, dFdx(st) * 4.0, dFdy(st)) - texture(flat2d, st, 2.0);
+}`
+	m, errs, ok := compile_glsl(src)
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	for want in ([]string{"texture2d_array<float> ok_layers_tex [[texture(0)]]", "oksl_sample_bias(ok_layers_tex, ok_layers_smp, float3(g.in_st, u.ok_uLayer)", "rint(z)", "ok_layers_tex.get_array_size()", "gradient2d("}) {
+		testing.expectf(t, strings.contains(m.msl, want), "MSL lacks %s", want)
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "test_sampler_array", m.spirv)
+	}
+	sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		return {uv.x, lod, f32(layer), f32(channel)}
+	}
+	// st steps 1/16 across and 1/8 down a pixel: 4 x 4 texels of the
+	// 64x32 array (lod 2), 8 x 8 of the 128x64 2D one.
+	W, H :: 8, 2
+	targets: [5][W * H][4]f32
+	slices := [5][][4]f32{targets[0][:], targets[1][:], targets[2][:], targets[3][:], targets[4][:]}
+	varyings := []Varying{{dx = {1.0 / 16, 0, 0, 0}, dy = {0, 1.0 / 8, 0, 0}}}
+	sizes := [][3]i32{{64, 32, 6}, {128, 64, 1}}
+	block := make([]u8, m.block_size, context.temp_allocator)
+	// 2.5 rounds to 2 and 3.5 to 4 (nearest even).
+	testing.expect(t, set_uniform(m, block, "uLayer", {2.5}))
+	run_targets(&m.program, block, W, H, slices[:], temp_scratch(), {sampler = sampler, varyings = varyings, channel_sizes = sizes})
+	for i in 0 ..< W * H {
+		x := (f32(i % W) + 0.5) / 16
+		near(t, targets[0][i], {x, 2, 2, 0})
+		near(t, targets[1][i], {x, 1, 4, 0})
+		near(t, targets[2][i], {32, 16, 6, 0})
+		near(t, targets[3][i], {0, 0, 0, 0})
+		near(t, targets[4][i], {0, 0, 0, 0})
+	}
+
+	// An infinite layer saturates and NaN is 0, for the host to clamp.
+	for c in ([][2]f32{{math.inf_f32(1), f32(max(i32))}, {math.nan_f32(), 0}}) {
+		testing.expect(t, set_uniform(m, block, "uLayer", {c[0]}))
+		run_targets(&m.program, block, W, H, slices[:], temp_scratch(), {sampler = sampler, varyings = varyings, channel_sizes = sizes})
+		testing.expect_value(t, targets[0][0].z, c[1])
+	}
+
+	// The header profiles' channels are 2D.
+	sm, serrs, sok := compile_shadertoy("uniform sampler2DArray a;\nvoid mainImage(out vec4 o, in vec2 p) { o = vec4(1); }")
+	defer destroy(sm)
+	testing.expect(t, !sok && strings.contains(format_errors(serrs, context.temp_allocator), "sampler2DArray is GLSL's"))
+	// texelFetch takes a sampler2D.
+	fm, _, fok := compile_glsl("uniform sampler2DArray a;\nout vec4 c;\nvoid main() { c = texelFetch(a, ivec2(0), 0); }")
+	defer destroy(fm)
+	testing.expect(t, !fok)
+}
+
+// GLSL binds 16 samplers, the header profiles four channels; sampling
+// calls the host only for the running lanes.
+@(test)
+test_samplers :: proc(t: ^testing.T) {
+	b := strings.builder_make(context.temp_allocator)
+	for i in 0 ..< SAMPLER_COUNT {
+		fmt.sbprintf(&b, "uniform sampler2D s%d;\n", i)
+	}
+	strings.write_string(&b, "out vec4 c;\nvoid main() {\n    c = vec4(0.0);\n    if (gl_FragCoord.x > 2.0) { return; }\n")
+	for i in 0 ..< SAMPLER_COUNT {
+		fmt.sbprintf(&b, "    c += textureLod(s%d, vec2(0.5), 0.0);\n", i)
+	}
+	strings.write_string(&b, "}\n")
+	m, errs, ok := compile_glsl(strings.to_string(b))
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	testing.expect_value(t, m.num_samplers, SAMPLER_COUNT)
+	testing.expect_value(t, m.channel_names[SAMPLER_COUNT - 1], "s15")
+	if have_spirv_val() {
+		expect_valid_spirv(t, "test_samplers", m.spirv)
+	}
+	// 4x2: x > 2 returns early in half the lanes, which sample nothing.
+	count := 0
+	block := make([]u8, m.block_size, context.temp_allocator)
+	out := make([][4]f32, 8, context.temp_allocator)
+	run_f32(&m.program, block, 4, 2, out, temp_scratch(), {user = &count, sampler = proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		(^int)(user)^ += 1
+		return {f32(channel), 0, 0, 0}
+	}})
+	testing.expect_value(t, count, 4 * SAMPLER_COUNT)
+	near(t, out[0], {120, 0, 0, 0})
+	near(t, out[3], {0, 0, 0, 0})
+
+	// A discarded lane still samples for its quad (as a GPU's helper), so
+	// derivatives of the result stay the quad's.
+	dm, derrs, dok := compile_glsl("uniform sampler2D tex;\nin vec2 uv;\nout vec4 c;\nvoid main() {\n    if (int(gl_FragCoord.x) % 2 == 1) { discard; }\n    vec4 s = textureLod(tex, uv, 0.0);\n    c = vec4(dFdx(s.x), dFdy(s.y), 0.0, 1.0);\n}")
+	defer destroy(dm)
+	if testing.expectf(t, dok, "%s", format_errors(derrs, context.temp_allocator)) {
+		dblock := make([]u8, max(dm.block_size, 16), context.temp_allocator)
+		dout := make([][4]f32, 8, context.temp_allocator)
+		run_f32(&dm.program, dblock, 4, 2, dout, temp_scratch(), {sampler = proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+			return {uv.x, uv.y, 0, 1}
+		}})
+		for x in ([]int{0, 2}) {
+			near(t, dout[x], {0.25, 0.5, 0, 1})
+		}
+	}
+
+	strings.write_string(&b, "uniform sampler2D s16;\n")
+	em, eerrs, eok := compile_glsl(strings.to_string(b))
+	defer destroy(em)
+	testing.expect(t, !eok && strings.contains(format_errors(eerrs, context.temp_allocator), "at most 16 sampler2D uniforms"))
+	five := "uniform shader a;\nuniform shader b;\nuniform shader c;\nuniform shader d;\nuniform shader e;\nhalf4 main(float2 p) { return a.eval(p); }"
+	testing.expect(t, strings.contains(errors_of(five), "at most 4 shader uniforms"))
+}
+
+// Instructions of a SPIR-V module whose opcode is `op`.
+@(private = "file")
+spirv_count :: proc(words: []u32, op: u32) -> int {
+	n := 0
+	for i := 5; i < len(words); i += int(words[i] >> 16) {
+		if words[i] & 0xffff == op {
+			n += 1
+		}
+		if words[i] >> 16 == 0 {
+			break
+		}
+	}
+	return n
+}
+
+// What o3d's software rasterizer hands run_fragment and run_vertex beyond
+// colours and floats: gl_SampleMask[0] out per lane, gl_FragCoord.z in,
+// packed vertex formats; and fine derivatives in SPIR-V, as the
+// interpreter computes them.
+@(test)
+test_fragment_extras :: proc(t: ^testing.T) {
+	src := `#version 300 es
+precision highp float;
+layout(location = 0) out vec4 c;
+layout(location = 2) out ivec2 cell;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    gl_SampleMask[0] = (p.x + 3 * p.y) & 15;
+    c = vec4(gl_FragCoord.z, dFdx(gl_FragCoord.z), fwidth(gl_FragCoord.x), 1.0);
+    cell = p - 1;
+}`
+	m, errs, ok := compile_glsl(src)
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	for want in ([]string{"uint out_gl_SampleMask [[sample_mask]];", "oksl_out.out_gl_SampleMask = uint(g.out_gl_SampleMask[0]);"}) {
+		testing.expectf(t, strings.contains(m.msl, want), "MSL lacks %s", want)
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "test_fragment_extras", m.spirv)
+	}
+	// OpDPdxFine and OpFwidthFine, not OpDPdx / OpFwidth.
+	testing.expect_value(t, spirv_count(m.spirv, 210), 1)
+	testing.expect_value(t, spirv_count(m.spirv, 212), 1)
+	testing.expect_value(t, spirv_count(m.spirv, 207) + spirv_count(m.spirv, 209), 0)
+
+	Q :: LANES / 4 + 1
+	origin := make([][2]i32, Q, context.temp_allocator)
+	depth := make([]f32, Q * 4, context.temp_allocator)
+	for q in 0 ..< Q {
+		origin[q] = {i32(q * 2), 6}
+		for i in 0 ..< 4 {
+			depth[q * 4 + i] = 0.25 + 0.01 * f32(q * 2 + (i & 1))
+		}
+	}
+	// Every location: 0, nothing at 1, 2 (an ivec2, as floats).
+	out := make([][4]f32, Q * 4, context.temp_allocator)
+	none := make([][4]f32, Q * 4, context.temp_allocator)
+	cells := make([][4]f32, Q * 4, context.temp_allocator)
+	targets := [3][][4]f32{out, none, cells}
+	shaded := make([]Quad_Lanes, Q, context.temp_allocator)
+	masks := make([]u32, Q * 4, context.temp_allocator)
+	scratch: Scratch
+	defer scratch_destroy(&scratch)
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	run_fragment(&m.program, block, {count = Q, origin = origin, depth = depth}, targets[:], shaded, &scratch, {}, masks)
+	for q in 0 ..< Q {
+		for i in 0 ..< 4 {
+			x, y := q * 2 + (i & 1), 6 + (i >> 1)
+			testing.expect_value(t, masks[q * 4 + i], u32((x + 3 * y) & 15))
+			near(t, out[q * 4 + i], {depth[q * 4 + i], 0.01, 1, 1})
+			near(t, none[q * 4 + i], {0, 0, 0, 1})
+			near(t, cells[q * 4 + i], {f32(x - 1), f32(y - 1), 0, 1})
+		}
+	}
+	// Not written: every sample.
+	plain, _, pok := compile_glsl("out vec4 c;\nvoid main() { c = vec4(1.0); }")
+	defer destroy(plain)
+	testing.expect(t, pok)
+	run_fragment(&plain.program, block, {count = Q, origin = origin}, targets[:1], shaded, &scratch, {}, masks)
+	testing.expect_value(t, masks[5], ~u32(0))
+	// Fragment shaders only.
+	vm, verrs, vok := compile_glsl("void main() { gl_SampleMask[0] = 1; gl_Position = vec4(0.0); }", {stage = .Vertex})
+	defer destroy(vm)
+	testing.expect(t, !vok && strings.contains(format_errors(verrs, context.temp_allocator), "gl_SampleMask"))
+
+	// Packed attributes: colours as unorm bytes, joints as u16s.
+	vs := `#version 300 es
+in vec4 color;
+in uvec4 joints;
+out vec4 vColor;
+flat out uvec4 vJoints;
+void main() { vColor = color; vJoints = joints + 1u; gl_Position = vec4(0.0); }`
+	pm, perrs, pok2 := compile_glsl(vs, {stage = .Vertex})
+	defer destroy(pm)
+	if !testing.expectf(t, pok2, "%s", format_errors(perrs, context.temp_allocator)) {
+		return
+	}
+	Packed :: struct {
+		color:  [4]u8,
+		joints: [4]u16,
+	}
+	N :: 3
+	verts := [N]Packed{{{0, 51, 255, 128}, {0, 1, 2, 65535}}, {{255, 0, 0, 0}, {7, 8, 9, 10}}, {{1, 2, 3, 4}, {300, 0, 0, 0}}}
+	attrs: [2]Attribute
+	for a in pm.stage_inputs {
+		if a.name == "color" {attrs[a.location] = {&verts[0].color, size_of(Packed), .Ubyte4_Norm}}
+		if a.name == "joints" {attrs[a.location] = {&verts[0].joints, size_of(Packed), .Ushort4}}
+	}
+	positions: [N][4]f32
+	record := pm.varying_floats
+	vary := make([]f32, N * record, context.temp_allocator)
+	vblock := make([]u8, max(pm.block_size, 16), context.temp_allocator)
+	run_vertex(&pm.program, vblock, attrs[:], N, positions[:], vary, &scratch)
+	offsets: map[string]int
+	defer delete(offsets)
+	for o in pm.stage_outputs {
+		offsets[o.name] = o.offset
+	}
+	for v, i in verts {
+		r := vary[i * record:]
+		c := offsets["vColor"]
+		testing.expect_value(t, [4]f32{r[c], r[c + 1], r[c + 2], r[c + 3]}, [4]f32{f32(v.color[0]) / 255, f32(v.color[1]) / 255, f32(v.color[2]) / 255, f32(v.color[3]) / 255})
+		j := offsets["vJoints"]
+		got := transmute([4]u32)[4]f32{r[j], r[j + 1], r[j + 2], r[j + 3]}
+		testing.expect_value(t, got, [4]u32{u32(v.joints[0]) + 1, u32(v.joints[1]) + 1, u32(v.joints[2]) + 1, u32(v.joints[3]) + 1})
 	}
 }

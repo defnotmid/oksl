@@ -11,8 +11,9 @@ import "core:math/linalg"
 // Samples channel `channel` at normalized `uv` (origin top-left) and mip
 // level `lod`; returns RGBA. The level texture() picks is fractional and
 // may be below 0 (magnified, -inf where uv is constant): clamp it to the
-// levels the channel has.
-Sampler_Proc :: #type proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32
+// levels the channel has. `layer` is a sampler2DArray's, its coordinate
+// rounded to nearest even (0 for a sampler2D): clamp it to the layers.
+Sampler_Proc :: #type proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32
 
 Run_Options :: struct {
 	sampler:  Sampler_Proc,
@@ -24,11 +25,19 @@ Run_Options :: struct {
 	// The stage inputs by location. Absent ones are zero, except location
 	// 0, which is the layer's uv (what the layer vertex shader writes).
 	varyings: []Varying,
-	// Each channel's size in texels (level 0), for textureSize and
-	// texelFetch in GLSL shaders and the level texture() picks in fragment
-	// shaders. A channel without one is 0x0, and texture() samples it at
-	// its bias.
-	channel_sizes: [][2]i32,
+	// Each channel's size in texels (level 0) and its layers (a
+	// sampler2DArray's; ignored for a sampler2D), for textureSize and
+	// texelFetch in GLSL shaders and the level texture() and textureGrad
+	// pick. A channel without one is 0x0, and texture() samples it at its
+	// bias.
+	channel_sizes: [][3]i32,
+	// run_vertex: gl_VertexID of its first vertex (vertex i's is
+	// first_vertex + i), as a draw's first vertex counts on the GPU.
+	first_vertex: int,
+	// The storage buffers' words, in the shader's declaration order
+	// (Module.storage_buffers). A read past a buffer's words gives 0 here;
+	// on the GPU it is undefined (Metal reads past the buffer).
+	buffers: [][]u32,
 }
 
 // A stage input across the layer, as one triangle's rasterization gives
@@ -85,6 +94,8 @@ Runner :: struct {
 	masks:    []Lane_Mask,
 	uniforms: []u8,
 	opts:     Run_Options,
+	// The batch's lanes: the exec mask it starts with.
+	lanes:    Lane_Mask,
 }
 
 // A runner over `scratch` with the program's constants and uniforms loaded,
@@ -97,7 +108,7 @@ runner_begin :: proc(p: ^Program, scratch: ^Scratch, uniforms: []u8, opts: Run_O
 	if len(scratch.masks) < max(p.num_masks, 2) {
 		resize(&scratch.masks, max(p.num_masks, 2))
 	}
-	r := Runner{p, scratch.regs[:], scratch.masks[:], uniforms, opts}
+	r := Runner{p = p, regs = scratch.regs[:], masks = scratch.masks[:], uniforms = uniforms, opts = opts}
 	for c in p.consts {
 		r.regs[c[0]] = c[1]
 	}
@@ -215,11 +226,25 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 					fill_reg(&r.regs[v.slot + i32(k)], col, v.base)
 				}
 			}
-			r.masks[MASK_EXEC] = ALL_LANES
+			// The quads the region touches run, all four lanes of each (as
+			// a GPU's helpers); the batch's others sample nothing.
+			inside := bx >= start_x && by >= start_y && bx + BATCH_W <= end_x && by + BATCH_H <= end_y
+			exec := ALL_LANES
+			if !inside {
+				exec = {}
+				for lane in 0 ..< LANES {
+					qx, qy := bx + lx[lane] &~ 1, by + ly[lane] &~ 1
+					if qx + 1 >= start_x && qx < end_x && qy + 1 >= start_y && qy < end_y {
+						exec += {lane}
+					}
+				}
+			}
+			r.masks[MASK_EXEC] = exec
+			r.lanes = exec
 			r.masks[MASK_DISCARD] = {}
 			execute(&r, p.code[p.init_len:])
 			alive := ~r.masks[MASK_DISCARD]
-			full_tile := bx >= start_x && by >= start_y && bx + BATCH_W <= end_x && by + BATCH_H <= end_y && alive == ALL_LANES
+			full_tile := inside && alive == ALL_LANES
 			for v in p.outputs {
 				if v.kind != .Stage_Out {
 					continue
@@ -282,7 +307,7 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 // ---- vertices and quads: for hosts that rasterize ----------------------------------------
 
 // What an attribute's data holds per vertex: 1 to 4 components of f32, i32
-// or u32.
+// or u32, or four packed ones as SDL_GPU's formats of the name have them.
 Vertex_Format :: enum u8 {
 	Float,
 	Float2,
@@ -296,6 +321,10 @@ Vertex_Format :: enum u8 {
 	Uint2,
 	Uint3,
 	Uint4,
+	// Four u8, each / 255, as floats.
+	Ubyte4_Norm,
+	// Four u16, as uints.
+	Ushort4,
 }
 
 @(private, rodata)
@@ -311,18 +340,29 @@ Attribute :: struct {
 // Runs a vertex program over `count` vertices. `attributes[n]` feeds the
 // input at location n (absent or nil data: (0, 0, 0, 1)); `position[i]`
 // receives vertex i's gl_Position and `varyings[i * p.varying_floats:]`
-// its outputs at their offsets (Stage_Var_Info.offset), integers as
-// floats. Threads may run one program at once, each with its own scratch.
+// its outputs at their offsets (Stage_Var_Info.offset), integers (flat) as
+// their bits, so every 32-bit value is exact. Threads may run one program
+// at once, each with its own scratch.
 run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: int, position: [][4]f32, varyings: []f32, scratch: ^Scratch, opts := Run_Options{}) {
+	if count <= 0 {
+		return
+	}
 	r := runner_begin(p, scratch, uniforms, opts)
 	n := p.varying_floats
 	for first := 0; first < count; first += LANES {
 		lanes := min(count - first, LANES)
 		// Per component, one of: absent (0, 0, 0, 1), as stored, converted.
 		for v in p.inputs {
+			if v.kind == .Vertex_ID {
+				reg := &r.regs[v.slot]
+				for l in 0 ..< lanes {reg[l] = u32(i32(opts.first_vertex + first + l))}
+				continue
+			}
 			a := attributes[v.location] if int(v.location) < len(attributes) else Attribute{}
-			comps := int(a.format) % 4 + 1
-			from := FORMAT_BASES[int(a.format) / 4]
+			comps := 4
+			if a.format <= .Uint4 {
+				comps = int(a.format) % 4 + 1
+			}
 			for k in 0 ..< int(v.n) {
 				reg := &r.regs[v.slot + i32(k)]
 				if a.data == nil || k >= comps {
@@ -330,15 +370,25 @@ run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: 
 					for l in 0 ..< lanes {reg[l] = fill}
 					continue
 				}
-				words := uintptr(a.data) + uintptr(first * a.stride + k * 4)
-				if from == v.base {
-					for l in 0 ..< lanes {reg[l] = (^u32)(words + uintptr(l * a.stride))^}
-				} else {
-					for l in 0 ..< lanes {reg[l] = convert_bits((^u32)(words + uintptr(l * a.stride))^, from, v.base)}
+				vertex := uintptr(a.data) + uintptr(first * a.stride)
+				#partial switch a.format {
+				case .Ubyte4_Norm:
+					for l in 0 ..< lanes {reg[l] = convert_bits(fbits(f32((^u8)(vertex + uintptr(l * a.stride + k))^) / 255), .Float, v.base)}
+				case .Ushort4:
+					for l in 0 ..< lanes {reg[l] = convert_bits(u32((^u16)(vertex + uintptr(l * a.stride + k * 2))^), .Uint, v.base)}
+				case:
+					from := FORMAT_BASES[int(a.format) / 4]
+					words := vertex + uintptr(k * 4)
+					if from == v.base {
+						for l in 0 ..< lanes {reg[l] = (^u32)(words + uintptr(l * a.stride))^}
+					} else {
+						for l in 0 ..< lanes {reg[l] = convert_bits((^u32)(words + uintptr(l * a.stride))^, from, v.base)}
+					}
 				}
 			}
 		}
 		r.masks[MASK_EXEC] = transmute(Lane_Mask)Lane_Bits((1 << uint(lanes)) - 1)
+		r.lanes = r.masks[MASK_EXEC]
 		r.masks[MASK_DISCARD] = {}
 		execute(&r, p.code[p.init_len:])
 		for v in p.outputs {
@@ -352,11 +402,7 @@ run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: 
 			for k in 0 ..< int(v.n) {
 				reg := &r.regs[v.slot + i32(k)]
 				out := varyings[first * n + int(v.offset) + k:]
-				if v.base == .Float {
-					for l in 0 ..< lanes {out[l * n] = fval(reg[l])}
-				} else {
-					for l in 0 ..< lanes {out[l * n] = float_of(reg[l], v.base)}
-				}
+				for l in 0 ..< lanes {out[l * n] = fval(reg[l])}
 			}
 		}
 	}
@@ -378,23 +424,41 @@ Fragment_Quads :: struct {
 	helpers:      []Quad_Lanes,
 	// The interpolated varyings: float k of the record (Stage_Var_Info.offset)
 	// for lane j (quad j / 4, lane j % 4) at varyings[k * count * 4 + j].
+	// Integer (flat) inputs are their bits, as run_vertex writes them:
+	// take the provoking vertex's.
 	varyings:     []f32,
+	// Per lane (quad j / 4, lane j % 4), the rasterizer's depth: gl_FragCoord.z.
+	// Nil: 0.
+	depth:        []f32,
 }
 
 // Shades quads with a fragment program, four at a time like a GPU's 2x2
-// quads (dFdx / dFdy within each). `out[j]` receives lane j's colour at
-// location 0 (four per quad), `shaded[q]` the lanes of quad q that
-// produced one (not helpers, not discarded). Threads may run one program
-// at once, each with its own scratch.
-run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, out: [][4]f32, shaded: []Quad_Lanes, scratch: ^Scratch, opts := Run_Options{}) {
+// quads (dFdx / dFdy within each). `targets[n][j]` (nil to skip) receives
+// lane j's output at location n (four lanes per quad; integer outputs
+// converted to float, missing components 0, alpha 1, (0, 0, 0, 1) where
+// the shader writes no location n), `shaded[q]` the lanes of quad q that
+// produced one (not helpers, not discarded), and `sample_masks[j]` (when
+// given) the samples lane j keeps: gl_SampleMask[0]'s bits, or all of them
+// when the shader does not write it, for the host to AND with the
+// fragment's coverage. Threads may run one program at once, each with its
+// own scratch.
+run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, targets: [][][4]f32, shaded: []Quad_Lanes, scratch: ^Scratch, opts := Run_Options{}, sample_masks: []u32 = nil) {
+	if quads.count <= 0 {
+		return
+	}
 	r := runner_begin(p, scratch, uniforms, opts)
 	total := quads.count * 4
-	out_v: Program_Var
-	has_out := false
+	// The output at each location (n == 0: none).
+	outs: [FRAGMENT_OUTPUTS]Program_Var
+	mask_v: Program_Var
+	has_mask := false
 	for v in p.outputs {
-		if v.kind == .Stage_Out && v.location == 0 {
-			out_v = v
-			has_out = true
+		if v.kind == .Stage_Out && int(v.location) < len(outs) {
+			outs[v.location] = v
+		}
+		if v.kind == .Sample_Mask {
+			mask_v = v
+			has_mask = true
 		}
 	}
 	for first := 0; first < quads.count; first += LANES / 4 {
@@ -410,6 +474,10 @@ run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, out: []
 						for l in 0 ..< lanes {col[l] = f32(quads.origin[first + l / 4].x + i32(l & 1)) + 0.5}
 					case 1:
 						for l in 0 ..< lanes {col[l] = f32(quads.origin[first + l / 4].y + i32((l >> 1) & 1)) + 0.5}
+					case 2:
+						if quads.depth != nil {
+							for l in 0 ..< lanes {col[l] = quads.depth[first * 4 + l]}
+						}
 					case 3:
 						for l in 0 ..< lanes {col[l] = 1}
 					}
@@ -420,13 +488,18 @@ run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, out: []
 						for l in 0 ..< lanes {col[l] = 1 if quads.front_facing[first + l / 4] else 0}
 					}
 				case .Stage_In:
+					// The record's bits: floats, and integers as run_vertex
+					// writes them.
 					src := quads.varyings[(int(v.offset) + k) * total + first * 4:]
-					for l in 0 ..< lanes {col[l] = src[l]}
+					reg := fl(&r.regs[v.slot + i32(k)])
+					for l in 0 ..< lanes {reg[l] = src[l]}
+					continue
 				}
 				fill_reg(&r.regs[v.slot + i32(k)], col, v.base)
 			}
 		}
 		r.masks[MASK_EXEC] = transmute(Lane_Mask)Lane_Bits((1 << uint(lanes)) - 1)
+		r.lanes = r.masks[MASK_EXEC]
 		r.masks[MASK_DISCARD] = {}
 		execute(&r, p.code[p.init_len:])
 		alive := ~r.masks[MASK_DISCARD]
@@ -440,13 +513,22 @@ run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, out: []
 					continue
 				}
 				lanes_out += {i}
-				c := [4]f32{0, 0, 0, 1}
-				if has_out {
-					for k in 0 ..< int(out_v.n) {
-						c[k] = float_of(r.regs[out_v.slot + i32(k)][l], out_v.base)
+				for target, n in targets {
+					if target == nil {
+						continue
 					}
+					c := [4]f32{0, 0, 0, 1}
+					if n < len(outs) {
+						v := outs[n]
+						for k in 0 ..< int(v.n) {
+							c[k] = float_of(r.regs[v.slot + i32(k)][l], v.base)
+						}
+					}
+					target[q * 4 + i] = c
 				}
-				out[q * 4 + i] = c
+				if sample_masks != nil {
+					sample_masks[q * 4 + i] = r.regs[mask_v.slot][l] if has_mask else ~u32(0)
+				}
 			}
 			shaded[q] = lanes_out
 		}
@@ -1310,7 +1392,19 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 				}
 			}
 		case .Texture, .Texture_Bias:
-			sample_texture(r, in_)
+			sample_texture(r, in_, exec)
+		case .Load_Buf:
+			// The word index in 32 bits, wrapping as SPIR-V's and Metal's
+			// do; past the host's words, 0.
+			words := r.opts.buffers[in_.k] if int(in_.k) < len(r.opts.buffers) else nil
+			idx := &regs[in_.a]
+			for i in 0 ..< i32(in_.n) {
+				d := &regs[in_.dst + i]
+				for l in 0 ..< LANES {
+					w := idx[l] * u32(in_.b) + u32(in_.c + i)
+					d[l] = words[w] if int(w) < len(words) else 0
+				}
+			}
 		case .Texture_Size:
 			size := channel_size(r, int(in_.k))
 			for l in 0 ..< LANES {
@@ -1318,6 +1412,9 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 				lod := regs[a][l]
 				for i in 0 ..< i32(2) {
 					regs[dst + i][l] = u32(max(size[i] >> lod, 1) if size[i] > 0 else 0)
+				}
+				if in_.n == 3 {
+					regs[dst + 2][l] = u32(size.z)
 				}
 			}
 		case .Mask_Copy:
@@ -1355,39 +1452,55 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 
 // A sample: dst = channel k at uv a, lod b (Texture_Bias: b plus the
 // level the uv derivatives pick in the channel's texels, one per quad from
-// its top row and left column, as GPUs' texture units pick it).
+// its top row and left column, as GPUs' texture units pick it). Quads
+// with a running lane (`exec`) are sampled; the others read 0.
 @(private)
-sample_texture :: proc(r: ^Runner, in_: Instr) {
+sample_texture :: proc(r: ^Runner, in_: Instr, exec: Lane_Mask) {
 	regs := r.regs
 	ch := int(in_.k)
 	dst, a, b := in_.dst, in_.a, in_.b
-	lod := fl(&regs[b])^
-	if size := channel_size(r, ch); in_.op == .Texture_Bias && size != {} {
-		w, h := f32(size.x), f32(size.y)
-		u, v := fl(&regs[a]), fl(&regs[a + 1])
-		for o := 0; o < LANES; o += 4 {
+	for i in 0 ..< i32(4) {
+		regs[dst + i] = {}
+	}
+	if r.opts.sampler == nil || ch < 0 {
+		return
+	}
+	size := channel_size(r, ch)
+	lod := fl(&regs[b])
+	u, v := fl(&regs[a]), fl(&regs[a + 1])
+	running, have := transmute(Lane_Bits)exec, transmute(Lane_Bits)r.lanes
+	for o := 0; o < LANES; o += 4 {
+		// A quad with a running lane samples all four lanes the batch has,
+		// as a GPU quad's helpers do, so derivatives of the result are the
+		// quad's like any temporary's; an idle quad samples nothing.
+		if (running >> uint(o)) & 0xf == 0 {
+			continue
+		}
+		level: f32 = 0
+		if in_.op == .Texture_Bias && size.xy != {} {
+			w, h := f32(size.x), f32(size.y)
 			dx := [2]f32{(u[o + 1] - u[o]) * w, (v[o + 1] - v[o]) * h}
 			dy := [2]f32{(u[o + 2] - u[o]) * w, (v[o + 2] - v[o]) * h}
-			level := 0.5 * math.log2(max(dx.x * dx.x + dx.y * dx.y, dy.x * dy.x + dy.y * dy.y))
-			for k in 0 ..< 4 {
-				lod[o + k] += level
+			level = 0.5 * math.log2(max(dx.x * dx.x + dx.y * dx.y, dy.x * dy.x + dy.y * dy.y))
+		}
+		for l in o ..< o + 4 {
+			if (have >> uint(l)) & 1 == 0 {
+				continue
 			}
-		}
-	}
-	for l in 0 ..< LANES {
-		c: [4]f32
-		if r.opts.sampler != nil && ch >= 0 {
-			c = r.opts.sampler(r.opts.user, ch, {fval(regs[a][l]), fval(regs[a + 1][l])}, lod[l])
-		}
-		for i in 0 ..< 4 {
-			regs[dst + i32(i)][l] = fbits(c[i])
+			// The layer as GPUs take it, rounded to nearest even (NaN and
+			// out-of-range values as F_To_I takes them).
+			layer := int(f_to_i(fval(fn1(fval(regs[a + 2][l]), .Round_Even)))) if in_.n == 3 else 0
+			c := r.opts.sampler(r.opts.user, ch, {u[l], v[l]}, lod[l] + level, layer)
+			for i in 0 ..< i32(4) {
+				regs[dst + i][l] = fbits(c[i])
+			}
 		}
 	}
 }
 
 // Channel ch's size from the host (0x0 without one).
 @(private)
-channel_size :: #force_inline proc "contextless" (r: ^Runner, ch: int) -> [2]i32 {
+channel_size :: #force_inline proc "contextless" (r: ^Runner, ch: int) -> [3]i32 {
 	return r.opts.channel_sizes[ch] if ch >= 0 && ch < len(r.opts.channel_sizes) else {}
 }
 

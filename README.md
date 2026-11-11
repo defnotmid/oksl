@@ -52,7 +52,8 @@ if !ok {
 	return
 }
 // GPU: SDL_CreateGPUShader with m.spirv (entry oksl.SPIRV_ENTRY) or m.msl
-// (entry oksl.MSL_ENTRY), num_samplers = m.num_samplers, num_uniform_buffers = 1;
+// (entry oksl.MSL_ENTRY), num_samplers = m.num_samplers, num_uniform_buffers =
+// m.num_uniform_buffers, num_storage_buffers = len(m.storage_buffers);
 // Vertex shader: oksl.compile(oksl.LAYER_VERTEX_GLSL, {profile = .Glsl, stage = .Vertex}), once.
 // CPU:
 block := make([]u8, m.block_size)
@@ -210,15 +211,40 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   location, flat).
 - **gl_FragCoord:** the fragment's window position, origin top-left
   (Vulkan's and Metal's), pixel centres at .5. **gl_FrontFacing:** whether
-  the triangle faces the camera.
+  the triangle faces the camera. **gl_VertexID** (vertex shaders): the
+  vertex's index in the draw, its first vertex included (Vulkan's
+  VertexIndex, Metal's `vertex_id`); on the CPU, `Run_Options.first_vertex`
+  plus the vertex's index in `run_vertex`. **gl_SampleMask[0]** (fragment
+  shaders): the samples of the fragment's coverage it keeps (SPIR-V's
+  SampleMask, Metal's `sample_mask`; `run_fragment`'s `sample_masks`).
+  `dFdx`, `dFdy` and `fwidth` are fine derivatives, per row and column of
+  the quad, as the interpreter computes them (SPIR-V's `OpDPdxFine` and
+  friends: a driver may take plain `OpDPdx` coarse).
 - **Uniforms and samplers:** nothing is declared up front. The uniform
   block holds only the uniforms the shader uses, std140 from offset 0, in
   declaration order (none: no block); `uniform_offset` and `set_uniform`
   find them by name, and unused or undeclared names are not found.
-  `uniform sampler2D`s take channels in declaration order. `texture` uv
-  starts at the top left, as in Vulkan (no flip). `textureSize` queries
-  the image (on the CPU, the size the host gives) and `texelFetch` samples
-  the texel's centre at its level, so both take sampler parameters too.
+  Up to 16 `uniform sampler2D`s and `sampler2DArray`s take channels in
+  declaration order (`Module.channel_arrays` marks the arrays). `texture`
+  uv starts at the top left, as in Vulkan (no flip). `textureSize` queries
+  the image (on the CPU, the size the host gives; an array's z is its
+  layers) and `texelFetch` samples the texel's centre at its level, so
+  both take sampler parameters too. A `sampler2DArray` takes `vec3(uv,
+  layer)` in `texture`, `textureLod` and `textureGrad` (the layer rounded
+  to nearest even and clamped, as GPUs take it); `texelFetch` takes 2D
+  samplers only. `textureGrad(s, uv, dPdx, dPdy)` samples at the level
+  those derivatives pick, in any stage.
+- **Storage buffers:** read-only, GLSL ES 3.1's block with one
+  runtime-sized array: `layout(std430) readonly buffer Rows { Row rows[];
+  } rowBuf;` read as `rowBuf.rows[i]` (or `rows[i]` without an instance
+  name), at any int or uint index, in any function and either stage.
+  Elements are float, int and uint scalars and vectors and structs of
+  them, laid out std430 (`layout(std430)` is optional; other packings,
+  writes, sized arrays, bools and matrices are diagnosed).
+  `Module.storage_buffers` gives each block's name, element type and
+  stride in declaration order, the order they bind in. Word addresses are
+  32-bit (they wrap) on every backend; a read past the buffer gives 0 on
+  the CPU and is undefined on the GPU (Metal reads past it).
 - **Taps:** `Options.taps` (in a pipeline, the vertex stage's) runs what
   a vertex shader's `main` does toward `gl_Position` again for other
   environments, such as a motion blur's shutter opening, once per tap and
@@ -241,7 +267,9 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   duplicate or out-of-range locations, integer interpolated variables
   without `flat`, initializers on stage variables, writes to inputs,
   gl_FragCoord and gl_FrontFacing, fragment-only features (`discard`,
-  derivatives, gl_FragCoord) in vertex shaders, taps outside a vertex
+  derivatives, gl_FragCoord, gl_SampleMask) in vertex shaders, gl_VertexID
+  in fragment shaders, `sampler2DArray` in the Shadertoy profile (whose channels are
+  2D), more than 16 samplers, taps outside a vertex
   shader, a tap position, attribute or twin not declared as one, a
   position the shader uses itself, and two taps writing one position.
 
@@ -329,7 +357,8 @@ Bools are stored as 4-byte uints. `write_builtins`, `write_input` (one
 row, by index) and `set_uniform` fill a block.
 `inputs_used` and `channels_used`/`num_samplers` say what the shader
 reads, and `channel_names[n]` names what channel n binds (a `uniform
-shader`, `iChannelN` or a `uniform sampler2D`).
+shader`, `iChannelN` or a `uniform sampler2D`). SkSL and Shadertoy have
+four channels (the rows above); GLSL shaders have 16 (`SAMPLER_COUNT`).
 
 ### Bindings (SDL_GPU)
 
@@ -337,21 +366,27 @@ shader`, `iChannelN` or a `uniform sampler2D`).
   locations (the layer profiles: `vec2 uv` at location 0, 0..1 across the
   layer, origin top-left, and the `vec4` colour at location 0);
   gl_FragCoord as the `FragCoord` built-in; integer inputs `Flat`; channel
-  n as a combined image sampler at set 2, binding n; the uniform block at
-  set 3, binding 0. `OriginUpperLeft`.
+  n as a combined image sampler at set 2, binding n (an arrayed image for a
+  `sampler2DArray`); storage buffer i at set 2, binding `num_samplers + i`
+  (a `BufferBlock` of `uint` words, read-only); the uniform block at set 3,
+  binding 0. `OriginUpperLeft`.
 - **MSL:** fragment entry `oksl_main`, returning `Oksl_Out` (output N as
   `[[color(N)]]`); input N read as `[[user(locnN)]]` (SPIRV-Cross's names,
   so SDL_shadercross vertex shaders match), gl_FragCoord as
-  `[[position]]`; channel n at `[[texture(n)]]` / `[[sampler(n)]]`; the
-  block at `[[buffer(0)]]`. Its struct is padded to the same std140
+  `[[position]]`; channel n at `[[texture(n)]]` / `[[sampler(n)]]`
+  (`texture2d_array` for a `sampler2DArray`); the block at
+  `[[buffer(0)]]`, storage buffer i at `[[buffer(num_uniform_buffers +
+  i)]]` as `const device uint*`. Its struct is padded to the same std140
   offsets.
 - **Vertex shaders:** SPIR-V entry `main` (Vertex), attributes at their
   locations, `gl_Position` as the `Position` built-in, varyings at their
-  locations; samplers at set 0, the uniform block at set 1, binding 0.
-  MSL: `vertex Oksl_Out oksl_main` with attributes as `[[attribute(N)]]`
-  of a `[[stage_in]]` struct, varyings as `[[user(locnN)]]` and the
-  position as `[[position]]`; the block at `[[buffer(0)]]`. One vertex
-  uniform block (`num_uniform_buffers` 1, or 0 when `block_size` is 0).
+  locations, `gl_VertexID` as `VertexIndex`; samplers then storage buffers
+  at set 0, the uniform block at set 1, binding 0. MSL: `vertex Oksl_Out
+  oksl_main` with attributes as `[[attribute(N)]]` of a `[[stage_in]]`
+  struct, `gl_VertexID` as a `[[vertex_id]]` parameter, varyings as
+  `[[user(locnN)]]` and the position as `[[position]]`; the block at
+  `[[buffer(0)]]`, storage buffers after it. One vertex uniform block
+  (`Module.num_uniform_buffers` 1, or 0 when there is none).
 - **Layer vertex shader** (`LAYER_VERTEX_GLSL`, the source of
   `testdata/layer.vert`, which a host compiles once like any vertex
   shader: `compile(LAYER_VERTEX_GLSL, {profile = .Glsl, stage =
@@ -374,9 +409,12 @@ RGBA8, or `run_f32` for float RGBA, from the output at location 0;
 `run_targets` writes every output, one float target per location. A
 `Scratch` (registers and masks) grows to the largest program it has run,
 so runs that reuse one allocate nothing. `Run_Options` takes a
-sampler callback (`proc(user, channel, uv, lod) -> [4]f32`; `.eval` passes
-lod 0), the channels' sizes in texels, an optional sub-rectangle and the
-stage inputs by location
+sampler callback (`proc(user, channel, uv, lod, layer) -> [4]f32`; `.eval`
+passes lod 0; `layer` is a `sampler2DArray`'s, rounded to nearest even,
+for the host to clamp to its layers), the channels' sizes in texels (and
+layers), the storage buffers' words (`buffers`, one `[]u32` per buffer in
+declaration order; a read past one gives 0), an optional sub-rectangle and
+the stage inputs by location
 (`Varying`: per component `a + dx * x + dy * y` at pixel centres, what one
 triangle's rasterization gives). An input without one is zero, except
 location 0, which gets the layer's uv as the layer vertex shader writes it.
@@ -387,14 +425,19 @@ own clipping, coverage and depth), two calls run a pipeline's stages:
 ```odin
 scratch: oksl.Scratch                      // one per thread; a Program is only read
 defer oksl.scratch_destroy(&scratch)
-// Vertices: attribute n from (pointer, byte stride, format); out come clip
+// Vertices: attribute n from (pointer, byte stride, format: 1 to 4 f32, i32
+// or u32, Ubyte4_Norm or Ushort4, as SDL_GPU's formats); out come clip
 // positions and each vertex's varyings, `varying_floats` per vertex at the
-// offsets Stage_Var_Info.offset gives (flat ones flagged).
+// offsets Stage_Var_Info.offset gives (flat ones flagged; integers as their
+// bits, so a fragment's flat integer input is its provoking vertex's bits).
 oksl.run_vertex(&p.vertex.program, vblock, attrs, count, positions, varyings, &scratch)
-// Fragments: the host's 2x2 quads (top-left pixel, facing, helper lanes)
-// with their interpolated varyings, one float of the record at a time
-// across every lane; out come a colour per lane and the lanes shaded.
-oksl.run_fragment(&p.fragment.program, fblock, {count = n, origin = origins, front_facing = facing, helpers = helpers, varyings = soa}, colours, shaded, &scratch)
+// Fragments: the host's 2x2 quads (top-left pixel, facing, helper lanes,
+// optionally each lane's depth for gl_FragCoord.z) with their interpolated
+// varyings, one float of the record at a time across every lane; out come
+// every output per lane (targets[n] for location n, nil to skip), the
+// lanes shaded and, when given, each lane's kept samples (gl_SampleMask[0],
+// all ones when unwritten: AND it with coverage).
+oksl.run_fragment(&p.fragment.program, fblock, {count = n, origin = origins, front_facing = facing, helpers = helpers, varyings = soa, depth = z}, targets, shaded, &scratch, {}, sample_masks)
 ```
 
 `run_fragment` shades `LANES / 4` (16) quads at a time, each quad's
@@ -544,15 +587,16 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
   (`run_vertex`, `run_fragment`); no compute stage
   (`Stage.Compute` is reserved). Programs run their passes as fragment
   shaders and the host owns the float targets and swaps them each frame.
-  GLSL shaders have no `gl_FragDepth`, `gl_VertexID` / `gl_InstanceID`,
-  interface blocks or array stage variables.
+  GLSL shaders have no `gl_FragDepth` or `gl_InstanceID` (draw instances
+  as vertex ranges and divide `gl_VertexID`), no uniform blocks, no
+  writable storage buffers or images, and no array stage variables.
 - **MSL is compiled only on macOS:** Metal has no Linux compiler, so on
   Linux the emitter is checked textually; on macOS `tools/gpu_parity` runs
   the MSL through SDL_GPU's Metal driver against the CPU interpreter.
 - **No DXIL:** on Windows, run SDL_GPU's Vulkan driver.
 - **Not supported:** struct uniforms, arrays of arrays,
-  `colorFilter` / `blender` children; in GLSL, cubemap / 3D / array
-  samplers and Shadertoy's keyboard, sound and webcam inputs. Children
+  `colorFilter` / `blender` children; in GLSL, cubemap and 3D samplers,
+  arrays of samplers and Shadertoy's keyboard, sound and webcam inputs. Children
   and channels are images bound by the
   host (no shader trees); `sk_FragCoord` is layer-local.
 - **Precision:** transcendental functions differ by a few ulps between
@@ -560,6 +604,11 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
   can flip. `tools/gpu_parity` reports these as threshold edges.
 - **Runaway loops:** the interpreter has no iteration cap, so a shader
   that loops forever hangs it, as it would hang a GPU.
+- **Uniform blocks past 4 KB on Vulkan:** SDL_GPU's Vulkan backend binds
+  4,096 bytes of each uniform push (`MAX_UBO_SECTION_SIZE` in SDL 3.4), so
+  a larger block (`Module.block_size`) reads zeros beyond it there, with
+  no error; Metal and the CPU see all of it. Put large tables in storage
+  buffers.
 
 ## Roadmap
 

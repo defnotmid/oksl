@@ -79,6 +79,8 @@ Builtin :: enum u8 {
 	Texture_Lod,
 	Texture,
 	Texture_Size,
+	// textureGrad: at the level the given uv derivatives pick.
+	Texture_Grad,
 	Float_Bits_To_Int,
 	Float_Bits_To_Uint,
 	Int_Bits_To_Float,
@@ -120,10 +122,13 @@ Builtin_Args :: enum u8 {
 	// equal, notEqual: vectors of one type (unified).
 	Vector_Equal,
 	Bool_Vector,
-	// sampler, vec2 uv, float lod (or bias).
+	// sampler, vec2 uv (vec3: uv and layer of a sampler2DArray), float lod
+	// (or bias).
 	Texture_Lod,
 	// sampler, int or uint lod.
 	Texture_Size,
+	// sampler, uv as Texture_Lod, vec2 dPdx and dPdy.
+	Texture_Grad,
 }
 
 // A built-in's result type, from its (checked) arguments.
@@ -141,7 +146,8 @@ Builtin_Result :: enum u8 {
 	// outerProduct(c, r): columns of c, one per component of r.
 	Outer,
 	Transposed,
-	Ivec2,
+	// textureSize: ivec2, ivec3 (with the layers) for a sampler2DArray.
+	Image_Size,
 }
 
 Builtin_Info :: struct {
@@ -233,7 +239,8 @@ BUILTINS := [Builtin]Builtin_Info {
 	.Not                = {"not", 1, .Bool_Vector, .First, {}, {}, {}},
 	.Texture_Lod        = {"", 3, .Texture_Lod, .Vec4, {}, {}, {}},
 	.Texture            = {"", 3, .Texture_Lod, .Vec4, {}, {}, {.Derivatives}},
-	.Texture_Size       = {"", 2, .Texture_Size, .Ivec2, {}, {}, {}},
+	.Texture_Size       = {"", 2, .Texture_Size, .Image_Size, {}, {}, {}},
+	.Texture_Grad       = {"", 4, .Texture_Grad, .Vec4, {}, {}, {}},
 	.Float_Bits_To_Int  = {"floatBitsToInt", 1, .Float_Exact, .Int_Shape, {}, {}, {}},
 	.Float_Bits_To_Uint = {"floatBitsToUint", 1, .Float_Exact, .Uint_Shape, {}, {}, {}},
 	.Int_Bits_To_Float  = {"intBitsToFloat", 1, .Exact_Base, .Float_Shape, {}, .Int, {}},

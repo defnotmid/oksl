@@ -15,6 +15,7 @@ Var_Id :: distinct u32
 Spec_Id :: distinct u32
 Func_Decl_Id :: distinct u32
 Struct_Decl_Id :: distinct u32
+Buffer_Decl_Id :: distinct u32
 Sym_Id :: distinct u32
 Func_Id :: distinct u32
 Type_Id :: distinct u32
@@ -55,6 +56,8 @@ Expr_Kind :: enum u8 {
 	Comma,
 	// Checker-added conversion of a to the expression's type.
 	Convert,
+	// Checker-made from a[b] on a buffer: element b of buffer `sym`.
+	Buffer_Load,
 }
 
 Call_Kind :: enum u8 {
@@ -190,16 +193,32 @@ Struct_Decl :: struct {
 	fields: Range,
 }
 
+// `readonly buffer Block { T name[]; } instance;`: its members are
+// Var_Decls in `Unit.vars` (the checker takes one runtime-sized array).
+Buffer_Decl :: struct {
+	pos:      Pos,
+	block:    string,
+	// "" when the members are global names.
+	instance: string,
+	// layout(...)'s packing ("" when none is given).
+	packing:  string,
+	readonly: bool,
+	// Into `Unit.vars` directly.
+	members:  Range,
+}
+
 Top_Kind :: enum u8 {
 	Func,
 	Vars,
 	Struct,
+	Buffer,
 }
 
 Top :: struct {
 	kind:   Top_Kind,
 	fn:     Func_Decl_Id,
 	strukt: Struct_Decl_Id,
+	buffer: Buffer_Decl_Id,
 	// Declarators (Var_Ids).
 	vars:   Range,
 }
@@ -216,6 +235,10 @@ Storage :: enum u8 {
 	Builtin_Uniform,
 	// A `uniform shader` child or a sampler (index: its channel).
 	Channel,
+	// A read-only storage buffer's runtime-sized array, typed as its
+	// element (index: the buffer's place among the shader's buffers). Only
+	// Buffer_Load reads it.
+	Buffer,
 	// The stage's inputs and outputs (Checked.interface).
 	Stage_In,
 	Stage_Out,
@@ -285,6 +308,7 @@ Unit :: struct {
 	params:       [dynamic]Param,
 	func_decls:   [dynamic]Func_Decl,
 	struct_decls: [dynamic]Struct_Decl,
+	buffer_decls: [dynamic]Buffer_Decl,
 	tops:         [dynamic]Top,
 	ids:          [dynamic]u32,
 	// Semantics.
@@ -316,6 +340,7 @@ unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass 
 	u.params = make([dynamic]Param)
 	u.func_decls = make([dynamic]Func_Decl)
 	u.struct_decls = make([dynamic]Struct_Decl)
+	u.buffer_decls = make([dynamic]Buffer_Decl)
 	u.tops = make([dynamic]Top)
 	u.ids = make([dynamic]u32)
 	u.types = make([dynamic]Type)
@@ -354,6 +379,7 @@ unit_copy_syntax :: proc(dst, src: ^Unit) {
 	copy_array(&dst.params, src.params)
 	copy_array(&dst.func_decls, src.func_decls)
 	copy_array(&dst.struct_decls, src.struct_decls)
+	copy_array(&dst.buffer_decls, src.buffer_decls)
 	copy_array(&dst.tops, src.tops)
 	copy_array(&dst.ids, src.ids)
 }

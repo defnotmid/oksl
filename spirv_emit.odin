@@ -271,7 +271,7 @@ emit_lvalue :: proc(s: ^Spv, id: Expr_Id) -> LValue {
 			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_OUTPUT}
 		case .Local, .Param:
 			return {ptr = local_sym(s, e.sym), type = t, storage = SC_FUNCTION}
-		case .Channel:
+		case .Channel, .Buffer:
 		}
 	case .Index:
 		base := emit_lvalue(s, e.a)
@@ -408,6 +408,15 @@ emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		return load_lvalue(s, emit_lvalue(s, id))
 	case .Convert:
 		return convert(s, emit_expr(s, e.a), expr_type(u, e.a), t)
+	case .Buffer_Load:
+		t_uint := type_id(s, T_UINT)
+		idx := emit_expr(s, e.b)
+		if expr_type(u, e.b).base == .Int {
+			idx = unop(s, .Bitcast, t_uint, idx)
+		}
+		size, _, _ := std430(u, t)
+		base := binop_raw(s, .I_Mul, t_uint, idx, const_u32(s, u32(size / 4)))
+		return buffer_value(s, s.sym_ids[e.sym], t, base, 0)
 	case .Comma:
 		emit_expr(s, e.a)
 		return emit_expr(s, e.b)
@@ -718,6 +727,10 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		return ext(s, rt, op, ..args)
 	}
 	if op := SPV_OP_BUILTINS[b][at.base]; op != Op(0) {
+		if (op == .D_Pdx_Fine || op == .D_Pdy_Fine || op == .Fwidth_Fine) && !s.derivative_control {
+			inst(&s.caps, .Capability, 51) // DerivativeControl
+			s.derivative_control = true
+		}
 		r := new_id(s)
 		words := make([dynamic]u32, context.temp_allocator)
 		append(&words, rt, r)
@@ -745,15 +758,21 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		return per_column(s, t, args[0], args[1], proc(s: ^Spv, ct: u32, a, b: u32) -> u32 {return binop_raw(s, .F_Mul, ct, a, b)})
 	case .Texture_Lod:
 		img := new_id(s)
-		inst(&s.body, .Load, sampled_image_type(s), img, args[0])
+		inst(&s.body, .Load, type_id(s, at), img, args[0])
 		r := new_id(s)
 		inst(&s.body, .Image_Sample_Explicit_Lod, rt, r, img, args[1], 0x2, args[2]) // Lod
 		return r
 	case .Texture:
 		img := new_id(s)
-		inst(&s.body, .Load, sampled_image_type(s), img, args[0])
+		inst(&s.body, .Load, type_id(s, at), img, args[0])
 		r := new_id(s)
 		inst(&s.body, .Image_Sample_Implicit_Lod, rt, r, img, args[1], 0x1, args[2]) // Bias
+		return r
+	case .Texture_Grad:
+		img := new_id(s)
+		inst(&s.body, .Load, type_id(s, at), img, args[0])
+		r := new_id(s)
+		inst(&s.body, .Image_Sample_Explicit_Lod, rt, r, img, args[1], 0x4, args[2], args[3]) // Grad
 		return r
 	case .Texture_Size:
 		if !s.image_query {
@@ -761,9 +780,9 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 			s.image_query = true
 		}
 		sampled := new_id(s)
-		inst(&s.body, .Load, sampled_image_type(s), sampled, args[0])
+		inst(&s.body, .Load, type_id(s, at), sampled, args[0])
 		img := new_id(s)
-		inst(&s.body, .Image, s.t_image, img, sampled)
+		inst(&s.body, .Image, s.t_image[int(at == T_SAMPLER_ARRAY)], img, sampled)
 		r := new_id(s)
 		inst(&s.body, .Image_Query_Size_Lod, rt, r, img, args[1])
 		return r
@@ -839,9 +858,11 @@ SPV_OP_BUILTINS := #partial [Builtin][Base]Op {
 	.Any                = #partial {.Bool = .Any},
 	.All                = #partial {.Bool = .All},
 	.Not                = #partial {.Bool = .Logical_Not},
-	.Dfdx               = #partial {.Float = .D_Pdx},
-	.Dfdy               = #partial {.Float = .D_Pdy},
-	.Fwidth             = #partial {.Float = .Fwidth},
+	// Fine (per row and column of the quad), as the interpreter's: a
+	// driver may take plain OpDPdx coarse.
+	.Dfdx               = #partial {.Float = .D_Pdx_Fine},
+	.Dfdy               = #partial {.Float = .D_Pdy_Fine},
+	.Fwidth             = #partial {.Float = .Fwidth_Fine},
 	.Float_Bits_To_Int  = #partial {.Float = .Bitcast},
 	.Float_Bits_To_Uint = #partial {.Float = .Bitcast},
 	.Int_Bits_To_Float  = #partial {.Int = .Bitcast},

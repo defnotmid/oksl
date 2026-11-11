@@ -75,8 +75,18 @@ Stage_Var_Info :: struct {
 	flat:     bool,
 	// Varyings (vertex outputs, fragment inputs): the float offset in the
 	// CPU interpreter's record of `Module.varying_floats` per vertex
-	// (run_vertex writes it, run_fragment reads it, interpolated).
+	// (run_vertex writes it, run_fragment reads it, interpolated; integer
+	// varyings are flat and travel as their bits).
 	offset:   int,
+}
+
+// A read-only storage buffer: element i of `element` (std430) at byte
+// i * stride.
+Storage_Buffer_Info :: struct {
+	// The block's name (`buffer Name { ... }`).
+	name:    string,
+	element: Type,
+	stride:  int,
 }
 
 Module :: struct {
@@ -94,13 +104,21 @@ Module :: struct {
 	// The inputs (INPUTS rows) the shader reads.
 	inputs_used:   Inputs,
 	// Channels the shader samples; bind at least `num_samplers` samplers.
-	channels_used: bit_set[0 ..< CHANNEL_COUNT],
+	channels_used: bit_set[0 ..< SAMPLER_COUNT],
+	// The channels that are sampler2DArrays: bind 2D array textures.
+	channel_arrays: bit_set[0 ..< SAMPLER_COUNT],
 	num_samplers:  int,
 	// The name each channel binds by: a `uniform shader` child, "iChannelN"
 	// or a `uniform sampler2D` ("" when unused).
-	channel_names: [CHANNEL_COUNT]string,
+	channel_names: [SAMPLER_COUNT]string,
 	// Where the source first names each channel (for diagnostics).
-	channel_pos:   [CHANNEL_COUNT]Pos,
+	channel_pos:   [SAMPLER_COUNT]Pos,
+	// 1 with a uniform block, else 0: SDL_GPU's num_uniform_buffers, which
+	// Metal's storage buffer indices follow.
+	num_uniform_buffers: int,
+	// Storage buffers in binding order, after the samplers: bind
+	// len(storage_buffers) (Run_Options.buffers on the CPU).
+	storage_buffers: []Storage_Buffer_Info,
 	profile:       Profile,
 	stage:         Stage,
 	// Floats per vertex in the varyings' record (Stage_Var_Info.offset).
@@ -238,6 +256,9 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 			continue
 		}
 		m.channels_used += {i}
+		if sym_type(u, ch) == T_SAMPLER_ARRAY {
+			m.channel_arrays += {i}
+		}
 		m.num_samplers = i + 1
 		m.channel_names[i] = strings.clone(u.syms[ch].name)
 		// Where the source first names the channel.
@@ -249,9 +270,17 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 			}
 		}
 	}
+	buffers := make([]Storage_Buffer_Info, len(c.buffers))
+	for b, i in c.buffers {
+		t := sym_type(u, b)
+		stride, _, _ := std430(u, t)
+		buffers[i] = {strings.clone(u.buffer_decls[c.buffer_decls[i]].block), t, stride}
+	}
+	m.storage_buffers = buffers
 	inputs := make([dynamic]Stage_Var_Info)
 	outputs := make([dynamic]Stage_Var_Info)
 	for row in c.interface {
+		m.num_uniform_buffers += 1 if row.kind == .Uniform_Block else 0
 		if row.kind == .Stage_In || row.kind == .Stage_Out {
 			s := u.syms[row.sym]
 			info := Stage_Var_Info{strings.clone(s.name), ty(u, s.type), int(row.binding), row.flat, int(row.offset)}

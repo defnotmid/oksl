@@ -27,6 +27,7 @@ Op :: enum u32 {
 	Type_Image               = 25,
 	Type_Sampled_Image       = 27,
 	Type_Array               = 28,
+	Type_Runtime_Array       = 29,
 	Type_Struct              = 30,
 	Type_Pointer             = 32,
 	Type_Function            = 33,
@@ -113,9 +114,9 @@ Op :: enum u32 {
 	Bitwise_Xor              = 198,
 	Bitwise_And              = 199,
 	Not                      = 200,
-	D_Pdx                    = 207,
-	D_Pdy                    = 208,
-	Fwidth                   = 209,
+	D_Pdx_Fine               = 210,
+	D_Pdy_Fine               = 211,
+	Fwidth_Fine              = 212,
 	Phi                      = 245,
 	Loop_Merge               = 246,
 	Selection_Merge          = 247,
@@ -203,6 +204,8 @@ SC_FUNCTION :: 7
 @(private)
 DEC_BLOCK :: 2
 @(private)
+DEC_BUFFER_BLOCK :: 3
+@(private)
 DEC_COL_MAJOR :: 5
 @(private)
 DEC_ARRAY_STRIDE :: 6
@@ -212,6 +215,8 @@ DEC_MATRIX_STRIDE :: 7
 DEC_BUILTIN :: 11
 @(private)
 DEC_FLAT :: 14
+@(private)
+DEC_NON_WRITABLE :: 24
 @(private)
 DEC_LOCATION :: 30
 @(private)
@@ -226,6 +231,10 @@ BUILTIN_POSITION :: 0
 BUILTIN_FRAG_COORD :: 15
 @(private)
 BUILTIN_FRONT_FACING :: 17
+@(private)
+BUILTIN_VERTEX_INDEX :: 42
+@(private)
+BUILTIN_SAMPLE_MASK :: 20
 
 // Where break and continue go: a loop's merge and continue blocks, or a
 // switch's merge and the continue block of the loop around it.
@@ -266,12 +275,17 @@ Spv :: struct {
 	consts:      map[[3]u32]u32,
 	nulls:       map[u32]u32,
 	glsl:        u32,
-	t_image:     u32,
-	t_sampled:   u32,
+	// The 2D and 2D array (1) image and sampled image types.
+	t_image:     [2]u32,
+	t_sampled:   [2]u32,
 	// The ImageQuery capability is declared (textureSize).
 	image_query: bool,
+	// The DerivativeControl capability is declared (fine derivatives).
+	derivative_control: bool,
 	block_var:   u32,
 	block_type:  u32,
+	// Every storage buffer's type: a block of one runtime array of words.
+	buffer_type: u32,
 	// Member index of each user uniform symbol in the block.
 	members:     map[Sym_Id]u32,
 	// SPIR-V type id of each block member.
@@ -428,7 +442,7 @@ type_id :: proc(s: ^Spv, t: Type) -> u32 {
 		col := type_id(s, column_type(t))
 		id = new_id(s)
 		inst(&s.globals, .Type_Matrix, id, col, u32(t.cols))
-	case t.rows > 1:
+	case t.rows > 1 && t.base != .Sampler:
 		comp := type_id(s, scalar_of(t))
 		id = new_id(s)
 		inst(&s.globals, .Type_Vector, id, comp, u32(t.rows))
@@ -447,7 +461,7 @@ type_id :: proc(s: ^Spv, t: Type) -> u32 {
 			inst(&s.globals, .Type_Float, id, 32)
 		case .Sampler:
 			s.next_id -= 1
-			return sampled_image_type(s)
+			return sampled_image_type(s, t == T_SAMPLER_ARRAY)
 		case .Struct:
 		}
 	}
@@ -456,16 +470,17 @@ type_id :: proc(s: ^Spv, t: Type) -> u32 {
 }
 
 @(private)
-sampled_image_type :: proc(s: ^Spv) -> u32 {
-	if s.t_sampled != 0 {
-		return s.t_sampled
+sampled_image_type :: proc(s: ^Spv, arrayed: bool) -> u32 {
+	a := int(arrayed)
+	if s.t_sampled[a] != 0 {
+		return s.t_sampled[a]
 	}
 	f := type_id(s, T_FLOAT)
-	s.t_image = new_id(s)
-	inst(&s.globals, .Type_Image, s.t_image, f, 1, 0, 0, 0, 1, 0) // 2D, sampled, unknown format
-	s.t_sampled = new_id(s)
-	inst(&s.globals, .Type_Sampled_Image, s.t_sampled, s.t_image)
-	return s.t_sampled
+	s.t_image[a] = new_id(s)
+	inst(&s.globals, .Type_Image, s.t_image[a], f, 1, 0, u32(a), 0, 1, 0) // 2D, (arrayed,) sampled, unknown format
+	s.t_sampled[a] = new_id(s)
+	inst(&s.globals, .Type_Sampled_Image, s.t_sampled[a], s.t_image[a])
+	return s.t_sampled[a]
 }
 
 @(private)
@@ -612,9 +627,9 @@ declare_interface :: proc(s: ^Spv) {
 	c := s.checked
 	for row in c.interface {
 		switch row.kind {
-		case .Stage_In, .Frag_Coord, .Front_Facing, .Stage_Out, .Position:
+		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID, .Stage_Out, .Position, .Sample_Mask:
 			sym := s.u.syms[row.sym]
-			class := u32(SC_OUTPUT if row.kind == .Stage_Out || row.kind == .Position else SC_INPUT)
+			class := u32(SC_OUTPUT if row.kind == .Stage_Out || row.kind == .Position || row.kind == .Sample_Mask else SC_INPUT)
 			v := new_id(s)
 			inst(&s.globals, .Variable, ptr_type(s, class, type_id(s, ty(s.u, sym.type))), v, class)
 			#partial switch row.kind {
@@ -622,6 +637,10 @@ declare_interface :: proc(s: ^Spv) {
 				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_FRAG_COORD)
 			case .Front_Facing:
 				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_FRONT_FACING)
+			case .Vertex_ID:
+				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_VERTEX_INDEX)
+			case .Sample_Mask:
+				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_SAMPLE_MASK)
 			case .Position:
 				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_POSITION)
 			case:
@@ -637,7 +656,14 @@ declare_interface :: proc(s: ^Spv) {
 			declare_uniform_block(s, row)
 		case .Channel:
 			v := new_id(s)
-			inst(&s.globals, .Variable, ptr_type(s, SC_UNIFORM_CONSTANT, sampled_image_type(s)), v, SC_UNIFORM_CONSTANT)
+			inst(&s.globals, .Variable, ptr_type(s, SC_UNIFORM_CONSTANT, type_id(s, sym_type(s.u, row.sym))), v, SC_UNIFORM_CONSTANT)
+			inst(&s.annotations, .Decorate, v, DEC_DESCRIPTOR_SET, u32(row.set))
+			inst(&s.annotations, .Decorate, v, DEC_BINDING, u32(row.binding))
+			name(s, v, s.u.syms[row.sym].name)
+			s.sym_ids[row.sym] = v
+		case .Buffer:
+			v := new_id(s)
+			inst(&s.globals, .Variable, ptr_type(s, SC_UNIFORM, buffer_type(s)), v, SC_UNIFORM)
 			inst(&s.annotations, .Decorate, v, DEC_DESCRIPTOR_SET, u32(row.set))
 			inst(&s.annotations, .Decorate, v, DEC_BINDING, u32(row.binding))
 			name(s, v, s.u.syms[row.sym].name)
@@ -653,6 +679,62 @@ declare_interface :: proc(s: ^Spv) {
 		name(s, v, s.u.syms[g].name)
 		s.sym_ids[g] = v
 	}
+}
+
+// A storage buffer as words: `struct { uint words[]; }`, read-only, in
+// SPIR-V 1.0's form (BufferBlock in the Uniform class). Loads build the
+// elements from words at their std430 offsets (buffer_value).
+@(private)
+buffer_type :: proc(s: ^Spv) -> u32 {
+	if s.buffer_type != 0 {
+		return s.buffer_type
+	}
+	words := new_id(s)
+	inst(&s.globals, .Type_Runtime_Array, words, type_id(s, T_UINT))
+	inst(&s.annotations, .Decorate, words, DEC_ARRAY_STRIDE, 4)
+	s.buffer_type = new_id(s)
+	inst(&s.globals, .Type_Struct, s.buffer_type, words)
+	inst(&s.annotations, .Decorate, s.buffer_type, DEC_BUFFER_BLOCK)
+	inst(&s.annotations, .Member_Decorate, s.buffer_type, 0, DEC_OFFSET, 0)
+	inst(&s.annotations, .Member_Decorate, s.buffer_type, 0, DEC_NON_WRITABLE)
+	name(s, s.buffer_type, "Oksl_Words")
+	return s.buffer_type
+}
+
+// The value of type `t` at `word` words past word `base` of buffer `v`:
+// scalars and vectors from their words, structs from their fields at their
+// std430 offsets.
+@(private)
+buffer_value :: proc(s: ^Spv, v: u32, t: Type, base: u32, word: int) -> u32 {
+	u := s.u
+	if t.base == .Struct {
+		parts := make([dynamic]u32, context.temp_allocator)
+		off := 0
+		for f in struct_fields(u, t.strukt) {
+			ft := ty(u, f.type)
+			size, align, _ := std430(u, ft)
+			off = round_up(off, align)
+			append(&parts, buffer_value(s, v, ft, base, word + off / 4))
+			off += size
+		}
+		return construct(s, type_id(s, t), ..parts[:])
+	}
+	t_uint := type_id(s, T_UINT)
+	comps: [4]u32
+	for i in 0 ..< int(t.rows) {
+		w := base if word + i == 0 else binop_raw(s, .I_Add, t_uint, base, const_u32(s, u32(word + i)))
+		ptr := new_id(s)
+		inst(&s.body, .Access_Chain, ptr_type(s, SC_UNIFORM, t_uint), ptr, v, const_u32(s, 0), w)
+		comps[i] = new_id(s)
+		inst(&s.body, .Load, t_uint, comps[i], ptr)
+		if t.base != .Uint {
+			comps[i] = unop(s, .Bitcast, type_id(s, scalar_of(t)), comps[i])
+		}
+	}
+	if t.rows == 1 {
+		return comps[0]
+	}
+	return construct(s, type_id(s, t), ..comps[:t.rows])
 }
 
 // The uniform block: the inputs' members, then the user uniforms.
@@ -757,7 +839,7 @@ emit_function :: proc(s: ^Spv, fid: Func_Id) {
 		pt := ty(u, p.type)
 		switch {
 		case pt.base == .Sampler:
-			append(&param_types, ptr_type(s, SC_UNIFORM_CONSTANT, sampled_image_type(s)))
+			append(&param_types, ptr_type(s, SC_UNIFORM_CONSTANT, type_id(s, pt)))
 		case p.qual != .In:
 			append(&param_types, ptr_type(s, SC_FUNCTION, type_id(s, pt)))
 		case:

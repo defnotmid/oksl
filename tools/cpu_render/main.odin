@@ -25,7 +25,7 @@ texel :: proc(x, y: int) -> [4]f32 {
 	return {f32(xx) / TEX, f32(yy) / TEX, 0.9 if on else 0.2, 1}
 }
 
-sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 	fx := uv.x * TEX - 0.5
 	fy := uv.y * TEX - 0.5
 	x0 := int(fx) if fx >= 0 else int(fx) - 1

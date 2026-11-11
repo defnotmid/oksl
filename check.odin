@@ -24,7 +24,11 @@ Checked :: struct {
 	uniforms:      []Sym_Id,
 	inputs_used:   Inputs,
 	// The sampler symbol bound to each channel the shader uses.
-	channels:      [CHANNEL_COUNT]Sym_Id,
+	channels:      [SAMPLER_COUNT]Sym_Id,
+	// Storage buffers in declaration order (their bindings' order), and
+	// each one's declaration.
+	buffers:       []Sym_Id,
+	buffer_decls:  []Buffer_Decl_Id,
 	// (1 + taps) environments of block_stride bytes: `uniforms` holds the
 	// first's, then each tap's copies (stage.odin).
 	block_size:    int,
@@ -50,13 +54,17 @@ Checker :: struct {
 	// declaration), and the ones the shader uses.
 	input_syms:    [Input]Sym_Id,
 	inputs_used:   Inputs,
-	channels:      [CHANNEL_COUNT]Sym_Id,
+	channels:      [SAMPLER_COUNT]Sym_Id,
+	buffers:       [dynamic]Sym_Id,
+	buffer_decls:  [dynamic]Buffer_Decl_Id,
 	// Channels the source names as iChannelN (GLSL keeps them for those).
-	named_channels: bit_set[0 ..< CHANNEL_COUNT],
+	named_channels: bit_set[0 ..< SAMPLER_COUNT],
 	frag_coord:    Sym_Id,
 	gl_frag_coord: Sym_Id,
 	gl_position:   Sym_Id,
 	gl_front_facing: Sym_Id,
+	gl_vertex_id:  Sym_Id,
+	gl_sample_mask: Sym_Id,
 	// The symbols the source names (statically used).
 	used:          bit_array.Bit_Array,
 	next_offset:   int,
@@ -101,6 +109,8 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 		switch t.kind {
 		case .Struct:
 			declare_struct(&c, t.strukt)
+		case .Buffer:
+			declare_buffer(&c, t.buffer)
 		case .Vars:
 			// Index rather than hold a `list` slice: checking can grow u.ids
 			// (saturate, eval), which would leave the slice dangling.
@@ -144,6 +154,8 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 	out.uniforms = c.uniforms[:]
 	out.inputs_used = c.inputs_used
 	out.channels = c.channels
+	out.buffers = c.buffers[:]
+	out.buffer_decls = c.buffer_decls[:]
 	out.block_stride = round_up(c.next_offset, 16)
 	out.taps = len(u.taps)
 	out.block_size = out.block_stride * (1 + out.taps)
@@ -329,6 +341,22 @@ builtin_symbol :: proc(c: ^Checker, name: string) -> Sym_Id {
 			c.gl_front_facing = add_sym(c, Symbol{name = name, type = intern(c.u, T_BOOL), storage = .Stage_In, is_const = true})
 		}
 		return c.gl_front_facing
+	case "gl_VertexID":
+		if .Gl_Vertex_ID not_in c.u.features {
+			return 0
+		}
+		if c.gl_vertex_id == 0 {
+			c.gl_vertex_id = add_sym(c, Symbol{name = name, type = intern(c.u, T_INT), storage = .Stage_In, is_const = true})
+		}
+		return c.gl_vertex_id
+	case "gl_SampleMask":
+		if .Gl_Sample_Mask not_in c.u.features {
+			return 0
+		}
+		if c.gl_sample_mask == 0 {
+			c.gl_sample_mask = add_sym(c, Symbol{name = name, type = intern(c.u, Type{base = .Int, rows = 1, array = 1}), storage = .Stage_Out})
+		}
+		return c.gl_sample_mask
 	case "$channel_resolution":
 		in_ := Input.Channel_Resolution
 		if c.input_syms[in_] == 0 {
@@ -429,6 +457,65 @@ check_init :: proc(c: ^Checker, v: Var_Id, t: ^Type) {
 	}
 }
 
+// A storage buffer block (parse_buffer_block): one runtime-sized array of
+// buffer elements, readonly and std430. The symbol is the instance, or the
+// member without one; reads are Buffer_Loads.
+@(private)
+declare_buffer :: proc(c: ^Checker, b: Buffer_Decl_Id) {
+	u := c.u
+	bd := u.buffer_decls[b]
+	v := Var_Id(bd.members.start)
+	if bd.members.count != 1 || !u.vars[v].unsized {
+		add_error(c, bd.pos, .Buffer_Member, bd.block)
+		return
+	}
+	d := u.vars[v]
+	t := resolve_type(c, d.spec, 0, false)
+	if is_error(t) {
+		return
+	}
+	switch {
+	case !bd.readonly:
+		add_error(c, d.pos, .Buffer_Writable, bd.block)
+		return
+	case bd.packing != "" && bd.packing != "std430":
+		add_error(c, d.pos, .Buffer_Layout, bd.block, a = bd.packing)
+		return
+	}
+	if _, _, ok := std430(u, t); !ok {
+		add_error(c, d.pos, .Buffer_Element, a = tn(c, t))
+		return
+	}
+	name := bd.instance if bd.instance != "" else d.name
+	id := add_sym(c, Symbol{name = name, pos = d.pos, type = intern(u, t), storage = .Buffer, is_const = true, index = len(c.buffers), decl = v})
+	append(&c.buffers, id)
+	append(&c.buffer_decls, b)
+	u.vars[v].sym = id
+	declare(c, id)
+}
+
+// The buffer `id` reads when it is indexed (`words` or `inst.words`), or 0.
+@(private)
+buffer_ref :: proc(c: ^Checker, id: Expr_Id) -> Sym_Id {
+	u := c.u
+	e := u.exprs[id]
+	name, member := e.name, ""
+	if e.kind == .Field && u.exprs[e.a].kind == .Ident {
+		name, member = u.exprs[e.a].name, e.name
+	} else if e.kind != .Ident {
+		return 0
+	}
+	s := lookup(c, name)
+	if s == 0 || u.syms[s].storage != .Buffer {
+		return 0
+	}
+	instance := u.buffer_decls[c.buffer_decls[u.syms[s].index]].instance
+	if (member == "") != (instance == "") || (member != "" && member != u.vars[u.syms[s].decl].name) {
+		return 0
+	}
+	return s
+}
+
 @(private)
 declare_global :: proc(c: ^Checker, v: Var_Id) {
 	u := c.u
@@ -461,20 +548,26 @@ declare_global :: proc(c: ^Checker, v: Var_Id) {
 		}
 		if t.base == .Sampler {
 			if t.array != 0 {
-				add_error(c, d.pos, .Sampler_Array, a = tn(c, T_SAMPLER))
+				add_error(c, d.pos, .Sampler_Array, a = tn(c, t))
+				return
+			}
+			if t == T_SAMPLER_ARRAY && c.rules.header {
+				add_error(c, d.pos, .Header_Sampler_Array, a = tn(c, t), b = tn(c, T_SAMPLER))
 				return
 			}
 			// Samplers and children take channel slots in declaration order,
-			// after the iChannelN the source names.
+			// after the iChannelN the source names: the inputs' rows hold
+			// a header's channel sizes, so it has CHANNEL_COUNT.
+			count := CHANNEL_COUNT if c.rules.header else SAMPLER_COUNT
 			slot := -1
-			for ch in 0 ..< CHANNEL_COUNT {
+			for ch in 0 ..< count {
 				if c.channels[ch] == 0 && ch not_in c.named_channels {
 					slot = ch
 					break
 				}
 			}
 			if slot < 0 {
-				add_error(c, d.pos, .Too_Many_Channels, a = tn(c, T_SAMPLER), n = CHANNEL_COUNT)
+				add_error(c, d.pos, .Too_Many_Channels, a = tn(c, T_SAMPLER), n = i64(count))
 				return
 			}
 			s.type = intern(u, t)
@@ -1101,6 +1194,9 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 	switch e.kind {
 	case .None:
 		return T_ERROR
+	case .Buffer_Load:
+		// Made by checking a[b] (below).
+		return sym_type(u, e.sym)
 	case .Int_Lit:
 		return T_INT
 	case .Uint_Lit:
@@ -1119,6 +1215,12 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 			} else {
 				add_error(c, e.pos, .Undeclared, e.name)
 			}
+			return T_ERROR
+		}
+		if u.syms[s].storage == .Buffer {
+			member := u.vars[u.syms[s].decl].name
+			instance := u.buffer_decls[c.buffer_decls[u.syms[s].index]].instance
+			add_error(c, e.pos, .Buffer_Use, fmt.tprintf("%s.%s", instance, member) if instance != "" else member)
 			return T_ERROR
 		}
 		u.exprs[id].sym = s
@@ -1223,6 +1325,25 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		}
 		return tl
 	case .Index:
+		if b := buffer_ref(c, e.a); b != 0 {
+			it := check_expr(c, e.b)
+			if is_error(it) {
+				return T_ERROR
+			}
+			if it != T_INT && it != T_UINT {
+				add_error(c, u.exprs[e.b].pos, .Index_Type, a = tn(c, it))
+				return T_ERROR
+			}
+			if v, ok := const_int(c, e.b); ok && v < 0 {
+				add_error(c, u.exprs[e.b].pos, .Index_Range, a = tn(c, sym_type(u, b)), n = v)
+				return T_ERROR
+			}
+			u.exprs[id].kind = .Buffer_Load
+			u.exprs[id].sym = b
+			u.exprs[id].a = 0
+			bit_array.set(&c.used, int(b))
+			return sym_type(u, b)
+		}
 		t := check_expr(c, e.a)
 		it := check_expr(c, e.b)
 		if is_error(t) || is_error(it) {
@@ -1543,7 +1664,7 @@ check_lvalue :: proc(c: ^Checker, id: Expr_Id) -> bool {
 		}
 		s := u.syms[e.sym]
 		switch s.storage {
-		case .Uniform, .Builtin_Uniform, .Channel, .Stage_In:
+		case .Uniform, .Builtin_Uniform, .Channel, .Stage_In, .Buffer:
 			add_error(c, e.pos, .Read_Only, s.name)
 			return false
 		case .Stage_Out:
@@ -1556,6 +1677,9 @@ check_lvalue :: proc(c: ^Checker, id: Expr_Id) -> bool {
 		return true
 	case .Index:
 		return check_lvalue(c, e.a)
+	case .Buffer_Load:
+		add_error(c, e.pos, .Read_Only, u.syms[e.sym].name)
+		return false
 	case .Field:
 		for i in 0 ..< int(e.swizzle_len) {
 			for j in 0 ..< i {
@@ -1597,7 +1721,7 @@ check_call :: proc(c: ^Checker, id: Expr_Id) -> Type {
 			return T_ERROR
 		}
 		return check_eval(c, id)
-	case "texture", "textureLod", "texelFetch", "textureSize", "texture2D":
+	case "texture", "textureLod", "textureGrad", "texelFetch", "textureSize", "texture2D":
 		if .Samplers not_in c.u.features {
 			add_error(c, e.pos, missing_feature(c.u.profile, c.u.stage, .Samplers), e.name)
 			return T_ERROR
@@ -1719,18 +1843,25 @@ check_eval :: proc(c: ^Checker, id: Expr_Id) -> Type {
 // iChannelResolution.xy, so texelFetch and textureSize take a channel
 // itself rather than a sampler parameter; without it (GLSL shaders) it is
 // the image's own size at lod.
+// A sampler's coordinate: uv, and the layer of a sampler2DArray.
+@(private)
+texture_coord :: proc "contextless" (sampler: Type) -> Type {
+	return vec_type(.Float, 3 if sampler == T_SAMPLER_ARRAY else 2)
+}
+
 @(private)
 check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 	u := c.u
 	e := u.exprs[id]
 	args := args_of(u, id)
-	want := 3 if e.name == "textureLod" || e.name == "texelFetch" else 2
+	want := 3 if e.name == "textureLod" || e.name == "texelFetch" else (4 if e.name == "textureGrad" else 2)
 	if len(args) != want && !(e.name == "texture" && len(args) == 3) {
 		add_error(c, e.pos, .Arg_Count, e.name, n = i64(want), m = i64(len(args)))
 		return T_ERROR
 	}
-	if expr_type(u, args[0]) != T_SAMPLER {
-		add_error(c, u.exprs[args[0]].pos, .Texture_Sampler, e.name, a = tn(c, expr_type(u, args[0])))
+	st := expr_type(u, args[0])
+	if st.base != .Sampler {
+		add_error(c, u.exprs[args[0]].pos, .Texture_Sampler, e.name, a = tn(c, st))
 		return T_ERROR
 	}
 	v2 := vec_type(.Float, 2)
@@ -1811,7 +1942,31 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 	sampler := args[0]
 	lod := args[2] if len(args) == 3 else 0
 	uv: Expr_Id
+	if e.name == "textureGrad" {
+		// The level is the derivatives': no bias, no flip (only their
+		// lengths matter).
+		ok, dok, eok: bool
+		ddx, ddy := args[2], args[3]
+		uv, ok = coerce(c, args[1], texture_coord(st))
+		ddx, dok = coerce(c, ddx, v2)
+		ddy, eok = coerce(c, ddy, v2)
+		if !ok || !dok || !eok {
+			return no_overload(c, e, args)
+		}
+		if c.rules.flip_y {
+			assert(st == T_SAMPLER)
+			scale := vec2_lit(c, 1, -1, e.pos)
+			offset := vec2_lit(c, 0, 1, e.pos)
+			uv = binary(c, .Plus, binary(c, .Star, uv, scale, v2), offset, v2)
+		}
+		u.exprs[id].args = push_ids(u, {u32(sampler), u32(uv), u32(ddx), u32(ddy)})
+		u.exprs[id].call = .Builtin
+		return check_builtin(c, id, .Texture_Grad)
+	}
 	if e.name == "texelFetch" {
+		if st != T_SAMPLER {
+			return no_overload(c, e, args)
+		}
 		p, ok := coerce(c, args[1], iv2)
 		if !ok || !is_integer_base(expr_type(u, args[2]).base) || !is_scalar(expr_type(u, args[2])) {
 			return no_overload(c, e, args)
@@ -1824,12 +1979,14 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		uv = binary(c, .Slash, centre, size, v2)
 	} else {
 		ok: bool
-		uv, ok = coerce(c, args[1], v2)
+		uv, ok = coerce(c, args[1], texture_coord(st))
 		if !ok || (len(args) == 3 && !is_scalar(expr_type(u, args[2]))) {
 			return no_overload(c, e, args)
 		}
 	}
 	if c.rules.flip_y {
+		// Only the header profiles flip, and their channels are 2D.
+		assert(st == T_SAMPLER)
 		scale := vec2_lit(c, 1, -1, e.pos)
 		offset := vec2_lit(c, 0, 1, e.pos)
 		uv = binary(c, .Plus, binary(c, .Star, uv, scale, v2), offset, v2)
@@ -2059,8 +2216,8 @@ check_builtin :: proc(c: ^Checker, id: Expr_Id, b: Builtin) -> Type {
 		return mat_type(int(last.rows), int(t0.rows))
 	case .Transposed:
 		return mat_type(int(t0.rows), int(t0.cols))
-	case .Ivec2:
-		return vec_type(.Int, 2)
+	case .Image_Size:
+		return vec_type(.Int, 3 if t0 == T_SAMPLER_ARRAY else 2)
 	}
 	return T_ERROR
 }
@@ -2235,9 +2392,12 @@ builtin_args_ok :: proc(c: ^Checker, info: Builtin_Info, args: []Expr_Id) -> boo
 	case .Bool_Vector:
 		return is_vector(at(c, args, 0)) && at(c, args, 0).base == .Bool
 	case .Texture_Lod:
-		return at(c, args, 0) == T_SAMPLER && at(c, args, 1) == vec_type(.Float, 2) && to_float(c, args, 2) && at(c, args, 2) == T_FLOAT
+		return at(c, args, 0).base == .Sampler && at(c, args, 1) == texture_coord(at(c, args, 0)) && to_float(c, args, 2) && at(c, args, 2) == T_FLOAT
 	case .Texture_Size:
-		return at(c, args, 0) == T_SAMPLER && (at(c, args, 1) == T_INT || at(c, args, 1) == T_UINT)
+		return at(c, args, 0).base == .Sampler && (at(c, args, 1) == T_INT || at(c, args, 1) == T_UINT)
+	case .Texture_Grad:
+		v2 := vec_type(.Float, 2)
+		return at(c, args, 0).base == .Sampler && at(c, args, 1) == texture_coord(at(c, args, 0)) && at(c, args, 2) == v2 && at(c, args, 3) == v2
 	}
 	return false
 }

@@ -40,19 +40,29 @@ Interface_Kind :: enum u8 {
 	Frag_Coord,
 	// Whether the fragment's triangle faces the camera (gl_FrontFacing).
 	Front_Facing,
+	// The vertex's index in the draw (gl_VertexID), the draw's first vertex
+	// included, as SPIR-V's VertexIndex and Metal's vertex_id count it.
+	Vertex_ID,
 	// A vertex shader's output or a fragment shader's colour target, at
 	// location `binding`.
 	Stage_Out,
 	// A vertex shader's clip-space position (gl_Position), as written.
 	Position,
+	// The samples of the fragment's coverage it keeps (gl_SampleMask[0],
+	// an int[1]).
+	Sample_Mask,
 	// The uniform block: the inputs, then the user uniforms (std140).
 	Uniform_Block,
 	// A channel's combined image sampler; `binding` is the channel.
 	Channel,
+	// A read-only storage buffer (std430 words); `binding` is its SPIR-V
+	// binding, after the samplers (its place among the buffers is the
+	// symbol's index).
+	Buffer,
 }
 
 // The kinds a host binds as resources.
-RESOURCE_KINDS :: bit_set[Interface_Kind]{.Uniform_Block, .Channel}
+RESOURCE_KINDS :: bit_set[Interface_Kind]{.Uniform_Block, .Channel, .Buffer}
 
 Interface_Var :: struct {
 	kind:    Interface_Kind,
@@ -103,13 +113,16 @@ Stage_Rules :: struct {
 	msl_qualifier:   string,
 }
 
+// Colour targets a fragment shader may write (locations 0..7).
+FRAGMENT_OUTPUTS :: 8
+
 @(rodata)
 STAGE_RULES := [Stage]Stage_Rules {
 	// OriginUpperLeft: Vulkan's window origin (and Metal's).
 	.Fragment = {
-		lacks = {.Gl_Position},
+		lacks = {.Gl_Position, .Gl_Vertex_ID},
 		in_locations = 16,
-		out_locations = 8,
+		out_locations = FRAGMENT_OUTPUTS,
 		execution_model = 4,
 		execution_modes = {7},
 		sampler_set = 2,
@@ -117,7 +130,7 @@ STAGE_RULES := [Stage]Stage_Rules {
 		msl_qualifier = "fragment",
 	},
 	.Vertex = {
-		lacks = {.Discard, .Derivatives, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing},
+		lacks = {.Discard, .Derivatives, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing, .Gl_Sample_Mask},
 		missing = #partial {.Discard = .Fragment_Only, .Derivatives = .Fragment_Only},
 		in_locations = 16,
 		out_locations = 16,
@@ -127,7 +140,7 @@ STAGE_RULES := [Stage]Stage_Rules {
 		msl_qualifier = "vertex",
 	},
 	.Compute = {
-		lacks = {.Discard, .Derivatives, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing, .Stage_Variables, .Gl_Position},
+		lacks = {.Discard, .Derivatives, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing, .Stage_Variables, .Gl_Position, .Gl_Vertex_ID, .Storage_Buffers, .Gl_Sample_Mask},
 		execution_model = 5,
 		msl_qualifier = "kernel",
 	},
@@ -196,6 +209,12 @@ stage_var_rows :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 	}
 	if c.gl_front_facing != 0 {
 		append(rows, Interface_Var{kind = .Front_Facing, sym = c.gl_front_facing})
+	}
+	if c.gl_vertex_id != 0 {
+		append(rows, Interface_Var{kind = .Vertex_ID, sym = c.gl_vertex_id})
+	}
+	if c.gl_sample_mask != 0 {
+		append(rows, Interface_Var{kind = .Sample_Mask, sym = c.gl_sample_mask})
 	}
 	if c.u.stage == .Vertex {
 		// Written or not, a vertex shader outputs its position.
@@ -377,10 +396,17 @@ append_resources :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 	if c.rules.header || len(c.uniforms) > 0 {
 		append(rows, Interface_Var{kind = .Uniform_Block, binding = 0, set = stage.uniform_set})
 	}
+	samplers := 0
 	for ch, i in c.channels {
 		if ch != 0 {
 			append(rows, Interface_Var{kind = .Channel, sym = ch, binding = i32(i), set = stage.sampler_set})
+			samplers = i + 1
 		}
+	}
+	// SDL_GPU's storage buffers follow the samplers (and storage textures,
+	// which oksl has none of) in the samplers' set.
+	for b, i in c.buffers {
+		append(rows, Interface_Var{kind = .Buffer, sym = b, binding = i32(samplers + i), set = stage.sampler_set})
 	}
 }
 

@@ -116,12 +116,17 @@ VM_Op :: enum u8 {
 	Deriv_X,
 	Deriv_Y,
 	Fwidth,
-	// dst vec4 = channel k sampled at uv a, explicit lod b.
+	// dst vec4 = channel k sampled at uv a, explicit lod b (n = 3: a + 2
+	// is the layer).
 	Texture,
 	// The same at the lod a's quad derivatives pick, plus bias b.
 	Texture_Bias,
-	// dst ivec2 = channel k's size at lod a.
+	// dst ivec2 = channel k's size at lod a (n = 3: ivec3, z the layers).
 	Texture_Size,
+	// dst + i = buffer k's word a * b + c + i for i < n (a: the element
+	// index in each lane, b: the element's words, c: the word in it); 0
+	// past the buffer.
+	Load_Buf,
 	// Masks: dst = a.
 	Mask_Copy,
 	// dst = the lanes of a where cond slot b holds (k = 1: where it does not).
@@ -267,7 +272,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 		#partial switch row.kind {
 		case .Channel:
 			l.sym_chan[row.sym] = row.binding
-		case .Stage_In, .Frag_Coord, .Front_Facing:
+		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID:
 			append(&inputs, stage_var(&l, row))
 		}
 	}
@@ -301,7 +306,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	// initializers.
 	l.globals[0] = l.next_slot
 	for row in c.interface {
-		if row.kind == .Stage_Out || row.kind == .Position {
+		if row.kind == .Stage_Out || row.kind == .Position || row.kind == .Sample_Mask {
 			append(&outputs, stage_var(&l, row))
 		}
 	}
@@ -616,6 +621,27 @@ store_lv :: proc(l: ^Lower, lv: LV, v: Val) {
 	} else {
 		emit(l, .Store, n = n, dst = lv.base, a = src)
 	}
+}
+
+// A buffer element of type `t` at `word` of element `idx` (stride words
+// each) into dst: a Load_Buf per scalar or vector, at its std430 offset.
+// Returns the slot after it.
+@(private)
+buffer_loads :: proc(l: ^Lower, t: Type, dst, idx, stride: i32, word, buf: int) -> i32 {
+	if t.base != .Struct {
+		emit(l, .Load_Buf, n = int(t.rows), k = buf, dst = dst, a = idx, b = stride, c = i32(word))
+		return dst + i32(t.rows)
+	}
+	off := 0
+	next := dst
+	for f in struct_fields(l.u, t.strukt) {
+		ft := ty(l.u, f.type)
+		size, align, _ := std430(l.u, ft)
+		off = round_up(off, align)
+		next = buffer_loads(l, ft, next, idx, stride, word + off / 4, buf)
+		off += size
+	}
+	return next
 }
 
 @(private)
@@ -992,6 +1018,12 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	case .Convert:
 		v := lower_expr(l, e.a)
 		return convert_val(l, v, t)
+	case .Buffer_Load:
+		idx := lower_expr(l, e.b)
+		size, _, _ := std430(u, t)
+		s := alloc_slots(l, cc(l, t))
+		buffer_loads(l, t, s, idx.slot, i32(size / 4), 0, u.syms[e.sym].index)
+		return {s, t}
 	case .Comma:
 		lower_expr(l, e.a)
 		return lower_expr(l, e.b)
@@ -1515,8 +1547,12 @@ instr_slots :: proc(in_: Instr) -> (writes: Slots, reads: [4]Slots, pure: bool) 
 	case .Inverse:
 		reads[0], writes.n = {a, k * k}, k * k
 	case .Texture_Size:
-		// The run's channel sizes at lod a: no sampler.
-		reads[0], writes.n = {a, 1}, 2
+		// The run's channel sizes at lod a (n: 2, or 3 with the layers): no
+		// sampler.
+		reads[0] = {a, 1}
+	case .Load_Buf:
+		// The run's buffers, which do not change during it.
+		reads[0] = {a, 1}
 	case .Texture, .Texture_Bias:
 		writes.n, pure = 4, false
 	case .Store, .Store_Zero, .Store_Dyn, .Load_Dyn, .Deriv_X, .Deriv_Y, .Fwidth:
@@ -1662,11 +1698,30 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	case .Float_Bits_To_Int, .Float_Bits_To_Uint, .Int_Bits_To_Float, .Uint_Bits_To_Float:
 		return {vals[0].slot, t}
 	case .Texture_Lod:
-		emit(l, .Texture, k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
+		emit(l, .Texture, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
 	case .Texture:
-		emit(l, .Texture_Bias, k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
+		emit(l, .Texture_Bias, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
 	case .Texture_Size:
-		emit(l, .Texture_Size, k = int(vals[0].slot), dst = s, a = vals[1].slot)
+		emit(l, .Texture_Size, n = n, k = int(vals[0].slot), dst = s, a = vals[1].slot)
+	case .Texture_Grad:
+		// The level the derivatives pick in level 0's texels, as texture()
+		// picks it from the quad's: half the log2 of the longer one's
+		// squared length.
+		// Each step its own temporary, as everywhere: one writer each.
+		ch := int(vals[0].slot)
+		isize, size := alloc_slots(l, 2), alloc_slots(l, 2)
+		emit(l, .Texture_Size, n = 2, k = ch, dst = isize, a = const_val(l, .Int, 0).slot)
+		emit(l, .I_To_F, n = 2, dst = size, a = isize)
+		dx, dy := alloc_slots(l, 2), alloc_slots(l, 2)
+		emit(l, .F_Mul, n = 2, dst = dx, a = vals[2].slot, b = size)
+		emit(l, .F_Mul, n = 2, dst = dy, a = vals[3].slot, b = size)
+		lx, ly, longer, lg, lod := alloc_slots(l, 1), alloc_slots(l, 1), alloc_slots(l, 1), alloc_slots(l, 1), alloc_slots(l, 1)
+		emit(l, .Dot, n = 2, dst = lx, a = dx, b = dx)
+		emit(l, .Dot, n = 2, dst = ly, a = dy, b = dy)
+		emit(l, .F_Fn2, k = int(Builtin.Max), dst = longer, a = lx, b = ly)
+		emit(l, .F_Fn1, k = int(Builtin.Log2), dst = lg, a = longer)
+		emit(l, .F_Mul, dst = lod, a = lg, b = const_val(l, .Float, 0.5).slot)
+		emit(l, .Texture, n = cc(l, vals[1].t), k = ch, dst = s, a = vals[1].slot, b = lod)
 	}
 	return {s, t}
 }

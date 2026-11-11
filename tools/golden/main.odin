@@ -291,7 +291,7 @@ corpus :: proc() {
 // ---- shader files -----------------------------------------------------------------------
 
 // The channels: uv and lod as colour, so sampling shows in the render.
-sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32) -> [4]f32 {
+sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 	return {uv.x, uv.y, f32(channel) * 0.25 + lod, 1}
 }
 
@@ -319,6 +319,7 @@ files :: proc(dir: string) {
 		}
 		refl := strings.builder_make()
 		fmt.sbprintf(&refl, "inputs_used=%v\nchannels_used=%v\nnum_samplers=%d\nchannel_names=%v\nchannel_pos=%v\nblock_size=%d\n", m.inputs_used, m.channels_used, m.num_samplers, m.channel_names, m.channel_pos, m.block_size)
+		fmt.sbprintf(&refl, "channel_arrays=%v\nnum_uniform_buffers=%d\nstorage_buffers=%v\n", m.channel_arrays, m.num_uniform_buffers, m.storage_buffers)
 		for un in m.uniforms {
 			fmt.sbprintf(&refl, "uniform %v\n", un)
 		}

@@ -160,8 +160,10 @@ parse_top :: proc(p: ^Parser) {
 		accept(p, .Semicolon)
 		return
 	}
-	// layout(location = N); other layout qualifiers are ignored.
+	// layout(location = N) and a block's packing (std430, ...); other
+	// layout qualifiers are ignored.
 	location := i32(-1)
+	packing := ""
 	if is_ident(p, "layout") {
 		p.i += 1
 		if accept(p, .L_Paren) {
@@ -171,17 +173,29 @@ parse_top :: proc(p: ^Parser) {
 					p.i += 3
 					continue
 				}
+				switch tok(p).text {
+				case "std430", "std140", "shared", "packed", "scalar":
+					packing = tok(p).text
+				}
 				p.i += 1
 			}
 			accept(p, .R_Paren)
 		}
 	}
 	stage_vars := .Stage_Variables in p.u.features
-	is_const, is_uniform, flat := false, false, false
+	buffers := .Storage_Buffers in p.u.features
+	is_const, is_uniform, flat, readonly := false, false, false, false
 	io: Var_Io
 	for {
 		skip_precision(p)
-		if is_ident(p, "const") {
+		if buffers && (is_ident(p, "readonly") || is_ident(p, "coherent") || is_ident(p, "volatile") || is_ident(p, "restrict")) {
+			readonly ||= is_ident(p, "readonly")
+			p.i += 1
+		} else if buffers && is_ident(p, "buffer") {
+			p.i += 1
+			parse_buffer_block(p, readonly, packing)
+			return
+		} else if is_ident(p, "const") {
 			is_const = true
 			p.i += 1
 		} else if is_ident(p, "uniform") {
@@ -240,6 +254,54 @@ parse_top :: proc(p: ^Parser) {
 		append(&u.tops, Top{kind = .Vars, vars = vars})
 	}
 	expect(p, .Semicolon)
+}
+
+// `buffer Block { T name[]; } instance;` after its qualifiers (the
+// checker takes one runtime-sized array). Members are parsed first (their
+// array sizes may add expressions), then stored contiguously.
+@(private = "file")
+parse_buffer_block :: proc(p: ^Parser, readonly: bool, packing: string) {
+	u := p.u
+	block := tok(p)
+	if !expect(p, .Ident, .Expected_Name) || !expect(p, .L_Brace) {
+		return
+	}
+	members := make([dynamic]Var_Decl, context.temp_allocator)
+	for peek(p) != .R_Brace && peek(p) != .EOF {
+		spec := parse_type_spec(p)
+		if spec == 0 {
+			return
+		}
+		name := tok(p)
+		if !expect(p, .Ident, .Expected_Field) {
+			return
+		}
+		v := Var_Decl{pos = name.pos, name = name.text, spec = spec, location = -1}
+		if accept(p, .L_Bracket) {
+			if peek(p) == .R_Bracket {
+				v.unsized = true
+			} else {
+				v.array_size = parse_expr(p)
+			}
+			expect(p, .R_Bracket)
+		}
+		append(&members, v)
+		if !expect(p, .Semicolon) {
+			return
+		}
+	}
+	expect(p, .R_Brace)
+	bd := Buffer_Decl{pos = block.pos, block = block.text, packing = packing, readonly = readonly}
+	if peek(p) == .Ident {
+		bd.instance = tok(p).text
+		p.i += 1
+	}
+	expect(p, .Semicolon)
+	bd.members = {u32(len(u.vars)), u32(len(members))}
+	append(&u.vars, ..members[:])
+	id := Buffer_Decl_Id(len(u.buffer_decls))
+	append(&u.buffer_decls, bd)
+	append(&u.tops, Top{kind = .Buffer, buffer = id})
 }
 
 @(private = "file")

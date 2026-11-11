@@ -27,6 +27,42 @@ Msl :: struct {
 	// Extra parameters/arguments every user function takes.
 	params:  string,
 	args:    string,
+	// The sampler2DArray helpers written to `helpers`.
+	array_helpers: bit_set[Builtin],
+}
+
+// A sampler's Metal texture type.
+@(private)
+msl_texture_type :: proc "contextless" (t: Type) -> string {
+	return "texture2d_array<float>" if t == T_SAMPLER_ARRAY else "texture2d<float>"
+}
+
+// A sampler2DArray sample (b: Texture_Lod, Texture or Texture_Grad) as a
+// helper taking the coordinate once: Metal takes the layer apart, as a
+// uint, which GPUs otherwise round to nearest even and clamp.
+@(private)
+msl_array_helper :: proc(m: ^Msl, b: Builtin) -> string {
+	if b not_in m.array_helpers {
+		if m.array_helpers == {} {
+			strings.write_string(&m.helpers, "inline uint oksl_layer(texture2d_array<float> t, float z) { return uint(clamp(rint(z), 0.0f, float(t.get_array_size()) - 1.0f)); }\n")
+		}
+		m.array_helpers += {b}
+		#partial switch b {
+		case .Texture_Lod:
+			strings.write_string(&m.helpers, "inline float4 oksl_sample_level(texture2d_array<float> t, sampler s, float3 c, float l) { return t.sample(s, c.xy, oksl_layer(t, c.z), level(l)); }\n")
+		case .Texture:
+			strings.write_string(&m.helpers, "inline float4 oksl_sample_bias(texture2d_array<float> t, sampler s, float3 c, float b) { return t.sample(s, c.xy, oksl_layer(t, c.z), bias(b)); }\n")
+		case .Texture_Grad:
+			strings.write_string(&m.helpers, "inline float4 oksl_sample_grad(texture2d_array<float> t, sampler s, float3 c, float2 dx, float2 dy) { return t.sample(s, c.xy, oksl_layer(t, c.z), gradient2d(dx, dy)); }\n")
+		}
+	}
+	#partial switch b {
+	case .Texture_Lod:
+		return "oksl_sample_level"
+	case .Texture:
+		return "oksl_sample_bias"
+	}
+	return "oksl_sample_grad"
 }
 
 emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
@@ -50,10 +86,15 @@ emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
 	strings.write_string(&pb, "constant Oksl_Uniforms& u, thread Oksl_Globals& g" if has_block else "thread Oksl_Globals& g")
 	strings.write_string(&ab, "u, g" if has_block else "g")
 	for row in c.interface {
-		if row.kind == .Channel {
+		#partial switch row.kind {
+		case .Channel:
 			n := u.syms[row.sym].name
-			fmt.sbprintf(&pb, ", texture2d<float> ok_%s_tex, sampler ok_%s_smp", n, n)
+			fmt.sbprintf(&pb, ", %s ok_%s_tex, sampler ok_%s_smp", msl_texture_type(sym_type(u, row.sym)), n, n)
 			fmt.sbprintf(&ab, ", ok_%s_tex, ok_%s_smp", n, n)
+		case .Buffer:
+			n := u.syms[row.sym].name
+			fmt.sbprintf(&pb, ", const device uint* oksl_buf_%s", n)
+			fmt.sbprintf(&ab, ", oksl_buf_%s", n)
 		}
 	}
 	m.params = strings.to_string(pb)
@@ -74,13 +115,16 @@ emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
 	}
 	for row in c.interface {
 		#partial switch row.kind {
-		case .Stage_In, .Frag_Coord, .Front_Facing:
+		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID:
 			w(&m, "\t%s in_%s;\n", msl_type(&m, sym_type(u, row.sym)), u.syms[row.sym].name)
-		case .Stage_Out, .Position:
+		case .Stage_Out, .Position, .Sample_Mask:
 			w(&m, "\t%s out_%s;\n", msl_type(&m, sym_type(u, row.sym)), u.syms[row.sym].name)
 		}
 	}
 	w(&m, "\tint _unused;\n};\n\n")
+	for b in c.buffers {
+		emit_buffer_load(&m, b)
+	}
 	for f in c.funcs {
 		if f != c.entry {
 			emit_msl_function(&m, f)
@@ -402,7 +446,7 @@ emit_msl_function :: proc(m: ^Msl, f: Func_Id) {
 		name := p.name if p.name != "" else fmt.tprintf("_unnamed%d", i)
 		switch {
 		case pt.base == .Sampler:
-			w(m, "texture2d<float> ok_%s_tex, sampler ok_%s_smp", name, name)
+			w(m, "%s ok_%s_tex, sampler ok_%s_smp", msl_texture_type(pt), name, name)
 		case p.qual != .In:
 			w(m, "thread %s& ok_%s", msl_type(m, pt), name)
 		case:
@@ -431,11 +475,62 @@ emit_msl_function :: proc(m: ^Msl, f: Func_Id) {
 	w(m, "}\n\n")
 }
 
+// Element i of a storage buffer, from its words at their std430 offsets
+// (oksl_buffer_<name>(words, i)).
+@(private)
+emit_buffer_load :: proc(m: ^Msl, b: Sym_Id) {
+	u := m.u
+	t := sym_type(u, b)
+	size, _, _ := std430(u, t)
+	w(m, "static %s oksl_buffer_%s(const device uint* w, uint i) {{\n", msl_type(m, t), u.syms[b].name)
+	w(m, "\tuint b = i * %du;\n\treturn ", size / 4)
+	value :: proc(m: ^Msl, t: Type, word: int) {
+		u := m.u
+		if t.base == .Struct {
+			w(m, "%s{{", msl_type(m, t))
+			off := 0
+			for f, i in struct_fields(u, t.strukt) {
+				ft := ty(u, f.type)
+				size, align, _ := std430(u, ft)
+				off = round_up(off, align)
+				w(m, ", " if i > 0 else "")
+				value(m, ft, word + off / 4)
+				off += size
+			}
+			w(m, "}}")
+			return
+		}
+		if t.rows > 1 {
+			w(m, "%s(", msl_type(m, t))
+		}
+		for i in 0 ..< int(t.rows) {
+			w(m, ", " if i > 0 else "")
+			#partial switch t.base {
+			case .Float:
+				w(m, "as_type<float>(w[b + %du])", word + i)
+			case .Int:
+				w(m, "as_type<int>(w[b + %du])", word + i)
+			case:
+				w(m, "w[b + %du]", word + i)
+			}
+		}
+		if t.rows > 1 {
+			w(m, ")")
+		}
+	}
+	value(m, t, 0)
+	w(m, ";\n}}\n\n")
+}
+
 @(private)
 emit_msl_entry :: proc(m: ^Msl) {
 	u := m.u
 	c := m.c
 	vertex := u.stage == .Vertex
+	has_block := false
+	for row in c.interface {
+		has_block ||= row.kind == .Uniform_Block
+	}
 	uniform_helpers(m)
 	// Vertex inputs are [[attribute(N)]]; what passes between the stages is
 	// [[user(locnN)]], as SPIRV-Cross (and so SDL_shadercross) names it.
@@ -471,6 +566,8 @@ emit_msl_entry :: proc(m: ^Msl) {
 			}
 		case .Position:
 			w(m, "\tfloat4 out_%s [[position]];\n", sym.name)
+		case .Sample_Mask:
+			w(m, "\tuint out_%s [[sample_mask]];\n", sym.name)
 		}
 	}
 	w(m, "}};\n\n")
@@ -483,12 +580,21 @@ emit_msl_entry :: proc(m: ^Msl) {
 	}
 	for row in c.interface {
 		#partial switch row.kind {
+		case .Vertex_ID:
+			// Built-ins of a vertex function are its parameters.
+			w(m, "%suint oksl_vertex_id [[vertex_id]]", sep)
+			sep = ", "
 		case .Uniform_Block:
 			w(m, "%sconstant Oksl_Uniforms& u [[buffer(%d)]]", sep, row.binding)
 			sep = ", "
 		case .Channel:
 			n := u.syms[row.sym].name
-			w(m, "%stexture2d<float> ok_%s_tex [[texture(%d)]], sampler ok_%s_smp [[sampler(%d)]]", sep, n, row.binding, n, row.binding)
+			w(m, "%s%s ok_%s_tex [[texture(%d)]], sampler ok_%s_smp [[sampler(%d)]]", sep, msl_texture_type(sym_type(u, row.sym)), n, row.binding, n, row.binding)
+			sep = ", "
+		case .Buffer:
+			// SDL_GPU's storage buffers follow the uniform buffers.
+			sym := u.syms[row.sym]
+			w(m, "%sconst device uint* oksl_buf_%s [[buffer(%d)]]", sep, sym.name, sym.index + (1 if has_block else 0))
 			sep = ", "
 		}
 	}
@@ -502,6 +608,8 @@ emit_msl_entry :: proc(m: ^Msl) {
 		case .Stage_In, .Frag_Coord, .Front_Facing:
 			n := u.syms[row.sym].name
 			w(m, "\tg.in_%s = oksl_in.in_%s;\n", n, n)
+		case .Vertex_ID:
+			w(m, "\tg.in_%s = int(oksl_vertex_id);\n", u.syms[row.sym].name)
 		}
 	}
 	m.temp_id = 0
@@ -521,6 +629,9 @@ emit_msl_entry :: proc(m: ^Msl) {
 		case .Stage_Out, .Position:
 			n := u.syms[row.sym].name
 			w(m, "\toksl_out.out_%s = g.out_%s;\n", n, n)
+		case .Sample_Mask:
+			n := u.syms[row.sym].name
+			w(m, "\toksl_out.out_%s = uint(g.out_%s[0]);\n", n, n)
 		}
 	}
 	w(m, "\treturn oksl_out;\n")
@@ -704,6 +815,9 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
 	switch e.kind {
 	case .None:
 		return ""
+	case .Buffer_Load:
+		n := u.syms[e.sym].name
+		return fmt.aprintf("oksl_buffer_%s(oksl_buf_%s, uint(%s))", n, n, msl_expr(m, e.b))
 	case .Int_Lit:
 		return fmt.aprintf("%d", i32(e.value))
 	case .Uint_Lit:
@@ -723,7 +837,7 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
 			return fmt.aprintf("g.in_%s", sym.name)
 		case .Stage_Out:
 			return fmt.aprintf("g.out_%s", sym.name)
-		case .Local, .Param, .Channel:
+		case .Local, .Param, .Channel, .Buffer:
 		}
 		return fmt.aprintf("ok_%s", sym.name)
 	case .Convert:
@@ -1110,14 +1224,24 @@ msl_builtin :: proc(m: ^Msl, id: Expr_Id) -> string {
 		return fmt.aprintf("dot(%s, %s)", a[0], a[1])
 	case .Float_Bits_To_Int, .Float_Bits_To_Uint, .Int_Bits_To_Float, .Uint_Bits_To_Float:
 		return fmt.aprintf("as_type<%s>(%s)", msl_type(m, t), a[0])
-	case .Texture_Lod:
+	case .Texture_Lod, .Texture, .Texture_Grad:
 		tex, smp := msl_sampler(m, args[0])
-		return fmt.aprintf("%s.sample(%s, %s, level(%s))", tex, smp, a[1], a[2])
-	case .Texture:
-		tex, smp := msl_sampler(m, args[0])
-		return fmt.aprintf("%s.sample(%s, %s, bias(%s))", tex, smp, a[1], a[2])
+		if expr_type(u, args[0]) == T_SAMPLER_ARRAY {
+			extra := fmt.aprintf(", %s, %s", a[2], a[3]) if b == .Texture_Grad else fmt.aprintf(", %s", a[2])
+			return fmt.aprintf("%s(%s, %s, %s%s)", msl_array_helper(m, b), tex, smp, a[1], extra)
+		}
+		#partial switch b {
+		case .Texture_Lod:
+			return fmt.aprintf("%s.sample(%s, %s, level(%s))", tex, smp, a[1], a[2])
+		case .Texture:
+			return fmt.aprintf("%s.sample(%s, %s, bias(%s))", tex, smp, a[1], a[2])
+		}
+		return fmt.aprintf("%s.sample(%s, %s, gradient2d(%s, %s))", tex, smp, a[1], a[2], a[3])
 	case .Texture_Size:
 		tex, _ := msl_sampler(m, args[0])
+		if expr_type(u, args[0]) == T_SAMPLER_ARRAY {
+			return fmt.aprintf("int3(%s.get_width(uint(%s)), %s.get_height(uint(%s)), %s.get_array_size())", tex, a[1], tex, a[1], tex)
+		}
 		return fmt.aprintf("int2(%s.get_width(uint(%s)), %s.get_height(uint(%s)))", tex, a[1], tex, a[1])
 	}
 	return ""

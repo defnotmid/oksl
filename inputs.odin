@@ -40,6 +40,10 @@ Input_Info :: struct {
 
 CHANNEL_COUNT :: 4
 
+// Samplers a shader may bind (GLSL `uniform sampler2D`s): the first
+// CHANNEL_COUNT are also Shadertoy's iChannel0..3 and the inputs' rows.
+SAMPLER_COUNT :: 16
+
 OFFSET_RESOLUTION :: 0 // vec3
 OFFSET_TIME :: 12 // float
 OFFSET_TIME_DELTA :: 16 // float

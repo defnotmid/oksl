@@ -32,7 +32,10 @@ T_BOOL :: Type{base = .Bool, rows = 1}
 T_INT :: Type{base = .Int, rows = 1}
 T_UINT :: Type{base = .Uint, rows = 1}
 T_FLOAT :: Type{base = .Float, rows = 1}
+// A sampler's rows: 1 for sampler2D (and SkSL's shader), 2 for
+// sampler2DArray.
 T_SAMPLER :: Type{base = .Sampler, rows = 1}
+T_SAMPLER_ARRAY :: Type{base = .Sampler, rows = 2}
 T_ERROR :: Type{base = .Void, rows = 255}
 
 vec_type :: proc "contextless" (base: Base, n: int) -> Type {
@@ -56,7 +59,7 @@ is_matrix :: #force_inline proc "contextless" (t: Type) -> bool {
 }
 
 is_vector :: #force_inline proc "contextless" (t: Type) -> bool {
-	return t.rows > 1 && t.cols == 0 && t.array == 0 && t.base != .Struct
+	return t.rows > 1 && t.cols == 0 && t.array == 0 && t.base != .Struct && t.base != .Sampler
 }
 
 is_scalar :: #force_inline proc "contextless" (t: Type) -> bool {
@@ -124,7 +127,7 @@ type_name :: proc(u: ^Unit, t: Type, allocator := context.temp_allocator) -> str
 	case .Void:
 		strings.write_string(&b, "void")
 	case .Sampler:
-		strings.write_string(&b, "sampler2D" if u.dialect == .GLSL else "shader")
+		strings.write_string(&b, "sampler2DArray" if t.rows == 2 else ("sampler2D" if u.dialect == .GLSL else "shader"))
 	case .Struct:
 		strings.write_string(&b, u.structs[t.strukt].name if int(t.strukt) < len(u.structs) else "struct")
 	case .Bool, .Int, .Uint, .Float:
@@ -179,6 +182,8 @@ builtin_type :: proc(name: string, dialect := Dialect.SkSL) -> (Type, bool) {
 		return T_SAMPLER, .Children in has
 	case "sampler2D":
 		return T_SAMPLER, .Samplers in has
+	case "sampler2DArray":
+		return T_SAMPLER_ARRAY, .Samplers in has
 	}
 	if len(name) < 4 {
 		return {}, false
@@ -258,4 +263,25 @@ std140_array_stride :: proc(t: Type) -> int {
 
 round_up :: proc "contextless" (v, a: int) -> int {
 	return (v + a - 1) / a * a
+}
+
+// A buffer element's std430 size and alignment in bytes, when it can be
+// one: float, int and uint, their vectors, and structs of those (a field
+// at the next multiple of its alignment, a struct's size a multiple of
+// its largest). Element i starts at i * size.
+std430 :: proc(u: ^Unit, t: Type) -> (size, align: int, ok: bool) {
+	switch {
+	case (t.base == .Float || t.base == .Int || t.base == .Uint) && t.cols == 0 && t.array == 0:
+		n := int(t.rows)
+		align = 4 if n == 1 else (8 if n == 2 else 16)
+		return 4 * n, align, true
+	case t.base == .Struct && t.array == 0:
+		for f in struct_fields(u, t.strukt) {
+			fs, fa := std430(u, ty(u, f.type)) or_return
+			size = round_up(size, fa) + fs
+			align = max(align, fa)
+		}
+		return round_up(size, align), align, align > 0
+	}
+	return
 }
