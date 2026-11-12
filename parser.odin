@@ -4,12 +4,13 @@ import "core:strconv"
 
 @(private)
 Parser :: struct {
-	u:            ^Unit,
-	toks:         []Token,
-	i:            int,
-	struct_names: map[string]bool,
+	u:                   ^Unit,
+	toks:                []Token,
+	i:                   int,
+	struct_names:        map[string]bool,
+	default_buf_packing: string,
 	// Set after an error until the parser resynchronizes.
-	panicking:    bool,
+	panicking:           bool,
 }
 
 // Parses preprocessed tokens into `u` (tops, expressions, statements...).
@@ -148,6 +149,118 @@ add_var :: proc(p: ^Parser, v: Var_Decl) -> Var_Id {
 // ---- declarations ------------------------------------------------------------------
 
 @(private = "file")
+Layout_Qual :: struct {
+	has_layout:  bool,
+	bad:         bool,
+	empty:       bool,
+	non_default: bool,
+	count:       i32,
+	layout_pos:  Pos,
+	location:    i32,
+	packing:     string,
+	format:      Image_Format,
+	workgroups:  [dynamic]Workgroup_Item,
+}
+
+@(private = "file")
+parse_layout :: proc(p: ^Parser, lay: ^Layout_Qual) {
+	lay.has_layout = true
+	lay.layout_pos = tok(p).pos
+	p.i += 1
+	if !accept(p, .L_Paren) {
+		return
+	}
+	start_count := lay.count
+	need_comma := false
+	for peek(p) != .R_Paren && peek(p) != .EOF {
+		if accept(p, .Comma) {
+			if !need_comma || peek(p) == .R_Paren {
+				lay.empty = true
+			}
+			need_comma = false
+			continue
+		}
+		if need_comma {
+			expect(p, .Comma)
+			lay.bad = true
+			return
+		}
+		need_comma = true
+		lay.count += 1
+		if is_ident(p, "location") && peek(p, 1) == .Eq && peek(p, 2) == .Int_Lit {
+			lay.location = i32(parse_int_text(tok(p, 2).text))
+			lay.non_default = true
+			p.i += 3
+			continue
+		}
+		if is_ident(p, "local_size_x") || is_ident(p, "local_size_y") || is_ident(p, "local_size_z") {
+			t := tok(p)
+			axis := i8(t.text[len("local_size_")] - 'x')
+			lay.non_default = true
+			p.i += 1
+			if !expect(p, .Eq) {
+				lay.bad = true
+				return
+			}
+			vt := tok(p)
+			next_k := peek(p, 1)
+			if (vt.kind == .Int_Lit || vt.kind == .Uint_Lit) && (next_k == .Comma || next_k == .R_Paren || next_k == .Ident) {
+				val, ok := parse_int_text(vt.text)
+				if !ok {
+					error_at(p, vt.pos, .Invalid_Int_Literal, a = vt.text)
+					lay.bad = true
+					return
+				}
+				p.i += 1
+				if lay.workgroups.allocator.procedure == nil {
+					lay.workgroups = make([dynamic]Workgroup_Item, 0, 4, context.temp_allocator)
+				}
+				append(&lay.workgroups, Workgroup_Item{pos = t.pos, value = i64(val), axis = axis})
+				continue
+			}
+			error_at(p, vt.pos, .Local_Size_Constant, t.text)
+			lay.bad = true
+			return
+		}
+		if peek(p) == .Ident && peek(p, 1) == .Eq {
+			// Other `key = value` layout qualifiers (binding, set, offset, ...): ignored on declarations, rejected as defaults.
+			lay.non_default = true
+			p.i += 2
+			parse_assignment(p)
+			continue
+		}
+		if peek(p) == .Ident {
+			t := tok(p)
+			switch t.text {
+			case "std430", "std140", "shared", "packed":
+				lay.packing = t.text
+			case "scalar":
+				lay.packing = t.text
+				lay.non_default = true
+			case "row_major", "column_major":
+				// Matrix storage order on buffer blocks: accepted.
+			case:
+				if fmt, ok := image_format_from_name(t.text); ok {
+					lay.format = fmt
+					lay.non_default = true
+				} else if p.u.dialect == .GLSL {
+					error_at(p, t.pos, .Image_Format_Unknown, t.text)
+					lay.bad = true
+				}
+			}
+			p.i += 1
+			continue
+		}
+		lay.non_default = true
+		p.i += 1
+	}
+	if lay.count == start_count {
+		lay.empty = true
+	}
+	accept(p, .R_Paren)
+}
+
+@(private = "file")
 parse_top :: proc(p: ^Parser) {
 	u := p.u
 	if accept(p, .Semicolon) {
@@ -160,51 +273,67 @@ parse_top :: proc(p: ^Parser) {
 		accept(p, .Semicolon)
 		return
 	}
-	// layout(location = N) and a block's packing (std430, ...); other
-	// layout qualifiers are ignored.
-	location := i32(-1)
-	packing := ""
-	if is_ident(p, "layout") {
-		p.i += 1
-		if accept(p, .L_Paren) {
-			for peek(p) != .R_Paren && peek(p) != .EOF {
-				if is_ident(p, "location") && peek(p, 1) == .Eq && peek(p, 2) == .Int_Lit {
-					location = i32(parse_int_text(tok(p, 2).text))
-					p.i += 3
-					continue
-				}
-				switch tok(p).text {
-				case "std430", "std140", "shared", "packed", "scalar":
-					packing = tok(p).text
-				}
-				p.i += 1
-			}
-			accept(p, .R_Paren)
-		}
-	}
+	lay := Layout_Qual{location = -1}
 	stage_vars := .Stage_Variables in p.u.features
 	buffers := .Storage_Buffers in p.u.features
-	is_const, is_uniform, flat, readonly := false, false, false, false
+	is_const, is_uniform, flat, readonly, writeonly := false, false, false, false, false
+	has_mem_qual, has_prec, has_interp := false, false, false
 	io: Var_Io
 	for {
+		before_prec := p.i
 		skip_precision(p)
-		if buffers && (is_ident(p, "readonly") || is_ident(p, "coherent") || is_ident(p, "volatile") || is_ident(p, "restrict")) {
+		if p.i != before_prec {
+			has_prec = true
+		}
+		default_ok := lay.has_layout && !lay.empty && !lay.non_default && lay.count > 0 && !has_mem_qual && !has_prec && !has_interp && !is_const && io == .None
+		if is_ident(p, "layout") && peek(p, 1) == .L_Paren {
+			parse_layout(p, &lay)
+			if p.panicking {
+				return
+			}
+		} else if buffers && (is_ident(p, "readonly") || is_ident(p, "writeonly") || is_ident(p, "coherent") || is_ident(p, "volatile") || is_ident(p, "restrict")) {
+			has_mem_qual = true
 			readonly ||= is_ident(p, "readonly")
+			writeonly ||= is_ident(p, "writeonly")
 			p.i += 1
+		} else if default_ok && buffers && is_ident(p, "buffer") && peek(p, 1) == .Semicolon && u.dialect == .GLSL {
+			if !lay.bad && lay.packing != "" {
+				p.default_buf_packing = lay.packing
+			}
+			p.i += 2
+			return
 		} else if buffers && is_ident(p, "buffer") {
 			p.i += 1
-			parse_buffer_block(p, readonly, packing)
+			parse_buffer_block(p, readonly, writeonly, &lay)
 			return
 		} else if is_ident(p, "const") {
 			is_const = true
 			p.i += 1
+		} else if default_ok && lay.packing != "std430" && is_ident(p, "uniform") && peek(p, 1) == .Semicolon && u.dialect == .GLSL {
+			p.i += 2
+			return
 		} else if is_ident(p, "uniform") {
 			is_uniform = true
 			p.i += 1
+		} else if is_ident(p, "in") && peek(p, 1) == .Semicolon && u.dialect == .GLSL {
+			in_pos := tok(p).pos
+			p.i += 2
+			if len(lay.workgroups) > 0 {
+				r := Range{u32(len(u.workgroups)), u32(len(lay.workgroups))}
+				append(&u.workgroups, ..lay.workgroups[:])
+				append(&u.tops, Top{kind = .Workgroup, vars = r})
+			} else if !lay.bad {
+				error_at(p, lay.layout_pos if lay.has_layout else in_pos, .Missing_Local_Size if u.stage == .Compute else .Expected_Type, a = "in")
+			}
+			return
 		} else if is_ident(p, "in") || is_ident(p, "out") || is_ident(p, "varying") || is_ident(p, "attribute") {
 			t := tok(p)
 			if !stage_vars || t.text == "varying" || t.text == "attribute" {
-				error_at(p, t.pos, .Global_In_Out if !stage_vars else .Varying_Keyword, t.text)
+				code := Error_Code.Varying_Keyword
+				if !stage_vars {
+					code = .Compute_Stage_Var if u.stage == .Compute && u.dialect == .GLSL else .Global_In_Out
+				}
+				error_at(p, t.pos, code, t.text)
 				return
 			}
 			io = .In if t.text == "in" else .Out
@@ -212,6 +341,7 @@ parse_top :: proc(p: ^Parser) {
 		} else if stage_vars && (is_ident(p, "flat") || is_ident(p, "smooth") || is_ident(p, "centroid")) {
 			// Interpolation: flat matters (integer inputs need it), the
 			// others are the default.
+			has_interp = true
 			flat ||= is_ident(p, "flat")
 			p.i += 1
 		} else {
@@ -248,7 +378,9 @@ parse_top :: proc(p: ^Parser) {
 	vars, ok := parse_declarators(p, spec, is_const, is_uniform)
 	for k in 0 ..< vars.count {
 		v := &u.vars[u.ids[vars.start + k]]
-		v.io, v.location, v.flat = io, location, flat
+		v.io, v.location, v.flat = io, lay.location, flat
+		v.readonly, v.writeonly = readonly, writeonly
+		v.format, v.bad_layout = lay.format, lay.bad
 	}
 	if ok {
 		append(&u.tops, Top{kind = .Vars, vars = vars})
@@ -260,7 +392,7 @@ parse_top :: proc(p: ^Parser) {
 // checker takes one runtime-sized array). Members are parsed first (their
 // array sizes may add expressions), then stored contiguously.
 @(private = "file")
-parse_buffer_block :: proc(p: ^Parser, readonly: bool, packing: string) {
+parse_buffer_block :: proc(p: ^Parser, readonly, writeonly: bool, lay: ^Layout_Qual) {
 	u := p.u
 	block := tok(p)
 	if !expect(p, .Ident, .Expected_Name) || !expect(p, .L_Brace) {
@@ -291,7 +423,14 @@ parse_buffer_block :: proc(p: ^Parser, readonly: bool, packing: string) {
 		}
 	}
 	expect(p, .R_Brace)
-	bd := Buffer_Decl{pos = block.pos, block = block.text, packing = packing, readonly = readonly}
+	bd := Buffer_Decl {
+		pos        = block.pos,
+		block      = block.text,
+		packing    = lay.packing if lay.packing != "" else p.default_buf_packing,
+		readonly   = readonly,
+		writeonly  = writeonly,
+		bad_layout = lay.bad,
+	}
 	if peek(p) == .Ident {
 		bd.instance = tok(p).text
 		p.i += 1
@@ -427,7 +566,21 @@ parse_function :: proc(p: ^Parser, ret: Spec_Id, name: Token) -> Func_Decl_Id {
 		prm := Param{pos = tok(p).pos}
 		for {
 			skip_precision(p)
-			if is_ident(p, "const") {
+			if is_ident(p, "layout") && peek(p, 1) == .L_Paren {
+				lay_pos := tok(p).pos
+				p.i += 2
+				depth := 1
+				for depth > 0 && peek(p) != .EOF {
+					if peek(p) == .L_Paren {
+						depth += 1
+					} else if peek(p) == .R_Paren {
+						depth -= 1
+					}
+					p.i += 1
+				}
+				error_at(p, lay_pos, .Param_Layout)
+				continue
+			} else if is_ident(p, "const") {
 				prm.is_const = true
 			} else if is_ident(p, "in") {
 				prm.qual = .In
@@ -435,6 +588,9 @@ parse_function :: proc(p: ^Parser, ret: Spec_Id, name: Token) -> Func_Decl_Id {
 				prm.qual = .Out
 			} else if is_ident(p, "inout") {
 				prm.qual = .Inout
+			} else if u.dialect == .GLSL && (is_ident(p, "readonly") || is_ident(p, "writeonly") || is_ident(p, "coherent") || is_ident(p, "volatile") || is_ident(p, "restrict")) {
+				prm.readonly ||= is_ident(p, "readonly")
+				prm.writeonly ||= is_ident(p, "writeonly")
 			} else {
 				break
 			}
@@ -917,21 +1073,23 @@ parse_primary :: proc(p: ^Parser) -> Expr_Id {
 }
 
 // The value of an integer literal (decimal, 0x hex or 0-prefixed octal, an
-// optional u suffix), wrapped to 32 bits.
+// optional u suffix), wrapped to 32 bits; `ok` reports whether every digit is
+// valid for the base and the value fits in 32 bits.
 @(private)
-parse_int_text :: proc(text: string) -> u32 {
+parse_int_text :: proc(text: string) -> (val: u32, ok: bool) #optional_ok {
 	s := text
 	if len(s) > 0 && (s[len(s) - 1] == 'u' || s[len(s) - 1] == 'U') {
 		s = s[:len(s) - 1]
 	}
 	base: u64 = 10
-	if len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+	if len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
 		base = 16
 		s = s[2:]
 	} else if len(s) > 1 && s[0] == '0' {
 		base = 8
 		s = s[1:]
 	}
+	ok = len(s) > 0
 	v: u64
 	for c in transmute([]u8)s {
 		d: u64
@@ -942,8 +1100,13 @@ parse_int_text :: proc(text: string) -> u32 {
 			d = u64(c - 'a' + 10)
 		case 'A' ..= 'F':
 			d = u64(c - 'A' + 10)
+		case:
+			d = base
+		}
+		if d >= base || v > (u64(max(u32)) - d) / base {
+			ok = false
 		}
 		v = v * base + d
 	}
-	return u32(v)
+	return u32(v), ok
 }

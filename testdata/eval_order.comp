@@ -1,0 +1,174 @@
+#version 310 es
+precision highp float;
+precision highp int;
+precision highp uimage2D;
+
+layout(local_size_x = 4, local_size_y = 4) in;
+
+struct Pair {
+    uint a;
+    uint b;
+};
+
+layout(std430) buffer OutBuf {
+    uint w[];
+} out_buf;
+
+layout(r32ui) uniform highp uimage2D rw_img;
+uniform mat2 uMatArr[2];
+
+void set_val(out uint dst, uint val) {
+    dst = val;
+}
+
+void add_void(inout uint x, uint d) {
+    x += d;
+}
+
+void nop_void() {
+}
+
+uint bump(inout uint x) {
+    x += 10u;
+    return 1u;
+}
+
+int bumpi(inout ivec2 p) {
+    p += ivec2(1, 1);
+    return 1;
+}
+
+uint snap_inout(inout uint a, uint b) {
+    uint old = a;
+    a = old + b;
+    return old * 100u + b;
+}
+
+uint two(inout uint x, uint y) {
+    x = x * 10u + y;
+    return x;
+}
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+    if (gid.x >= 4u || gid.y >= 4u || gid.z != 0u) {
+        return;
+    }
+    uint id = gid.y * 4u + gid.x;
+    uint base = id * 18u;
+    uint seed = id + 2u;
+
+    // Built-in and vector constructors with side-effecting later arguments.
+    uint k = seed;
+    out_buf.w[base + 0u] = max(k, bump(k)) * 100u + k;
+
+    uint j = seed + 3u;
+    uvec2 v = uvec2(j, bump(j));
+    out_buf.w[base + 1u] = v.x * 100u + v.y + j;
+
+    uint q = seed + 5u;
+    out_buf.w[base + 2u] = clamp(q, 0u, q + bump(q)) * 100u + q;
+
+    uint r = seed + 1u;
+    uvec3 t = uvec3(r, r + 1u, bump(r));
+    out_buf.w[base + 3u] = t.x * 10000u + t.y * 100u + t.z;
+
+    // Binary LHS assignment read on RHS, and earlier side-effecting arguments.
+    uint s = seed + 2u;
+    out_buf.w[base + 4u] = (s = seed + 9u) + uvec2(s, 1u).x;
+
+    uint e1 = seed;
+    uint m1 = max(bump(e1), e1);
+    uint e2 = seed + 1u;
+    uvec2 vc = uvec2(bump(e2), e2);
+    out_buf.w[base + 5u] = m1 * 10000u + vc.x * 100u + vc.y;
+
+    // Struct and array constructors with side-effecting later arguments.
+    uint p0 = seed + 4u;
+    Pair pr = Pair(p0, bump(p0));
+    uint a0 = seed + 6u;
+    uint arr[2] = uint[2](a0, bump(a0));
+    out_buf.w[base + 6u] = pr.a * 1000u + pr.b * 100u + arr[0] * 10u + arr[1];
+
+    // inout argument followed by an in argument that mutates the same variable.
+    uint x = seed;
+    uint sr = snap_inout(x, x = seed + 20u);
+    out_buf.w[base + 7u] = sr * 100u + x;
+
+    // Nested subscript with side effect in the first index.
+    uvec2 mat[2] = uvec2[2](uvec2(seed + 1u, seed + 2u), uvec2(seed + 3u, seed + 4u));
+    int mi = 0;
+    out_buf.w[base + 8u] = mat[mi++][mi] * 10u + uint(mi);
+
+    // imageStore with side-effecting value mutating coord, plus fenced read-back.
+    ivec2 tile = ivec2(int(gid.x) * 7, int(gid.y) * 4);
+    ivec2 ip = tile;
+    imageStore(rw_img, ip, uvec4(uint(bumpi(ip)) + seed * 10u));
+    ivec2 ip2 = tile + ivec2(2, 0);
+    imageStore(rw_img, ip2 + ivec2(0, 2), uvec4(uint(ip2.x) + uint(bumpi(ip2)) + seed));
+    out_buf.w[base + 9u] = imageLoad(rw_img, tile).x * 1000u + imageLoad(rw_img, tile + ivec2(2, 2)).x;
+    out_buf.w[base + 10u] = uint(ip.x * 100 + ip.y * 10 + ip2.x + ip2.y);
+
+    // WAR + RAW image read-modify-write loop (both separate-statement and inline).
+    ivec2 war_p = tile + ivec2(3, 1);
+    imageStore(rw_img, war_p, uvec4(seed));
+    uint war_acc = 0u;
+    for (int wi = 0; wi < 4; ++wi) {
+        uint prev = imageLoad(rw_img, war_p).x;
+        imageStore(rw_img, war_p, uvec4(prev + 10u));
+        imageStore(rw_img, war_p, imageLoad(rw_img, war_p) + uvec4(3u));
+        war_acc = war_acc * 10u + (prev % 10u);
+    }
+
+    // Additional constructor/builtin sequencing cases (mt_ctor_call).
+    uint cw = 1u;
+    uvec3 u3 = uvec3(cw, bump(cw), cw);
+    uint ct = 1u;
+    uint carr[3] = uint[3](ct++, ct++, ct);
+    uint cr = 1u;
+    uint cc = clamp(cr, cr++, 5u) * 10u + cr;
+    uint ce = 1u;
+    Pair cp = Pair(ce++, ce);
+    out_buf.w[base + 11u] = (u3.x * 100u + u3.y * 10u + u3.z) * 1000u + (carr[0] * 100u + carr[1] * 10u + carr[2]) + cc + (cp.a * 10u + cp.b);
+
+    // inout order across swizzle, static index, dynamic index, buffer, and nested call.
+    uvec2 iv = uvec2(1u, 3u);
+    uint io1 = two(iv.y, (iv.y = 7u));
+    uint iarr[2] = uint[2](0u, 3u);
+    uint io2 = two(iarr[1], (iarr[1] = 7u));
+    out_buf.w[base + 12u] = io1 * 100u + io2;
+
+    uint ii = 1u;
+    iarr[1] = 3u;
+    uint io3 = two(iarr[ii], (iarr[1] = 7u));
+    out_buf.w[base + 15u] = 3u;
+    uint io4 = two(out_buf.w[base + 15u], (out_buf.w[base + 15u] = 7u));
+    out_buf.w[base + 13u] = io3 * 100u + io4;
+
+    uint ic = 2u;
+    uint io5 = two(ic, two(ic, 5u));
+    out_buf.w[base + 14u] = io5 * 100u + ic;
+
+    // Indexed `=` assignment used as an rvalue expression, plus scalar self-assignment with post-inc.
+    vec4 eq_v = vec4(0.0);
+    uint eq_j = 1u;
+    float eq_r = (eq_j > 0u) ? (eq_v[eq_j] = float(eq_j++)) : 0.0;
+    uint eq_x = 3u;
+    eq_x = eq_x++;
+    out_buf.w[base + 15u] = war_acc * 1000u + uint(eq_r) * 100u + uint(eq_v.y) * 10u + eq_x + eq_j;
+
+    // Uniform matrix array dynamic indexing with side-effecting subscripts.
+    uint mn = 0u;
+    uint um0 = uint(uMatArr[mn++][mn].y * 10.0);
+    uint mr = 1u;
+    uint um1 = uint(uMatArr[mr][mr--].x * 10.0);
+    out_buf.w[base + 16u] = um0 * 100u + um1 + mn * 10u + mr;
+
+    // Void `?:` arms (imageStore built-ins, void out calls, and inout-vs-plain-void calls).
+    ivec2 vt_p = tile + ivec2(4, 0);
+    ((id & 1u) == 0u) ? imageStore(rw_img, vt_p, uvec4(seed + 5u)) : imageStore(rw_img, vt_p, uvec4(seed + 6u));
+    uint vf_v = 0u;
+    ((id & 2u) == 0u) ? set_val(vf_v, seed + 11u) : set_val(vf_v, seed + 22u);
+    ((id & 1u) == 0u) ? add_void(vf_v, 30u) : nop_void();
+    out_buf.w[base + 17u] = imageLoad(rw_img, vt_p).x * 100u + vf_v;
+}

@@ -55,14 +55,22 @@ Interface_Kind :: enum u8 {
 	Uniform_Block,
 	// A channel's combined image sampler; `binding` is the channel.
 	Channel,
-	// A read-only storage buffer (std430 words); `binding` is its SPIR-V
-	// binding, after the samplers (its place among the buffers is the
-	// symbol's index).
+	// A storage buffer (std430 words); `binding` is its SPIR-V binding in
+	// `set` (its place among Module.storage_buffers is the symbol's index).
 	Buffer,
+	// Compute invocation built-ins (uvec3, except Local_Invocation_Index: uint).
+	Global_Invocation_ID,
+	Local_Invocation_ID,
+	Work_Group_ID,
+	Num_Work_Groups,
+	Local_Invocation_Index,
+	// A 2D storage image; `binding` is its SPIR-V binding in `set` (its
+	// place among Module.storage_images is the symbol's index).
+	Storage_Image,
 }
 
 // The kinds a host binds as resources.
-RESOURCE_KINDS :: bit_set[Interface_Kind]{.Uniform_Block, .Channel, .Buffer}
+RESOURCE_KINDS :: bit_set[Interface_Kind]{.Uniform_Block, .Channel, .Buffer, .Storage_Image}
 
 Interface_Var :: struct {
 	kind:    Interface_Kind,
@@ -85,7 +93,6 @@ Interface_Var :: struct {
 Stage :: enum u8 {
 	Fragment,
 	Vertex,
-	// Reserved: no profile compiles to it yet.
 	Compute,
 }
 
@@ -120,7 +127,8 @@ FRAGMENT_OUTPUTS :: 8
 STAGE_RULES := [Stage]Stage_Rules {
 	// OriginUpperLeft: Vulkan's window origin (and Metal's).
 	.Fragment = {
-		lacks = {.Gl_Position, .Gl_Vertex_ID},
+		lacks = {.Gl_Position, .Gl_Vertex_ID, .Writable_Buffers, .Storage_Images, .Compute_Ids},
+		missing = #partial {.Writable_Buffers = .Buffer_Writable, .Storage_Images = .Compute_Only, .Compute_Ids = .Compute_Only},
 		in_locations = 16,
 		out_locations = FRAGMENT_OUTPUTS,
 		execution_model = 4,
@@ -130,8 +138,8 @@ STAGE_RULES := [Stage]Stage_Rules {
 		msl_qualifier = "fragment",
 	},
 	.Vertex = {
-		lacks = {.Discard, .Derivatives, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing, .Gl_Sample_Mask},
-		missing = #partial {.Discard = .Fragment_Only, .Derivatives = .Fragment_Only},
+		lacks = {.Discard, .Derivatives, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing, .Gl_Sample_Mask, .Writable_Buffers, .Storage_Images, .Compute_Ids},
+		missing = #partial {.Discard = .Fragment_Only, .Derivatives = .Fragment_Only, .Writable_Buffers = .Buffer_Writable, .Storage_Images = .Compute_Only, .Compute_Ids = .Compute_Only},
 		in_locations = 16,
 		out_locations = 16,
 		execution_model = 0,
@@ -140,8 +148,17 @@ STAGE_RULES := [Stage]Stage_Rules {
 		msl_qualifier = "vertex",
 	},
 	.Compute = {
-		lacks = {.Discard, .Derivatives, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing, .Stage_Variables, .Gl_Position, .Gl_Vertex_ID, .Storage_Buffers, .Gl_Sample_Mask},
+		lacks = {.Discard, .Derivatives, .Implicit_Lod, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing, .Stage_Variables, .Gl_Position, .Gl_Vertex_ID, .Gl_Sample_Mask},
+		missing = #partial {
+			.Discard         = .Fragment_Only,
+			.Derivatives     = .Fragment_Only,
+			.Implicit_Lod    = .Compute_Implicit_Sample,
+			.Gl_Frag_Coord   = .Fragment_Only,
+			.Gl_Front_Facing = .Fragment_Only,
+			.Gl_Sample_Mask  = .Fragment_Only,
+		},
 		execution_model = 5,
+		uniform_set = 2,
 		msl_qualifier = "kernel",
 	},
 }
@@ -215,6 +232,21 @@ stage_var_rows :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 	}
 	if c.gl_sample_mask != 0 {
 		append(rows, Interface_Var{kind = .Sample_Mask, sym = c.gl_sample_mask})
+	}
+	if c.gl_global_id != 0 {
+		append(rows, Interface_Var{kind = .Global_Invocation_ID, sym = c.gl_global_id})
+	}
+	if c.gl_local_id != 0 {
+		append(rows, Interface_Var{kind = .Local_Invocation_ID, sym = c.gl_local_id})
+	}
+	if c.gl_group_id != 0 {
+		append(rows, Interface_Var{kind = .Work_Group_ID, sym = c.gl_group_id})
+	}
+	if c.gl_num_groups != 0 {
+		append(rows, Interface_Var{kind = .Num_Work_Groups, sym = c.gl_num_groups})
+	}
+	if c.gl_local_index != 0 {
+		append(rows, Interface_Var{kind = .Local_Invocation_Index, sym = c.gl_local_index})
 	}
 	if c.u.stage == .Vertex {
 		// Written or not, a vertex shader outputs its position.
@@ -388,10 +420,40 @@ stage_entry :: proc(c: ^Checker, main: Func_Id, funcs: ^[dynamic]Func_Id) -> (en
 	return entry, rows[:]
 }
 
-// The uniform block and the channels in use, at the stage's sets.
+// The uniform block, samplers, storage images and storage buffers at SDL_GPU's
+// descriptor sets (graphics: sets 0/1 or 2/3; compute: set 0 read-only, set 1
+// read-write, set 2 uniform block).
 @(private)
 append_resources :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 	stage := STAGE_RULES[c.u.stage]
+	if c.u.stage == .Compute {
+		samplers := 0
+		for ch, i in c.channels {
+			if ch != 0 {
+				append(rows, Interface_Var{kind = .Channel, sym = ch, binding = i32(i), set = 0})
+				samplers = i + 1
+			}
+		}
+		ro_img := c.num_ro_images
+		ro_buf := c.num_ro_buffers
+		for im, i in c.images[:ro_img] {
+			append(rows, Interface_Var{kind = .Storage_Image, sym = im, binding = i32(samplers + i), set = 0})
+		}
+		for b, i in c.buffers[:ro_buf] {
+			append(rows, Interface_Var{kind = .Buffer, sym = b, binding = i32(samplers + ro_img + i), set = 0})
+		}
+		for im, i in c.images[ro_img:] {
+			append(rows, Interface_Var{kind = .Storage_Image, sym = im, binding = i32(i), set = 1})
+		}
+		rw_img := len(c.images) - ro_img
+		for b, i in c.buffers[ro_buf:] {
+			append(rows, Interface_Var{kind = .Buffer, sym = b, binding = i32(rw_img + i), set = 1})
+		}
+		if c.rules.header || len(c.uniforms) > 0 {
+			append(rows, Interface_Var{kind = .Uniform_Block, binding = 0, set = 2})
+		}
+		return
+	}
 	// No block when there is nothing in it.
 	if c.rules.header || len(c.uniforms) > 0 {
 		append(rows, Interface_Var{kind = .Uniform_Block, binding = 0, set = stage.uniform_set})

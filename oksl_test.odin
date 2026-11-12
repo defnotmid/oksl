@@ -3,6 +3,7 @@ package oksl
 import "core:fmt"
 import "core:math"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -889,7 +890,8 @@ test_corpus :: proc(t: ^testing.T) {
 		testing.expectf(t, ok, "%s:\n%s", path, format_errors(errs, context.temp_allocator))
 		if ok {
 			testing.expect(t, len(m.spirv) > 5 && m.spirv[0] == 0x07230203)
-			entry := fmt.tprintf("%s Oksl_Out oksl_main(", STAGE_RULES[m.stage].msl_qualifier)
+			ret := "void" if m.stage == .Compute else "Oksl_Out"
+			entry := fmt.tprintf("%s %s oksl_main(", STAGE_RULES[m.stage].msl_qualifier, ret)
 			testing.expectf(t, strings.contains(m.msl, entry), "%s: no %s", path, entry)
 			// Internal names ($channel_resolution) are not MSL identifiers.
 			testing.expectf(t, !strings.contains(m.msl, "$"), "%s: '$' in MSL", path)
@@ -2924,6 +2926,1702 @@ void main() {
 		testing.expect(t, st_vm.calls == 8 && st_vm.bad == 0)
 		for i in 0 ..< len(tout_jit) {
 			testing.expect_value(t, transmute([4]u32)tout_jit[i], transmute([4]u32)tout_vm[i])
+		}
+	}
+}
+
+// ---- compute shaders ----------------------------------------------------------------
+
+@(private = "file")
+compile_compute :: proc(src: string) -> (^Module, []Error, bool) {
+	return compile_glsl(src, {profile = .Glsl, stage = .Compute})
+}
+
+// Bit-exact RGBA8 -> NV12 Q16/Q18 reference matching oicut/video/color.odin.
+@(test)
+test_compute_nv12 :: proc(t: ^testing.T) {
+	src_bytes, rerr := os.read_entire_file("testdata/nv12.comp", context.temp_allocator)
+	if !testing.expectf(t, rerr == nil, "read nv12.comp: %v", rerr) {
+		return
+	}
+	m, errs, ok := compile_compute(string(src_bytes))
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	testing.expect_value(t, m.threadcount, [3]u32{8, 8, 1})
+	testing.expect_value(t, m.num_samplers, 0)
+	testing.expect_value(t, m.num_readonly_storage_textures, 1)
+	testing.expect_value(t, m.num_readonly_storage_buffers, 0)
+	testing.expect_value(t, m.num_readwrite_storage_textures, 0)
+	testing.expect_value(t, m.num_readwrite_storage_buffers, 1)
+	testing.expect_value(t, m.num_uniform_buffers, 1)
+	testing.expect(t, m.program.jit_body == nil && m.program.jit_init == nil)
+
+	// Non-multiple-of-8 frame (34x18) with padded row stride on both the
+	// source RGBA8 image (148 bytes/row) and NV12 output (40 bytes/row).
+	W, H :: 34, 18
+	SRC_STRIDE :: W * 4 + 12
+	Y_STRIDE :: 40
+	CHROMA_OFFSET :: Y_STRIDE * H
+	OUT_WORDS :: (CHROMA_OFFSET + Y_STRIDE * (H / 2)) / 4
+
+	rgba := make([]u8, SRC_STRIDE * H, context.temp_allocator)
+	for &b in rgba {
+		b = 0xdd
+	}
+	corners := [][3]u8 {
+		{0, 0, 0},
+		{255, 255, 255},
+		{255, 0, 0},
+		{0, 255, 0},
+		{0, 0, 255},
+		{255, 255, 0},
+		{0, 255, 255},
+		{255, 0, 255},
+	}
+	for y in 0 ..< H {
+		row := rgba[y * SRC_STRIDE:]
+		for x in 0 ..< W {
+			idx := y * W + x
+			c: [3]u8
+			if idx < len(corners) {
+				c = corners[idx]
+			} else {
+				c = {u8((x * 37 + y * 13 + 7) & 0xff), u8((x * 19 + y * 53 + 101) & 0xff), u8((x * 71 + y * 29 + 211) & 0xff)}
+			}
+			row[x * 4 + 0] = c[0]
+			row[x * 4 + 1] = c[1]
+			row[x * 4 + 2] = c[2]
+			row[x * 4 + 3] = u8((x + y) & 0xff)
+		}
+	}
+
+	q16 :: proc(v: f64) -> i32 {
+		return i32(math.round(v * 65536.0))
+	}
+
+	Config :: struct {
+		kr, kb:     f64,
+		full_range: bool,
+	}
+	configs := []Config {
+		{0.2126, 0.0722, false}, // BT.709 limited
+		{0.2126, 0.0722, true},  // BT.709 full
+		{0.2990, 0.1140, false}, // BT.601 limited
+		{0.2990, 0.1140, true},  // BT.601 full
+	}
+
+	block := make([]u8, m.block_size, context.temp_allocator)
+	got_words := make([]u32, OUT_WORDS, context.temp_allocator)
+	want_bytes := make([]u8, OUT_WORDS * 4, context.temp_allocator)
+
+	for cfg in configs {
+		ys := (255.0 if cfg.full_range else 219.0) / 255.0
+		cs := (255.0 if cfg.full_range else 224.0) / 255.0
+		yr := q16(cfg.kr * ys)
+		yb := q16(cfg.kb * ys)
+		yg := q16(ys) - yr - yb
+		y_bias := ((i32(0) if cfg.full_range else i32(16 << 16)) + (1 << 15))
+
+		cb := cs / (2.0 * (1.0 - cfg.kb))
+		cr := cs / (2.0 * (1.0 - cfg.kr))
+		u0 := q16(-cfg.kr * cb)
+		u2 := q16((1.0 - cfg.kb) * cb)
+		u1 := -u0 - u2
+		v0 := q16((1.0 - cfg.kr) * cr)
+		v2 := q16(-cfg.kb * cr)
+		v1 := -v0 - v2
+		c_bias := i32((128 << 18) + (1 << 17))
+		c_max := i32(255)
+
+		ky := [4]i32{yr, yg, yb, y_bias}
+		ku := [4]i32{u0, u1, u2, c_bias}
+		kv := [4]i32{v0, v1, v2, c_max}
+		sz := [4]u32{W, H, Y_STRIDE, CHROMA_OFFSET}
+		copy(block[0:16], slice.to_bytes(ky[:]))
+		copy(block[16:32], slice.to_bytes(ku[:]))
+		copy(block[32:48], slice.to_bytes(kv[:]))
+		copy(block[48:64], slice.to_bytes(sz[:]))
+
+		for &w in got_words {
+			w = 0xa5a5_5a5a
+		}
+		want_words := slice.reinterpret([]u32, want_bytes)
+		for &w in want_words {
+			w = 0xa5a5_5a5a
+		}
+
+		// Reference: nv12.comp processes 8x2 pixel blocks across y_stride.
+		fetch_rgb :: proc(rgba: []u8, x, y: int) -> [3]i32 {
+			cx := min(x, W - 1)
+			cy := min(y, H - 1)
+			off := cy * SRC_STRIDE + cx * 4
+			return {i32(rgba[off + 0]), i32(rgba[off + 1]), i32(rgba[off + 2])}
+		}
+		luma :: proc(c: [3]i32, ky: [4]i32) -> u8 {
+			return u8(clamp((ky[0] * c[0] + ky[1] * c[1] + ky[2] * c[2] + ky[3]) >> 16, 0, 255))
+		}
+		for by := 0; by < H; by += 2 {
+			for bx := 0; bx < Y_STRIDE; bx += 2 {
+				a := fetch_rgb(rgba, bx, by)
+				b := fetch_rgb(rgba, bx + 1, by)
+				c := fetch_rgb(rgba, bx, by + 1)
+				d := fetch_rgb(rgba, bx + 1, by + 1)
+				want_bytes[by * Y_STRIDE + bx + 0] = luma(a, ky)
+				want_bytes[by * Y_STRIDE + bx + 1] = luma(b, ky)
+				want_bytes[(by + 1) * Y_STRIDE + bx + 0] = luma(c, ky)
+				want_bytes[(by + 1) * Y_STRIDE + bx + 1] = luma(d, ky)
+				s := a + b + c + d
+				uv_off := CHROMA_OFFSET + (by / 2) * Y_STRIDE + bx
+				want_bytes[uv_off + 0] = u8(clamp((ku[0] * s[0] + ku[1] * s[1] + ku[2] * s[2] + ku[3]) >> 18, 0, kv[3]))
+				want_bytes[uv_off + 1] = u8(clamp((kv[0] * s[0] + kv[1] * s[1] + kv[2] * s[2] + ku[3]) >> 18, 0, kv[3]))
+			}
+		}
+
+		groups := [3]int{((Y_STRIDE / 8) + 7) / 8, ((H / 2) + 7) / 8, 1}
+		img := Storage_Image{data = rgba, width = W, height = H, stride = SRC_STRIDE, format = .Rgba8}
+		run_compute(&m.program, block, groups, temp_scratch(), {images = {img}, buffers = {got_words}})
+
+		mismatches := 0
+		for i in 0 ..< OUT_WORDS {
+			if got_words[i] != want_words[i] {
+				mismatches += 1
+			}
+		}
+		testing.expectf(t, mismatches == 0, "nv12 mismatch count %d (kr=%v full=%v)", mismatches, cfg.kr, cfg.full_range)
+	}
+}
+
+// Disjoint workgroup ranges produce the exact same state whether run in one
+// call, uneven slices, or across 8 concurrent threads with independent Scratch.
+@(test)
+test_compute_workgroup_ranges_and_threads :: proc(t: ^testing.T) {
+	src_bytes, rerr := os.read_entire_file("testdata/particles.comp", context.temp_allocator)
+	if !testing.expectf(t, rerr == nil, "read particles.comp: %v", rerr) {
+		return
+	}
+	m, errs, ok := compile_compute(string(src_bytes))
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+
+	GROUPS :: [3]int{5, 3, 2} // 30 workgroups * 32 lanes = 960 invocations
+	N_PARTICLES :: 917
+	STATE_WORDS :: N_PARTICLES * 8
+
+	forces := make([]u32, 16 * 4, context.temp_allocator)
+	for i in 0 ..< len(forces) {
+		forces[i] = transmute(u32)(f32((i % 11) - 5) * 0.375)
+	}
+
+	init_state :: proc(buf: []u32) {
+		for p in 0 ..< N_PARTICLES {
+			base := p * 8
+			buf[base + 0] = transmute(u32)(f32(p) * 0.25)
+			buf[base + 1] = transmute(u32)(f32(p % 17) * -0.5)
+			buf[base + 2] = transmute(u32)(f32(p % 9) * 1.125)
+			buf[base + 3] = transmute(u32)(0.5 + f32(p % 5) * 0.5)
+			buf[base + 4] = transmute(u32)(f32((p % 7) - 3) * 0.125)
+			buf[base + 5] = transmute(u32)(f32((p % 5) - 2) * 0.25)
+			buf[base + 6] = transmute(u32)(f32((p % 3) - 1) * 0.5)
+			buf[base + 7] = u32(p * 3)
+		}
+	}
+
+	block := make([]u8, m.block_size, context.temp_allocator)
+	testing.expect(t, set_uniform(m, block, "uDt", {0.0625}))
+	testing.expect(t, set_uniform(m, block, "uCount", {f32(N_PARTICLES)}))
+
+	state_single := make([]u32, STATE_WORDS, context.temp_allocator)
+	state_sliced := make([]u32, STATE_WORDS, context.temp_allocator)
+	state_mt := make([]u32, STATE_WORDS, context.temp_allocator)
+	init_state(state_single)
+	init_state(state_sliced)
+	init_state(state_mt)
+
+	// 1. Full dispatch in one call.
+	run_compute(&m.program, block, GROUPS, temp_scratch(), {buffers = {forces, state_single}})
+
+	// 2. Uneven range splits + zero/clamped/out-of-range slices.
+	opts_sliced := Run_Options{buffers = {forces, state_sliced}}
+	run_compute(&m.program, block, GROUPS, temp_scratch(), opts_sliced, 0, 0)
+	run_compute(&m.program, block, GROUPS, temp_scratch(), opts_sliced, -4, 0)
+	run_compute(&m.program, block, GROUPS, temp_scratch(), opts_sliced, 0, 1)
+	run_compute(&m.program, block, GROUPS, temp_scratch(), opts_sliced, 1, 7)
+	run_compute(&m.program, block, GROUPS, temp_scratch(), opts_sliced, 8, 13)
+	run_compute(&m.program, block, GROUPS, temp_scratch(), opts_sliced, 21, 99)
+	run_compute(&m.program, block, GROUPS, temp_scratch(), opts_sliced, 30, 5)
+
+	// 3. 8 OS threads concurrently running disjoint workgroup slices.
+	Worker :: struct {
+		prog:   ^Program,
+		block:  []u8,
+		forces: []u32,
+		state:  []u32,
+		first:  int,
+		count:  int,
+	}
+	WORKERS :: 8
+	workers: [WORKERS]Worker
+	threads: [WORKERS]^thread.Thread
+	for w in 0 ..< WORKERS {
+		workers[w] = {
+			prog   = &m.program,
+			block  = block,
+			forces = forces,
+			state  = state_mt,
+			first  = w * 4,
+			count  = 4,
+		}
+		threads[w] = thread.create_and_start_with_poly_data(&workers[w], proc(wk: ^Worker) {
+			sc: Scratch
+			defer scratch_destroy(&sc)
+			run_compute(wk.prog, wk.block, GROUPS, &sc, {buffers = {wk.forces, wk.state}}, wk.first, wk.count)
+		})
+	}
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+
+	for i in 0 ..< STATE_WORDS {
+		if state_sliced[i] != state_single[i] || state_mt[i] != state_single[i] {
+			testing.expectf(t, false, "word %d mismatch: single=%08x sliced=%08x mt=%08x", i, state_single[i], state_sliced[i], state_mt[i])
+			break
+		}
+	}
+}
+
+// All 6 storage image formats, IEEE-754 RNE f16 conversion, row stride padding,
+// single-channel .gba = (0, 0, 1) substitution, and OOB load/store safety.
+@(test)
+test_compute_image_formats_and_bounds :: proc(t: ^testing.T) {
+	// 1. rgba16f RNE rounding, subnormals, overflow, -0.0, NaN, and roundtrip load.
+	src_f16 := `#version 310 es
+layout(local_size_x = 16) in;
+layout(rgba16f) writeonly uniform highp image2D dst16;
+layout(rgba16f) readonly uniform highp image2D src16;
+buffer IO { vec4 vals[]; } io;
+uniform int uMode;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= 10u) return;
+    if (uMode == 0) {
+        imageStore(dst16, ivec2(int(i), 0), io.vals[i]);
+    } else {
+        io.vals[i] = imageLoad(src16, ivec2(int(i), 0));
+    }
+}`
+	mf16, ef16, ok16 := compile_compute(src_f16)
+	defer destroy(mf16)
+	if !testing.expectf(t, ok16, "%s", format_errors(ef16, context.temp_allocator)) {
+		return
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "f16", mf16.spirv)
+	}
+	tie_even := math.ldexp_f32(1.0, 0) + math.ldexp_f32(1.0, -11)       // 1.0 + 0.5 ulp -> rounds to even (0x3c00)
+	tie_odd := math.ldexp_f32(1.0, 0) + math.ldexp_f32(3.0, -11)        // 1.0 + 1.5 ulp -> rounds to even (0x3c02)
+	min_sub := math.ldexp_f32(1.0, -24)                                 // 0x0001
+	sub_tie_zero := math.ldexp_f32(1.0, -25)                            // 0.5 * min_sub -> 0x0000 (even)
+	sub_tie_up := math.ldexp_f32(3.0, -25)                              // 1.5 * min_sub -> 0x0002 (even)
+	neg_zero := transmute(f32)u32(0x8000_0000)
+	qnan := transmute(f32)u32(0x7fc0_1234)
+
+	vals := make([][4]f32, 10, context.temp_allocator)
+	vals[0] = {1.0, -2.5, 0.0, neg_zero}
+	vals[1] = {tie_even, tie_odd, min_sub, sub_tie_zero}
+	vals[2] = {sub_tie_up, 65504.0, 65519.996, 65520.0} // 65519.996 < 65504 + 16 -> 65504 (even); 65520.0 == tie -> +Inf (even 0x7c00)
+	vals[3] = {math.inf_f32(1), math.inf_f32(-1), qnan, -65504.0}
+	for i in 4 ..< 10 {
+		vals[i] = {f32(i), -f32(i), f32(i) * 0.5, 1.0}
+	}
+
+	f16_words := make([][4]u16, 10, context.temp_allocator)
+	f16_img := Storage_Image{data = slice.to_bytes(f16_words), width = 10, height = 1, format = .Rgba16f}
+	vals_u32 := slice.reinterpret([]u32, vals)
+	b16 := make([]u8, mf16.block_size, context.temp_allocator)
+	testing.expect(t, set_uniform(mf16, b16, "uMode", {0}))
+	run_compute(&mf16.program, b16, {1, 1, 1}, temp_scratch(), {images = {f16_img, f16_img}, buffers = {vals_u32}})
+
+	testing.expect_value(t, f16_words[0], [4]u16{0x3c00, 0xc100, 0x0000, 0x8000})
+	testing.expect_value(t, f16_words[1], [4]u16{0x3c00, 0x3c02, 0x0001, 0x0000})
+	testing.expect_value(t, f16_words[2], [4]u16{0x0002, 0x7bff, 0x7bff, 0x7c00})
+	testing.expect_value(t, f16_words[3][0], u16(0x7c00))
+	testing.expect_value(t, f16_words[3][1], u16(0xfc00))
+	testing.expect(t, (f16_words[3][2] & 0x7c00) == 0x7c00 && (f16_words[3][2] & 0x03ff) != 0)
+	testing.expect_value(t, f16_words[3][3], u16(0xfbff))
+
+	// Load back and check IEEE values (+ -0.0 sign bit, Inf, NaN, subnormal).
+	for &v in vals {
+		v = {-99, -99, -99, -99}
+	}
+	testing.expect(t, set_uniform(mf16, b16, "uMode", {1}))
+	run_compute(&mf16.program, b16, {1, 1, 1}, temp_scratch(), {images = {f16_img, f16_img}, buffers = {vals_u32}})
+	testing.expect_value(t, vals[0][0], f32(1.0))
+	testing.expect_value(t, vals[0][1], f32(-2.5))
+	testing.expect_value(t, transmute(u32)vals[0][3], u32(0x8000_0000))
+	testing.expect_value(t, vals[1][2], min_sub)
+	testing.expect_value(t, vals[2][1], f32(65504.0))
+	testing.expect(t, math.is_inf(vals[2][3], 1))
+	testing.expect(t, math.is_inf(vals[3][0], 1) && math.is_inf(vals[3][1], -1) && math.is_nan(vals[3][2]))
+
+	// 2. Single-channel RW formats (r32f, r32ui, r32i), rgba8 stride/clamp/NaN,
+	//    rgba32f exact, imageSize, and OOB load/store behaviour.
+	src_all := `#version 310 es
+layout(local_size_x = 8) in;
+layout(rgba8) writeonly uniform highp image2D out8;
+layout(rgba32f) writeonly uniform highp image2D out32;
+layout(r32f) uniform highp image2D rwf;
+layout(r32ui) uniform highp uimage2D rwu;
+layout(r32i) uniform highp iimage2D rwi;
+buffer Probe { uvec4 info[]; } probe;
+void main() {
+    int i = int(gl_LocalInvocationIndex);
+    vec4 lf = imageLoad(rwf, ivec2(i, 0));     // in-bounds for i < 4, OOB for i >= 4
+    uvec4 lu = imageLoad(rwu, ivec2(i, 0));
+    ivec4 li = imageLoad(rwi, ivec2(i, 0));
+    ivec2 sz = imageSize(out8);
+    probe.info[i] = uvec4(
+        floatBitsToUint(lf.w) ^ (uint(lf.y == 0.0 && lf.z == 0.0) << 31u),
+        lu.x + lu.w * 100u + lu.y + lu.z,
+        uint(li.x + li.w * 1000 + li.y + li.z),
+        uint(sz.x * 100 + sz.y)
+    );
+    imageStore(rwf, ivec2(i, 0), vec4(lf.x + 2.5, 9.0, 9.0, 9.0));
+    imageStore(rwu, ivec2(i, 0), uvec4(lu.x + 7u, 9u, 9u, 9u));
+    imageStore(rwi, ivec2(i, 0), ivec4(li.x - 5, 9, 9, 9));
+    float nanv = uintBitsToFloat(0x7fc00000u);
+    imageStore(out8, ivec2(i - 1, i & 1), vec4(-0.5, 1.5, 100.0 / 255.0, nanv));
+    imageStore(out32, ivec2(i, 0), vec4(float(i), -float(i), 0.25, 0.75));
+    // OOB buffer store is masked off cleanly.
+    if (i == 7) {
+        probe.info[99] = uvec4(1u);
+    }
+}`
+	mall, eall, okall := compile_compute(src_all)
+	defer destroy(mall)
+	if !testing.expectf(t, okall, "%s", format_errors(eall, context.temp_allocator)) {
+		return
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "all_formats", mall.spirv)
+	}
+
+	// out8 is 3x2 with stride = 20 bytes (8 padding bytes per row filled with 0xaa).
+	out8_bytes := make([]u8, 20 * 2, context.temp_allocator)
+	for &b in out8_bytes {
+		b = 0xaa
+	}
+	out32_px := make([][4]f32, 4, context.temp_allocator)
+	rwf_px := [4]f32{1.25, -3.0, 0.0, 10.5}
+	rwu_px := [4]u32{10, 20, 30, 40}
+	rwi_px := [4]i32{-10, 0, 15, -99}
+	probe_words := make([][4]u32, 8, context.temp_allocator)
+
+	// Binding order for RW/WO storage images: declaration order since none are readonly!
+	testing.expect_value(t, mall.num_readonly_storage_textures, 0)
+	testing.expect_value(t, mall.num_readwrite_storage_textures, 5)
+	imgs := []Storage_Image {
+		{data = out8_bytes, width = 3, height = 2, stride = 20, format = .Rgba8},
+		{data = slice.to_bytes(out32_px), width = 4, height = 1, format = .Rgba32f},
+		{data = slice.to_bytes(rwf_px[:]), width = 4, height = 1, format = .R32f},
+		{data = slice.to_bytes(rwu_px[:]), width = 4, height = 1, format = .R32ui},
+		{data = slice.to_bytes(rwi_px[:]), width = 4, height = 1, format = .R32i},
+	}
+	run_compute(&mall.program, nil, {1, 1, 1}, temp_scratch(), {images = imgs, buffers = {slice.reinterpret([]u32, probe_words)}})
+
+	for i in 0 ..< 8 {
+		// In-bounds single-channel load sets .w = 1 (1.0f / 1u / 1), OOB returns (0, 0, 0, 0).
+		want_w_bits := (transmute(u32)f32(1.0) if i < 4 else u32(0)) | (1 << 31)
+		testing.expect_value(t, probe_words[i][0], want_w_bits)
+		want_u := (u32(10 * (i + 1)) + 100) if i < 4 else 0
+		testing.expect_value(t, probe_words[i][1], want_u)
+		init_i := [4]i32{-10, 0, 15, -99}
+		want_i := u32(init_i[i] + 1000) if i < 4 else 0
+		testing.expect_value(t, probe_words[i][2], want_i)
+		testing.expect_value(t, probe_words[i][3], u32(302))
+	}
+	testing.expect_value(t, rwf_px, [4]f32{3.75, -0.5, 2.5, 13.0})
+	testing.expect_value(t, rwu_px, [4]u32{17, 27, 37, 47})
+	testing.expect_value(t, rwi_px, [4]i32{-15, -5, 10, -104})
+	for i in 0 ..< 4 {
+		testing.expect_value(t, out32_px[i], [4]f32{f32(i), -f32(i), 0.25, 0.75})
+	}
+	// Check rgba8 written texels (i=1 -> (0,1), i=2 -> (1,0), i=3 -> (2,1); i=0 -> (-1,0) OOB; i>=4 -> x>=3 OOB)
+	// and verify row padding bytes [12..20) remain untouched (0xaa).
+	testing.expect_value(t, [4]u8{out8_bytes[4], out8_bytes[5], out8_bytes[6], out8_bytes[7]}, [4]u8{0, 255, 100, 0})
+	testing.expect_value(t, [4]u8{out8_bytes[20], out8_bytes[21], out8_bytes[22], out8_bytes[23]}, [4]u8{0, 255, 100, 0})
+	testing.expect_value(t, [4]u8{out8_bytes[28], out8_bytes[29], out8_bytes[30], out8_bytes[31]}, [4]u8{0, 255, 100, 0})
+	for row in 0 ..< 2 {
+		for b in 12 ..< 20 {
+			testing.expect_value(t, out8_bytes[row * 20 + b], u8(0xaa))
+		}
+	}
+
+	// Valid 0x0 empty Storage_Images drop stores and return (0, 0, 0, 0) on loads.
+	empty_res := make([]u32, 32, context.temp_allocator)
+	empty_imgs := []Storage_Image {
+		{width = 0, height = 0, format = .Rgba8},
+		{width = 0, height = 0, format = .Rgba32f},
+		{width = 0, height = 0, format = .R32f},
+		{width = 0, height = 0, format = .R32ui},
+		{width = 0, height = 0, format = .R32i},
+	}
+	run_compute(&mall.program, nil, {1, 1, 1}, temp_scratch(), {images = empty_imgs, buffers = {empty_res}})
+	for i in 0 ..< 8 {
+		// Out-of-bounds loads on 0x0 return (0, 0, 0, 0); bit 31 = 1 (lf.y==0 && lf.z==0) ^ floatBitsToUint(0.0).
+		testing.expect_value(t, empty_res[i * 4 + 0], u32(0x8000_0000))
+		testing.expect_value(t, empty_res[i * 4 + 1], u32(0))
+		testing.expect_value(t, empty_res[i * 4 + 2], u32(0))
+	}
+}
+
+// SDL_GPU compute binding order: read-only resources precede read-write/writeonly
+// in reflection, SPIR-V descriptor sets (set 0 RO, set 1 RW, set 2 UBO), MSL flat
+// indices, and Run_Options slices.
+@(test)
+test_compute_binding_order_and_reflection :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 16, local_size_y = 2) in;
+uniform float uScale;
+uniform sampler2D sTex0;
+uniform sampler2DArray sTex1;
+
+buffer BufRW0 { uint rw0[]; };
+readonly buffer BufRO0 { uint ro0[]; };
+writeonly buffer BufWO1 { uint wo1[]; };
+readonly buffer BufRO1 { uint ro1[]; };
+
+layout(r32ui) uniform highp uimage2D imgRW0;
+layout(rgba8) readonly uniform highp image2D imgRO0;
+layout(rgba32f) writeonly uniform highp image2D imgWO1;
+layout(r32i) readonly uniform highp iimage2D imgRO1;
+
+void main() {
+    uint idx = gl_LocalInvocationIndex;
+    vec4 t0 = textureLod(sTex0, vec2(0.25, 0.75), 0.0);
+    vec4 t1 = textureGrad(sTex1, vec3(0.5, 0.5, 1.0), vec2(0.1, 0.0), vec2(0.0, 0.1));
+    ivec2 sz = textureSize(sTex0, 0);
+    vec4 c0 = imageLoad(imgRO0, ivec2(0, 0));
+    ivec4 c1 = imageLoad(imgRO1, ivec2(0, 0));
+    uvec4 prev = imageLoad(imgRW0, ivec2(int(idx), 0));
+    uint sum = ro0[0] + ro1[0] + prev.x + uint(c1.x) + uint(sz.x);
+    rw0[idx] += sum;
+    wo1[idx] = sum * 2u;
+    imageStore(imgRW0, ivec2(int(idx), 0), uvec4(sum, 0u, 0u, 0u));
+    imageStore(imgWO1, ivec2(int(idx), 0), (t0 + t1 + c0) * uScale);
+}`
+	m, errs, ok := compile_compute(src)
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "binding_order", m.spirv)
+	}
+
+	testing.expect_value(t, m.threadcount, [3]u32{16, 2, 1})
+	testing.expect_value(t, m.num_samplers, 2)
+	testing.expect_value(t, m.num_readonly_storage_textures, 2)
+	testing.expect_value(t, m.num_readonly_storage_buffers, 2)
+	testing.expect_value(t, m.num_readwrite_storage_textures, 2)
+	testing.expect_value(t, m.num_readwrite_storage_buffers, 2)
+	testing.expect_value(t, m.num_uniform_buffers, 1)
+
+	testing.expect_value(t, len(m.storage_buffers), 4)
+	testing.expect(t, m.storage_buffers[0].name == "BufRO0" && m.storage_buffers[0].readonly && !m.storage_buffers[0].writeonly)
+	testing.expect(t, m.storage_buffers[1].name == "BufRO1" && m.storage_buffers[1].readonly && !m.storage_buffers[1].writeonly)
+	testing.expect(t, m.storage_buffers[2].name == "BufRW0" && !m.storage_buffers[2].readonly && !m.storage_buffers[2].writeonly)
+	testing.expect(t, m.storage_buffers[3].name == "BufWO1" && !m.storage_buffers[3].readonly && m.storage_buffers[3].writeonly)
+
+	testing.expect_value(t, len(m.storage_images), 4)
+	testing.expect(t, m.storage_images[0].name == "imgRO0" && m.storage_images[0].format == .Rgba8 && m.storage_images[0].readonly && !m.storage_images[0].writeonly)
+	testing.expect(t, m.storage_images[1].name == "imgRO1" && m.storage_images[1].format == .R32i && m.storage_images[1].readonly && !m.storage_images[1].writeonly)
+	testing.expect(t, m.storage_images[2].name == "imgRW0" && m.storage_images[2].format == .R32ui && !m.storage_images[2].readonly && !m.storage_images[2].writeonly)
+	testing.expect(t, m.storage_images[3].name == "imgWO1" && m.storage_images[3].format == .Rgba32f && !m.storage_images[3].readonly && m.storage_images[3].writeonly)
+
+	// MSL flat binding slots: textures 0..1 = samplers, 2..3 = RO images, 4..5 = RW/WO images;
+	// buffer 0 = UBO, buffers 1..2 = RO buffers, buffers 3..4 = RW/WO buffers.
+	for want in ([]string {
+		"kernel void oksl_main(",
+		"texture2d<float> ok_sTex0_tex [[texture(0)]], sampler ok_sTex0_smp [[sampler(0)]]",
+		"texture2d_array<float> ok_sTex1_tex [[texture(1)]], sampler ok_sTex1_smp [[sampler(1)]]",
+		"texture2d<float, access::read> ok_imgRO0_img [[texture(2)]]",
+		"texture2d<int, access::read> ok_imgRO1_img [[texture(3)]]",
+		"texture2d<uint, access::read_write> ok_imgRW0_img [[texture(4)]]",
+		"texture2d<float, access::write> ok_imgWO1_img [[texture(5)]]",
+		"const device uint* oksl_buf_ro0 [[buffer(1)]]",
+		"const device uint* oksl_buf_ro1 [[buffer(2)]]",
+		"device uint* oksl_buf_rw0 [[buffer(3)]]",
+		"device uint* oksl_buf_wo1 [[buffer(4)]]",
+		"constant Oksl_Uniforms& u [[buffer(0)]]",
+	}) {
+		testing.expectf(t, strings.contains(m.msl, want), "MSL lacks %q in:\n%s", want, m.msl)
+	}
+
+	// Execute via run_compute using the reflection order.
+	ro0 := []u32{10}
+	ro1 := []u32{20}
+	rw0 := make([]u32, 32, context.temp_allocator)
+	wo1 := make([]u32, 32, context.temp_allocator)
+	for i in 0 ..< 32 {
+		rw0[i] = u32(i)
+	}
+
+	img_ro0 := [4]u8{255, 0, 0, 255}
+	img_ro1 := [1]i32{7}
+	img_rw0 := make([]u32, 32, context.temp_allocator)
+	for i in 0 ..< 32 {
+		img_rw0[i] = 5
+	}
+	img_wo1 := make([][4]f32, 32, context.temp_allocator)
+
+	block := make([]u8, m.block_size, context.temp_allocator)
+	testing.expect(t, set_uniform(m, block, "uScale", {2.0}))
+	sampler_cb :: proc(user: rawptr, ch: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		return {f32(ch + 1), f32(layer), 0.5, 1.0}
+	}
+	opts := Run_Options {
+		sampler       = sampler_cb,
+		channel_sizes = {{64, 32, 1}, {16, 16, 4}},
+		buffers       = {ro0, ro1, rw0, wo1},
+		images        = {
+			{data = img_ro0[:], width = 1, height = 1, format = .Rgba8},
+			{data = slice.to_bytes(img_ro1[:]), width = 1, height = 1, format = .R32i},
+			{data = slice.to_bytes(img_rw0), width = 32, height = 1, format = .R32ui},
+			{data = slice.to_bytes(img_wo1), width = 32, height = 1, format = .Rgba32f},
+		},
+	}
+	run_compute(&m.program, block, {1, 1, 1}, temp_scratch(), opts)
+
+	// sum = 10 + 20 + 5 + 7 + 64 = 106
+	for i in 0 ..< 32 {
+		testing.expect_value(t, rw0[i], u32(i) + 106)
+		testing.expect_value(t, wo1[i], u32(212))
+		testing.expect_value(t, img_rw0[i], u32(106))
+		// (t0={1,0,0.5,1} + t1={2,1,0.5,1} + c0={1,0,0,1}) * 2.0 = {8, 2, 2, 6}
+		near(t, img_wo1[i], {8, 2, 2, 6})
+	}
+}
+
+// Buffer lvalues (non-contiguous/composed swizzles, dynamic vector component,
+// pre/post ++/--, out/inout args, writeonly stores), >64-lane multi-chunk
+// workgroups, gl_WorkGroupSize constant expressions, and RW-to-RO/WO image params.
+@(test)
+test_compute_buffer_lvalues_and_workgroup_size :: proc(t: ^testing.T) {
+	src_lval := `#version 310 es
+layout(local_size_x = 4) in;
+struct Item {
+    vec4 v;
+    ivec4 iv;
+};
+buffer Data { Item items[]; } data;
+writeonly buffer Out { uvec4 res[]; } out_buf;
+
+void set_out(out vec2 p) { p = vec2(9.0, 10.0); }
+void bump_inout(inout float x) { x += 3.5; }
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= 4u) return;
+    // Non-contiguous and composed swizzle stores + compound assignment.
+    data.items[i].v.zx = vec2(10.0, 20.0);
+    data.items[i].v.zyx.xz += vec2(1.0, 2.0); // .z += 1 -> 11, .x += 2 -> 22
+    // Dynamic component store and compound assignment.
+    int c = int(i & 3u);
+    data.items[i].v[c] += 100.0;
+    // Pre and post increment/decrement on buffer elements.
+    int pre = ++data.items[i].iv.x;
+    int post = data.items[i].iv.y--;
+    // out and inout parameters backed by buffer lvalues.
+    set_out(data.items[i].v.yw);
+    bump_inout(data.items[i].v.w); // 10.0 + 3.5 = 13.5
+    out_buf.res[i] = uvec4(uint(pre), uint(post), uint(data.items[i].iv.y), i);
+}`
+	ml, el, okl := compile_compute(src_lval)
+	defer destroy(ml)
+	if !testing.expectf(t, okl, "%s", format_errors(el, context.temp_allocator)) {
+		return
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "buffer_lvalues", ml.spirv)
+	}
+
+	Item_CPU :: struct {
+		v:  [4]f32,
+		iv: [4]i32,
+	}
+	items := make([]Item_CPU, 4, context.temp_allocator)
+	for i in 0 ..< 4 {
+		items[i] = {v = {1, 2, 3, 4}, iv = {10 + i32(i), 20 + i32(i), 0, 0}}
+	}
+	res_out := make([][4]u32, 4, context.temp_allocator)
+	run_compute(&ml.program, nil, {1, 1, 1}, temp_scratch(), {
+		buffers = {slice.reinterpret([]u32, items), slice.reinterpret([]u32, res_out)},
+	})
+
+	for i in 0 ..< 4 {
+		// Before dynamic [c] += 100 and set_out(.yw)/bump_inout(.w):
+		// v starts {1,2,3,4} -> .zx={10,20} => {20,2,10,4} -> .zyx.xz += {1,2} => {22,2,11,4}
+		// then v[i] += 100, then .yw = {9, 10}, then .w += 3.5 => 13.5!
+		want_v := [4]f32{22, 9, 11, 13.5}
+		if i == 0 {
+			want_v[0] += 100
+		} else if i == 2 {
+			want_v[2] += 100
+		}
+		// Note: for i==1 or i==3, v[i] += 100 happened BEFORE set_out(v.yw) overwrote y and w!
+		near(t, items[i].v, want_v)
+		testing.expect_value(t, items[i].iv[0], 11 + i32(i))
+		testing.expect_value(t, items[i].iv[1], 19 + i32(i))
+		testing.expect_value(t, res_out[i], [4]u32{u32(11 + i), u32(20 + i), u32(19 + i), u32(i)})
+	}
+
+	// 256-lane workgroup (4 chunks of 64 lanes), gl_WorkGroupSize constant array,
+	// and passing a RW uimage2D to both readonly and writeonly helper params.
+	src_256 := `#version 310 es
+layout(local_size_x = 256) in;
+const uint CHUNKS = gl_WorkGroupSize.x / 64u;
+layout(r32ui) uniform highp uimage2D hist;
+
+uint read_slot(readonly highp uimage2D im, int x) {
+    return imageLoad(im, ivec2(x, 0)).x;
+}
+void write_slot(writeonly highp uimage2D im, int x, uint v) {
+    imageStore(im, ivec2(x, 0), uvec4(v, 0u, 0u, 0u));
+}
+void main() {
+    uint bins[gl_WorkGroupSize.x / 64u];
+    for (uint k = 0u; k < CHUNKS; ++k) {
+        bins[k] = k + 1u;
+    }
+    int gx = int(gl_GlobalInvocationID.x);
+    uint cur = read_slot(hist, gx);
+    uint tag = bins[gl_LocalInvocationIndex / 64u] * 1000u + gl_WorkGroupID.x * 500u + gl_LocalInvocationID.x;
+    write_slot(hist, gx, cur + tag);
+}`
+	m256, e256, ok256 := compile_compute(src_256)
+	defer destroy(m256)
+	if !testing.expectf(t, ok256, "%s", format_errors(e256, context.temp_allocator)) {
+		return
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "workgroup_256", m256.spirv)
+	}
+	testing.expect(t, strings.contains(m256.msl, "template<access oksl_a0>"))
+	testing.expect_value(t, m256.threadcount, [3]u32{256, 1, 1})
+
+	slots := make([]u32, 512, context.temp_allocator)
+	for i in 0 ..< 512 {
+		slots[i] = 7
+	}
+	run_compute(&m256.program, nil, {2, 1, 1}, temp_scratch(), {
+		images = {{data = slice.to_bytes(slots), width = 512, height = 1, format = .R32ui}},
+	})
+	for wg in 0 ..< 2 {
+		for lid in 0 ..< 256 {
+			gx := wg * 256 + lid
+			want := u32(7 + ((lid / 64) + 1) * 1000 + wg * 500 + lid)
+			if slots[gx] != want {
+				testing.expectf(t, false, "slot %d: got %d, want %d", gx, slots[gx], want)
+				break
+			}
+		}
+	}
+}
+
+// Phase 1 compute & graphics stage diagnostics.
+@(test)
+test_compute_diagnostics :: proc(t: ^testing.T) {
+	expect_code :: proc(t: ^testing.T, src: string, want: Error_Code, opts := Options{profile = .Glsl, stage = .Compute}, loc := #caller_location) {
+		m, errs, ok := compile(src, opts)
+		defer destroy(m)
+		found := false
+		for e in errs {
+			if e.code == want {
+				found = true
+				break
+			}
+		}
+		testing.expectf(t, !ok && found, "expected %v for:\n%s\ngot:\n%s", want, src, format_errors(errs, context.temp_allocator), loc = loc)
+	}
+
+	// Dialect & options restrictions.
+	expect_code(t, "half4 main(float2 p) { return half4(1); }", .Stage_Unsupported, {profile = .Sksl, stage = .Compute})
+	expect_code(t, "void mainImage(out vec4 o, in vec2 p) { o = vec4(1); }", .Stage_Unsupported, {profile = .Shadertoy, stage = .Compute})
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() {}", .Tap_Stage, {profile = .Glsl, stage = .Compute, taps = {{position = "p"}}})
+
+	// Workgroup local_size rules.
+	expect_code(t, "void main() {}", .Missing_Local_Size)
+	expect_code(t, "int n = 4;\nlayout(local_size_x = n) in;\nvoid main() {}", .Local_Size_Constant)
+	expect_code(t, "const int N = 4;\nlayout(local_size_x = N) in;\nvoid main() {}", .Local_Size_Constant)
+	expect_code(t, "layout(local_size_x = 4 * 2) in;\nvoid main() {}", .Local_Size_Constant)
+	expect_code(t, "layout(local_size_x = (8)) in;\nvoid main() {}", .Local_Size_Constant)
+	expect_code(t, "layout(local_size_x = ~0u) in;\nvoid main() {}", .Local_Size_Constant)
+	expect_code(t, "layout(local_size_x = -4) in;\nvoid main() {}", .Local_Size_Constant)
+	expect_code(t, "layout(local_size_x = 0) in;\nvoid main() {}", .Local_Size_Positive)
+	expect_code(t, "layout(local_size_x = 32, local_size_y = 32, local_size_z = 2) in;\nvoid main() {}", .Local_Size_Max)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(local_size_x = 16) in;\nvoid main() {}", .Local_Size_Conflict)
+	// Matching duplicate declaration and uint/hex literals are valid GLSL ES 3.1.
+	{
+		m, errs, ok := compile_compute("layout(local_size_x = 8u, local_size_y = 0x8) in;\nlayout(local_size_y = 8, local_size_x = 010) in;\nvoid main() {}")
+		defer destroy(m)
+		testing.expectf(t, ok && m.threadcount == {8, 8, 1}, "%s", format_errors(errs, context.temp_allocator))
+	}
+
+	// Stage boundaries: compute rejects graphics features; graphics rejects compute features.
+	expect_code(t, "layout(local_size_x = 8) in;\nin vec2 v;\nvoid main() {}", .Compute_Stage_Var)
+	expect_code(t, "layout(local_size_x = 8) in;\nout vec4 o;\nvoid main() {}", .Compute_Stage_Var)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { discard; }", .Fragment_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nuniform float u;\nvoid main() { float d = dFdx(u); }", .Fragment_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nuniform float u;\nvoid main() { float d = fwidth(u); }", .Fragment_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { vec4 c = gl_FragCoord; }", .Fragment_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { bool f = gl_FrontFacing; }", .Fragment_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { gl_SampleMask[0] = 1; }", .Fragment_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { gl_Position = vec4(0); }", .Vertex_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { int v = gl_VertexID; }", .Vertex_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { gl_WorkGroupSize = uvec3(1u); }", .Is_Const)
+
+	// Implicit-LOD sampling rejected in compute.
+	expect_code(t, "layout(local_size_x = 8) in;\nuniform sampler2D s;\nvoid main() { vec4 c = texture(s, vec2(0.5)); }", .Compute_Implicit_Sample)
+	expect_code(t, "layout(local_size_x = 8) in;\nuniform sampler2D s;\nvoid main() { vec4 c = texture(s, vec2(0.5), 1.0); }", .Compute_Implicit_Sample)
+	expect_code(t, "layout(local_size_x = 8) in;\nuniform sampler2D s;\nvoid main() { vec4 c = textureProj(s, vec3(0.5, 0.5, 1.0)); }", .Compute_Implicit_Sample)
+
+	// Compute-only features rejected in Fragment and Vertex.
+	frag_opts := Options{profile = .Glsl, stage = .Fragment}
+	vert_opts := Options{profile = .Glsl, stage = .Vertex}
+	expect_code(t, "layout(local_size_x = 8) in;\nout vec4 o;\nvoid main() { o = vec4(1); }", .Compute_Only, frag_opts)
+	expect_code(t, "out vec4 o;\nvoid main() { o = vec4(float(gl_GlobalInvocationID.x)); }", .Compute_Only, frag_opts)
+	expect_code(t, "void main() { gl_Position = vec4(float(gl_LocalInvocationIndex)); }", .Compute_Only, vert_opts)
+	expect_code(t, "out vec4 o;\nvoid main() { o = vec4(float(gl_WorkGroupSize.x)); }", .Compute_Only, frag_opts)
+	expect_code(t, "layout(rgba8) readonly uniform image2D im;\nout vec4 o;\nvoid main() { o = imageLoad(im, ivec2(0)); }", .Compute_Only, frag_opts)
+	expect_code(t, "layout(rgba8) readonly uniform image2D im;\nvoid main() { gl_Position = imageLoad(im, ivec2(0)); }", .Compute_Only, vert_opts)
+	expect_code(t, "buffer B { float a[]; } b;\nout vec4 o;\nvoid main() { o = vec4(b.a[0]); }", .Buffer_Writable, frag_opts)
+	expect_code(t, "writeonly buffer B { float a[]; } b;\nvoid main() { gl_Position = vec4(1); }", .Buffer_Writable, vert_opts)
+
+	// Buffer & image access qualifiers.
+	expect_code(t, "layout(local_size_x = 8) in;\nreadonly writeonly buffer B { uint a[]; } b;\nvoid main() {}", .Readonly_Writeonly)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba8) readonly writeonly uniform image2D im;\nvoid main() {}", .Readonly_Writeonly)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid f(readonly writeonly image2D im) {}\nvoid main() {}", .Readonly_Writeonly)
+
+	expect_code(t, "layout(local_size_x = 8) in;\nreadonly buffer B { uint a[]; } b;\nvoid main() { b.a[0] = 1u; }", .Read_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nreadonly buffer B { uint a[]; } b;\nvoid main() { b.a[0] += 1u; }", .Read_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nreadonly buffer B { uint a[]; } b;\nvoid main() { b.a[0]++; }", .Read_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nreadonly buffer B { uint a[]; } b;\nvoid f(inout uint x) { x = 1u; }\nvoid main() { f(b.a[0]); }", .Read_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba8) readonly uniform image2D im;\nvoid main() { imageStore(im, ivec2(0), vec4(1)); }", .Read_Only)
+
+	expect_code(t, "layout(local_size_x = 8) in;\nwriteonly buffer B { uint a[]; } b;\nbuffer Out { uint y[]; } o;\nvoid main() { o.y[0] = b.a[0]; }", .Write_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nwriteonly buffer B { uint a[]; } b;\nvoid main() { b.a[0] += 1u; }", .Write_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nwriteonly buffer B { uint a[]; } b;\nvoid main() { ++b.a[0]; }", .Write_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nwriteonly buffer B { uint a[]; } b;\nvoid f(inout uint x) { x += 1u; }\nvoid main() { f(b.a[0]); }", .Write_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba8) writeonly uniform image2D im;\nbuffer Out { vec4 y[]; } o;\nvoid main() { o.y[0] = imageLoad(im, ivec2(0)); }", .Write_Only)
+
+	// Image format and parameter rules.
+	expect_code(t, "layout(local_size_x = 8) in;\nreadonly uniform image2D im;\nvoid main() {}", .Image_Format_Required)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid f(layout(rgba8) readonly image2D im) {}\nvoid main() {}", .Param_Layout)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba16ui) readonly uniform uimage2D im;\nvoid main() {}", .Image_Format_Unknown)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba8) readonly uniform uimage2D im;\nvoid main() {}", .Image_Format_Mismatch)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(r32ui) uniform image2D im;\nvoid main() {}", .Image_Format_Mismatch)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(r32i) uniform uimage2D im;\nvoid main() {}", .Image_Format_Mismatch)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba8) uniform image2D im;\nvoid main() {}", .Image_RW_Format)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba16f) uniform image2D im;\nvoid main() {}", .Image_RW_Format)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba32f) uniform image2D im;\nvoid main() {}", .Image_RW_Format)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid f(out uimage2D im) {}\nvoid main() {}", .Image_Out_Param)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid f(inout uimage2D im) {}\nvoid main() {}", .Image_Out_Param)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba8) readonly uniform image2D im;\nvoid f(writeonly image2D p) {}\nvoid main() { f(im); }", .No_Overload)
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(rgba8) readonly uniform image2D a;\nlayout(rgba16f) readonly uniform image2D b;\nvec4 f(readonly image2D p) { return imageLoad(p, ivec2(0)); }\nvoid main() { vec4 x = f(a) + f(b); }", .Image_Param_Format)
+
+	// > MAX_STORAGE_IMAGES (16) limit.
+	{
+		b := strings.builder_make(context.temp_allocator)
+		strings.write_string(&b, "layout(local_size_x = 8) in;\n")
+		for i in 0 ..< 17 {
+			fmt.sbprintf(&b, "layout(rgba8) readonly uniform image2D im%d;\n", i)
+		}
+		strings.write_string(&b, "buffer Out { float v[]; } o;\nvoid main() { o.v[0] = ")
+		for i in 0 ..< 17 {
+			if i > 0 {
+				strings.write_string(&b, " + ")
+			}
+			fmt.sbprintf(&b, "imageLoad(im%d, ivec2(0)).x", i)
+		}
+		strings.write_string(&b, "; }\n")
+		expect_code(t, strings.to_string(b), .Too_Many_Images)
+	}
+}
+
+// Regression tests for all Round 1 compute review items (evaluation order &
+// aliasing, std430 vec3[] strides, local_size 64-bit overflow, opaque ?:,
+// gl_WorkGroupSize lexical ordering, exact rgba8 imageLoad, MSL parameter
+// shadowing & read_write fence, row_major/column_major buffer layouts, AST
+// record sizes, portable layout-less image parameters, and diagnostic nits).
+@(test)
+test_compute_review_fixes :: proc(t: ^testing.T) {
+	// 1. Evaluation order & aliasing (VM + MSL sequencing + oksl_fence).
+	alias_src := `#version 310 es
+layout(local_size_x = 1) in;
+buffer B { uint w[]; } b;
+buffer V { uvec2 v[]; } vb;
+layout(r32ui) uniform highp uimage2D im;
+uint g = 0u;
+
+void setg(out uint dst) {
+    g = 3u;
+    dst = 77u;
+}
+uvec4 mutate_p(inout ivec2 p) {
+    p = ivec2(5, 0);
+    return uvec4(99u, 0u, 0u, 0u);
+}
+uint bump(inout uint x) {
+    x += 10u;
+    return 3u;
+}
+
+void main() {
+    uint k = 5u;
+    b.w[k] = k++;                      // b.w[5] = 5, k = 6
+    b.w[0] = k;
+
+    uint m = 7u;
+    b.w[m] += (m = 20u);               // b.w[7] += 20 (was 1) -> 21, m = 20
+
+    g = 1u;
+    setg(b.w[g]);                      // b.w[1] = 77 (addressed before setg mutates g=3)
+
+    uint j = 0u;
+    vb.v[0] = uvec2(10u, 20u);
+    vb.v[1] = uvec2(30u, 40u);
+    vb.v[j].y += vb.v[j++].x;          // vb.v[0].y = 20 + 10 = 30, j = 1
+    b.w[2] = j;
+
+    ivec2 p = ivec2(2, 0);
+    imageStore(im, p, mutate_p(p));    // stores 99 at x=2, not x=5
+    b.w[8] = imageLoad(im, ivec2(2, 0)).x;
+    b.w[9] = imageLoad(im, ivec2(5, 0)).x;
+
+    uint q = 10u;
+    b.w[10] = q - bump(q);             // 10 - 3 = 7 (LHS=10 snapshotted before bump mutates q=20)
+    b.w[11] = q;
+
+    uint r = 4u;
+    b.w[12] = max(r, bump(r));         // max(4, 3) = 4 (arg0=4 snapshotted before bump mutates r=14)
+    b.w[13] = r;
+
+    b.w[3] = 5u;
+    b.w[3] += (b.w[3] = 100u);         // RHS sets b.w[3]=100, then LHS loads 100 + 100 = 200
+
+    uint a[4] = uint[4](1u, 2u, 3u, 4u);
+    uint am = 1u;
+    a[am] += (am = 2u);                // a[1] = 2 + 2 = 4, am = 2
+    b.w[14] = a[1];
+    b.w[15] = a[2];
+
+    uint x = 5u;
+    x += (x = 100u);                   // RHS sets x=100, then 100 + 100 = 200
+    b.w[16] = x;
+}`
+	ma, ea, oka := compile_compute(alias_src)
+	defer destroy(ma)
+	if !testing.expectf(t, oka, "%s", format_errors(ea, context.temp_allocator)) {
+		return
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "alias_fixes", ma.spirv)
+	}
+	testing.expect(t, strings.contains(ma.msl, "oksl_fence(ok_im_img)"))
+
+	bw := make([]u32, 32, context.temp_allocator)
+	bw[7] = 1
+	vw := make([]u32, 8, context.temp_allocator)
+	imw := make([]u32, 8, context.temp_allocator)
+	run_compute(&ma.program, nil, {1, 1, 1}, temp_scratch(), {
+		buffers = {bw, vw},
+		images  = {{data = slice.to_bytes(imw), width = 8, height = 1, format = .R32ui}},
+	})
+	testing.expect_value(t, bw[5], u32(5))
+	testing.expect_value(t, bw[0], u32(6))
+	testing.expect_value(t, bw[7], u32(21))
+	testing.expect_value(t, bw[1], u32(77))
+	testing.expect_value(t, bw[3], u32(200))
+	testing.expect_value(t, vw[0], u32(10))
+	testing.expect_value(t, vw[1], u32(30))
+	testing.expect_value(t, bw[2], u32(1))
+	testing.expect_value(t, imw[2], u32(99))
+	testing.expect_value(t, imw[5], u32(0))
+	testing.expect_value(t, bw[8], u32(99))
+	testing.expect_value(t, bw[9], u32(0))
+	testing.expect_value(t, bw[10], u32(7))
+	testing.expect_value(t, bw[11], u32(20))
+	testing.expect_value(t, bw[12], u32(4))
+	testing.expect_value(t, bw[13], u32(14))
+	testing.expect_value(t, bw[14], u32(4))
+	testing.expect_value(t, bw[15], u32(3))
+	testing.expect_value(t, bw[16], u32(200))
+
+	// 2. std430 runtime-sized array stride on vec3/ivec3/uvec3 vs structs.
+	stride_src := `#version 310 es
+layout(local_size_x = 4) in;
+struct PackA { vec3 v; float s; };
+struct PackB { vec3 a; vec3 b; };
+struct Single { vec3 v; };
+readonly buffer B0 { vec3 f3[]; } b0;
+readonly buffer B1 { ivec3 i3[]; } b1;
+buffer B2 { uvec3 u3[]; } b2;
+readonly buffer B3 { PackA pa[]; } b3;
+readonly buffer B4 { PackB pb[]; } b4;
+readonly buffer B5 { Single sg[]; } b5;
+readonly buffer B6 { float f1[]; } b6;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    vec3 f = b0.f3[i] + b3.pa[i].v + b4.pb[i].b + b5.sg[i].v;
+    ivec3 iv = b1.i3[i];
+    b2.u3[i] += uvec3(uint(f.x + b6.f1[i]), uint(iv.y), uint(f.z));
+}`
+	ms, es, oks := compile_compute(stride_src)
+	defer destroy(ms)
+	if !testing.expectf(t, oks, "%s", format_errors(es, context.temp_allocator)) {
+		return
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "std430_strides", ms.spirv)
+	}
+	// Binding order: readonly B0, B1, B3, B4, B5, B6 first, then RW B2.
+	want_strides := [7]int{16, 16, 16, 32, 16, 4, 16}
+	for ws, i in want_strides {
+		testing.expect_value(t, ms.storage_buffers[i].stride, ws)
+	}
+	b0w := make([]u32, 16, context.temp_allocator)
+	b1w := make([]u32, 16, context.temp_allocator)
+	b3w := make([]u32, 16, context.temp_allocator)
+	b4w := make([]u32, 32, context.temp_allocator)
+	b5w := make([]u32, 16, context.temp_allocator)
+	b6w := make([]u32, 4, context.temp_allocator)
+	b2w := make([]u32, 16, context.temp_allocator)
+	for i in 0 ..< 4 {
+		// Element i of vec3[] sits at word i * 4 (16-byte stride), NOT i * 3!
+		b0w[i * 4 + 0] = transmute(u32)f32(i + 1)
+		b0w[i * 4 + 2] = transmute(u32)f32(10 + i)
+		b1w[i * 4 + 1] = u32(20 + i)
+		b3w[i * 4 + 0] = transmute(u32)f32(2)
+		b4w[i * 8 + 4] = transmute(u32)f32(3) // PackB.b is at offset 16 (word 4) inside 32-byte struct
+		b5w[i * 4 + 0] = transmute(u32)f32(4)
+		b6w[i] = transmute(u32)f32(5)
+		b2w[i * 4 + 0] = 100
+		b2w[i * 4 + 3] = 0xdead_beef // padding word 3 must remain untouched
+	}
+	run_compute(&ms.program, nil, {1, 1, 1}, temp_scratch(), {
+		buffers = {b0w, b1w, b3w, b4w, b5w, b6w, b2w},
+	})
+	for i in 0 ..< 4 {
+		// f.x = (i+1) + 2 + 3 + 4 = i + 10; + f1[i](5) = i + 15; + 100 = 115 + i
+		testing.expect_value(t, b2w[i * 4 + 0], u32(115 + i))
+		testing.expect_value(t, b2w[i * 4 + 1], u32(20 + i))
+		testing.expect_value(t, b2w[i * 4 + 2], u32(10 + i))
+		testing.expect_value(t, b2w[i * 4 + 3], u32(0xdead_beef))
+	}
+
+	// 6. Exact rgba8 imageLoad for all 256 byte values (0 ulp vs b / 255.0f).
+	rgba8_src := `#version 310 es
+layout(local_size_x = 64) in;
+layout(rgba8) readonly uniform highp image2D src;
+writeonly buffer Out { vec4 vals[]; } out_buf;
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    out_buf.vals[x] = imageLoad(src, ivec2(x, 0));
+}`
+	m8, e8, ok8 := compile_compute(rgba8_src)
+	defer destroy(m8)
+	if !testing.expectf(t, ok8, "%s", format_errors(e8, context.temp_allocator)) {
+		return
+	}
+	in_bytes := make([]u8, 256, context.temp_allocator)
+	for i in 0 ..< 256 {
+		in_bytes[i] = u8(i)
+	}
+	out_f := make([][4]f32, 64, context.temp_allocator)
+	run_compute(&m8.program, nil, {1, 1, 1}, temp_scratch(), {
+		images  = {{data = in_bytes, width = 64, height = 1, format = .Rgba8}},
+		buffers = {slice.reinterpret([]u32, out_f)},
+	})
+	for i in 0 ..< 256 {
+		got := out_f[i / 4][i % 4]
+		want := f32(i) / f32(255)
+		if transmute(u32)got != transmute(u32)want {
+			testing.expectf(t, false, "rgba8 byte %d: got 0x%08x, want 0x%08x", i, transmute(u32)got, transmute(u32)want)
+			break
+		}
+	}
+
+	// 7 & 13. MSL parameter shadowing (image + sampler) & chained layout-less image params.
+	shadow_src := `#version 310 es
+layout(local_size_x = 4) in;
+uniform sampler2D s;
+layout(rgba8) readonly uniform highp image2D src;
+layout(r32ui) uniform highp uimage2D rw;
+writeonly buffer Out { vec4 o[]; } out_buf;
+
+vec4 leaf(readonly highp image2D src, sampler2D s, ivec2 p) {
+    return imageLoad(src, p) + textureLod(s, vec2(0.5), 0.0);
+}
+vec4 mid(readonly highp image2D src, sampler2D s, ivec2 p) {
+    return leaf(src, s, p);
+}
+void bump_rw(highp uimage2D rw, int x) {
+    uint v = imageLoad(rw, ivec2(x, 0)).x;
+    imageStore(rw, ivec2(x, 0), uvec4(v + 1u, 0u, 0u, 0u));
+}
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    bump_rw(rw, x);
+    out_buf.o[x] = mid(src, s, ivec2(x, 0));
+}`
+	msh, esh, oksh := compile_compute(shadow_src)
+	defer destroy(msh)
+	if !testing.expectf(t, oksh, "%s", format_errors(esh, context.temp_allocator)) {
+		return
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "shadow_and_chain", msh.spirv)
+	}
+	testing.expect(t, strings.contains(msh.msl, "okp_src_img"))
+	testing.expect(t, strings.contains(msh.msl, "okp_s_tex"))
+	testing.expect(t, strings.contains(msh.msl, "okp_s_smp"))
+	testing.expect(t, strings.contains(msh.msl, "oksl_fence(okp_rw_img)"))
+
+	// 9. row_major and column_major accepted on storage buffers in fragment, vertex, and compute.
+	for st in ([]Stage{.Fragment, .Vertex, .Compute}) {
+		rm_src := `#version 310 es
+precision highp float;
+layout(local_size_x = 4) in;
+layout(std430, row_major) readonly buffer A { vec4 x[]; } a;
+layout(column_major, std430) readonly buffer B { vec4 y[]; } b;
+void main() {}`
+		if st == .Fragment {
+			rm_src = `#version 310 es
+precision highp float;
+layout(std430, row_major) readonly buffer A { vec4 x[]; } a;
+layout(column_major) readonly buffer B { vec4 y[]; } b;
+out vec4 o;
+void main() { o = a.x[0] + b.y[0]; }`
+		} else if st == .Vertex {
+			rm_src = `#version 310 es
+layout(std430, row_major) readonly buffer A { vec4 x[]; } a;
+layout(column_major) readonly buffer B { vec4 y[]; } b;
+void main() { gl_Position = a.x[0] + b.y[0]; }`
+		}
+		mr, er, okr := compile(rm_src, {profile = .Glsl, stage = st})
+		defer destroy(mr)
+		testing.expectf(t, okr, "stage %v failed row_major/column_major: %s", st, format_errors(er, context.temp_allocator))
+	}
+
+	// 3, 4, 5, 13, 15. Diagnostics & single-error guarantees.
+	expect_err :: proc(t: ^testing.T, src: string, want: Error_Code, opts := Options{profile = .Glsl, stage = .Compute}, loc := #caller_location) {
+		m, errs, ok := compile(src, opts)
+		defer destroy(m)
+		found := false
+		for e in errs {
+			if e.code == want {
+				found = true
+				break
+			}
+		}
+		testing.expectf(t, !ok && found, "expected %v for:\n%s\ngot:\n%s", want, src, format_errors(errs, context.temp_allocator), loc = loc)
+	}
+
+	// 3. 64-bit multiplication overflow in local_size.
+	expect_err(t, "layout(local_size_x = 2097152, local_size_y = 2097152, local_size_z = 2097152) in;\nvoid main() {}", .Local_Size_Max)
+	expect_err(t, "layout(local_size_x = 65536, local_size_y = 65536, local_size_z = 2) in;\nvoid main() {}", .Local_Size_Max)
+	expect_err(t, "layout(local_size_x = 1025) in;\nvoid main() {}", .Local_Size_Max)
+
+	// 4. Opaque types (images and samplers) in ?: and function return types rejected.
+	expect_err(t, "layout(local_size_x = 4) in;\nuniform bool c;\nlayout(rgba8) readonly uniform image2D a;\nlayout(rgba8) readonly uniform image2D b;\nvoid main() { vec4 v = imageLoad(c ? a : b, ivec2(0)); }", .Opaque_Ternary)
+	expect_err(t, "precision highp float;\nuniform bool c;\nuniform sampler2D a;\nuniform sampler2D b;\nout vec4 o;\nvoid main() { o = texture(c ? a : b, vec2(0.5)); }", .Opaque_Ternary, {profile = .Glsl, stage = .Fragment})
+	expect_err(t, "layout(local_size_x = 4) in;\nlayout(r32f) uniform image2D a;\nimage2D get() { return a; }\nvoid main() { imageStore(get(), ivec2(0), vec4(1)); }", .Opaque_Return)
+	expect_err(t, "precision highp float;\nuniform sampler2D s;\nsampler2D get() { return s; }\nout vec4 o;\nvoid main() { o = texture(get(), vec2(0.5)); }", .Opaque_Return, {profile = .Glsl, stage = .Fragment})
+
+	// 5. gl_WorkGroupSize referenced before layout(local_size_*) in;.
+	expect_err(t, "const uint N = gl_WorkGroupSize.x;\nlayout(local_size_x = 8) in;\nvoid main() {}", .Work_Group_Size_Before_Decl)
+	expect_err(t, "uint f() { return gl_WorkGroupSize.x; }\nlayout(local_size_x = 8) in;\nvoid main() {}", .Work_Group_Size_Before_Decl)
+
+	// 13. Missing format on uniform image fires once (not twice on parameter).
+	{
+		m, errs, ok := compile_compute("layout(local_size_x = 4) in;\nreadonly uniform image2D im;\nvoid main() {}")
+		defer destroy(m)
+		testing.expect(t, !ok && len(errs) == 1 && errs[0].code == .Image_Format_Required)
+	}
+
+	// 15. Misleading diagnostics & enum ordinal stability vs v0.0.9.
+	expect_err(t, "layout(local_size_x = 1) in;\nlayout(local_size_x = 8) in;\nvoid main() {}", .Local_Size_Conflict)
+	expect_err(t, "precision highp float;\nlayout(early_fragment_tests) in;\nout vec4 o;\nvoid main() { o = vec4(1); }", .Image_Format_Unknown, {profile = .Glsl, stage = .Fragment})
+	{
+		for tc in ([][2]string {
+			{"image2D", "an image2D must be a uniform"},
+			{"iimage2D", "an iimage2D must be a uniform"},
+			{"uimage2D", "a uimage2D must be a uniform"},
+		}) {
+			m, errs, ok := compile_compute(fmt.tprintf("layout(local_size_x = 4) in;\nvoid main() {{ %s x; }}", tc[0]))
+			defer destroy(m)
+			msg := format_errors(errs, context.temp_allocator)
+			testing.expectf(t, !ok && strings.contains(msg, tc[1]), "expected %q in %q", tc[1], msg)
+		}
+	}
+
+	// AST record sizes and v0.0.9 enum ordinals.
+	testing.expect(t, size_of(Var_Decl) <= 64)
+	testing.expect(t, size_of(Param) <= 48)
+	testing.expect(t, size_of(Buffer_Decl) <= 80)
+	testing.expect(t, size_of(Top) <= 24)
+	testing.expect_value(t, int(Error_Code.Pass_Missing), 159)
+	testing.expect_value(t, int(Interface_Kind.Buffer), 9)
+	testing.expect_value(t, int(Builtin.Uint_Bits_To_Float), 73)
+	testing.expect_value(t, int(Storage.Stage_Out), 8)
+	testing.expect_value(t, int(Feature.Gl_Sample_Mask), 15)
+}
+
+@(test)
+test_compute_round2_fixes :: proc(t: ^testing.T) {
+	expect_code :: proc(t: ^testing.T, body: string, code: Error_Code, opts := Options{profile = .Glsl, stage = .Compute}, loc := #caller_location) {
+		m, errs, ok := compile(fmt.tprintf("#version 310 es\n%s", body), opts)
+		defer destroy(m)
+		testing.expect(t, !ok && len(errs) > 0, loc = loc)
+		if len(errs) > 0 {
+			testing.expect_value(t, errs[0].code, code, loc = loc)
+		}
+	}
+	// Every declared MSL temporary `_tN = {};` in oksl_main must be assigned `(_tN = `
+	// in the emitted body (regression test for dropped `pre` wrappers in constructors
+	// and built-in calls), and C++14 unsequenced forms must be sequenced.
+	src_bytes, rerr := os.read_entire_file("testdata/eval_order.comp", context.temp_allocator)
+	testing.expect(t, rerr == nil)
+	if rerr != nil {
+		return
+	}
+	m, errs, ok := compile(string(src_bytes), {profile = .Glsl, stage = .Compute})
+	defer destroy(m)
+	testing.expectf(t, ok, "eval_order.comp failed:\n%s", format_errors(errs, context.temp_allocator))
+	if !ok {
+		return
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "eval_order.comp", m.spirv)
+	}
+
+	main_pos := strings.index(m.msl, "void ok_main(")
+	testing.expect(t, main_pos >= 0)
+	if main_pos >= 0 {
+		rest_msl := m.msl[main_pos:]
+		end_fn := strings.index(rest_msl, "\n}\n")
+		fn_msl := rest_msl[:end_fn] if end_fn >= 0 else rest_msl
+		temp_count := 0
+		for line in strings.split_lines(fn_msl, context.temp_allocator) {
+			trimmed := strings.trim_space(line)
+			if ix := strings.index(trimmed, " _t"); ix >= 0 && strings.has_suffix(trimmed, " = {};") {
+				rest := trimmed[ix + 1:]
+				eq := strings.index(rest, " = {};")
+				tname := rest[:eq]
+				assign_pat := fmt.tprintf("(%s = ", tname)
+				testing.expectf(t, strings.contains(fn_msl, assign_pat), "MSL temporary %s declared but never assigned in ok_main", tname)
+				temp_count += 1
+			}
+		}
+		testing.expect(t, temp_count >= 10)
+		// C++14 sequencing checks:
+		// - binary LHS write sequenced before RHS
+		testing.expect(t, !strings.contains(fn_msl, "((ok_s = ") || !strings.contains(fn_msl, ") + uint2(ok_s"))
+		// - nested subscript side effect sequenced
+		testing.expect(t, !strings.contains(fn_msl, "ok_mat[(ok_mi++)][ok_mi]"))
+		// - built-in and constructor sequencing when argument 0 writes (`max(bump(e1), e1)`, `uvec2(bump(e2), e2)`, `Pair(ce++, ce)`)
+		testing.expect(t, !strings.contains(fn_msl, ", ok_e1)") && strings.contains(fn_msl, " = ok_e1)"))
+		testing.expect(t, !strings.contains(fn_msl, ", ok_e2)") && strings.contains(fn_msl, " = ok_e2)"))
+		testing.expect(t, !strings.contains(fn_msl, ", ok_ce}") && strings.contains(fn_msl, " = ok_ce)"))
+		// - `=` sequencing (`eq_x = eq_x++`) and indexed `=` rvalue tail (`(ok_eq_v[_tX] = _tY), _tY)`)
+		testing.expect(t, !strings.contains(fn_msl, "(ok_eq_x = (ok_eq_x++))"))
+		eq_ix := strings.index(fn_msl, "(ok_eq_v[")
+		testing.expect(t, eq_ix >= 0)
+		if eq_ix >= 0 {
+			after_eq := fn_msl[eq_ix:]
+			close_ix := strings.index(after_eq, "))")
+			testing.expect(t, close_ix > 0 && strings.contains(after_eq[:close_ix], "), _t"))
+		}
+		// - pre-write and post-write oksl_fence on imageStore, with arguments hoisted into temporaries before pre-write fence
+		testing.expect(t, strings.contains(fn_msl, "(oksl_fence(ok_rw_img_img), ok_rw_img_img.write(_t"))
+		testing.expect(t, strings.contains(fn_msl, "), oksl_fence(ok_rw_img_img))"))
+		// - void `?:` casts both arms to `(void)` so an out/inout arm compiles opposite a void arm in Metal
+		testing.expect(t, strings.contains(fn_msl, "? (void)((_t"))
+		testing.expect(t, strings.contains(fn_msl, ") : (void)ok_nop_void("))
+	}
+
+	// Execute eval_order.comp on CPU and verify exact results across all 16 invocations.
+	buf := make([]u32, 320, context.temp_allocator)
+	img_words := make([]u32, 32 * 16, context.temp_allocator)
+	img := Storage_Image{
+		data   = slice.to_bytes(img_words),
+		width  = 32,
+		height = 16,
+		format = .R32ui,
+	}
+	ublock := make([]u8, m.block_size, context.temp_allocator)
+	set_uniform(m, ublock, "uMatArr", {1, 2, 3, 4}, 0)
+	set_uniform(m, ublock, "uMatArr", {5, 6, 7, 8}, 1)
+	run_compute(&m.program, ublock, {1, 1, 1}, temp_scratch(), {
+		buffers = {buf},
+		images  = {img},
+	})
+	for gy in u32(0) ..< 4 {
+		for gx in u32(0) ..< 4 {
+			id := gy * 4 + gx
+			base := id * 18
+			seed := id + 2
+			testing.expect_value(t, buf[base + 0], max(seed, u32(1)) * 100 + (seed + 10))
+			testing.expect_value(t, buf[base + 1], (seed + 3) * 100 + 1 + (seed + 13))
+			testing.expect_value(t, buf[base + 2], (seed + 5) * 100 + (seed + 15))
+			testing.expect_value(t, buf[base + 3], (seed + 1) * 10000 + (seed + 2) * 100 + 1)
+			testing.expect_value(t, buf[base + 4], (seed + 9) * 2)
+			testing.expect_value(t, buf[base + 5], (seed + 10) * 10000 + 1 * 100 + (seed + 11))
+			testing.expect_value(t, buf[base + 6], (seed + 4) * 1000 + 1 * 100 + (seed + 6) * 10 + 1)
+			// snap_inout(x, x = seed + 20u): old a is seed, b is seed + 20, final x is 2*seed + 20.
+			want_sr := seed * 100 + (seed + 20)
+			testing.expect_value(t, buf[base + 7], want_sr * 100 + (2 * seed + 20))
+			// mat[mi++][mi]: mat[0][1] = seed + 2, final mi = 1.
+			testing.expect_value(t, buf[base + 8], (seed + 2) * 10 + 1)
+			tx, ty_c := int(gx) * 7, int(gy) * 4
+			w1 := 1 + seed * 10
+			w2 := u32(tx + 2) + 1 + seed
+			testing.expect_value(t, buf[base + 9], w1 * 1000 + w2)
+			testing.expect_value(t, img_words[ty_c * 32 + tx], w1)
+			testing.expect_value(t, img_words[(ty_c + 2) * 32 + (tx + 2)], w2)
+			ip_end_x, ip_end_y := tx + 1, ty_c + 1
+			ip2_end_x, ip2_end_y := tx + 3, ty_c + 1
+			testing.expect_value(t, buf[base + 10], u32(ip_end_x * 100 + ip_end_y * 10 + ip2_end_x + ip2_end_y))
+			// u3 = (1, 1, 11) -> 121; carr = (1, 2, 3) -> 123; cc = 12; cp = (1, 2) -> 12.
+			testing.expect_value(t, buf[base + 11], u32(121 * 1000 + 123 + 12 + 12))
+			// inout order: two(3, 7) = 37 across swizzle, static/dynamic array, and buffer; two(c, two(c, 5)) = 45, c = 45.
+			testing.expect_value(t, buf[base + 12], u32(3737))
+			testing.expect_value(t, buf[base + 13], u32(3737))
+			testing.expect_value(t, buf[base + 14], u32(4545))
+			war_acc := u32(0)
+			for wi in u32(0) ..< 4 {
+				war_acc = war_acc * 10 + ((seed + wi * 13) % 10)
+			}
+			testing.expect_value(t, img_words[(ty_c + 1) * 32 + (tx + 3)], seed + 52)
+			testing.expect_value(t, buf[base + 15], war_acc * 1000 + 115)
+			// uMatArr[0][1].y = 4 -> 40; uMatArr[1][1].x = 7 -> 70; mn = 1, mr = 0 -> 4080.
+			testing.expect_value(t, buf[base + 16], u32(4080))
+			vt_want := (seed + 5) if (id & 1) == 0 else (seed + 6)
+			vf_want := ((seed + 11) if (id & 2) == 0 else (seed + 22)) + (30 if (id & 1) == 0 else 0)
+			testing.expect_value(t, img_words[ty_c * 32 + (tx + 4)], vt_want)
+			testing.expect_value(t, buf[base + 17], vt_want * 100 + vf_want)
+		}
+	}
+
+	// Fragment inout argument evaluation order (JIT and interpreter must both give 37, 37, 45, 45).
+	{
+		fsrc := `#version 300 es
+precision highp float;
+precision highp int;
+out vec4 o;
+uint two(inout uint x, uint y) { x = x * 10u + y; return x; }
+void main() {
+    uint q = 3u;
+    uint r0 = two(q, (q = 7u));
+    uint arr[2] = uint[2](0u, 3u);
+    uint i = uint(gl_FragCoord.x) & 1u | 1u;
+    uint r1 = two(arr[i], (arr[1] = 7u));
+    uint c = 2u;
+    uint r2 = two(c, two(c, 5u));
+    o = vec4(float(r0), float(r1), float(r2), float(c));
+}`
+		fm, ferrs, fok := compile_glsl(fsrc)
+		defer destroy(fm)
+		testing.expectf(t, fok, "inout.frag failed:\n%s", format_errors(ferrs, context.temp_allocator))
+		if fok {
+			px := make([][4]f32, 16, context.temp_allocator)
+			run_f32(&fm.program, nil, 4, 4, px, temp_scratch())
+			testing.expect_value(t, px[0], [4]f32{37, 37, 45, 45})
+		}
+	}
+
+	// GLSL ES 3.10 §4.4.1.1: multiple local_size_* declarations must specify the
+	// exact same set of axes with the exact same values.
+	{
+		for tc in ([][2]string {
+			{"layout(local_size_x = 8) in;\nlayout(local_size_y = 4) in;\nvoid main() {}", "without local_size_x"},
+			{"layout(local_size_x = 8) in;\nlayout(local_size_x = 8, local_size_y = 4) in;\nvoid main() {}", "with local_size_y"},
+			{"layout(local_size_x = 8, local_size_y = 4) in;\nlayout(local_size_x = 8) in;\nvoid main() {}", "without local_size_y"},
+			{"layout(local_size_x = 8, local_size_y = 4) in;\nlayout(local_size_x = 8, local_size_y = 4, local_size_z = 1) in;\nvoid main() {}", "with local_size_z"},
+		}) {
+			rm, rerrs, rok := compile(fmt.tprintf("#version 310 es\n%s", tc[0]), {profile = .Glsl, stage = .Compute})
+			defer destroy(rm)
+			testing.expect(t, !rok && len(rerrs) > 0 && rerrs[0].code == .Local_Size_Redeclared)
+			if len(rerrs) > 0 {
+				msg := format_errors(rerrs, context.temp_allocator)
+				testing.expectf(t, strings.contains(msg, tc[1]), "expected %q in %q", tc[1], msg)
+			}
+		}
+		expect_code(t, "layout(local_size_x = 8) in;\nlayout(local_size_x = 16) in;\nvoid main() {}", .Local_Size_Conflict, {profile = .Glsl, stage = .Compute})
+		expect_code(t, "layout(local_size_x = 8, local_size_y = 4) in;\nlayout(local_size_x = 8, local_size_y = 2) in;\nvoid main() {}", .Local_Size_Conflict, {profile = .Glsl, stage = .Compute})
+		expect_code(t, "layout(local_size_x = 8) in;\nlayout(local_size_y = 2, local_size_x = 4) in;\nvoid main() {}", .Local_Size_Conflict, {profile = .Glsl, stage = .Compute})
+		expect_code(t, "layout(local_size_x = 8, local_size_x = 4) in;\nvoid main() {}", .Local_Size_Conflict, {profile = .Glsl, stage = .Compute})
+		// Non-literal expressions and invalid/out-of-range literals rejected in local_size_* (§4.4.1.1 / §4.1.3), while `8u` and `0x8` succeed.
+		for bad_ls in ([]string {
+			"const int N = 4;\nlayout(local_size_x = N) in;\nvoid main() {}",
+			"layout(local_size_x = 4 * 2) in;\nvoid main() {}",
+			"layout(local_size_x = (8)) in;\nvoid main() {}",
+			"layout(local_size_x = ~0u) in;\nvoid main() {}",
+		}) {
+			lm, lerrs, lok := compile(fmt.tprintf("#version 310 es\n%s", bad_ls), {profile = .Glsl, stage = .Compute})
+			defer destroy(lm)
+			testing.expect(t, !lok && len(lerrs) > 0 && lerrs[0].code == .Local_Size_Constant)
+		}
+		for bad_lit in ([]string {
+			"layout(local_size_x = 4294967304) in;\nvoid main() {}",
+			"layout(local_size_x = 4294967296u) in;\nvoid main() {}",
+			"layout(local_size_x = 0x100000008) in;\nvoid main() {}",
+			"layout(local_size_x = 08) in;\nvoid main() {}",
+			"layout(local_size_x = 0x) in;\nvoid main() {}",
+		}) {
+			lm, lerrs, lok := compile(fmt.tprintf("#version 310 es\n%s", bad_lit), {profile = .Glsl, stage = .Compute})
+			defer destroy(lm)
+			testing.expectf(t, !lok && len(lerrs) > 0 && lerrs[0].code == .Invalid_Int_Literal, "expected Invalid_Int_Literal on %q, got %v", bad_lit, lerrs)
+		}
+		// Offending axis positions on cross-declaration errors, and no cascading redeclaration error after a bad value.
+		{
+			pm1, perrs1, pok1 := compile("#version 310 es\nlayout(local_size_x = 8, local_size_y = 4) in;\nlayout(local_size_x = 8, local_size_y = 2) in;\nvoid main() {}", {profile = .Glsl, stage = .Compute})
+			defer destroy(pm1)
+			pmsg1 := format_errors(perrs1, context.temp_allocator)
+			testing.expectf(t, !pok1 && strings.contains(pmsg1, "3:26: local_size_y is already declared as 4 (got 2)"), "got %q", pmsg1)
+
+			pm2, perrs2, pok2 := compile("#version 310 es\nlayout(local_size_x = 8, local_size_y = 4) in;\nlayout(local_size_x = 8, local_size_y = 4, local_size_z = 2) in;\nvoid main() {}", {profile = .Glsl, stage = .Compute})
+			defer destroy(pm2)
+			pmsg2 := format_errors(perrs2, context.temp_allocator)
+			testing.expectf(t, !pok2 && strings.contains(pmsg2, "3:44: workgroup size redeclared with local_size_z"), "got %q", pmsg2)
+
+			dm1, derrs1, dok1 := compile("#version 310 es\nlayout(local_size_x = 8, local_size_y = 4) in;\nlayout(local_size_x = 8, local_size_y = 0) in;\nvoid main() { uint k = gl_WorkGroupSize.x; }", {profile = .Glsl, stage = .Compute})
+			defer destroy(dm1)
+			testing.expectf(t, !dok1 && len(derrs1) == 1 && derrs1[0].code == .Local_Size_Positive, "expected 1 Local_Size_Positive error, got %d: %s", len(derrs1), format_errors(derrs1, context.temp_allocator))
+
+			dm2, derrs2, dok2 := compile("#version 310 es\nlayout(local_size_x = 2000) in;\nlayout(local_size_x = 8) in;\nvoid main() { uint k = gl_WorkGroupSize.x; }", {profile = .Glsl, stage = .Compute})
+			defer destroy(dm2)
+			testing.expectf(t, !dok2 && len(derrs2) == 1 && derrs2[0].code == .Local_Size_Max, "expected 1 Local_Size_Max error, got %d: %s", len(derrs2), format_errors(derrs2, context.temp_allocator))
+		}
+		{
+			sm, serrs, sok := compile("#version 310 es\nlayout(local_size_x = 8u, local_size_y = 0x2) in;\nlayout(local_size_y = 2, local_size_x = 8) in;\nvoid main() {}", {profile = .Glsl, stage = .Compute})
+			defer destroy(sm)
+			testing.expectf(t, sok, "identical repeat local_size failed:\n%s", format_errors(serrs, context.temp_allocator))
+			if sok {
+				testing.expect_value(t, sm.threadcount, [3]u32{8, 2, 1})
+			}
+		}
+	}
+
+	// Default block layout qualifiers: accept only packing and matrix-order qualifiers, and require commas in layout(...).
+	{
+		dm, derrs, dok := compile(
+			"#version 310 es\nlayout(std140) buffer;\nlayout(std430) buffer;\nlayout(column_major) buffer;\nlayout(row_major) uniform;\nlayout(std140) uniform;\nlayout(local_size_x = 8) in;\nbuffer B { vec3 w[]; } b;\nvoid main() { b.w[0] = vec3(1.0); }",
+			{profile = .Glsl, stage = .Compute},
+		)
+		defer destroy(dm)
+		testing.expectf(t, dok, "default buffer layout failed:\n%s", format_errors(derrs, context.temp_allocator))
+		dfm, dferrs, dfok := compile(
+			"#version 310 es\nprecision highp float;\nlayout(std430) buffer;\nlayout(std430) readonly buffer B { vec4 w[]; } b;\nout vec4 o;\nvoid main() { o = b.w[0]; }",
+			{profile = .Glsl, stage = .Fragment},
+		)
+		defer destroy(dfm)
+		testing.expectf(t, dfok, "fragment default buffer layout failed:\n%s", format_errors(dferrs, context.temp_allocator))
+		expect_code(t, "layout(std140) buffer;\nlayout(local_size_x = 8) in;\nbuffer B { vec3 w[]; } b;\nvoid main() { b.w[0] = vec3(1.0); }", .Buffer_Layout, {profile = .Glsl, stage = .Compute})
+		for bad_dl in ([]string {
+			"layout(std430, binding = 2) buffer;",
+			"layout(std430, set = 1) buffer;",
+			"layout(std430) coherent buffer;",
+			"layout(std430) volatile buffer;",
+			"layout(std430) restrict buffer;",
+			"layout(std430) readonly buffer;",
+			"layout(std430) writeonly buffer;",
+			"layout() buffer;",
+			"layout(std430,) buffer;",
+			"layout(,std430) buffer;",
+			"layout(std430) highp buffer;",
+			"layout(std430) const buffer;",
+			"layout(scalar) buffer;",
+			"layout(rgba8) buffer;",
+			"layout(location = 2) buffer;",
+			"layout(local_size_y = 2) buffer;",
+			"layout(foo) buffer;",
+			"layout(binding = 2) uniform;",
+			"layout(std430) uniform;",
+			"layout() uniform;",
+			"layout(std430 row_major) buffer;",
+			"layout(std430 set = 1 binding = 0) buffer B2 { uint w[]; } b2;",
+		}) {
+			bm, _, bok := compile(fmt.tprintf("#version 310 es\nlayout(local_size_x = 1) in;\n%s\nlayout(std430) buffer B {{ uint w[]; }} b;\nvoid main() {{ b.w[0] = 1u; }}", bad_dl), {profile = .Glsl, stage = .Compute})
+			defer destroy(bm)
+			testing.expectf(t, !bok, "expected invalid default layout %q to fail", bad_dl)
+		}
+		{
+			ncm, ncerrs, ncok := compile("#version 310 es\nlayout(local_size_x = 8 local_size_y = 4) in;\nvoid main() {}", {profile = .Glsl, stage = .Compute})
+			defer destroy(ncm)
+			ncmsg := format_errors(ncerrs, context.temp_allocator)
+			testing.expectf(t, !ncok && len(ncerrs) > 0 && ncerrs[0].code == .Expected && strings.contains(ncmsg, "expected ','"), "got %q", ncmsg)
+		}
+		for bad_frag_dl in ([]string {
+			"layout(std430) flat buffer;",
+			"layout(std430) in buffer;",
+			"layout(std430) out buffer;",
+		}) {
+			bfm, _, bfok := compile(fmt.tprintf("#version 310 es\nprecision highp float;\n%s\nout vec4 o;\nvoid main() {{ o = vec4(1.0); }}", bad_frag_dl), {profile = .Glsl, stage = .Fragment})
+			defer destroy(bfm)
+			testing.expectf(t, !bfok, "expected invalid fragment default layout %q to fail", bad_frag_dl)
+		}
+	}
+
+	// Item 10c: imageStore rejects mismatched texel base types (`ivec4`/`uvec4` into float image, etc.).
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(r32f) uniform image2D im;\nvoid main() { imageStore(im, ivec2(0), ivec4(7)); }", .No_Overload, {profile = .Glsl, stage = .Compute})
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(r32f) uniform image2D im;\nvoid main() { imageStore(im, ivec2(0), uvec4(7u)); }", .No_Overload, {profile = .Glsl, stage = .Compute})
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(r32ui) uniform uimage2D im;\nvoid main() { imageStore(im, ivec2(0), ivec4(7)); }", .No_Overload, {profile = .Glsl, stage = .Compute})
+	expect_code(t, "layout(local_size_x = 8) in;\nlayout(r32i) uniform iimage2D im;\nvoid main() { imageStore(im, ivec2(0), vec4(7.0)); }", .No_Overload, {profile = .Glsl, stage = .Compute})
+
+	// Non-std430 helper struct alongside a storage buffer must not divide by zero in std430_field_offset.
+	{
+		helper_src := `
+#version 310 es
+layout(local_size_x = 1) in;
+struct LocalOnly {
+    mat2 m;
+    bool flag;
+    float arr[2];
+};
+struct BufElem {
+    vec3 a;
+    uint b;
+};
+layout(std430) buffer B { BufElem items[]; } b;
+void main() {
+    LocalOnly loc = LocalOnly(mat2(1.0), true, float[2](2.0, 3.0));
+    if (loc.flag) {
+        b.items[0] = BufElem(vec3(loc.arr[0], loc.arr[1], loc.m[0][0]), 7u);
+    }
+}`
+		hm, herrs, hok := compile(helper_src, {profile = .Glsl, stage = .Compute})
+		defer destroy(hm)
+		testing.expectf(t, hok, "helper struct shader failed:\n%s", format_errors(herrs, context.temp_allocator))
+		if hok {
+			testing.expect_value(t, len(hm.structs), 2)
+			testing.expect_value(t, hm.structs[0].fields[0].offset, 0)
+			testing.expect_value(t, hm.structs[0].fields[1].offset, 0)
+			testing.expect_value(t, hm.structs[0].fields[2].offset, 0)
+			testing.expect_value(t, hm.structs[1].fields[0].offset, 0)
+			testing.expect_value(t, hm.structs[1].fields[1].offset, 12)
+		}
+	}
+
+	// Single-struct buffer shader (0-based Type.strukt == 0) populates Module.structs[0].
+	{
+		psrc, perr := os.read_entire_file("testdata/particles.comp", context.temp_allocator)
+		testing.expect(t, perr == nil)
+		if perr == nil {
+			pm, _, pok := compile(string(psrc), {profile = .Glsl, stage = .Compute})
+			defer destroy(pm)
+			testing.expect(t, pok && len(pm.structs) == 1 && len(pm.structs[0].fields) == 4)
+			if pok && len(pm.structs) == 1 && len(pm.structs[0].fields) == 4 {
+				testing.expect_value(t, pm.structs[0].fields[0].offset, 0)
+				testing.expect_value(t, pm.structs[0].fields[1].offset, 12)
+				testing.expect_value(t, pm.structs[0].fields[2].offset, 16)
+				testing.expect_value(t, pm.structs[0].fields[3].offset, 28)
+			}
+		}
+	}
+}
+
+@(test)
+test_compute_ensure :: proc(t: ^testing.T) {
+	// `ensure` in run_compute stays active even when built with `-disable-assert`.
+	m, _, ok := compile(
+		"#version 310 es\nlayout(local_size_x = 4) in;\nlayout(rgba8) writeonly uniform image2D dst;\nvoid main() { imageStore(dst, ivec2(0), vec4(1.0)); }",
+		{profile = .Glsl, stage = .Compute},
+	)
+	testing.cleanup(t, proc(p: rawptr) { destroy((^Module)(p)) }, m)
+	testing.expect(t, ok)
+	if !ok {
+		return
+	}
+	tiny := make([]u8, 4, context.temp_allocator)
+	testing.expect_assert_message(t, "oksl: Storage_Image.data is too small for width, height and stride")
+	run_compute(&m.program, nil, {1, 1, 1}, temp_scratch(), {
+		images = {{data = tiny, width = 8, height = 8, format = .Rgba8}},
+	})
+}
+
+@(test)
+test_compute_round3_fixes :: proc(t: ^testing.T) {
+	has_member_decorations :: proc(spv: []u32) -> (col_major, mat_stride: bool) {
+		i := 5
+		for i < len(spv) {
+			wc := int(spv[i] >> 16)
+			op := Op(spv[i] & 0xffff)
+			if wc <= 0 || i + wc > len(spv) {
+				break
+			}
+			if op == .Member_Decorate && wc >= 4 {
+				if spv[i + 3] == DEC_COL_MAJOR {
+					col_major = true
+				} else if spv[i + 3] == DEC_MATRIX_STRIDE && wc >= 5 && spv[i + 4] == 16 {
+					mat_stride = true
+				}
+			}
+			i += wc
+		}
+		return
+	}
+
+	// 1. Uniform matrix arrays emit ColMajor and MatrixStride in SPIR-V across all stages.
+	for tc in ([]struct {
+		name:  string,
+		stage: Stage,
+		src:   string,
+	} {
+		{"um_comp", .Compute, "#version 310 es\nlayout(local_size_x = 1) in;\nbuffer B { vec4 w[]; } b;\nuniform mat4 bones[4];\nvoid main() { b.w[0] = bones[1] * vec4(1.0) + bones[2][3]; }"},
+		{"um_frag", .Fragment, "#version 300 es\nprecision highp float;\nuniform mat2 um[2];\nuniform float k;\nout vec4 o;\nvoid main() { int n = int(k); o = vec4(um[n][n], um[1][1]); }"},
+		{"um_vert", .Vertex, "#version 300 es\nlayout(location = 0) in vec4 pos;\nlayout(location = 1) in vec4 w;\nuniform mat4 bones[4];\nvoid main() { gl_Position = bones[int(w.x)] * pos + bones[1][2]; }"},
+	}) {
+		um, uerrs, uok := compile(tc.src, {profile = .Glsl, stage = tc.stage})
+		defer destroy(um)
+		testing.expectf(t, uok, "%s failed:\n%s", tc.name, format_errors(uerrs, context.temp_allocator))
+		if uok {
+			cm, ms := has_member_decorations(um.spirv)
+			testing.expectf(t, cm && ms, "%s missing ColMajor (%v) or MatrixStride (%v)", tc.name, cm, ms)
+			if have_spirv_val() {
+				expect_valid_spirv(t, tc.name, um.spirv)
+			}
+		}
+	}
+
+	// 3. `?:` with void arms (imageStore in compute, and void user functions in fragment).
+	{
+		vt_comp := `#version 310 es
+layout(local_size_x = 1) in;
+layout(std430) buffer B { uint w[]; } b;
+layout(r32ui) uniform highp uimage2D im;
+void main() {
+    uint k = 1u;
+    k > 0u ? imageStore(im, ivec2(0, 1), uvec4(5u)) : imageStore(im, ivec2(0, 1), uvec4(6u));
+    b.w[0] = imageLoad(im, ivec2(0, 1)).x;
+}`
+		vm, verrs, vok := compile(vt_comp, {profile = .Glsl, stage = .Compute})
+		defer destroy(vm)
+		testing.expectf(t, vok, "vt_comp failed:\n%s", format_errors(verrs, context.temp_allocator))
+		if vok {
+			void_id: u32
+			has_void_phi := false
+			for i := 5; i < len(vm.spirv); {
+				wc := int(vm.spirv[i] >> 16)
+				op := Op(vm.spirv[i] & 0xffff)
+				if wc <= 0 || i + wc > len(vm.spirv) {
+					break
+				}
+				if op == .Type_Void && wc >= 2 {
+					void_id = vm.spirv[i + 1]
+				} else if op == .Phi && wc >= 3 && vm.spirv[i + 1] == void_id {
+					has_void_phi = true
+				}
+				i += wc
+			}
+			testing.expect(t, !has_void_phi)
+			if have_spirv_val() {
+				expect_valid_spirv(t, "vt_comp", vm.spirv)
+			}
+			bw := make([]u32, 4, context.temp_allocator)
+			imw := make([]u32, 16, context.temp_allocator)
+			run_compute(&vm.program, nil, {1, 1, 1}, temp_scratch(), {
+				buffers = {bw},
+				images  = {{data = slice.to_bytes(imw), width = 4, height = 4, format = .R32ui}},
+			})
+			testing.expect_value(t, bw[0], u32(5))
+		}
+
+		vt_frag := `#version 300 es
+precision highp float;
+out vec4 o;
+float g;
+void f() { g = 1.0; }
+void h() { g = 2.0; }
+void main() { g = 0.0; gl_FragCoord.x > 2.0 ? f() : h(); o = vec4(g); }`
+		fm, ferrs, fok := compile_glsl(vt_frag)
+		defer destroy(fm)
+		testing.expectf(t, fok, "vt_frag failed:\n%s", format_errors(ferrs, context.temp_allocator))
+		if fok {
+			if have_spirv_val() {
+				expect_valid_spirv(t, "vt_frag", fm.spirv)
+			}
+			px := make([][4]f32, 16, context.temp_allocator)
+			run_f32(&fm.program, nil, 4, 4, px, temp_scratch())
+			testing.expect_value(t, px[0][0], f32(2.0)) // x = 0.5 <= 2.0 -> h()
+			testing.expect_value(t, px[1][0], f32(2.0)) // x = 1.5 <= 2.0 -> h()
+			testing.expect_value(t, px[2][0], f32(1.0)) // x = 2.5 >  2.0 -> f()
+			testing.expect_value(t, px[3][0], f32(1.0)) // x = 3.5 >  2.0 -> f()
+		}
+	}
+
+	// 4. testdata/image_war.comp compiles cleanly, fences before and after write, and matches accumulator.
+	{
+		wsrc, werr := os.read_entire_file("testdata/image_war.comp", context.temp_allocator)
+		testing.expect(t, werr == nil)
+		if werr == nil {
+			wm, werrs, wok := compile(string(wsrc), {profile = .Glsl, stage = .Compute})
+			defer destroy(wm)
+			testing.expectf(t, wok, "image_war.comp failed:\n%s", format_errors(werrs, context.temp_allocator))
+			if wok {
+				if have_spirv_val() {
+					expect_valid_spirv(t, "image_war.comp", wm.spirv)
+				}
+				testing.expect(t, strings.contains(wm.msl, "(oksl_fence(ok_ui_img), ok_ui_img.write(_t"))
+				testing.expect(t, strings.contains(wm.msl, "), oksl_fence(ok_ui_img))"))
+				imw := make([]u32, 16 * 16, context.temp_allocator)
+				bw := make([]u32, 16 * 16, context.temp_allocator)
+				run_compute(&wm.program, nil, {2, 2, 1}, temp_scratch(), {
+					buffers = {bw},
+					images  = {{data = slice.to_bytes(imw), width = 16, height = 16, format = .R32ui}},
+				})
+				want_acc := u32(0)
+				for k in u32(0) ..< 16 {
+					want_acc = want_acc * 31 + (k * 7 + 1)
+				}
+				testing.expect_value(t, bw[0], want_acc)
+				testing.expect_value(t, bw[255], want_acc)
+				testing.expect_value(t, imw[255], u32(15 * 7 + 1))
+			}
+		}
+	}
+
+	// 7. Inline read-modify-write `imageStore(tex, p, imageLoad(tex, p) + ...)` with NO `may_write`
+	// argument hoists `tex.read(...)` into a temporary BEFORE `(oksl_fence(tex), tex.write(_t...))`.
+	{
+		inc_src := `#version 310 es
+layout(local_size_x = 1) in;
+layout(r32f) uniform highp image2D im;
+void incf(highp image2D tex, ivec2 p) {
+    imageStore(tex, p, imageLoad(tex, p) + vec4(1.0));
+}
+void main() {
+    incf(im, ivec2(0));
+}`
+		im_m, im_errs, im_ok := compile(inc_src, {profile = .Glsl, stage = .Compute})
+		defer destroy(im_m)
+		testing.expectf(t, im_ok, "incf failed:\n%s", format_errors(im_errs, context.temp_allocator))
+		if im_ok {
+			fn_pos := strings.index(im_m.msl, "void ok_incf(")
+			testing.expect(t, fn_pos >= 0)
+			if fn_pos >= 0 {
+				rest := im_m.msl[fn_pos:]
+				end := strings.index(rest, "\n}\n")
+				body := rest[:end] if end >= 0 else rest
+				read_pos := strings.index(body, "okp_tex_img.read(")
+				fence_write_pos := strings.index(body, "(oksl_fence(okp_tex_img), okp_tex_img.write(_t")
+				testing.expectf(t, read_pos >= 0 && fence_write_pos > read_pos, "expected read hoisted before pre-write fence in:\n%s", body)
+			}
 		}
 	}
 }

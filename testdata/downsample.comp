@@ -1,0 +1,63 @@
+#version 310 es
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Exercises all six storage image formats (loads and stores) and layout-less
+// writeonly image helper parameters (valid unextended GLSL ES 3.10 in glslang).
+layout(rgba8) readonly uniform highp image2D src8;
+layout(rgba16f) readonly uniform highp image2D src16;
+layout(rgba32f) readonly uniform highp image2D src32;
+
+layout(r32f) uniform highp image2D rwF;
+layout(r32ui) uniform highp uimage2D rwU;
+layout(r32i) uniform highp iimage2D rwI;
+
+layout(rgba8) writeonly uniform highp image2D dst8;
+layout(rgba16f) writeonly uniform highp image2D dst16;
+layout(rgba32f) writeonly uniform highp image2D dst32;
+
+uniform float uScale;
+
+ivec2 clamp_coord(ivec2 p, ivec2 hi) {
+    return clamp(p, ivec2(0), hi);
+}
+
+void write_out16(writeonly highp image2D im, ivec2 q, vec4 v) {
+    imageStore(im, q, v);
+}
+
+void write_out8(writeonly highp image2D im, ivec2 q, vec4 v) {
+    imageStore(im, q, clamp(v, vec4(0.0), vec4(1.0)));
+}
+
+void main() {
+    ivec2 out_size = imageSize(dst16);
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= out_size.x || q.y >= out_size.y) {
+        return;
+    }
+    ivec2 hi8 = imageSize(src8) - ivec2(1);
+    ivec2 p = q * 2;
+    vec4 box = (imageLoad(src8, clamp_coord(p, hi8))
+              + imageLoad(src8, clamp_coord(p + ivec2(1, 0), hi8))
+              + imageLoad(src8, clamp_coord(p + ivec2(0, 1), hi8))
+              + imageLoad(src8, clamp_coord(p + ivec2(1, 1), hi8))) * 0.25;
+
+    ivec2 hi16 = imageSize(src16) - ivec2(1);
+    vec4 h16 = imageLoad(src16, clamp_coord(p, hi16));
+    ivec2 hi32 = imageSize(src32) - ivec2(1);
+    vec4 h32 = imageLoad(src32, clamp_coord(p, hi32));
+
+    float prev_f = imageLoad(rwF, q).r;
+    uint prev_u = imageLoad(rwU, q).r;
+    int prev_i = imageLoad(rwI, q).r;
+
+    float luma = dot(box.rgb, vec3(0.25, 0.5, 0.25)) + h16.r * 0.125;
+    imageStore(rwF, q, vec4(prev_f + luma, 0.0, 0.0, 1.0));
+    imageStore(rwU, q, uvec4(prev_u + uint(q.x + q.y) + 1u, 0u, 0u, 0u));
+    imageStore(rwI, q, ivec4(prev_i - q.x + q.y * 2, 0, 0, 0));
+
+    vec4 combined = box * uScale + h16 * 0.25 + h32 * 0.125;
+    write_out16(dst16, q, combined);
+    imageStore(dst32, q, combined + vec4(prev_f * 0.0625, float(prev_u & 15u) * 0.0625, float(prev_i) * 0.00390625, 0.0));
+    write_out8(dst8, q, box * 0.75 + h16 * 0.125);
+}

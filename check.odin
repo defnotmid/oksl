@@ -25,46 +25,64 @@ Checked :: struct {
 	inputs_used:   Inputs,
 	// The sampler symbol bound to each channel the shader uses.
 	channels:      [SAMPLER_COUNT]Sym_Id,
-	// Storage buffers in declaration order (their bindings' order), and
-	// each one's declaration.
-	buffers:       []Sym_Id,
-	buffer_decls:  []Buffer_Decl_Id,
+	// Storage buffers and images in SDL_GPU binding order (readonly first,
+	// then read-write / writeonly), and each buffer's declaration.
+	buffers:        []Sym_Id,
+	buffer_decls:   []Buffer_Decl_Id,
+	images:         []Sym_Id,
+	num_ro_buffers: int,
+	num_ro_images:  int,
+	local_size:     [3]u32,
 	// (1 + taps) environments of block_stride bytes: `uniforms` holds the
 	// first's, then each tap's copies (stage.odin).
-	block_size:    int,
-	block_stride:  int,
-	taps:          int,
+	block_size:     int,
+	block_stride:   int,
+	taps:           int,
 	// The block starts with the inputs (PROFILE_RULES' header).
-	header:        bool,
+	header:         bool,
 	// Floats in the varyings' record (Interface_Var.offset).
 	varying_floats: int,
 }
 
 @(private)
 Checker :: struct {
-	u:             ^Unit,
-	rules:         ^Profile_Rules,
-	struct_index:  map[string]i32,
-	scopes:        [dynamic]map[string]Sym_Id,
-	pending:       map[string][dynamic]Func_Decl_Id,
-	by_name:       map[string][dynamic]Func_Id,
-	globals:       [dynamic]Sym_Id,
-	uniforms:      [dynamic]Sym_Id,
+	u:               ^Unit,
+	rules:           ^Profile_Rules,
+	struct_index:    map[string]i32,
+	scopes:          [dynamic]map[string]Sym_Id,
+	pending:         map[string][dynamic]Func_Decl_Id,
+	resolved_decls:  []i32,
+	by_name:         map[string][dynamic]Func_Id,
+	globals:         [dynamic]Sym_Id,
+	uniforms:        [dynamic]Sym_Id,
 	// The symbol of each input (declared up front, or bound by a uniform
 	// declaration), and the ones the shader uses.
-	input_syms:    [Input]Sym_Id,
-	inputs_used:   Inputs,
-	channels:      [SAMPLER_COUNT]Sym_Id,
-	buffers:       [dynamic]Sym_Id,
-	buffer_decls:  [dynamic]Buffer_Decl_Id,
+	input_syms:      [Input]Sym_Id,
+	inputs_used:     Inputs,
+	channels:        [SAMPLER_COUNT]Sym_Id,
+	buffers:         [dynamic]Sym_Id,
+	buffer_decls:    [dynamic]Buffer_Decl_Id,
+	images:          [dynamic]Sym_Id,
+	num_ro_buffers:  int,
+	num_ro_images:   int,
+	local_size:      [3]u32,
+	local_size_seen: [3]bool,
+	has_workgroup:   bool,
+	workgroup_bad:   bool,
 	// Channels the source names as iChannelN (GLSL keeps them for those).
-	named_channels: bit_set[0 ..< SAMPLER_COUNT],
-	frag_coord:    Sym_Id,
-	gl_frag_coord: Sym_Id,
-	gl_position:   Sym_Id,
+	named_channels:  bit_set[0 ..< SAMPLER_COUNT],
+	frag_coord:      Sym_Id,
+	gl_frag_coord:   Sym_Id,
+	gl_position:     Sym_Id,
 	gl_front_facing: Sym_Id,
-	gl_vertex_id:  Sym_Id,
-	gl_sample_mask: Sym_Id,
+	gl_vertex_id:    Sym_Id,
+	gl_sample_mask:  Sym_Id,
+	gl_global_id:    Sym_Id,
+	gl_local_id:     Sym_Id,
+	gl_group_id:     Sym_Id,
+	gl_num_groups:   Sym_Id,
+	gl_local_index:  Sym_Id,
+	gl_group_size:   Sym_Id,
 	// The symbols the source names (statically used).
 	used:          bit_array.Bit_Array,
 	next_offset:   int,
@@ -87,11 +105,13 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 		u            = u,
 		rules        = &PROFILE_RULES[u.profile],
 		struct_index = make(map[string]i32),
-		scopes       = make([dynamic]map[string]Sym_Id),
-		pending      = make(map[string][dynamic]Func_Decl_Id),
-		by_name      = make(map[string][dynamic]Func_Id),
+		scopes         = make([dynamic]map[string]Sym_Id),
+		pending        = make(map[string][dynamic]Func_Decl_Id),
+		resolved_decls = make([]i32, len(u.func_decls)),
+		by_name        = make(map[string][dynamic]Func_Id),
 		globals      = make([dynamic]Sym_Id),
 		uniforms     = make([dynamic]Sym_Id),
+		local_size   = {1, 1, 1},
 		next_offset  = OFFSET_USER if PROFILE_RULES[u.profile].header else 0,
 	}
 	error_count := len(u.errors)
@@ -111,6 +131,8 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 			declare_struct(&c, t.strukt)
 		case .Buffer:
 			declare_buffer(&c, t.buffer)
+		case .Workgroup:
+			check_workgroup(&c, t.vars)
 		case .Vars:
 			// Index rather than hold a `list` slice: checking can grow u.ids
 			// (saturate, eval), which would leave the slice dangling.
@@ -123,6 +145,23 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 				check_body(&c, f, t.fn)
 			}
 		}
+	}
+	if u.stage == .Compute && !c.has_workgroup && len(u.errors) == error_count {
+		add_error(&c, {line = 1, col = 1}, .Missing_Local_Size)
+	}
+	if u.stage == .Compute && len(c.buffers) > 0 {
+		for e in u.exprs {
+			if e.kind == .Buffer_Load && e.value == 0 {
+				bd := u.buffer_decls[c.buffer_decls[u.syms[e.sym].index]]
+				if bd.writeonly {
+					add_error(&c, e.pos, .Write_Only, u.syms[e.sym].name)
+				}
+			}
+		}
+	}
+	if u.stage == .Compute {
+		infer_image_param_formats(&c)
+		order_compute_resources(&c)
 	}
 
 	// The adapters check like user code, so they come before the tables
@@ -156,6 +195,10 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 	out.channels = c.channels
 	out.buffers = c.buffers[:]
 	out.buffer_decls = c.buffer_decls[:]
+	out.images = c.images[:]
+	out.num_ro_buffers = c.num_ro_buffers
+	out.num_ro_images = c.num_ro_images
+	out.local_size = c.local_size
 	out.block_stride = round_up(c.next_offset, 16)
 	out.taps = len(u.taps)
 	out.block_size = out.block_stride * (1 + out.taps)
@@ -357,6 +400,54 @@ builtin_symbol :: proc(c: ^Checker, name: string) -> Sym_Id {
 			c.gl_sample_mask = add_sym(c, Symbol{name = name, type = intern(c.u, Type{base = .Int, rows = 1, array = 1}), storage = .Stage_Out})
 		}
 		return c.gl_sample_mask
+	case "gl_GlobalInvocationID":
+		if .Compute_Ids not_in c.u.features {
+			return 0
+		}
+		if c.gl_global_id == 0 {
+			c.gl_global_id = add_sym(c, Symbol{name = name, type = intern(c.u, vec_type(.Uint, 3)), storage = .Stage_In, is_const = true})
+		}
+		return c.gl_global_id
+	case "gl_LocalInvocationID":
+		if .Compute_Ids not_in c.u.features {
+			return 0
+		}
+		if c.gl_local_id == 0 {
+			c.gl_local_id = add_sym(c, Symbol{name = name, type = intern(c.u, vec_type(.Uint, 3)), storage = .Stage_In, is_const = true})
+		}
+		return c.gl_local_id
+	case "gl_WorkGroupID":
+		if .Compute_Ids not_in c.u.features {
+			return 0
+		}
+		if c.gl_group_id == 0 {
+			c.gl_group_id = add_sym(c, Symbol{name = name, type = intern(c.u, vec_type(.Uint, 3)), storage = .Stage_In, is_const = true})
+		}
+		return c.gl_group_id
+	case "gl_NumWorkGroups":
+		if .Compute_Ids not_in c.u.features {
+			return 0
+		}
+		if c.gl_num_groups == 0 {
+			c.gl_num_groups = add_sym(c, Symbol{name = name, type = intern(c.u, vec_type(.Uint, 3)), storage = .Stage_In, is_const = true})
+		}
+		return c.gl_num_groups
+	case "gl_LocalInvocationIndex":
+		if .Compute_Ids not_in c.u.features {
+			return 0
+		}
+		if c.gl_local_index == 0 {
+			c.gl_local_index = add_sym(c, Symbol{name = name, type = intern(c.u, T_UINT), storage = .Stage_In, is_const = true})
+		}
+		return c.gl_local_index
+	case "gl_WorkGroupSize":
+		if .Compute_Ids not_in c.u.features {
+			return 0
+		}
+		if c.gl_group_size == 0 {
+			c.gl_group_size = add_sym(c, Symbol{name = name, type = intern(c.u, vec_type(.Uint, 3)), storage = .Work_Group_Size, is_const = true})
+		}
+		return c.gl_group_size
 	case "$channel_resolution":
 		in_ := Input.Channel_Resolution
 		if c.input_syms[in_] == 0 {
@@ -424,8 +515,8 @@ declare_struct :: proc(c: ^Checker, sd_id: Struct_Decl_Id) {
 	for i in sd.fields.start ..< sd.fields.start + sd.fields.count {
 		f := u.vars[i]
 		ft := resolve_type(c, f.spec, f.array_size)
-		if ft.base == .Sampler {
-			add_error(c, f.pos, .Struct_Sampler, a = tn(c, T_SAMPLER))
+		if ft.base == .Sampler || ft.base == .Image {
+			add_error(c, f.pos, .Struct_Sampler, a = tn(c, T_SAMPLER) if ft.base == .Sampler else image_base_name(ft))
 		}
 		append(&fields, Struct_Field{f.name, intern(u, ft)})
 	}
@@ -458,8 +549,8 @@ check_init :: proc(c: ^Checker, v: Var_Id, t: ^Type) {
 }
 
 // A storage buffer block (parse_buffer_block): one runtime-sized array of
-// buffer elements, readonly and std430. The symbol is the instance, or the
-// member without one; reads are Buffer_Loads.
+// buffer elements, std430 (readonly outside compute). The symbol is the
+// instance, or the member without one; accesses are Buffer_Loads.
 @(private)
 declare_buffer :: proc(c: ^Checker, b: Buffer_Decl_Id) {
 	u := c.u
@@ -475,11 +566,16 @@ declare_buffer :: proc(c: ^Checker, b: Buffer_Decl_Id) {
 		return
 	}
 	switch {
-	case !bd.readonly:
+	case bd.readonly && bd.writeonly:
+		add_error(c, bd.pos, .Readonly_Writeonly, bd.block)
+		return
+	case !bd.readonly && .Writable_Buffers not_in u.features:
 		add_error(c, d.pos, .Buffer_Writable, bd.block)
 		return
 	case bd.packing != "" && bd.packing != "std430":
 		add_error(c, d.pos, .Buffer_Layout, bd.block, a = bd.packing)
+		return
+	case bd.bad_layout:
 		return
 	}
 	if _, _, ok := std430(u, t); !ok {
@@ -487,11 +583,178 @@ declare_buffer :: proc(c: ^Checker, b: Buffer_Decl_Id) {
 		return
 	}
 	name := bd.instance if bd.instance != "" else d.name
-	id := add_sym(c, Symbol{name = name, pos = d.pos, type = intern(u, t), storage = .Buffer, is_const = true, index = len(c.buffers), decl = v})
+	id := add_sym(c, Symbol{name = name, pos = d.pos, type = intern(u, t), storage = .Buffer, is_const = bd.readonly, index = len(c.buffers), decl = v})
 	append(&c.buffers, id)
 	append(&c.buffer_decls, b)
 	u.vars[v].sym = id
 	declare(c, id)
+}
+
+@(private)
+check_workgroup :: proc(c: ^Checker, wg: Range) {
+	u := c.u
+	if wg.count == 0 {
+		return
+	}
+	if u.stage != .Compute {
+		add_error(c, u.workgroups[wg.start].pos, .Compute_Only, "layout(local_size_*)")
+		return
+	}
+	axis_names := [3]string{"local_size_x", "local_size_y", "local_size_z"}
+	decl_size := [3]i64{1, 1, 1}
+	decl_pos: [3]Pos
+	seen: [3]bool
+	had_err := false
+	first_pos := u.workgroups[wg.start].pos
+	for wi in wg.start ..< wg.start + wg.count {
+		item := u.workgroups[wi]
+		aname := axis_names[item.axis]
+		v := item.value
+		if v <= 0 {
+			add_error(c, item.pos, .Local_Size_Positive, aname, n = v)
+			had_err = true
+			continue
+		}
+		if v > 1024 {
+			add_error(c, item.pos, .Local_Size_Max, n = v, m = 1024)
+			had_err = true
+			continue
+		}
+		if seen[item.axis] && decl_size[item.axis] != v {
+			add_error(c, item.pos, .Local_Size_Conflict, aname, n = decl_size[item.axis], m = v)
+			had_err = true
+			continue
+		}
+		if !seen[item.axis] {
+			decl_pos[item.axis] = item.pos
+		}
+		seen[item.axis] = true
+		decl_size[item.axis] = v
+	}
+	if had_err {
+		if !c.has_workgroup {
+			c.local_size = {1, 1, 1}
+			c.has_workgroup = true
+			c.workgroup_bad = true
+		}
+		return
+	}
+	prod := decl_size[0] * decl_size[1] * decl_size[2]
+	if prod > 1024 {
+		add_error(c, first_pos, .Local_Size_Max, n = prod, m = 1024)
+		if !c.has_workgroup {
+			c.local_size = {1, 1, 1}
+			c.has_workgroup = true
+			c.workgroup_bad = true
+		}
+		return
+	}
+	if c.has_workgroup && !c.workgroup_bad {
+		for a in 0 ..< 3 {
+			if seen[a] && c.local_size_seen[a] && u32(decl_size[a]) != c.local_size[a] {
+				add_error(c, decl_pos[a], .Local_Size_Conflict, axis_names[a], n = i64(c.local_size[a]), m = decl_size[a])
+				return
+			}
+		}
+		for a in 0 ..< 3 {
+			if seen[a] != c.local_size_seen[a] {
+				pos := decl_pos[a] if seen[a] else first_pos
+				add_error(c, pos, .Local_Size_Redeclared, axis_names[a], a = "with" if seen[a] else "without")
+				return
+			}
+		}
+	}
+	if !c.workgroup_bad {
+		c.local_size = {u32(decl_size[0]), u32(decl_size[1]), u32(decl_size[2])}
+		c.local_size_seen = seen
+		c.has_workgroup = true
+	}
+}
+
+@(private)
+validate_image_type :: proc(c: ^Checker, pos: Pos, name: string, t: ^Type, format: Image_Format, readonly, writeonly, bad_layout: bool) -> bool {
+	u := c.u
+	if .Storage_Images not_in u.features {
+		add_error(c, pos, missing_feature(u.profile, u.stage, .Storage_Images), image_base_name(t^))
+		return false
+	}
+	if t.array != 0 {
+		add_error(c, pos, .Sampler_Array, a = image_base_name(t^))
+		return false
+	}
+	if readonly && writeonly {
+		add_error(c, pos, .Readonly_Writeonly, name)
+		return false
+	}
+	if bad_layout {
+		return false
+	}
+	if format == .None {
+		add_error(c, pos, .Image_Format_Required, name)
+		return false
+	}
+	want_base := image_format_base(format)
+	if image_texel_base(t^) != want_base {
+		want_img := "image2D" if want_base == .Float else ("uimage2D" if want_base == .Uint else "iimage2D")
+		add_error(c, pos, .Image_Format_Mismatch, a = IMAGE_FORMAT_NAMES[format], b = image_base_name(t^), c = want_img)
+		return false
+	}
+	if !readonly && !writeonly && (format == .Rgba8 || format == .Rgba16f || format == .Rgba32f) {
+		add_error(c, pos, .Image_RW_Format, name, a = IMAGE_FORMAT_NAMES[format])
+		return false
+	}
+	t^ = with_image_qual(t^, format, readonly, writeonly)
+	return true
+}
+
+// Orders storage buffers and storage images as SDL_GPU binds them: readonly
+// first (in declaration order), then read-write / writeonly (in declaration
+// order), updating each symbol's index to match.
+@(private)
+order_compute_resources :: proc(c: ^Checker) {
+	u := c.u
+	if len(c.buffers) > 0 {
+		bufs := make([dynamic]Sym_Id, 0, len(c.buffers))
+		decls := make([dynamic]Buffer_Decl_Id, 0, len(c.buffer_decls))
+		for b, i in c.buffers {
+			bd := c.buffer_decls[i]
+			if u.buffer_decls[bd].readonly {
+				append(&bufs, b)
+				append(&decls, bd)
+			}
+		}
+		c.num_ro_buffers = len(bufs)
+		for b, i in c.buffers {
+			bd := c.buffer_decls[i]
+			if !u.buffer_decls[bd].readonly {
+				append(&bufs, b)
+				append(&decls, bd)
+			}
+		}
+		for b, i in bufs {
+			u.syms[b].index = i
+		}
+		c.buffers = bufs
+		c.buffer_decls = decls
+	}
+	if len(c.images) > 0 {
+		imgs := make([dynamic]Sym_Id, 0, len(c.images))
+		for im in c.images {
+			if image_readonly(sym_type(u, im)) {
+				append(&imgs, im)
+			}
+		}
+		c.num_ro_images = len(imgs)
+		for im in c.images {
+			if !image_readonly(sym_type(u, im)) {
+				append(&imgs, im)
+			}
+		}
+		for im, i in imgs {
+			u.syms[im].index = i
+		}
+		c.images = imgs
+	}
 }
 
 // The buffer `id` reads when it is indexed (`words` or `inst.words`), or 0.
@@ -579,6 +842,24 @@ declare_global :: proc(c: ^Checker, v: Var_Id) {
 			declare(c, id)
 			return
 		}
+		if t.base == .Image {
+			if !validate_image_type(c, d.pos, d.name, &t, d.format, d.readonly, d.writeonly, d.bad_layout) {
+				return
+			}
+			if len(c.images) >= IMAGE_COUNT {
+				add_error(c, d.pos, .Too_Many_Images, n = IMAGE_COUNT)
+				return
+			}
+			s.type = intern(u, t)
+			s.storage = .Storage_Image
+			s.is_const = true
+			s.index = len(c.images)
+			id := add_sym(c, s)
+			append(&c.images, id)
+			u.vars[v].sym = id
+			declare(c, id)
+			return
+		}
 		if t.base == .Struct || t.array < 0 {
 			add_error(c, d.pos, .Uniform_Kind, d.name)
 			return
@@ -619,6 +900,15 @@ declare_global :: proc(c: ^Checker, v: Var_Id) {
 		add_error(c, d.pos, .Sampler_Not_Uniform, a = tn(c, T_SAMPLER))
 		return
 	}
+	if t.base == .Image {
+		bname := image_base_name(t)
+		if .Storage_Images not_in u.features {
+			add_error(c, d.pos, missing_feature(u.profile, u.stage, .Storage_Images), bname)
+		} else {
+			add_error(c, d.pos, .Image_Not_Uniform if bname[0] == 'i' else .Sampler_Not_Uniform, a = bname)
+		}
+		return
+	}
 	s.storage = .Global
 	check_init(c, v, &t)
 	if d.init == 0 && d.is_const {
@@ -642,9 +932,16 @@ declare_global :: proc(c: ^Checker, v: Var_Id) {
 
 @(private)
 resolve_func_decl :: proc(c: ^Checker, fd_id: Func_Decl_Id) -> Func_Id {
+	if int(fd_id) < len(c.resolved_decls) && c.resolved_decls[fd_id] != 0 {
+		return Func_Id(c.resolved_decls[fd_id]) if c.resolved_decls[fd_id] > 0 else 0
+	}
 	u := c.u
 	fd := u.func_decls[fd_id]
 	ret := resolve_type(c, fd.ret)
+	if ret.base == .Sampler || ret.base == .Image {
+		add_error(c, fd.pos, .Opaque_Return, a = tn(c, ret) if ret.base == .Sampler else image_base_name(ret))
+		ret = T_ERROR
+	}
 	params := make([dynamic]Func_Param, context.temp_allocator)
 	for pi in fd.params.start ..< fd.params.start + fd.params.count {
 		prm := u.params[pi]
@@ -652,9 +949,31 @@ resolve_func_decl :: proc(c: ^Checker, fd_id: Func_Decl_Id) -> Func_Id {
 		if t.base == .Sampler && .Sampler_Params not_in c.u.features {
 			add_error(c, prm.pos, missing_feature(c.u.profile, c.u.stage, .Sampler_Params))
 		}
+		if t.base == .Image {
+			pname := prm.name if prm.name != "" else image_base_name(t)
+			switch {
+			case .Storage_Images not_in u.features:
+				add_error(c, prm.pos, missing_feature(u.profile, u.stage, .Storage_Images), image_base_name(t))
+				t = T_ERROR
+			case t.array != 0:
+				add_error(c, prm.pos, .Sampler_Array, a = image_base_name(t))
+				t = T_ERROR
+			case prm.readonly && prm.writeonly:
+				add_error(c, prm.pos, .Readonly_Writeonly, pname)
+				t = T_ERROR
+			case:
+				if prm.qual != .In {
+					add_error(c, prm.pos, .Image_Out_Param, pname, a = "out" if prm.qual == .Out else "inout")
+				}
+				t = with_image_qual(t, .None, prm.readonly, prm.writeonly)
+			}
+		}
 		append(&params, Func_Param{prm.name, intern(u, t), prm.qual, 0})
 	}
 	if is_error(ret) {
+		if int(fd_id) < len(c.resolved_decls) {
+			c.resolved_decls[fd_id] = -1
+		}
 		return 0
 	}
 	rid := intern(u, ret)
@@ -674,16 +993,25 @@ resolve_func_decl :: proc(c: ^Checker, fd_id: Func_Decl_Id) -> Func_Id {
 			continue
 		}
 		if u.funcs[f].decl == fd_id {
+			if int(fd_id) < len(c.resolved_decls) {
+				c.resolved_decls[fd_id] = i32(f)
+			}
 			return f
 		}
 		if u.funcs[f].ret != rid {
 			add_error(c, fd.pos, .Return_Type_Redeclared, fd.name)
+			if int(fd_id) < len(c.resolved_decls) {
+				c.resolved_decls[fd_id] = -1
+			}
 			return 0
 		}
 		if fd.body != 0 {
 			if u.funcs[f].defined {
 				dp := u.func_decls[u.funcs[f].decl].pos
 				add_error(c, fd.pos, .Already_Defined_At, fd.name, n = i64(dp.line), m = i64(dp.col))
+				if int(fd_id) < len(c.resolved_decls) {
+					c.resolved_decls[fd_id] = -1
+				}
 				return 0
 			}
 			// The definition's parameter names win over the prototype's.
@@ -692,6 +1020,9 @@ resolve_func_decl :: proc(c: ^Checker, fd_id: Func_Decl_Id) -> Func_Id {
 				ps[i].name = p.name
 			}
 		}
+		if int(fd_id) < len(c.resolved_decls) {
+			c.resolved_decls[fd_id] = i32(f)
+		}
 		return f
 	}
 	f := Func_Id(len(u.funcs))
@@ -699,7 +1030,70 @@ resolve_func_decl :: proc(c: ^Checker, fd_id: Func_Decl_Id) -> Func_Id {
 	append(&u.func_params, ..params[:])
 	append(&l, f)
 	c.by_name[fd.name] = l
+	if int(fd_id) < len(c.resolved_decls) {
+		c.resolved_decls[fd_id] = i32(f)
+	}
 	return f
+}
+
+// Propagates storage-image formats from call-site arguments to image parameters
+// across user calls, diagnosing conflicting formats passed to the same parameter.
+@(private)
+infer_image_param_formats :: proc(c: ^Checker) {
+	u := c.u
+	if len(c.images) == 0 && u.stage != .Compute {
+		return
+	}
+	reported := make(map[u32]bool, context.temp_allocator)
+	for {
+		changed := false
+		for e in u.exprs {
+			if e.kind != .Call || e.call != .User || e.func == 0 {
+				continue
+			}
+			fn := u.funcs[e.func]
+			ps := fparams(u, e.func)
+			args := list(u, e.args)
+			if len(args) != len(ps) {
+				continue
+			}
+			for &p, i in ps {
+				pt := ty(u, p.type)
+				if pt.base != .Image {
+					continue
+				}
+				arg_id := Expr_Id(args[i])
+				arg_fmt := image_format_of(expr_type(u, arg_id))
+				if arg_fmt == .None {
+					continue
+				}
+				cur_fmt := image_format_of(pt)
+				if cur_fmt == .None {
+					nt := intern(u, with_image_qual(pt, arg_fmt, image_readonly(pt), image_writeonly(pt)))
+					p.type = nt
+					if p.sym != 0 {
+						u.syms[p.sym].type = nt
+						for &ex in u.exprs {
+							if ex.kind == .Ident && ex.sym == p.sym {
+								ex.type = nt
+							}
+						}
+					}
+					changed = true
+				} else if cur_fmt != arg_fmt {
+					pidx := fn.params.start + u32(i)
+					if !reported[pidx] {
+						reported[pidx] = true
+						pname := p.name if p.name != "" else image_base_name(pt)
+						add_error(c, u.exprs[arg_id].pos, .Image_Param_Format, pname, a = fn.name, b = IMAGE_FORMAT_NAMES[cur_fmt], c = IMAGE_FORMAT_NAMES[arg_fmt])
+					}
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
 }
 
 // Resolves not-yet-seen declarations of `name`, so calls may precede
@@ -787,9 +1181,14 @@ order_functions :: proc(c: ^Checker, entry: Func_Id) -> [dynamic]Func_Id {
 		append(&w.stack, f)
 		ok := true
 		for edge in u.calls {
-			if edge[0] == f && !visit(w, edge[1]) {
-				ok = false
-				break
+			if edge[0] == f {
+				if !visit(w, edge[1]) {
+					ok = false
+					break
+				}
+				if u.funcs[edge[1]].writes_state {
+					u.funcs[f].writes_state = true
+				}
 			}
 		}
 		pop(&w.stack)
@@ -987,6 +1386,15 @@ check_local :: proc(c: ^Checker, v: Var_Id) {
 		add_error(c, d.pos, .Sampler_Not_Uniform, a = tn(c, T_SAMPLER))
 		return
 	}
+	if t.base == .Image {
+		bname := image_base_name(t)
+		if .Storage_Images not_in u.features {
+			add_error(c, d.pos, missing_feature(u.profile, u.stage, .Storage_Images), bname)
+		} else {
+			add_error(c, d.pos, .Image_Not_Uniform if bname[0] == 'i' else .Sampler_Not_Uniform, a = bname)
+		}
+		return
+	}
 	check_init(c, v, &t)
 	if d.init == 0 && d.is_const {
 		add_error(c, d.pos, .Const_Needs_Init, d.name)
@@ -1006,11 +1414,18 @@ check_local :: proc(c: ^Checker, v: Var_Id) {
 
 // ---- conversions ---------------------------------------------------------------------
 
-// Implicit conversions: int -> uint -> float, same shape.
+// Implicit conversions: int -> uint -> float (same shape), and read-write
+// storage images passed to readonly/writeonly image parameters.
 @(private)
 can_convert :: proc(from, to: Type) -> bool {
 	if from == to {
 		return true
+	}
+	if from.base == .Image && to.base == .Image {
+		return from.rows == to.rows && from.array == to.array &&
+			(image_format_of(to) == .None || image_format_of(from) == image_format_of(to)) &&
+			(!image_readonly(from) || image_readonly(to)) &&
+			(!image_writeonly(from) || image_writeonly(to))
 	}
 	if from.rows != to.rows || from.cols != to.cols || from.array != to.array || from.base == .Struct || to.base == .Struct {
 		return false
@@ -1033,6 +1448,9 @@ coerce :: proc(c: ^Checker, e: Expr_Id, to: Type) -> (Expr_Id, bool) {
 	}
 	if !can_convert(from, to) {
 		return e, false
+	}
+	if from.base == .Image {
+		return e, true
 	}
 	return make_convert(c, e, to), true
 }
@@ -1171,6 +1589,22 @@ const_int :: proc(c: ^Checker, id: Expr_Id) -> (i64, bool) {
 		if t == T_INT || t == T_UINT {
 			return const_int(c, e.a)
 		}
+	case .Field:
+		if e.swizzle_len == 1 && u.exprs[e.a].kind == .Ident {
+			bs := u.exprs[e.a].sym
+			if bs != 0 && u.syms[bs].storage == .Work_Group_Size && c.has_workgroup && e.swizzle[0] < 3 {
+				return i64(c.local_size[e.swizzle[0]]), true
+			}
+		}
+	case .Index:
+		if u.exprs[e.a].kind == .Ident {
+			bs := u.exprs[e.a].sym
+			if bs != 0 && u.syms[bs].storage == .Work_Group_Size && c.has_workgroup {
+				if ix, ok := const_int(c, e.b); ok && ix >= 0 && ix < 3 {
+					return i64(c.local_size[ix]), true
+				}
+			}
+		}
 	}
 	return 0, false
 }
@@ -1212,9 +1646,19 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		if s == 0 {
 			if _, is_func := c.by_name[e.name]; is_func || builtin_from_name(e.name) != .None {
 				add_error(c, e.pos, .Is_Function, e.name)
+			} else if u.dialect == .GLSL && .Compute_Ids not_in u.features && (e.name == "gl_GlobalInvocationID" || e.name == "gl_LocalInvocationID" || e.name == "gl_WorkGroupID" || e.name == "gl_NumWorkGroups" || e.name == "gl_LocalInvocationIndex" || e.name == "gl_WorkGroupSize") {
+				add_error(c, e.pos, missing_feature(u.profile, u.stage, .Compute_Ids), e.name)
+			} else if u.stage == .Compute && (e.name == "gl_FragCoord" || e.name == "gl_FrontFacing" || e.name == "gl_SampleMask") {
+				add_error(c, e.pos, .Fragment_Only, e.name)
+			} else if u.stage == .Compute && (e.name == "gl_Position" || e.name == "gl_VertexID") {
+				add_error(c, e.pos, .Vertex_Only, e.name)
 			} else {
 				add_error(c, e.pos, .Undeclared, e.name)
 			}
+			return T_ERROR
+		}
+		if u.syms[s].storage == .Work_Group_Size && !c.has_workgroup {
+			add_error(c, e.pos, .Work_Group_Size_Before_Decl)
 			return T_ERROR
 		}
 		if u.syms[s].storage == .Buffer {
@@ -1235,6 +1679,10 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		tb := check_expr(c, e.b)
 		tc := check_expr(c, e.c)
 		if is_error(tb) || is_error(tc) {
+			return T_ERROR
+		}
+		if tb.base == .Sampler || tb.base == .Image {
+			add_error(c, e.pos, .Opaque_Ternary, a = tn(c, tb))
 			return T_ERROR
 		}
 		if tb != tc {
@@ -1300,6 +1748,9 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		}
 		check_lvalue(c, e.a)
 		if e.op == .Eq {
+			if bl, _ := target_buffer(u, e.a); bl != 0 {
+				u.exprs[bl].value = 1
+			}
 			nb, ok := coerce(c, e.b, tl)
 			u.exprs[id].b = nb
 			if !ok {
@@ -1453,6 +1904,10 @@ token_text :: proc(k: Token_Kind) -> string {
 		return "^^"
 	case .Colon:
 		return ":"
+	case .Comma:
+		return ","
+	case .Eq:
+		return "="
 	case .Semicolon:
 		return ";"
 	case .L_Paren:
@@ -1524,7 +1979,7 @@ check_binary :: proc(c: ^Checker, op: Token_Kind, a, b: ^Expr_Id, pos: Pos) -> T
 		if ta != tb {
 			return bad(c, op, ta, tb, pos)
 		}
-		if ta.base == .Struct || is_array(ta) || ta.base == .Sampler {
+		if ta.base == .Struct || is_array(ta) || ta.base == .Sampler || ta.base == .Image {
 			add_error(c, pos, .Compare_Unsupported, a = tn(c, ta))
 			return T_ERROR
 		}
@@ -1664,22 +2119,38 @@ check_lvalue :: proc(c: ^Checker, id: Expr_Id) -> bool {
 		}
 		s := u.syms[e.sym]
 		switch s.storage {
-		case .Uniform, .Builtin_Uniform, .Channel, .Stage_In, .Buffer:
+		case .Uniform, .Builtin_Uniform, .Channel, .Storage_Image, .Stage_In, .Buffer:
 			add_error(c, e.pos, .Read_Only, s.name)
 			return false
+		case .Work_Group_Size:
+			add_error(c, e.pos, .Is_Const, s.name)
+			return false
 		case .Stage_Out:
+			if c.cur_func != 0 {
+				u.funcs[c.cur_func].writes_state = true
+			}
 		case .Local, .Param, .Global:
 			if s.is_const && !(c.entry_writes && (e.sym == c.gl_frag_coord || e.sym == c.frag_coord)) {
 				add_error(c, e.pos, .Is_Const, s.name)
 				return false
+			}
+			if s.storage == .Global && c.cur_func != 0 {
+				u.funcs[c.cur_func].writes_state = true
 			}
 		}
 		return true
 	case .Index:
 		return check_lvalue(c, e.a)
 	case .Buffer_Load:
-		add_error(c, e.pos, .Read_Only, u.syms[e.sym].name)
-		return false
+		bd := u.buffer_decls[c.buffer_decls[u.syms[e.sym].index]]
+		if bd.readonly {
+			add_error(c, e.pos, .Read_Only, u.syms[e.sym].name)
+			return false
+		}
+		if c.cur_func != 0 {
+			u.funcs[c.cur_func].writes_state = true
+		}
+		return true
 	case .Field:
 		for i in 0 ..< int(e.swizzle_len) {
 			for j in 0 ..< i {
@@ -1729,6 +2200,17 @@ check_call :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		if e.name != "texture2D" {
 			return check_texture(c, id)
 		}
+	case "textureProj":
+		if .Implicit_Lod not_in c.u.features {
+			add_error(c, e.pos, missing_feature(c.u.profile, c.u.stage, .Implicit_Lod), e.name)
+			return T_ERROR
+		}
+	case "imageLoad", "imageStore", "imageSize":
+		if .Storage_Images not_in c.u.features {
+			add_error(c, e.pos, missing_feature(c.u.profile, c.u.stage, .Storage_Images), e.name)
+			return T_ERROR
+		}
+		return check_image_op(c, id)
 	case "saturate":
 		if .Saturate not_in c.u.features {
 			break
@@ -1854,6 +2336,10 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 	u := c.u
 	e := u.exprs[id]
 	args := args_of(u, id)
+	if e.name == "texture" && .Implicit_Lod not_in c.u.features {
+		add_error(c, e.pos, missing_feature(c.u.profile, c.u.stage, .Implicit_Lod), e.name)
+		return T_ERROR
+	}
 	want := 3 if e.name == "textureLod" || e.name == "texelFetch" else (4 if e.name == "textureGrad" else 2)
 	if len(args) != want && !(e.name == "texture" && len(args) == 3) {
 		add_error(c, e.pos, .Arg_Count, e.name, n = i64(want), m = i64(len(args)))
@@ -2004,6 +2490,56 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 }
 
 @(private)
+check_image_op :: proc(c: ^Checker, id: Expr_Id) -> Type {
+	u := c.u
+	e := u.exprs[id]
+	args := args_of(u, id)
+	want := 1 if e.name == "imageSize" else (2 if e.name == "imageLoad" else 3)
+	if len(args) != want {
+		add_error(c, e.pos, .Arg_Count, e.name, n = i64(want), m = i64(len(args)))
+		return T_ERROR
+	}
+	it := expr_type(u, args[0])
+	if it.base != .Image {
+		return no_overload(c, e, args)
+	}
+	img_name := u.exprs[args[0]].name if u.exprs[args[0]].kind == .Ident else image_base_name(it)
+	if e.name == "imageSize" {
+		u.exprs[id].call = .Builtin
+		u.exprs[id].builtin = .Image_Size
+		return vec_type(.Int, 2)
+	}
+	coord, cok := coerce(c, args[1], vec_type(.Int, 2))
+	if !cok {
+		return no_overload(c, e, args)
+	}
+	args[1] = coord
+	texel := vec_type(image_texel_base(it), 4)
+	if e.name == "imageLoad" {
+		if image_writeonly(it) {
+			add_error(c, e.pos, .Write_Only, img_name)
+			return T_ERROR
+		}
+		u.exprs[id].call = .Builtin
+		u.exprs[id].builtin = .Image_Load
+		return texel
+	}
+	if expr_type(u, args[2]) != texel {
+		return no_overload(c, e, args)
+	}
+	if image_readonly(it) {
+		add_error(c, e.pos, .Read_Only, img_name)
+		return T_ERROR
+	}
+	if c.cur_func != 0 {
+		u.funcs[c.cur_func].writes_state = true
+	}
+	u.exprs[id].call = .Builtin
+	u.exprs[id].builtin = .Image_Store
+	return T_VOID
+}
+
+@(private)
 pick_overload :: proc(c: ^Checker, id: Expr_Id, report: bool) -> Func_Id {
 	u := c.u
 	e := u.exprs[id]
@@ -2019,7 +2555,8 @@ pick_overload :: proc(c: ^Checker, id: Expr_Id, report: bool) -> Func_Id {
 		for p, i in ps {
 			at := expr_type(u, args[i])
 			pt := ty(u, p.type)
-			if at != pt {
+			same_img := at.base == .Image && pt.base == .Image && at.rows == pt.rows && at.array == pt.array && image_readonly(at) == image_readonly(pt) && image_writeonly(at) == image_writeonly(pt)
+			if at != pt && !same_img {
 				is_exact = false
 				if p.qual != .In || !can_convert(at, pt) {
 					is_loose = false
@@ -2067,6 +2604,11 @@ finish_user_call :: proc(c: ^Checker, id: Expr_Id, f: Func_Id) -> Type {
 				add_error(c, u.exprs[args[i]].pos, .Out_Arg_Type, a = tn(c, pt))
 			}
 			check_lvalue(c, args[i])
+			if p.qual == .Out {
+				if bl, _ := target_buffer(u, args[i]); bl != 0 {
+					u.exprs[bl].value = 1
+				}
+			}
 		} else {
 			args[i], _ = coerce(c, args[i], pt)
 		}
@@ -2085,7 +2627,7 @@ check_constructor :: proc(c: ^Checker, id: Expr_Id) -> Type {
 	if is_error(t) {
 		return t
 	}
-	if t.base == .Void || t.base == .Sampler {
+	if t.base == .Void || t.base == .Sampler || t.base == .Image {
 		add_error(c, e.pos, .Not_Constructible, e.name)
 		return T_ERROR
 	}

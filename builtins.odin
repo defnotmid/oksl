@@ -85,6 +85,10 @@ Builtin :: enum u8 {
 	Float_Bits_To_Uint,
 	Int_Bits_To_Float,
 	Uint_Bits_To_Float,
+	// Storage images (checked by check_image_op).
+	Image_Load,
+	Image_Store,
+	Image_Size,
 }
 
 // How a built-in's arguments are checked (and converted). Each rule runs
@@ -241,6 +245,9 @@ BUILTINS := [Builtin]Builtin_Info {
 	.Texture            = {"", 3, .Texture_Lod, .Vec4, {}, {}, {.Derivatives}},
 	.Texture_Size       = {"", 2, .Texture_Size, .Image_Size, {}, {}, {}},
 	.Texture_Grad       = {"", 4, .Texture_Grad, .Vec4, {}, {}, {}},
+	.Image_Load         = {"", 2, .None, .Vec4, {}, {}, {}},
+	.Image_Store        = {"", 3, .None, .First, {}, {}, {}},
+	.Image_Size         = {"", 1, .None, .Image_Size, {}, {}, {}},
 	.Float_Bits_To_Int  = {"floatBitsToInt", 1, .Float_Exact, .Int_Shape, {}, {}, {}},
 	.Float_Bits_To_Uint = {"floatBitsToUint", 1, .Float_Exact, .Uint_Shape, {}, {}, {}},
 	.Int_Bits_To_Float  = {"intBitsToFloat", 1, .Exact_Base, .Float_Shape, {}, .Int, {}},

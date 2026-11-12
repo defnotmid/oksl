@@ -5,11 +5,11 @@
 **A shader compiler you embed in your app.** oksl compiles a small, safe
 shading language at runtime, through one front end, from SkSL (the
 language of Skia's runtime effects), GLSL ES 3 as Shadertoy writes it, or
-plain GLSL ES 3.0 fragment shaders, into:
+plain GLSL ES 3.0 / 3.1 vertex, fragment and compute shaders, into:
 
 - **SPIR-V** for Vulkan,
 - **MSL** for Metal,
-- a **CPU program** that renders the same shader with no GPU at all.
+- a **CPU program** that renders or dispatches the same shader with no GPU at all.
 
 It's plain Odin with no external toolchain. Runtime shaders usually mean
 shipping glslang, shaderc, SPIRV-Cross, DXC or Slang; with oksl the compiler
@@ -45,6 +45,7 @@ fframes' SkSL shaders unchanged; [demo/](demo) is an onimite video about it.
 m, errors, ok := oksl.compile(source)            // SkSL
 // m, errors, ok := oksl.compile_shadertoy(glsl) // Shadertoy GLSL (Options.profile = .Shadertoy)
 // m, errors, ok := oksl.compile_glsl(frag)      // GLSL ES 3.0 fragment shader (Options.profile = .Glsl)
+// m, errors, ok := oksl.compile_glsl(comp, {stage = .Compute}) // GLSL ES 3.1 compute shader
 defer oksl.destroy(m)
 if !ok {
 	// Errors are values ({pos, code, operands}); text is made here.
@@ -234,17 +235,22 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   to nearest even and clamped, as GPUs take it); `texelFetch` takes 2D
   samplers only. `textureGrad(s, uv, dPdx, dPdy)` samples at the level
   those derivatives pick, in any stage.
-- **Storage buffers:** read-only, GLSL ES 3.1's block with one
-  runtime-sized array: `layout(std430) readonly buffer Rows { Row rows[];
-  } rowBuf;` read as `rowBuf.rows[i]` (or `rows[i]` without an instance
-  name), at any int or uint index, in any function and either stage.
-  Elements are float, int and uint scalars and vectors and structs of
-  them, laid out std430 (`layout(std430)` is optional; other packings,
-  writes, sized arrays, bools and matrices are diagnosed).
+- **Storage buffers:** in vertex and fragment shaders, read-only, GLSL ES
+  3.1's block with one runtime-sized array: `layout(std430) readonly buffer
+  Rows { Row rows[]; } rowBuf;` read as `rowBuf.rows[i]` (or `rows[i]`
+  without an instance name), at any int or uint index, in any function and
+  either stage (`row_major` and `column_major` layout qualifiers are
+  accepted as no-ops; compute shaders also allow read-write and `writeonly`
+  storage buffers, bound in SDL_GPU's compute order below). Elements are
+  float, int and uint scalars and vectors and structs of them, laid out
+  std430 (`layout(std430)` is optional; other packings, writes in graphics
+  stages, sized arrays, bools and matrices are diagnosed).
   `Module.storage_buffers` gives each block's name, element type and
-  stride in declaration order, the order they bind in. Word addresses are
-  32-bit (they wrap) on every backend; a read past the buffer gives 0 on
-  the CPU and is undefined on the GPU (Metal reads past it).
+  stride (`vec3[]` steps by 16 bytes, while a struct's `vec3` field takes
+  12) in SDL_GPU binding order—which in graphics stages equals declaration
+  order since every buffer is `readonly`. Word addresses are 32-bit (they
+  wrap) on every backend; a read past the buffer gives 0 on the CPU and is
+  undefined on the GPU (Metal reads past it).
 - **Taps:** `Options.taps` (in a pipeline, the vertex stage's) runs what
   a vertex shader's `main` does toward `gl_Position` again for other
   environments, such as a motion blur's shutter opening, once per tap and
@@ -272,6 +278,74 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   2D), more than 16 samplers, taps outside a vertex
   shader, a tap position, attribute or twin not declared as one, a
   position the shader uses itself, and two taps writing one position.
+
+### GLSL compute shaders
+
+`compile_glsl(src, {stage = .Compute})` (or `Options{profile = .Glsl,
+stage = .Compute}`, `.comp` in the tools; rejected by the SkSL and
+Shadertoy profiles) compiles a GLSL ES 3.1 compute shader:
+
+- **Workgroup size:** `layout(local_size_x = X, local_size_y = Y,
+  local_size_z = Z) in;` is required (omitted axes default to 1, positive
+  integer literals up to 1024 per axis and `X * Y * Z <= 1024` in total;
+  duplicate declarations must specify the same set of axes with the same
+  values) and is reflected in `Module.threadcount`. Vulkan's guaranteed
+  minimums (`maxComputeWorkGroupSize = {128, 128, 64}`,
+  `maxComputeWorkGroupInvocations = 128`) are lower, so `8x8`, `16x8` and
+  `64x1` stay portable across drivers.
+- **Built-ins:** `gl_GlobalInvocationID`, `gl_LocalInvocationID`,
+  `gl_WorkGroupID`, `gl_NumWorkGroups` (`uvec3`),
+  `gl_LocalInvocationIndex` (`uint`), and the compile-time constant
+  `gl_WorkGroupSize` (`const uvec3`, usable in constant expressions and
+  array sizes).
+- **Storage buffers and binding order:** `std430` storage buffers may be
+  `readonly`, read-write (unqualified) or `writeonly` (`readonly` and
+  `writeonly` together is diagnosed; reads from `writeonly` and writes to
+  `readonly`, including compound assignment, `++`/`--` and `out`/`inout`
+  arguments, are diagnosed). Because SDL_GPU binds read-only storage
+  buffers before read-write / `writeonly` ones, `Module.storage_buffers`
+  and `Run_Options.buffers` use that same order—read-only blocks in
+  declaration order, then read-write and `writeonly` blocks in declaration
+  order—and each `Storage_Buffer_Info` carries `readonly` and `writeonly`:
+
+  ```glsl
+  buffer A { uint out_words[]; };
+  readonly buffer B { float weights[]; };
+  // Binding / reflection / Run_Options.buffers order: [B, A].
+  ```
+
+  Writes are 32-bit word-addressed across SPIR-V, MSL and the CPU VM
+  (masked per lane; out-of-bounds writes are dropped on the CPU and
+  undefined on the GPU). Graphics stages still allow only `readonly`
+  buffers, so their binding order equals declaration order.
+- **Storage images:** up to 16 (`IMAGE_COUNT`) 2D storage images
+  (`image2D`, `uimage2D`, `iimage2D`), each with a required
+  `layout(<format>)` from `rgba8`, `rgba16f`, `rgba32f`, `r32f`
+  (`image2D`), `r32ui` (`uimage2D`) or `r32i` (`iimage2D`), qualified
+  `readonly` or `writeonly`; unqualified read-write is allowed on the
+  single-channel formats `r32f`, `r32ui` and `r32i` (GLSL ES 3.1 / Vulkan
+  baseline without `shaderStorageImageReadWithoutFormat`). Built-ins are
+  `imageLoad(img, ivec2)`, `imageStore(img, ivec2, val)` and
+  `imageSize(img)`. User functions may take `in` image parameters without
+  `layout(...)` qualifiers: the format is inferred from call-site arguments
+  and conflicting call-site formats are diagnosed (a read-write image may be
+  passed to a `readonly` or `writeonly` parameter). Portable GLSL ES 3.1
+  shaders pass images to `writeonly` parameters (`glslang` requires
+  `GL_EXT_shader_image_load_formatted` on `readonly` and read-write image
+  parameters, which oksl accepts as an extension). `Module.storage_images`
+  and `Run_Options.images` follow SDL_GPU's order: read-only images first,
+  then read-write / `writeonly`, each in declaration order. When creating
+  SDL_GPU textures, use `COMPUTE_STORAGE_READ` for `readonly`,
+  `COMPUTE_STORAGE_WRITE` for `writeonly`, and
+  `COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE` (not `READ | WRITE`) for
+  read-write `r32*` images.
+- **Sampling:** `sampler2D` and `sampler2DArray` work with `textureLod`,
+  `texelFetch`, `textureGrad` and `textureSize`. Implicit-level `texture`,
+  `textureProj` and derivatives (`dFdx`, `dFdy`, `fwidth`) need fragment
+  quads and are diagnosed in compute, along with stage `in`/`out`
+  variables, `discard` and vertex/fragment built-ins.
+- **Phase 1 scope:** `shared` workgroup memory, `barrier()` /
+  `memoryBarrier*()` and atomic operations are not implemented yet.
 
 ### Pass graphs and programs (multipass)
 
@@ -387,6 +461,23 @@ four channels (the rows above); GLSL shaders have 16 (`SAMPLER_COUNT`).
   `[[user(locnN)]]` and the position as `[[position]]`; the block at
   `[[buffer(0)]]`, storage buffers after it. One vertex uniform block
   (`Module.num_uniform_buffers` 1, or 0 when there is none).
+- **Compute shaders:** `Module.threadcount` and the six SDL_GPU counts
+  (`num_samplers`, `num_readonly_storage_textures`,
+  `num_readonly_storage_buffers`, `num_readwrite_storage_textures`,
+  `num_readwrite_storage_buffers`, `num_uniform_buffers`) populate
+  `SDL_GPUComputePipelineCreateInfo` directly. SPIR-V (`GLCompute`,
+  `LocalSize`, `NonWritable` on `readonly`, `NonReadable` on `writeonly`):
+  set 0 binds combined samplers (`0..num_samplers - 1`), read-only storage
+  images, then read-only storage buffers; set 1 binds read-write /
+  `writeonly` storage images, then read-write / `writeonly` storage
+  buffers; set 2, binding 0 binds the uniform block. MSL (`kernel void
+  oksl_main`): flat `[[texture(n)]]` (`0..num_samplers - 1` sampled
+  textures paired with `[[sampler(n)]]`, then read-only storage images as
+  `access::read`, then read-write / `writeonly` storage images as
+  `access::read_write` / `access::write`), the uniform block at
+  `[[buffer(0)]]` when present, then read-only storage buffers (`const
+  device uint*`) followed by read-write / `writeonly` storage buffers
+  (`device uint*`) starting at `[[buffer(num_uniform_buffers)]]`.
 - **Layer vertex shader** (`LAYER_VERTEX_GLSL`, the source of
   `testdata/layer.vert`, which a host compiles once like any vertex
   shader: `compile(LAYER_VERTEX_GLSL, {profile = .Glsl, stage =
@@ -413,7 +504,9 @@ sampler callback (`proc(user, channel, uv, lod, layer) -> [4]f32`; `.eval`
 passes lod 0; `layer` is a `sampler2DArray`'s, rounded to nearest even,
 for the host to clamp to its layers), the channels' sizes in texels (and
 layers), the storage buffers' words (`buffers`, one `[]u32` per buffer in
-declaration order; a read past one gives 0), an optional sub-rectangle and
+`Module.storage_buffers` order; a read past one gives 0 and a write past
+one is dropped), the compute storage images (`images`, one `Storage_Image`
+per image in `Module.storage_images` order), an optional sub-rectangle and
 the stage inputs by location
 (`Varying`: per component `a + dx * x + dy * y` at pixel centres, what one
 triangle's rasterization gives). An input without one is zero, except
@@ -444,6 +537,30 @@ oksl.run_fragment(&p.fragment.program, fblock, {count = n, origin = origins, fro
 derivatives from its own lanes as in the layer runner, so its results
 match the layer runner's bit for bit (a test checks).
 
+Compute shaders run through `run_compute`:
+
+```odin
+img := oksl.Storage_Image{data = rgba_bytes, width = w, height = h, stride = w * 4, format = .Rgba8}
+// Run all workgroups, or split [first_group ..< first_group + group_count) across a worker pool:
+oksl.run_compute(&m.program, block, {groups_x, groups_y, 1}, &scratch, {images = {img}, buffers = {out_words}}, first_group, group_count)
+```
+
+`run_compute` executes one workgroup at a time in `ceil(local_size / 64)`
+64-lane chunks (`group_count = -1` runs to the end of `groups.x * groups.y
+* groups.z`). Local sizes below 64 leave CPU lanes idle (`8x8` or `64x1`
+fill a batch), and lane layout inside a workgroup does not depend on how
+the workgroup range is split across caller threads (give each thread its
+own `Scratch`). `run_compute` validates `Run_Options` up front and panics on
+missing buffers or images, mismatched `Image_Format`, negative dimensions or
+strides, strides smaller than `width * texel_bytes`, or undersized `data`.
+On `Storage_Image` (`stride == 0` means `width *
+texel_bytes`), `rgba8` writes `round(clamp(x, 0, 1) * 255)`, `rgba16f`
+rounds to nearest even (Vulkan allows drivers to round toward zero),
+integer formats are exact, single-channel `r32*` loads fill `.gba = (0, 0,
+1)` in bounds, out-of-bounds `imageLoad` returns `(0, 0, 0, 0)`, and
+out-of-bounds `imageStore` and buffer writes are dropped. Concurrent
+writes to the same word or texel have unspecified results.
+
 `texture` in a fragment shader passes the sampler the level a GPU picks:
 `0.5 * log2(max(|duv/dx|², |duv/dy|²))` in the channel's texels
 (`Run_Options.channel_sizes`), one per quad from its top row and left
@@ -471,14 +588,15 @@ show both.
   `bit_set`s of lanes. Masked stores and selects are branchless, and
   `floor` avoids `core:math`'s modf.
 - **JIT:** on x86-64 Linux and macOS when the CPU has AVX2, `compile` also
-  translates the flat program into 8-lane (two 2x2 quads per 256-bit YMM
-  register) native AVX2 code in W^X pages (allocated read-write, switched
-  read-execute, and released by `destroy`). Elsewhere, without AVX2, when
-  the OS refuses executable memory (`PROT_EXEC`), or when built with
-  `-define:OKSL_JIT=false`, runs fall back to the 64-lane interpreter with
-  the same results, apart from NaN bit patterns and values computed in
-  lanes that aren't running (both undefined on GPUs too). CI runs the tests
-  and goldens both ways and requires identical output.
+  translates vertex and fragment programs into 8-lane (two 2x2 quads per
+  256-bit YMM register) native AVX2 code in W^X pages (allocated
+  read-write, switched read-execute, and released by `destroy`). Compute
+  shaders, other targets, machines without AVX2, environments that refuse
+  executable memory (`PROT_EXEC`), and builds with `-define:OKSL_JIT=false`
+  run on the 64-lane interpreter with the same results, apart from NaN bit
+  patterns and values computed in lanes that aren't running (both undefined
+  on GPUs too). CI runs the tests and goldens both ways and requires
+  identical output.
 - **Uniform work:** what follows from constants and uniforms alone moves
   to the front of the program and runs once per run, before the batches,
   even from inside loops and branches: a raymarcher's `rot(iTime)` is
@@ -582,25 +700,27 @@ odin run tools/golden -- compare ref out             # after (snapshot out first
 odin check . -no-entry-point -target:darwin_arm64
 ```
 
-`testdata/` holds 24 representative shaders, SkSL (`.sksl`), Shadertoy
-code (`.glsl`), a GLSL fragment shader (`.frag`) and the layer vertex
-shader in GLSL (`layer.vert`): gradients, value noise and fbm, SDF raymarching, a
+`testdata/` holds representative shaders across SkSL (`.sksl`), Shadertoy
+code (`.glsl`), GLSL fragment (`.frag`) and compute (`.comp`) shaders, and
+the layer vertex shader in GLSL (`layer.vert`): gradients, value noise and fbm, SDF raymarching, a
 textured tunnel, swizzles, out parameters, structs and arrays, defines,
 derivatives, premultiplied alpha, SkSL types and built-ins, matrices,
 integer hashing, loops, uniforms, ternaries and short-circuiting,
-matrix comparison,
-children, and Shadertoy-style snippets (`st_*.glsl`) with function-like
+matrix comparison, children, storage buffers, RGBA-to-NV12 conversion,
+storage images and explicit-LOD compute sampling, and Shadertoy-style snippets (`st_*.glsl`) with function-like
 macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 
 ## Limitations
 
-- **Stages:** fragment and (GLSL) vertex shaders, on the GPU and the CPU
-  (`run_vertex`, `run_fragment`); no compute stage
-  (`Stage.Compute` is reserved). Programs run their passes as fragment
-  shaders and the host owns the float targets and swaps them each frame.
-  GLSL shaders have no `gl_FragDepth` or `gl_InstanceID` (draw instances
-  as vertex ranges and divide `gl_VertexID`), no uniform blocks, no
-  writable storage buffers or images, and no array stage variables.
+- **Stages:** fragment, GLSL vertex and GLSL compute shaders, on the GPU
+  and the CPU (`run_vertex`, `run_fragment`, `run_compute`). Compute has no
+  `shared` workgroup memory, barriers or atomics yet (phase 2), and runs on
+  the 64-lane interpreter rather than the AVX2 JIT. Storage images and
+  writable storage buffers are compute-only. Programs run their passes as
+  fragment shaders and the host owns the float targets and swaps them each
+  frame. GLSL shaders have no `gl_FragDepth` or `gl_InstanceID` (draw
+  instances as vertex ranges and divide `gl_VertexID`), no user uniform
+  blocks, and no array stage variables.
 - **MSL is compiled only on macOS:** Metal has no Linux compiler, so on
   Linux the emitter is checked textually; on macOS `tools/gpu_parity` runs
   the MSL through SDL_GPU's Metal driver against the CPU interpreter.
@@ -626,7 +746,7 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 What would make oksl useful well beyond onimite:
 
 - **DXIL / HLSL output** for D3D12, SDL_GPU's preferred driver on Windows.
-- **Compute shaders.**
+- **Compute shared memory, barriers and atomics** (phase 2).
 - **WGSL output** for WebGPU and browsers.
 - **A loop iteration cap** (and SkSL's ES2 loop rules enforced) so untrusted
   shaders can't hang the CPU interpreter.

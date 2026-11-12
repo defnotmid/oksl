@@ -1,0 +1,23 @@
+#version 310 es
+layout(local_size_x = 8, local_size_y = 8) in;
+
+uniform highp sampler2D uTex;
+layout(r32ui) uniform highp uimage2D tapCounts;
+layout(rgba32f) writeonly uniform highp image2D outColor;
+
+void main() {
+    ivec2 sz = imageSize(outColor);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= sz.x || p.y >= sz.y) {
+        return;
+    }
+    ivec2 tsz = textureSize(uTex, 0);
+    vec2 uv = (vec2(p) + vec2(0.5)) / vec2(sz);
+    vec4 base = texelFetch(uTex, ivec2(p.x % tsz.x, p.y % tsz.y), 0);
+    vec4 mip1 = textureLod(uTex, uv, 1.0);
+    float step_uv = ((p.x + p.y) & 1) == 0 ? (2.0 / float(tsz.x)) : (4.0 / float(tsz.x));
+    vec4 grad = textureGrad(uTex, uv, vec2(step_uv, 0.0), vec2(0.0, step_uv));
+    uint prev = imageLoad(tapCounts, p).r;
+    imageStore(tapCounts, p, uvec4(prev + 3u, 0u, 0u, 0u));
+    imageStore(outColor, p, (base + mip1 + grad) / 3.0);
+}

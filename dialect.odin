@@ -56,13 +56,20 @@ Feature :: enum u8 {
 	Gl_Front_Facing,
 	// gl_VertexID: the vertex's index in the draw.
 	Gl_Vertex_ID,
-	// `readonly buffer Block { T name[]; } instance;`: read-only storage
-	// buffers (GLSL ES 3.1).
+	// `readonly buffer Block { T name[]; } instance;`: storage buffers
+	// (GLSL ES 3.1; writable in compute).
 	Storage_Buffers,
 	// gl_SampleMask[0]: the fragment's samples a shader keeps.
 	Gl_Sample_Mask,
+	Writable_Buffers,
+	// image2D, uimage2D, iimage2D and imageLoad, imageStore, imageSize.
+	Storage_Images,
+	// Implicit-LOD texture() and textureProj().
+	Implicit_Lod,
+	// gl_GlobalInvocationID and the other compute invocation built-ins.
+	Compute_Ids,
 }
-Features :: bit_set[Feature;u16]
+Features :: bit_set[Feature;u32]
 
 Dialect_Rules :: struct {
 	has:        Features,
@@ -84,7 +91,7 @@ DIALECT_RULES := [Dialect]Dialect_Rules {
 		missing = #partial {.Preprocessor = .No_Preprocessor, .Samplers = .Sksl_Texture_Call, .Discard = .Sksl_Discard, .Sampler_Params = .Sampler_Param, .Stage_Variables = .Global_In_Out},
 	},
 	.GLSL = {
-		has = {.Preprocessor, .Samplers, .Discard, .Gl_Frag_Coord, .Sampler_Params, .Stage_Variables, .Derivatives, .Gl_Position, .Gl_Front_Facing, .Gl_Vertex_ID, .Storage_Buffers, .Gl_Sample_Mask},
+		has = {.Preprocessor, .Samplers, .Implicit_Lod, .Discard, .Gl_Frag_Coord, .Sampler_Params, .Stage_Variables, .Derivatives, .Gl_Position, .Gl_Front_Facing, .Gl_Vertex_ID, .Storage_Buffers, .Writable_Buffers, .Gl_Sample_Mask, .Storage_Images, .Compute_Ids},
 		missing = #partial {.Children = .Glsl_Eval},
 		predefined = {{"GL_ES", "1"}, {"__VERSION__", "300"}},
 	},
@@ -144,13 +151,13 @@ PROFILE_RULES := [Profile]Profile_Rules {
 		stages = {.Fragment},
 		entry = .Main_Image,
 		header = true,
-		lacks = {.Stage_Variables, .Gl_Front_Facing, .Storage_Buffers, .Gl_Sample_Mask},
+		lacks = {.Stage_Variables, .Gl_Front_Facing, .Storage_Buffers, .Writable_Buffers, .Gl_Sample_Mask, .Storage_Images, .Compute_Ids},
 		missing = #partial {.Stage_Variables = .Global_In_Out},
 		inputs = UNIFORM_INPUTS | CHANNEL_INPUTS,
 		flip_y = true,
 		predefined = {{"HW_PERFORMANCE", "1"}},
 	},
-	.Glsl = {dialect = .GLSL, stages = {.Fragment, .Vertex}, entry = .Void_Main},
+	.Glsl = {dialect = .GLSL, stages = {.Fragment, .Vertex, .Compute}, entry = .Void_Main},
 }
 
 // What a source file's extension says it is, for tools.
@@ -166,6 +173,7 @@ SOURCE_EXTENSIONS := [?]Source_Extension {
 	{".glsl", .Shadertoy, .Fragment},
 	{".frag", .Glsl, .Fragment},
 	{".vert", .Glsl, .Vertex},
+	{".comp", .Glsl, .Compute},
 }
 
 // The options (profile and stage) a source file's extension names; SkSL

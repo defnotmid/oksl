@@ -14,6 +14,29 @@ Base :: enum u8 {
 	Float,
 	Sampler,
 	Struct,
+	Image,
+}
+
+// Storage image texel formats (GLSL ES 3.10 layout qualifiers).
+Image_Format :: enum u8 {
+	None,
+	Rgba8,
+	Rgba16f,
+	Rgba32f,
+	R32f,
+	R32ui,
+	R32i,
+}
+
+@(rodata)
+IMAGE_FORMAT_NAMES := [Image_Format]string {
+	.None    = "",
+	.Rgba8   = "rgba8",
+	.Rgba16f = "rgba16f",
+	.Rgba32f = "rgba32f",
+	.R32f    = "r32f",
+	.R32ui   = "r32ui",
+	.R32i    = "r32i",
 }
 
 // A type. Scalars have `rows == 1`, vectors `rows` 2..4; matrices
@@ -36,7 +59,72 @@ T_FLOAT :: Type{base = .Float, rows = 1}
 // sampler2DArray.
 T_SAMPLER :: Type{base = .Sampler, rows = 1}
 T_SAMPLER_ARRAY :: Type{base = .Sampler, rows = 2}
+// An image's rows hold its texel Base (.Float, .Uint, .Int); `strukt` packs
+// Image_Format in bits 0..7 and readonly/writeonly in bits 8..9.
+T_IMAGE_2D :: Type{base = .Image, rows = u8(Base.Float)}
+T_UIMAGE_2D :: Type{base = .Image, rows = u8(Base.Uint)}
+T_IIMAGE_2D :: Type{base = .Image, rows = u8(Base.Int)}
 T_ERROR :: Type{base = .Void, rows = 255}
+
+image_texel_base :: #force_inline proc "contextless" (t: Type) -> Base {
+	return Base(t.rows)
+}
+
+image_format_of :: #force_inline proc "contextless" (t: Type) -> Image_Format {
+	return Image_Format(t.strukt & 0xff)
+}
+
+image_readonly :: #force_inline proc "contextless" (t: Type) -> bool {
+	return (t.strukt & 0x100) != 0
+}
+
+image_writeonly :: #force_inline proc "contextless" (t: Type) -> bool {
+	return (t.strukt & 0x200) != 0
+}
+
+with_image_qual :: proc "contextless" (t: Type, format: Image_Format, readonly, writeonly: bool) -> Type {
+	r := t
+	r.strukt = i32(format) | (0x100 if readonly else 0) | (0x200 if writeonly else 0)
+	return r
+}
+
+image_format_from_name :: proc "contextless" (name: string) -> (Image_Format, bool) {
+	switch name {
+	case "rgba8":
+		return .Rgba8, true
+	case "rgba16f":
+		return .Rgba16f, true
+	case "rgba32f":
+		return .Rgba32f, true
+	case "r32f":
+		return .R32f, true
+	case "r32ui":
+		return .R32ui, true
+	case "r32i":
+		return .R32i, true
+	}
+	return .None, false
+}
+
+image_format_base :: proc "contextless" (f: Image_Format) -> Base {
+	#partial switch f {
+	case .R32ui:
+		return .Uint
+	case .R32i:
+		return .Int
+	}
+	return .Float
+}
+
+image_base_name :: proc "contextless" (t: Type) -> string {
+	#partial switch Base(t.rows) {
+	case .Uint:
+		return "uimage2D"
+	case .Int:
+		return "iimage2D"
+	}
+	return "image2D"
+}
 
 vec_type :: proc "contextless" (base: Base, n: int) -> Type {
 	return {base = base, rows = u8(n)}
@@ -55,11 +143,11 @@ is_array :: #force_inline proc "contextless" (t: Type) -> bool {
 }
 
 is_matrix :: #force_inline proc "contextless" (t: Type) -> bool {
-	return t.cols > 0 && t.array == 0
+	return t.base == .Float && t.cols > 0 && t.array == 0
 }
 
 is_vector :: #force_inline proc "contextless" (t: Type) -> bool {
-	return t.rows > 1 && t.cols == 0 && t.array == 0 && t.base != .Struct && t.base != .Sampler
+	return t.rows > 1 && t.cols == 0 && t.array == 0 && t.base >= .Bool && t.base <= .Float
 }
 
 is_scalar :: #force_inline proc "contextless" (t: Type) -> bool {
@@ -103,7 +191,7 @@ with_base :: proc "contextless" (t: Type, b: Base) -> Type {
 component_count :: proc(u: ^Unit, t: Type) -> int {
 	n := 0
 	switch t.base {
-	case .Void, .Sampler:
+	case .Void, .Sampler, .Image:
 		n = 0 if t.base == .Void else 1
 	case .Struct:
 		for f in struct_fields(u, t.strukt) {
@@ -128,6 +216,17 @@ type_name :: proc(u: ^Unit, t: Type, allocator := context.temp_allocator) -> str
 		strings.write_string(&b, "void")
 	case .Sampler:
 		strings.write_string(&b, "sampler2DArray" if t.rows == 2 else ("sampler2D" if u.dialect == .GLSL else "shader"))
+	case .Image:
+		if f := image_format_of(t); f != .None {
+			fmt.sbprintf(&b, "layout(%s) ", IMAGE_FORMAT_NAMES[f])
+		}
+		if image_readonly(t) {
+			strings.write_string(&b, "readonly ")
+		}
+		if image_writeonly(t) {
+			strings.write_string(&b, "writeonly ")
+		}
+		strings.write_string(&b, image_base_name(t))
 	case .Struct:
 		strings.write_string(&b, u.structs[t.strukt].name if int(t.strukt) < len(u.structs) else "struct")
 	case .Bool, .Int, .Uint, .Float:
@@ -184,6 +283,12 @@ builtin_type :: proc(name: string, dialect := Dialect.SkSL) -> (Type, bool) {
 		return T_SAMPLER, .Samplers in has
 	case "sampler2DArray":
 		return T_SAMPLER_ARRAY, .Samplers in has
+	case "image2D":
+		return T_IMAGE_2D, .Storage_Images in has
+	case "uimage2D":
+		return T_UIMAGE_2D, .Storage_Images in has
+	case "iimage2D":
+		return T_IIMAGE_2D, .Storage_Images in has
 	}
 	if len(name) < 4 {
 		return {}, false
@@ -268,7 +373,9 @@ round_up :: proc "contextless" (v, a: int) -> int {
 // A buffer element's std430 size and alignment in bytes, when it can be
 // one: float, int and uint, their vectors, and structs of those (a field
 // at the next multiple of its alignment, a struct's size a multiple of
-// its largest). Element i starts at i * size.
+// its largest). An array of `t` has element stride `std430_stride(u, t)`
+// (`round_up(size, align)`, so vec3[] steps by 16 bytes while a struct's
+// vec3 field takes 12).
 std430 :: proc(u: ^Unit, t: Type) -> (size, align: int, ok: bool) {
 	switch {
 	case (t.base == .Float || t.base == .Int || t.base == .Uint) && t.cols == 0 && t.array == 0:
@@ -284,4 +391,28 @@ std430 :: proc(u: ^Unit, t: Type) -> (size, align: int, ok: bool) {
 		return round_up(size, align), align, align > 0
 	}
 	return
+}
+
+// Byte stride between elements of a std430 runtime-sized array `T[]`.
+std430_stride :: proc(u: ^Unit, t: Type) -> int {
+	size, align, _ := std430(u, t)
+	return round_up(size, align) if align > 0 else 0
+}
+
+// Byte offset of field `field` inside struct `st` under std430 layout
+// (0 when `st` is not a valid std430 buffer struct).
+std430_field_offset :: proc(u: ^Unit, st: i32, field: i32) -> int {
+	off := 0
+	for f, i in struct_fields(u, st) {
+		size, align, ok := std430(u, ty(u, f.type))
+		if !ok {
+			return 0
+		}
+		off = round_up(off, align)
+		if i32(i) == field {
+			return off
+		}
+		off += size
+	}
+	return off
 }

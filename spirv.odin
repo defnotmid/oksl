@@ -54,8 +54,11 @@ Op :: enum u32 {
 	Transpose                = 84,
 	Image_Sample_Implicit_Lod = 87,
 	Image_Sample_Explicit_Lod = 88,
+	Image_Read               = 98,
+	Image_Write              = 99,
 	Image                    = 100,
 	Image_Query_Size_Lod     = 103,
+	Image_Query_Size         = 104,
 	Convert_F_To_U           = 109,
 	Convert_F_To_S           = 110,
 	Convert_S_To_F           = 111,
@@ -218,6 +221,8 @@ DEC_FLAT :: 14
 @(private)
 DEC_NON_WRITABLE :: 24
 @(private)
+DEC_NON_READABLE :: 25
+@(private)
 DEC_LOCATION :: 30
 @(private)
 DEC_BINDING :: 33
@@ -232,9 +237,19 @@ BUILTIN_FRAG_COORD :: 15
 @(private)
 BUILTIN_FRONT_FACING :: 17
 @(private)
-BUILTIN_VERTEX_INDEX :: 42
-@(private)
 BUILTIN_SAMPLE_MASK :: 20
+@(private)
+BUILTIN_NUM_WORKGROUPS :: 24
+@(private)
+BUILTIN_WORKGROUP_ID :: 26
+@(private)
+BUILTIN_LOCAL_INVOCATION_ID :: 27
+@(private)
+BUILTIN_GLOBAL_INVOCATION_ID :: 28
+@(private)
+BUILTIN_LOCAL_INVOCATION_INDEX :: 29
+@(private)
+BUILTIN_VERTEX_INDEX :: 42
 
 // Where break and continue go: a loop's merge and continue blocks, or a
 // switch's merge and the continue block of the loop around it.
@@ -278,14 +293,18 @@ Spv :: struct {
 	// The 2D and 2D array (1) image and sampled image types.
 	t_image:     [2]u32,
 	t_sampled:   [2]u32,
-	// The ImageQuery capability is declared (textureSize).
+	t_storage_image: [Image_Format]u32,
+	// The ImageQuery capability is declared (textureSize / imageSize).
 	image_query: bool,
 	// The DerivativeControl capability is declared (fine derivatives).
 	derivative_control: bool,
 	block_var:   u32,
 	block_type:  u32,
-	// Every storage buffer's type: a block of one runtime array of words.
-	buffer_type: u32,
+	// Storage buffer block types: read-only, read-write and write-only.
+	buffer_type:    u32,
+	rw_buffer_type: u32,
+	wo_buffer_type: u32,
+	workgroup_size_id: u32,
 	// Member index of each user uniform symbol in the block.
 	members:     map[Sym_Id]u32,
 	// SPIR-V type id of each block member.
@@ -348,6 +367,9 @@ emit_spirv :: proc(u: ^Unit, c: ^Checked) -> []u32 {
 	inst_words(&header, .Entry_Point, ep[:])
 	for mode in stage.execution_modes {
 		inst(&header, .Execution_Mode, entry, mode)
+	}
+	if u.stage == .Compute {
+		inst(&header, .Execution_Mode, entry, 17, c.local_size[0], c.local_size[1], c.local_size[2]) // LocalSize
 	}
 
 	out := make([dynamic]u32)
@@ -438,11 +460,11 @@ type_id :: proc(s: ^Spv, t: Type) -> u32 {
 		append(&words, ..members[:])
 		inst_words(&s.globals, .Type_Struct, words[:])
 		name(s, id, s.u.structs[t.strukt].name)
-	case t.cols > 0:
+	case is_matrix(t):
 		col := type_id(s, column_type(t))
 		id = new_id(s)
 		inst(&s.globals, .Type_Matrix, id, col, u32(t.cols))
-	case t.rows > 1 && t.base != .Sampler:
+	case is_vector(t):
 		comp := type_id(s, scalar_of(t))
 		id = new_id(s)
 		inst(&s.globals, .Type_Vector, id, comp, u32(t.rows))
@@ -462,10 +484,37 @@ type_id :: proc(s: ^Spv, t: Type) -> u32 {
 		case .Sampler:
 			s.next_id -= 1
 			return sampled_image_type(s, t == T_SAMPLER_ARRAY)
+		case .Image:
+			s.next_id -= 1
+			return storage_image_type(s, t)
 		case .Struct:
 		}
 	}
 	s.types[t] = id
+	return id
+}
+
+@(rodata)
+SPV_IMAGE_FORMATS := [Image_Format]u32 {
+	.None    = 0,
+	.Rgba32f = 1,
+	.Rgba16f = 2,
+	.R32f    = 3,
+	.Rgba8   = 4,
+	.R32i    = 24,
+	.R32ui   = 33,
+}
+
+@(private)
+storage_image_type :: proc(s: ^Spv, t: Type) -> u32 {
+	f := image_format_of(t)
+	if s.t_storage_image[f] != 0 {
+		return s.t_storage_image[f]
+	}
+	sampled := type_id(s, Type{base = image_texel_base(t), rows = 1})
+	id := new_id(s)
+	inst(&s.globals, .Type_Image, id, sampled, 1, 0, 0, 0, 2, SPV_IMAGE_FORMATS[f]) // 2D, storage, typed format
+	s.t_storage_image[f] = id
 	return id
 }
 
@@ -522,7 +571,7 @@ const_bits :: proc(s: ^Spv, base: Base, bits: u32) -> u32 {
 		inst(&s.globals, .Constant_True if bits != 0 else .Constant_False, type_id(s, T_BOOL), id)
 	case .Int, .Uint, .Float:
 		inst(&s.globals, .Constant, type_id(s, Type{base = base, rows = 1}), id, bits)
-	case .Void, .Sampler, .Struct:
+	case .Void, .Sampler, .Image, .Struct:
 	}
 	s.consts[key] = id
 	return id
@@ -566,9 +615,25 @@ const_of :: proc(s: ^Spv, base: Base, v: f64) -> u32 {
 		return const_u32(s, u32(v))
 	case .Bool:
 		return const_bits(s, .Bool, u32(v != 0))
-	case .Void, .Sampler, .Struct:
+	case .Void, .Sampler, .Image, .Struct:
 	}
 	return 0
+}
+
+@(private)
+workgroup_size_const :: proc(s: ^Spv) -> u32 {
+	if s.workgroup_size_id != 0 {
+		return s.workgroup_size_id
+	}
+	ls := s.checked.local_size
+	cx := const_u32(s, ls[0])
+	cy := const_u32(s, ls[1])
+	cz := const_u32(s, ls[2])
+	t := type_id(s, vec_type(.Uint, 3))
+	id := new_id(s)
+	inst(&s.globals, .Constant_Composite, t, id, cx, cy, cz)
+	s.workgroup_size_id = id
+	return id
 }
 
 // ---- module interface ------------------------------------------------------------------
@@ -627,7 +692,8 @@ declare_interface :: proc(s: ^Spv) {
 	c := s.checked
 	for row in c.interface {
 		switch row.kind {
-		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID, .Stage_Out, .Position, .Sample_Mask:
+		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID, .Stage_Out, .Position, .Sample_Mask,
+		     .Global_Invocation_ID, .Local_Invocation_ID, .Work_Group_ID, .Num_Work_Groups, .Local_Invocation_Index:
 			sym := s.u.syms[row.sym]
 			class := u32(SC_OUTPUT if row.kind == .Stage_Out || row.kind == .Position || row.kind == .Sample_Mask else SC_INPUT)
 			v := new_id(s)
@@ -643,6 +709,16 @@ declare_interface :: proc(s: ^Spv) {
 				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_SAMPLE_MASK)
 			case .Position:
 				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_POSITION)
+			case .Global_Invocation_ID:
+				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_GLOBAL_INVOCATION_ID)
+			case .Local_Invocation_ID:
+				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_LOCAL_INVOCATION_ID)
+			case .Work_Group_ID:
+				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_WORKGROUP_ID)
+			case .Num_Work_Groups:
+				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_NUM_WORKGROUPS)
+			case .Local_Invocation_Index:
+				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_LOCAL_INVOCATION_INDEX)
 			case:
 				inst(&s.annotations, .Decorate, v, DEC_LOCATION, u32(row.binding))
 			}
@@ -661,9 +737,25 @@ declare_interface :: proc(s: ^Spv) {
 			inst(&s.annotations, .Decorate, v, DEC_BINDING, u32(row.binding))
 			name(s, v, s.u.syms[row.sym].name)
 			s.sym_ids[row.sym] = v
+		case .Storage_Image:
+			t := sym_type(s.u, row.sym)
+			v := new_id(s)
+			inst(&s.globals, .Variable, ptr_type(s, SC_UNIFORM_CONSTANT, storage_image_type(s, t)), v, SC_UNIFORM_CONSTANT)
+			inst(&s.annotations, .Decorate, v, DEC_DESCRIPTOR_SET, u32(row.set))
+			inst(&s.annotations, .Decorate, v, DEC_BINDING, u32(row.binding))
+			if image_readonly(t) {
+				inst(&s.annotations, .Decorate, v, DEC_NON_WRITABLE)
+			}
+			if image_writeonly(t) {
+				inst(&s.annotations, .Decorate, v, DEC_NON_READABLE)
+			}
+			name(s, v, s.u.syms[row.sym].name)
+			s.sym_ids[row.sym] = v
 		case .Buffer:
 			v := new_id(s)
-			inst(&s.globals, .Variable, ptr_type(s, SC_UNIFORM, buffer_type(s)), v, SC_UNIFORM)
+			bd := s.u.buffer_decls[c.buffer_decls[s.u.syms[row.sym].index]]
+			bt := buffer_type(s) if bd.readonly else (wo_buffer_type(s) if bd.writeonly else rw_buffer_type(s))
+			inst(&s.globals, .Variable, ptr_type(s, SC_UNIFORM, bt), v, SC_UNIFORM)
 			inst(&s.annotations, .Decorate, v, DEC_DESCRIPTOR_SET, u32(row.set))
 			inst(&s.annotations, .Decorate, v, DEC_BINDING, u32(row.binding))
 			name(s, v, s.u.syms[row.sym].name)
@@ -701,6 +793,39 @@ buffer_type :: proc(s: ^Spv) -> u32 {
 	return s.buffer_type
 }
 
+@(private)
+rw_buffer_type :: proc(s: ^Spv) -> u32 {
+	if s.rw_buffer_type != 0 {
+		return s.rw_buffer_type
+	}
+	words := new_id(s)
+	inst(&s.globals, .Type_Runtime_Array, words, type_id(s, T_UINT))
+	inst(&s.annotations, .Decorate, words, DEC_ARRAY_STRIDE, 4)
+	s.rw_buffer_type = new_id(s)
+	inst(&s.globals, .Type_Struct, s.rw_buffer_type, words)
+	inst(&s.annotations, .Decorate, s.rw_buffer_type, DEC_BUFFER_BLOCK)
+	inst(&s.annotations, .Member_Decorate, s.rw_buffer_type, 0, DEC_OFFSET, 0)
+	name(s, s.rw_buffer_type, "Oksl_Words_RW")
+	return s.rw_buffer_type
+}
+
+@(private)
+wo_buffer_type :: proc(s: ^Spv) -> u32 {
+	if s.wo_buffer_type != 0 {
+		return s.wo_buffer_type
+	}
+	words := new_id(s)
+	inst(&s.globals, .Type_Runtime_Array, words, type_id(s, T_UINT))
+	inst(&s.annotations, .Decorate, words, DEC_ARRAY_STRIDE, 4)
+	s.wo_buffer_type = new_id(s)
+	inst(&s.globals, .Type_Struct, s.wo_buffer_type, words)
+	inst(&s.annotations, .Decorate, s.wo_buffer_type, DEC_BUFFER_BLOCK)
+	inst(&s.annotations, .Member_Decorate, s.wo_buffer_type, 0, DEC_OFFSET, 0)
+	inst(&s.annotations, .Member_Decorate, s.wo_buffer_type, 0, DEC_NON_READABLE)
+	name(s, s.wo_buffer_type, "Oksl_Words_WO")
+	return s.wo_buffer_type
+}
+
 // The value of type `t` at `word` words past word `base` of buffer `v`:
 // scalars and vectors from their words, structs from their fields at their
 // std430 offsets.
@@ -709,13 +834,10 @@ buffer_value :: proc(s: ^Spv, v: u32, t: Type, base: u32, word: int) -> u32 {
 	u := s.u
 	if t.base == .Struct {
 		parts := make([dynamic]u32, context.temp_allocator)
-		off := 0
-		for f in struct_fields(u, t.strukt) {
+		for f, i in struct_fields(u, t.strukt) {
 			ft := ty(u, f.type)
-			size, align, _ := std430(u, ft)
-			off = round_up(off, align)
+			off := std430_field_offset(u, t.strukt, i32(i))
 			append(&parts, buffer_value(s, v, ft, base, word + off / 4))
-			off += size
 		}
 		return construct(s, type_id(s, t), ..parts[:])
 	}
@@ -735,6 +857,33 @@ buffer_value :: proc(s: ^Spv, v: u32, t: Type, base: u32, word: int) -> u32 {
 		return comps[0]
 	}
 	return construct(s, type_id(s, t), ..comps[:t.rows])
+}
+
+// Writes value `val` of type `t` to `word` words past word `base` of buffer `v`.
+@(private)
+buffer_store :: proc(s: ^Spv, v: u32, t: Type, base: u32, word: int, val: u32) {
+	u := s.u
+	if t.base == .Struct {
+		for f, i in struct_fields(u, t.strukt) {
+			ft := ty(u, f.type)
+			off := std430_field_offset(u, t.strukt, i32(i))
+			fv := extract(s, type_id(s, ft), val, u32(i))
+			buffer_store(s, v, ft, base, word + off / 4, fv)
+		}
+		return
+	}
+	t_uint := type_id(s, T_UINT)
+	st := type_id(s, scalar_of(t))
+	for i in 0 ..< int(t.rows) {
+		comp := val if t.rows == 1 else extract(s, st, val, u32(i))
+		if t.base != .Uint {
+			comp = unop(s, .Bitcast, t_uint, comp)
+		}
+		w := base if word + i == 0 else binop_raw(s, .I_Add, t_uint, base, const_u32(s, u32(word + i)))
+		ptr := new_id(s)
+		inst(&s.body, .Access_Chain, ptr_type(s, SC_UNIFORM, t_uint), ptr, v, const_u32(s, 0), w)
+		inst(&s.body, .Store, ptr, comp)
+	}
 }
 
 // The uniform block: the inputs' members, then the user uniforms.
@@ -766,7 +915,7 @@ declare_uniform_block :: proc(s: ^Spv, row: Interface_Var) {
 	name(s, s.block_type, "Oksl_Uniforms")
 	for m, i in members {
 		inst(&s.annotations, .Member_Decorate, s.block_type, u32(i), DEC_OFFSET, u32(m.offset))
-		if m.type.cols > 0 {
+		if is_matrix(elem_type(m.type)) {
 			inst(&s.annotations, .Member_Decorate, s.block_type, u32(i), DEC_COL_MAJOR)
 			inst(&s.annotations, .Member_Decorate, s.block_type, u32(i), DEC_MATRIX_STRIDE, 16)
 		}
@@ -838,7 +987,7 @@ emit_function :: proc(s: ^Spv, fid: Func_Id) {
 	for p in ps {
 		pt := ty(u, p.type)
 		switch {
-		case pt.base == .Sampler:
+		case pt.base == .Sampler || pt.base == .Image:
 			append(&param_types, ptr_type(s, SC_UNIFORM_CONSTANT, type_id(s, pt)))
 		case p.qual != .In:
 			append(&param_types, ptr_type(s, SC_FUNCTION, type_id(s, pt)))
@@ -853,6 +1002,15 @@ emit_function :: proc(s: ^Spv, fid: Func_Id) {
 	for &pid, i in param_ids {
 		pid = new_id(s)
 		inst(&header, .Function_Parameter, param_types[i], pid)
+		pt := ty(u, ps[i].type)
+		if pt.base == .Image {
+			if image_readonly(pt) {
+				inst(&s.annotations, .Decorate, pid, DEC_NON_WRITABLE)
+			}
+			if image_writeonly(pt) {
+				inst(&s.annotations, .Decorate, pid, DEC_NON_READABLE)
+			}
+		}
 	}
 	first := new_id(s)
 	s.cur_block = first
@@ -861,7 +1019,7 @@ emit_function :: proc(s: ^Spv, fid: Func_Id) {
 			continue
 		}
 		pt := ty(u, p.type)
-		if pt.base == .Sampler || p.qual != .In {
+		if pt.base == .Sampler || pt.base == .Image || p.qual != .In {
 			s.sym_ids[p.sym] = param_ids[i]
 			continue
 		}

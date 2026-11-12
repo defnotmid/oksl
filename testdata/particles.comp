@@ -1,0 +1,43 @@
+#version 310 es
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 2) in;
+
+struct Particle {
+    vec3 pos;
+    float mass;
+    vec3 vel;
+    uint steps;
+};
+
+// Declared read-write first, read-only second: SDL_GPU binds Forces before State.
+buffer State {
+    Particle items[];
+} state;
+
+readonly buffer Forces {
+    vec4 impulses[];
+} forces;
+
+uniform float uDt;
+uniform uint uCount;
+
+const uint GROUP_THREADS = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+
+void advance(inout vec3 pos, vec3 vel, float dt) {
+    pos += vel * dt;
+}
+
+void main() {
+    uvec3 grid = gl_NumWorkGroups * gl_WorkGroupSize;
+    uvec3 gid = gl_GlobalInvocationID;
+    uint linear = (gid.z * grid.y + gid.y) * grid.x + gid.x;
+    uint group_linear = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x) * GROUP_THREADS + gl_LocalInvocationIndex;
+    if (linear >= uCount || gl_LocalInvocationID.z >= gl_WorkGroupSize.z) {
+        return;
+    }
+    vec4 imp = forces.impulses[group_linear & 15u];
+    float inv_m = 1.0 / max(state.items[linear].mass, 0.25);
+    state.items[linear].vel += imp.xyz * (uDt * inv_m);
+    advance(state.items[linear].pos, state.items[linear].vel, uDt);
+    state.items[linear].pos.xy += vec2(imp.w * 0.125, -imp.w * 0.125);
+    state.items[linear].steps++;
+}

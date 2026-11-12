@@ -20,6 +20,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:slice"
 import "core:strings"
+import "core:thread"
 import oksl "../.."
 import sdl "vendor:sdl3"
 import stbi "vendor:stb/image"
@@ -171,12 +172,18 @@ main :: proc() {
 
 	infos, _ := os.read_all_directory_by_path(data_dir, context.allocator)
 	names := make([dynamic]string)
+	comp_names := make([dynamic]string)
 	for fi in infos {
-		if o, known := oksl.options_of_path(fi.name); known && o.stage == .Fragment {
-			append(&names, fi.fullpath)
+		if o, known := oksl.options_of_path(fi.name); known {
+			if o.stage == .Fragment {
+				append(&names, fi.fullpath)
+			} else if o.stage == .Compute {
+				append(&comp_names, fi.fullpath)
+			}
 		}
 	}
 	slice.sort(names[:])
+	slice.sort(comp_names[:])
 
 	failed := 0
 	scratch: oksl.Scratch
@@ -263,7 +270,20 @@ main :: proc() {
 		failed += 1
 	}
 	fmt.printfln("%-16s max diff %d  %s", "gl_SampleMask", mask_d, "ok" if mask_ok && mask_d <= 2 else "MISMATCH")
-	checks := len(names) + 3
+	for path in comp_names {
+		name := filepath.base(path)
+		detail, comp_ok := compute_file_check(&g, path, &scratch)
+		if !comp_ok {
+			failed += 1
+		}
+		fmt.printfln("%-16s %s  %s", name, detail, "ok" if comp_ok else "MISMATCH")
+	}
+	fmt_detail, fmt_ok := image_formats_check(&g, &scratch)
+	if !fmt_ok {
+		failed += 1
+	}
+	fmt.printfln("%-16s %s  %s", "image_formats", fmt_detail, "ok" if fmt_ok else "MISMATCH")
+	checks := len(names) + 3 + len(comp_names) + 1
 	fmt.printfln("%d/%d shaders match (images in %s)", checks - failed, checks, out_dir)
 	if failed > 0 {
 		os.exit(1)
@@ -770,4 +790,482 @@ sample_mask_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
 		}
 	}
 	return max_d, true
+}
+
+sdl_image_format :: proc(f: oksl.Image_Format) -> (sdl.GPUTextureFormat, int) {
+	switch f {
+	case .None:
+		return .INVALID, 0
+	case .Rgba8:
+		return .R8G8B8A8_UNORM, 4
+	case .Rgba16f:
+		return .R16G16B16A16_FLOAT, 8
+	case .Rgba32f:
+		return .R32G32B32A32_FLOAT, 16
+	case .R32f:
+		return .R32_FLOAT, 4
+	case .R32ui:
+		return .R32_UINT, 4
+	case .R32i:
+		return .R32_INT, 4
+	}
+	return .INVALID, 0
+}
+
+parity_f16_to_f32 :: proc(h: u16) -> f32 {
+	sign := u32(h & 0x8000) << 16
+	exp := u32((h >> 10) & 0x1f)
+	mant := u32(h & 0x03ff)
+	if exp == 0 {
+		if mant == 0 {
+			return transmute(f32)sign
+		}
+		e := u32(113)
+		for (mant & 0x0400) == 0 {
+			mant <<= 1
+			e -= 1
+		}
+		return transmute(f32)(sign | (e << 23) | ((mant & 0x03ff) << 13))
+	}
+	if exp == 31 {
+		return transmute(f32)(sign | 0x7f80_0000 | (mant << 13))
+	}
+	return transmute(f32)(sign | ((exp + 112) << 23) | (mant << 13))
+}
+
+compute_file_check :: proc(g: ^Gpu, path: string, scratch: ^oksl.Scratch) -> (string, bool) {
+	src, err := os.read_entire_file(path, context.temp_allocator)
+	if err != nil {
+		return "read error", false
+	}
+	options, _ := oksl.options_of_path(path)
+	m, errs, ok := oksl.compile(string(src), options)
+	defer oksl.destroy(m)
+	if !ok {
+		return strings.trim_space(oksl.format_errors(errs, context.temp_allocator)), false
+	}
+	if filepath.base(path) == "image_war.comp" {
+		return compute_module_check(g, m, scratch, rw_w = 128, rw_h = 128, buf_words = 16384, exact_groups = true)
+	}
+	return compute_module_check(g, m, scratch)
+}
+
+IMAGE_FORMATS_CS :: `#version 310 es
+layout(local_size_x = 8, local_size_y = 4) in;
+
+layout(r32f) readonly uniform image2D inF;
+layout(r32i) readonly uniform iimage2D inI;
+layout(r32f) uniform image2D rwF;
+layout(r32i) uniform iimage2D rwI;
+layout(rgba8) writeonly uniform image2D out8;
+writeonly buffer Checks { uint ok_bits[]; } checks;
+
+void main() {
+    ivec2 sz = imageSize(out8);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= sz.x || p.y >= sz.y) {
+        return;
+    }
+    vec4 vf = imageLoad(inF, p);
+    ivec4 vi = imageLoad(inI, p);
+    vec4 rf = imageLoad(rwF, p);
+    ivec4 ri = imageLoad(rwI, p);
+    imageStore(rwF, p, vec4(rf.r + vf.r * 0.5 + vf.a, 9.0, 9.0, 9.0));
+    imageStore(rwI, p, ivec4(ri.r - vi.r + vi.a * 7, 3, 4, 5));
+    uint sub_ok = (vf.g == 0.0 && vf.b == 0.0 && vf.a == 1.0 && vi.g == 0 && vi.b == 0 && vi.a == 1) ? 1u : 0u;
+    checks.ok_bits[p.y * sz.x + p.x] = sub_ok * 100u + uint(vi.a + ri.a);
+    imageStore(out8, p, vec4(clamp(vf.r * 0.25, 0.0, 1.0), vf.g, vf.b, vf.a * 0.5));
+}`
+
+image_formats_check :: proc(g: ^Gpu, scratch: ^oksl.Scratch) -> (string, bool) {
+	m, errs, ok := oksl.compile(IMAGE_FORMATS_CS, {profile = .Glsl, stage = .Compute})
+	defer oksl.destroy(m)
+	if !ok {
+		return strings.trim_space(oksl.format_errors(errs, context.temp_allocator)), false
+	}
+	return compute_module_check(g, m, scratch)
+}
+
+mark_float_words :: proc(m: ^oksl.Module, t: oksl.Type, byte_off: int, float_words: []bool) -> bool {
+	if t.base == .Struct {
+		if t.strukt < 0 || int(t.strukt) >= len(m.structs) || len(m.structs[t.strukt].fields) == 0 {
+			return false
+		}
+		for f in m.structs[t.strukt].fields {
+			if !mark_float_words(m, f.type, byte_off + f.offset, float_words) {
+				return false
+			}
+		}
+		return true
+	}
+	if t.base == .Float {
+		words := int(t.rows) * max(int(t.cols), 1)
+		for k in 0 ..< words {
+			idx := byte_off / 4 + k
+			if idx >= 0 && idx < len(float_words) {
+				float_words[idx] = true
+			}
+		}
+	}
+	return true
+}
+
+Range_Job :: struct {
+	program: ^oksl.Program,
+	block:   []u8,
+	groups:  [3]int,
+	opts:    oksl.Run_Options,
+	first:   int,
+	count:   int,
+}
+
+run_range_job :: proc(job: ^Range_Job) {
+	s: oksl.Scratch
+	defer oksl.scratch_destroy(&s)
+	oksl.run_compute(job.program, job.block, job.groups, &s, job.opts, job.first, job.count)
+}
+
+compute_module_check :: proc(g: ^Gpu, m: ^oksl.Module, scratch: ^oksl.Scratch, rw_w := 29, rw_h := 17, buf_words := 4096, exact_groups := false) -> (string, bool) {
+	_ = scratch
+	info := sdl.GPUComputePipelineCreateInfo {
+		code_size                      = uint(len(m.msl)) if g.msl else uint(len(m.spirv) * 4),
+		code                           = raw_data(m.msl) if g.msl else ([^]u8)(raw_data(m.spirv)),
+		entrypoint                     = oksl.MSL_ENTRY if g.msl else oksl.SPIRV_ENTRY,
+		format                         = {.MSL} if g.msl else {.SPIRV},
+		num_samplers                   = u32(m.num_samplers),
+		num_readonly_storage_textures  = u32(m.num_readonly_storage_textures),
+		num_readonly_storage_buffers   = u32(m.num_readonly_storage_buffers),
+		num_readwrite_storage_textures = u32(m.num_readwrite_storage_textures),
+		num_readwrite_storage_buffers  = u32(m.num_readwrite_storage_buffers),
+		num_uniform_buffers            = u32(m.num_uniform_buffers),
+		threadcount_x                  = m.threadcount.x,
+		threadcount_y                  = m.threadcount.y,
+		threadcount_z                  = m.threadcount.z,
+	}
+	pipeline := sdl.CreateGPUComputePipeline(g.device, info)
+	if pipeline == nil {
+		return fmt.tprintf("pipeline failed: %s", sdl.GetError()), false
+	}
+	defer sdl.ReleaseGPUComputePipeline(g.device, pipeline)
+
+	// Non-multiple-of-8 default dimensions exercise partial edge workgroups.
+	ro_w, ro_h := rw_w * 2, rw_h * 2
+	y_stride := (ro_w + 7) &~ 7
+
+	block := make([]u8, m.block_size, context.temp_allocator)
+	oksl.set_uniform(m, block, "uScale", {1.25})
+	oksl.set_uniform(m, block, "uDt", {0.25})
+	oksl.set_uniform(m, block, "uCount", {500})
+	oksl.set_uniform(m, block, "uMatArr", {1, 2, 3, 4}, 0)
+	oksl.set_uniform(m, block, "uMatArr", {5, 6, 7, 8}, 1)
+	oksl.set_uniform(m, block, "ky", {13933, 46871, 4732, 1081344})
+	oksl.set_uniform(m, block, "ku", {-7509, -25259, 32768, 33685504})
+	oksl.set_uniform(m, block, "kv", {32768, -29763, -3005, 255})
+	oksl.set_uniform(m, block, "size", {f32(ro_w), f32(ro_h), f32(y_stride), f32(y_stride * ro_h)})
+
+	nb := len(m.storage_buffers)
+	ni := len(m.storage_images)
+	cpu_bufs := make([][]u32, nb, context.temp_allocator)
+	gpu_init_bufs := make([][]u32, nb, context.temp_allocator)
+	buf_float_words := make([][]bool, nb, context.temp_allocator)
+	gpu_bufs := make([]^sdl.GPUBuffer, nb, context.temp_allocator)
+	defer for b in gpu_bufs {
+		if b != nil {sdl.ReleaseGPUBuffer(g.device, b)}
+	}
+	for sb, bi in m.storage_buffers {
+		stride_words := max(sb.stride / 4, 1)
+		fw := make([]bool, stride_words, context.temp_allocator)
+		if !mark_float_words(m, sb.element, 0, fw) {
+			return fmt.tprintf("missing struct reflection for buffer %s", sb.name), false
+		}
+		buf_float_words[bi] = fw
+		init_w := make([]u32, buf_words, context.temp_allocator)
+		cpu_w := make([]u32, buf_words, context.temp_allocator)
+		for i in 0 ..< buf_words {
+			if !fw[i % stride_words] {
+				init_w[i] = 0xdead_0000 | u32((bi * 31 + i * 17) & 0xffff)
+			} else {
+				init_w[i] = transmute(u32)(f32(((bi * 29 + i * 37 + 11) % 64) + 8) * 0.25)
+			}
+		}
+		copy(cpu_w, init_w)
+		gpu_init_bufs[bi] = init_w
+		cpu_bufs[bi] = cpu_w
+		usage: sdl.GPUBufferUsageFlags = {.COMPUTE_STORAGE_READ} if sb.readonly else {.COMPUTE_STORAGE_READ, .COMPUTE_STORAGE_WRITE}
+		gpu_bufs[bi] = sdl.CreateGPUBuffer(g.device, {usage = usage, size = u32(buf_words * 4)})
+		if gpu_bufs[bi] == nil {
+			return fmt.tprintf("buffer failed: %s", sdl.GetError()), false
+		}
+	}
+
+	cpu_imgs := make([]oksl.Storage_Image, ni, context.temp_allocator)
+	gpu_init_imgs := make([][]u8, ni, context.temp_allocator)
+	gpu_texs := make([]^sdl.GPUTexture, ni, context.temp_allocator)
+	img_dims := make([][3]int, ni, context.temp_allocator)
+	defer for tx in gpu_texs {
+		if tx != nil {sdl.ReleaseGPUTexture(g.device, tx)}
+	}
+	for im, ii in m.storage_images {
+		sfmt, tb := sdl_image_format(im.format)
+		iw := ro_w if im.readonly else rw_w
+		ih := ro_h if im.readonly else rw_h
+		img_dims[ii] = {iw, ih, tb}
+		nbytes := iw * ih * tb
+		init_d := make([]u8, nbytes, context.temp_allocator)
+		cpu_d := make([]u8, nbytes, context.temp_allocator)
+		switch im.format {
+		case .None:
+		case .Rgba8:
+			for &b, i in init_d {
+				b = u8((ii * 53 + i * 41 + 19) & 255)
+			}
+		case .Rgba16f:
+			u16s := slice.reinterpret([]u16, init_d)
+			for &h, i in u16s {
+				h = u16(0x3800 + ((ii * 31 + i * 19) & 0x07ff))
+			}
+		case .Rgba32f, .R32f:
+			f32s := slice.reinterpret([]f32, init_d)
+			for &f, i in f32s {
+				f = f32((ii * 23 + i * 43 + 7) % 128) / 64.0
+			}
+		case .R32ui:
+			u32s := slice.reinterpret([]u32, init_d)
+			for &v, i in u32s {
+				v = u32((ii * 13 + i * 17 + 5) & 1023)
+			}
+		case .R32i:
+			i32s := slice.reinterpret([]i32, init_d)
+			for &v, i in i32s {
+				v = i32((ii * 13 + i * 19) % 511) - 255
+			}
+		}
+		copy(cpu_d, init_d)
+		gpu_init_imgs[ii] = init_d
+		cpu_imgs[ii] = {data = cpu_d, width = iw, height = ih, format = im.format}
+		usage: sdl.GPUTextureUsageFlags
+		if im.readonly {
+			usage = {.COMPUTE_STORAGE_READ}
+		} else if im.writeonly {
+			usage = {.COMPUTE_STORAGE_WRITE}
+		} else {
+			usage = {.COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE}
+		}
+		gpu_texs[ii] = sdl.CreateGPUTexture(g.device, {
+			type                 = .D2,
+			format               = sfmt,
+			usage                = usage,
+			width                = u32(iw),
+			height               = u32(ih),
+			layer_count_or_depth = 1,
+			num_levels           = 1,
+		})
+		if gpu_texs[ii] == nil {
+			return fmt.tprintf("texture failed: %s", sdl.GetError()), false
+		}
+	}
+
+	upload_bytes := nb * buf_words * 4
+	for d in gpu_init_imgs {
+		upload_bytes += len(d)
+	}
+	if upload_bytes > 0 {
+		up := sdl.CreateGPUTransferBuffer(g.device, {usage = .UPLOAD, size = u32(upload_bytes)})
+		defer sdl.ReleaseGPUTransferBuffer(g.device, up)
+		mapped := ([^]u8)(sdl.MapGPUTransferBuffer(g.device, up, false))
+		off := 0
+		for w in gpu_init_bufs {
+			mem.copy(mapped[off:], raw_data(w), len(w) * 4)
+			off += len(w) * 4
+		}
+		for d in gpu_init_imgs {
+			mem.copy(mapped[off:], raw_data(d), len(d))
+			off += len(d)
+		}
+		sdl.UnmapGPUTransferBuffer(g.device, up)
+		cmd := sdl.AcquireGPUCommandBuffer(g.device)
+		cp := sdl.BeginGPUCopyPass(cmd)
+		off = 0
+		for w, bi in gpu_init_bufs {
+			sdl.UploadToGPUBuffer(cp, {transfer_buffer = up, offset = u32(off)}, {buffer = gpu_bufs[bi], size = u32(len(w) * 4)}, false)
+			off += len(w) * 4
+		}
+		for d, ii in gpu_init_imgs {
+			iw, ih := u32(img_dims[ii][0]), u32(img_dims[ii][1])
+			sdl.UploadToGPUTexture(cp, {transfer_buffer = up, offset = u32(off), pixels_per_row = iw, rows_per_layer = ih}, {texture = gpu_texs[ii], w = iw, h = ih, d = 1}, false)
+			off += len(d)
+		}
+		sdl.EndGPUCopyPass(cp)
+		fence := sdl.SubmitGPUCommandBufferAndAcquireFence(cmd)
+		_ = sdl.WaitForGPUFences(g.device, true, &fence, 1)
+		sdl.ReleaseGPUFence(g.device, fence)
+	}
+
+	tx, ty := int(m.threadcount.x), int(m.threadcount.y)
+	extra := 0 if exact_groups else 3
+	groups := [3]int {
+		max((rw_w + extra + tx - 1) / tx, 2),
+		max((rw_h + extra + ty - 1) / ty, 2),
+		3 if m.threadcount.z > 1 else 1,
+	}
+
+	ro_tex := m.num_readonly_storage_textures
+	rw_tex := m.num_readwrite_storage_textures
+	ro_buf := m.num_readonly_storage_buffers
+	rw_buf := m.num_readwrite_storage_buffers
+
+	rw_tex_binds := make([]sdl.GPUStorageTextureReadWriteBinding, rw_tex, context.temp_allocator)
+	for i in 0 ..< rw_tex {
+		rw_tex_binds[i] = {texture = gpu_texs[ro_tex + i]}
+	}
+	rw_buf_binds := make([]sdl.GPUStorageBufferReadWriteBinding, rw_buf, context.temp_allocator)
+	for i in 0 ..< rw_buf {
+		rw_buf_binds[i] = {buffer = gpu_bufs[ro_buf + i]}
+	}
+
+	cmd := sdl.AcquireGPUCommandBuffer(g.device)
+	if m.num_uniform_buffers > 0 {
+		sdl.PushGPUComputeUniformData(cmd, 0, raw_data(block), u32(len(block)))
+	}
+	pass := sdl.BeginGPUComputePass(cmd, raw_data(rw_tex_binds), u32(rw_tex), raw_data(rw_buf_binds), u32(rw_buf))
+	sdl.BindGPUComputePipeline(pass, pipeline)
+	if m.num_samplers > 0 {
+		samplers := make([]sdl.GPUTextureSamplerBinding, m.num_samplers, context.temp_allocator)
+		for &s, ch in samplers {
+			s = {texture = g.layers if ch in m.channel_arrays else g.tex, sampler = g.sampler}
+		}
+		sdl.BindGPUComputeSamplers(pass, 0, raw_data(samplers), u32(len(samplers)))
+	}
+	if ro_tex > 0 {
+		sdl.BindGPUComputeStorageTextures(pass, 0, raw_data(gpu_texs[:ro_tex]), u32(ro_tex))
+	}
+	if ro_buf > 0 {
+		sdl.BindGPUComputeStorageBuffers(pass, 0, raw_data(gpu_bufs[:ro_buf]), u32(ro_buf))
+	}
+	sdl.DispatchGPUCompute(pass, u32(groups.x), u32(groups.y), u32(groups.z))
+	sdl.EndGPUComputePass(pass)
+
+	down_bytes := rw_buf * buf_words * 4
+	for i in 0 ..< rw_tex {
+		down_bytes += len(gpu_init_imgs[ro_tex + i])
+	}
+	down := sdl.CreateGPUTransferBuffer(g.device, {usage = .DOWNLOAD, size = u32(max(down_bytes, 4))})
+	defer sdl.ReleaseGPUTransferBuffer(g.device, down)
+	cp := sdl.BeginGPUCopyPass(cmd)
+	off := 0
+	for i in 0 ..< rw_buf {
+		sdl.DownloadFromGPUBuffer(cp, {buffer = gpu_bufs[ro_buf + i], size = u32(buf_words * 4)}, {transfer_buffer = down, offset = u32(off)})
+		off += buf_words * 4
+	}
+	for i in 0 ..< rw_tex {
+		ii := ro_tex + i
+		iw, ih := u32(img_dims[ii][0]), u32(img_dims[ii][1])
+		sdl.DownloadFromGPUTexture(cp, {texture = gpu_texs[ii], w = iw, h = ih, d = 1}, {transfer_buffer = down, offset = u32(off), pixels_per_row = iw, rows_per_layer = ih})
+		off += len(gpu_init_imgs[ii])
+	}
+	sdl.EndGPUCopyPass(cp)
+	fence := sdl.SubmitGPUCommandBufferAndAcquireFence(cmd)
+	_ = sdl.WaitForGPUFences(g.device, true, &fence, 1)
+	sdl.ReleaseGPUFence(g.device, fence)
+
+	sizes: [oksl.SAMPLER_COUNT][3]i32
+	for &s, ch in sizes {
+		s = {TEX, TEX, LAYERS if ch in m.channel_arrays else 1}
+	}
+	opts := oksl.Run_Options{sampler = cpu_sampler, channel_sizes = sizes[:], buffers = cpu_bufs, images = cpu_imgs}
+	// Split across three concurrent OS threads, each with its own Scratch.
+	total_groups := groups.x * groups.y * groups.z
+	third := total_groups / 3
+	jobs := [3]Range_Job {
+		{program = &m.program, block = block, groups = groups, opts = opts, first = 0, count = third},
+		{program = &m.program, block = block, groups = groups, opts = opts, first = third, count = third},
+		{program = &m.program, block = block, groups = groups, opts = opts, first = third * 2, count = -1},
+	}
+	threads: [3]^thread.Thread
+	for &th, ti in threads {
+		th = thread.create_and_start_with_poly_data(&jobs[ti], run_range_job)
+	}
+	for th in threads {
+		thread.destroy(th)
+	}
+
+	got := ([^]u8)(sdl.MapGPUTransferBuffer(g.device, down, false))
+	defer sdl.UnmapGPUTransferBuffer(g.device, down)
+
+	max_f_err: f32 = 0
+	int_mismatches := 0
+	off = 0
+	for i in 0 ..< rw_buf {
+		bi := ro_buf + i
+		fw := buf_float_words[bi]
+		stride_words := len(fw)
+		gpu_w := slice.reinterpret([]u32, got[off : off + buf_words * 4])
+		cpu_w := cpu_bufs[bi]
+		off += buf_words * 4
+		for w_idx in 0 ..< buf_words {
+			if gpu_w[w_idx] == cpu_w[w_idx] {
+				continue
+			}
+			if !fw[w_idx % stride_words] {
+				int_mismatches += 1
+				continue
+			}
+			gf := transmute(f32)gpu_w[w_idx]
+			cf := transmute(f32)cpu_w[w_idx]
+			d := abs(gf - cf)
+			max_f_err = max(max_f_err, d)
+			if !(d <= 1e-4) {
+				int_mismatches += 1
+			}
+		}
+	}
+	for i in 0 ..< rw_tex {
+		ii := ro_tex + i
+		im := m.storage_images[ii]
+		nbytes := len(gpu_init_imgs[ii])
+		gpu_b := got[off : off + nbytes]
+		cpu_b := cpu_imgs[ii].data
+		off += nbytes
+		switch im.format {
+		case .None:
+		case .R32ui, .R32i:
+			gw := slice.reinterpret([]u32, gpu_b)
+			cw := slice.reinterpret([]u32, cpu_b)
+			for k in 0 ..< len(gw) {
+				if gw[k] != cw[k] {
+					int_mismatches += 1
+				}
+			}
+		case .Rgba8:
+			for k in 0 ..< nbytes {
+				d := abs(int(gpu_b[k]) - int(cpu_b[k]))
+				max_f_err = max(max_f_err, f32(d) / 255.0)
+				if d > 1 {
+					int_mismatches += 1
+				}
+			}
+		case .Rgba16f:
+			gh := slice.reinterpret([]u16, gpu_b)
+			ch := slice.reinterpret([]u16, cpu_b)
+			for k in 0 ..< len(gh) {
+				d := abs(parity_f16_to_f32(gh[k]) - parity_f16_to_f32(ch[k]))
+				max_f_err = max(max_f_err, d)
+				if !(d <= 2e-3) {
+					int_mismatches += 1
+				}
+			}
+		case .Rgba32f, .R32f:
+			gf := slice.reinterpret([]f32, gpu_b)
+			cf := slice.reinterpret([]f32, cpu_b)
+			tol: f32 = 0.02 if m.num_samplers > 0 else 1e-4
+			for k in 0 ..< len(gf) {
+				d := abs(gf[k] - cf[k])
+				max_f_err = max(max_f_err, d)
+				if !(d <= tol) {
+					int_mismatches += 1
+				}
+			}
+		}
+	}
+	return fmt.tprintf("max float err %.6f, mismatches %d", max_f_err, int_mismatches), int_mismatches == 0
 }

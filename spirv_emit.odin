@@ -231,7 +231,11 @@ addressable :: proc(u: ^Unit, id: Expr_Id) -> bool {
 	e := u.exprs[id]
 	#partial switch e.kind {
 	case .Ident:
-		return e.sym != 0 && u.syms[e.sym].storage != .Channel
+		if e.sym == 0 {
+			return false
+		}
+		st := u.syms[e.sym].storage
+		return st != .Channel && st != .Storage_Image && st != .Work_Group_Size
 	case .Index:
 		return addressable(u, e.a)
 	case .Field:
@@ -271,7 +275,7 @@ emit_lvalue :: proc(s: ^Spv, id: Expr_Id) -> LValue {
 			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_OUTPUT}
 		case .Local, .Param:
 			return {ptr = local_sym(s, e.sym), type = t, storage = SC_FUNCTION}
-		case .Channel, .Buffer:
+		case .Channel, .Buffer, .Storage_Image, .Work_Group_Size:
 		}
 	case .Index:
 		base := emit_lvalue(s, e.a)
@@ -383,6 +387,77 @@ store_lvalue :: proc(s: ^Spv, lv: LValue, v: u32) {
 	inst(&s.body, .Store, lv.ptr, nv)
 }
 
+@(private)
+Spv_Buf_LV :: struct {
+	path:      Buf_Path,
+	buf_var:   u32,
+	base_word: u32,
+}
+
+@(private)
+emit_buf_lvalue :: proc(s: ^Spv, p: Buf_Path) -> Spv_Buf_LV {
+	u := s.u
+	t_uint := type_id(s, T_UINT)
+	idx := emit_expr(s, p.elem_idx)
+	if expr_type(u, p.elem_idx).base == .Int {
+		idx = unop(s, .Bitcast, t_uint, idx)
+	}
+	base := binop_raw(s, .I_Mul, t_uint, idx, const_u32(s, u32(p.stride_words)))
+	if p.word_off != 0 {
+		base = binop_raw(s, .I_Add, t_uint, base, const_u32(s, u32(p.word_off)))
+	}
+	if p.dyn_comp != 0 {
+		t_int := type_id(s, T_INT)
+		ci := emit_expr(s, p.dyn_comp)
+		if expr_type(u, p.dyn_comp).base == .Uint {
+			ci = unop(s, .Bitcast, t_int, ci)
+		}
+		clamped := ext(s, t_int, .S_Clamp, ci, const_i32(s, 0), const_i32(s, i32(p.dyn_rows - 1)))
+		cu := unop(s, .Bitcast, t_uint, clamped)
+		if p.dyn_swz_len > 0 {
+			mapped := const_u32(s, u32(p.dyn_swz[0]))
+			for k in 1 ..< p.dyn_rows {
+				cond := binop_raw(s, .I_Equal, type_id(s, T_BOOL), cu, const_u32(s, u32(k)))
+				sel := new_id(s)
+				inst(&s.body, .Select, t_uint, sel, cond, const_u32(s, u32(p.dyn_swz[k])), mapped)
+				mapped = sel
+			}
+			cu = mapped
+		}
+		base = binop_raw(s, .I_Add, t_uint, base, cu)
+	}
+	return {path = p, buf_var = s.sym_ids[p.sym], base_word = base}
+}
+
+@(private)
+load_buf_lvalue :: proc(s: ^Spv, blv: Spv_Buf_LV) -> u32 {
+	p := blv.path
+	if p.swz_len == 0 {
+		return buffer_value(s, blv.buf_var, p.type, blv.base_word, 0)
+	}
+	sc := scalar_of(p.type)
+	comps: [4]u32
+	for k in 0 ..< p.swz_len {
+		comps[k] = buffer_value(s, blv.buf_var, sc, blv.base_word, int(p.swz[k]))
+	}
+	return construct(s, type_id(s, p.type), ..comps[:p.swz_len])
+}
+
+@(private)
+store_buf_lvalue :: proc(s: ^Spv, blv: Spv_Buf_LV, val: u32) {
+	p := blv.path
+	if p.swz_len == 0 {
+		buffer_store(s, blv.buf_var, p.type, blv.base_word, 0, val)
+		return
+	}
+	sc := scalar_of(p.type)
+	st := type_id(s, sc)
+	for k in 0 ..< p.swz_len {
+		ck := extract(s, st, val, u32(k))
+		buffer_store(s, blv.buf_var, sc, blv.base_word, int(p.swz[k]), ck)
+	}
+}
+
 // ---- expressions -----------------------------------------------------------------------
 
 @(private)
@@ -402,8 +477,12 @@ emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 	case .Bool_Lit:
 		return const_bits(s, .Bool, u32(e.value))
 	case .Ident:
-		if u.syms[e.sym].storage == .Channel {
+		st := u.syms[e.sym].storage
+		if st == .Channel || st == .Storage_Image {
 			return s.sym_ids[e.sym]
+		}
+		if st == .Work_Group_Size {
+			return workgroup_size_const(s)
 		}
 		return load_lvalue(s, emit_lvalue(s, id))
 	case .Convert:
@@ -414,8 +493,8 @@ emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		if expr_type(u, e.b).base == .Int {
 			idx = unop(s, .Bitcast, t_uint, idx)
 		}
-		size, _, _ := std430(u, t)
-		base := binop_raw(s, .I_Mul, t_uint, idx, const_u32(s, u32(size / 4)))
+		stride := std430_stride(u, t)
+		base := binop_raw(s, .I_Mul, t_uint, idx, const_u32(s, u32(stride / 4)))
 		return buffer_value(s, s.sym_ids[e.sym], t, base, 0)
 	case .Comma:
 		emit_expr(s, e.a)
@@ -448,6 +527,17 @@ emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		b := emit_expr(s, e.b)
 		return binop(s, e.op, a, expr_type(u, e.a), b, expr_type(u, e.b), t)
 	case .Assign:
+		if bp, is_buf := buf_path(u, e.a); is_buf {
+			blv := emit_buf_lvalue(s, bp)
+			v := emit_expr(s, e.b)
+			if e.op != .Eq {
+				old := load_buf_lvalue(s, blv)
+				lt := expr_type(u, e.a)
+				v = binop(s, compound_op(e.op), old, lt, v, expr_type(u, e.b), lt)
+			}
+			store_buf_lvalue(s, blv, v)
+			return v
+		}
 		lv := emit_lvalue(s, e.a)
 		v := emit_expr(s, e.b)
 		if e.op != .Eq {
@@ -458,6 +548,14 @@ emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		store_lvalue(s, lv, v)
 		return v
 	case .Pre_Inc, .Pre_Dec, .Post_Inc, .Post_Dec:
+		if bp, is_buf := buf_path(u, e.a); is_buf {
+			blv := emit_buf_lvalue(s, bp)
+			old := load_buf_lvalue(s, blv)
+			inc := e.kind == .Pre_Inc || e.kind == .Post_Inc
+			nv := binop(s, .Plus if inc else .Minus, old, t, const_of(s, t.base, 1), scalar_of(t), t)
+			store_buf_lvalue(s, blv, nv)
+			return nv if e.kind == .Pre_Inc || e.kind == .Pre_Dec else old
+		}
 		lv := emit_lvalue(s, e.a)
 		old := load_lvalue(s, lv)
 		inc := e.kind == .Pre_Inc || e.kind == .Post_Inc
@@ -478,6 +576,9 @@ emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		b_block := s.cur_block
 		terminate(s, .Branch, merge)
 		label(s, merge)
+		if t == T_VOID {
+			return 0
+		}
 		r := new_id(s)
 		inst(&s.body, .Phi, type_id(s, t), r, a, a_block, b, b_block)
 		return r
@@ -560,20 +661,32 @@ emit_user_call :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 	vals := make([]u32, len(args), context.temp_allocator)
 	temps := make([]u32, len(args), context.temp_allocator)
 	lvs := make([]LValue, len(args), context.temp_allocator)
+	buf_lvs := make([]Spv_Buf_LV, len(args), context.temp_allocator)
+	is_buf_lv := make([]bool, len(args), context.temp_allocator)
 	for p, i in ps {
 		pt := ty(u, p.type)
 		switch {
-		case pt.base == .Sampler:
+		case pt.base == .Sampler || pt.base == .Image:
 			vals[i] = s.sym_ids[u.exprs[args[i]].sym]
 		case p.qual == .In:
 			vals[i] = emit_expr(s, args[i])
 		case:
-			lvs[i] = emit_lvalue(s, args[i])
 			tmp := local_var(s, pt)
-			if p.qual == .Inout {
-				inst(&s.body, .Store, tmp, load_lvalue(s, lvs[i]))
+			if bp, is_buf := buf_path(u, args[i]); is_buf {
+				buf_lvs[i] = emit_buf_lvalue(s, bp)
+				is_buf_lv[i] = true
+				if p.qual == .Inout {
+					inst(&s.body, .Store, tmp, load_buf_lvalue(s, buf_lvs[i]))
+				} else {
+					inst(&s.body, .Store, tmp, const_null(s, type_id(s, pt)))
+				}
 			} else {
-				inst(&s.body, .Store, tmp, const_null(s, type_id(s, pt)))
+				lvs[i] = emit_lvalue(s, args[i])
+				if p.qual == .Inout {
+					inst(&s.body, .Store, tmp, load_lvalue(s, lvs[i]))
+				} else {
+					inst(&s.body, .Store, tmp, const_null(s, type_id(s, pt)))
+				}
 			}
 			temps[i] = tmp
 			vals[i] = tmp
@@ -586,10 +699,14 @@ emit_user_call :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 	inst_words(&s.body, .Function_Call, words[:])
 	for p, i in ps {
 		pt := ty(u, p.type)
-		if p.qual != .In && pt.base != .Sampler {
+		if p.qual != .In && pt.base != .Sampler && pt.base != .Image {
 			v := new_id(s)
 			inst(&s.body, .Load, type_id(s, pt), v, temps[i])
-			store_lvalue(s, lvs[i], v)
+			if is_buf_lv[i] {
+				store_buf_lvalue(s, buf_lvs[i], v)
+			} else {
+				store_lvalue(s, lvs[i], v)
+			}
 		}
 	}
 	return r
@@ -713,7 +830,7 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 	types := make([]Type, len(argx), context.temp_allocator)
 	for a, i in argx {
 		types[i] = expr_type(u, a)
-		if types[i].base == .Sampler {
+		if types[i].base == .Sampler || types[i].base == .Image {
 			args[i] = s.sym_ids[u.exprs[a].sym]
 		} else {
 			args[i] = emit_expr(s, a)
@@ -785,6 +902,27 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		inst(&s.body, .Image, s.t_image[int(at == T_SAMPLER_ARRAY)], img, sampled)
 		r := new_id(s)
 		inst(&s.body, .Image_Query_Size_Lod, rt, r, img, args[1])
+		return r
+	case .Image_Load:
+		img := new_id(s)
+		inst(&s.body, .Load, type_id(s, at), img, args[0])
+		r := new_id(s)
+		inst(&s.body, .Image_Read, rt, r, img, args[1])
+		return r
+	case .Image_Store:
+		img := new_id(s)
+		inst(&s.body, .Load, type_id(s, at), img, args[0])
+		inst(&s.body, .Image_Write, img, args[1], args[2])
+		return 0
+	case .Image_Size:
+		if !s.image_query {
+			inst(&s.caps, .Capability, 50) // ImageQuery
+			s.image_query = true
+		}
+		img := new_id(s)
+		inst(&s.body, .Load, type_id(s, at), img, args[0])
+		r := new_id(s)
+		inst(&s.body, .Image_Query_Size, rt, r, img)
 		return r
 	}
 	return 0

@@ -80,13 +80,38 @@ Stage_Var_Info :: struct {
 	offset:   int,
 }
 
-// A read-only storage buffer: element i of `element` (std430) at byte
-// i * stride.
+// Storage images a compute shader may declare.
+IMAGE_COUNT :: 16
+
+// A storage buffer: element i of `element` (std430) at byte i * stride.
 Storage_Buffer_Info :: struct {
 	// The block's name (`buffer Name { ... }`).
-	name:    string,
-	element: Type,
-	stride:  int,
+	name:      string,
+	element:   Type,
+	stride:    int,
+	readonly:  bool,
+	writeonly: bool,
+}
+
+// A struct member's reflection (std430 byte offset when `std430` applies).
+Struct_Field_Info :: struct {
+	name:   string,
+	type:   Type,
+	offset: int,
+}
+
+// A declared struct (`Type.strukt` into `Module.structs`).
+Buffer_Struct_Info :: struct {
+	name:   string,
+	fields: []Struct_Field_Info,
+}
+
+// A 2D storage image (`uniform layout(<format>) image2D/uimage2D/iimage2D`).
+Storage_Image_Info :: struct {
+	name:      string,
+	format:    Image_Format,
+	readonly:  bool,
+	writeonly: bool,
 }
 
 Module :: struct {
@@ -115,11 +140,26 @@ Module :: struct {
 	channel_pos:   [SAMPLER_COUNT]Pos,
 	// 1 with a uniform block, else 0: SDL_GPU's num_uniform_buffers, which
 	// Metal's storage buffer indices follow.
-	num_uniform_buffers: int,
-	// Storage buffers in binding order, after the samplers: bind
-	// len(storage_buffers) (Run_Options.buffers on the CPU).
+	num_uniform_buffers:            int,
+	// SDL_GPU resource counts for graphics and compute pipelines.
+	num_readonly_storage_textures:  int,
+	num_readonly_storage_buffers:   int,
+	num_readwrite_storage_textures: int,
+	num_readwrite_storage_buffers:  int,
+	// Storage buffers in SDL_GPU binding order (readonly first, then
+	// read-write / writeonly, each in declaration order; Run_Options.buffers
+	// on the CPU).
 	storage_buffers: []Storage_Buffer_Info,
-	profile:       Profile,
+	// Storage images in SDL_GPU binding order (readonly first, then
+	// read-write / writeonly, each in declaration order; Run_Options.images
+	// on the CPU).
+	storage_images:  []Storage_Image_Info,
+	// Declared structs (`Type.strukt`) when the module binds storage buffers.
+	structs:         []Buffer_Struct_Info,
+	// Compute workgroup dimensions (`layout(local_size_*) in;`); zero for
+	// graphics stages.
+	threadcount:     [3]u32,
+	profile:         Profile,
 	stage:         Stage,
 	// Floats per vertex in the varyings' record (Stage_Var_Info.offset).
 	varying_floats: int,
@@ -273,10 +313,36 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 	buffers := make([]Storage_Buffer_Info, len(c.buffers))
 	for b, i in c.buffers {
 		t := sym_type(u, b)
-		stride, _, _ := std430(u, t)
-		buffers[i] = {strings.clone(u.buffer_decls[c.buffer_decls[i]].block), t, stride}
+		stride := std430_stride(u, t)
+		bd := u.buffer_decls[c.buffer_decls[i]]
+		buffers[i] = {strings.clone(bd.block), t, stride, bd.readonly, bd.writeonly}
 	}
 	m.storage_buffers = buffers
+	if len(c.buffers) > 0 && len(u.structs) > 0 {
+		structs := make([]Buffer_Struct_Info, len(u.structs))
+		for sd, st_idx in u.structs {
+			sf := struct_fields(u, i32(st_idx))
+			fields := make([]Struct_Field_Info, len(sf))
+			for f, fi in sf {
+				fields[fi] = {strings.clone(f.name), ty(u, f.type), std430_field_offset(u, i32(st_idx), i32(fi))}
+			}
+			structs[st_idx] = {strings.clone(sd.name), fields}
+		}
+		m.structs = structs
+	}
+	images := make([]Storage_Image_Info, len(c.images))
+	for im, i in c.images {
+		t := sym_type(u, im)
+		images[i] = {strings.clone(u.syms[im].name), image_format_of(t), image_readonly(t), image_writeonly(t)}
+	}
+	m.storage_images = images
+	m.num_readonly_storage_buffers = c.num_ro_buffers
+	m.num_readwrite_storage_buffers = len(c.buffers) - c.num_ro_buffers
+	m.num_readonly_storage_textures = c.num_ro_images
+	m.num_readwrite_storage_textures = len(c.images) - c.num_ro_images
+	if u.stage == .Compute {
+		m.threadcount = c.local_size
+	}
 	inputs := make([dynamic]Stage_Var_Info)
 	outputs := make([dynamic]Stage_Var_Info)
 	for row in c.interface {

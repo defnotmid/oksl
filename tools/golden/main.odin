@@ -300,7 +300,7 @@ files :: proc(dir: string) {
 	for sub in ([]string{"testdata", "demo/media"}) {
 		fis, _ := os.read_all_directory_by_path(sub, context.allocator)
 		for fi in fis {
-			if o, known := oksl.options_of_path(fi.name); known && o.stage == .Fragment {
+			if o, known := oksl.options_of_path(fi.name); known && (o.stage == .Fragment || o.stage == .Compute) {
 				append(&paths, fi.fullpath)
 			}
 		}
@@ -317,9 +317,23 @@ files :: proc(dir: string) {
 			_ = os.write_entire_file(fmt.tprintf("%s.errors", base), transmute([]u8)oksl.format_errors(errs))
 			continue
 		}
+		if options.stage == .Compute {
+			snapshot_compute(base, m)
+			oksl.destroy(m)
+			continue
+		}
+		Storage_Buffer_Info :: struct {
+			name:    string,
+			element: oksl.Type,
+			stride:  int,
+		}
+		sbs := make([]Storage_Buffer_Info, len(m.storage_buffers), context.temp_allocator)
+		for sb, i in m.storage_buffers {
+			sbs[i] = {sb.name, sb.element, sb.stride}
+		}
 		refl := strings.builder_make()
 		fmt.sbprintf(&refl, "inputs_used=%v\nchannels_used=%v\nnum_samplers=%d\nchannel_names=%v\nchannel_pos=%v\nblock_size=%d\n", m.inputs_used, m.channels_used, m.num_samplers, m.channel_names, m.channel_pos, m.block_size)
-		fmt.sbprintf(&refl, "channel_arrays=%v\nnum_uniform_buffers=%d\nstorage_buffers=%v\n", m.channel_arrays, m.num_uniform_buffers, m.storage_buffers)
+		fmt.sbprintf(&refl, "channel_arrays=%v\nnum_uniform_buffers=%d\nstorage_buffers=%v\n", m.channel_arrays, m.num_uniform_buffers, sbs)
 		for un in m.uniforms {
 			fmt.sbprintf(&refl, "uniform %v\n", un)
 		}
@@ -347,6 +361,99 @@ files :: proc(dir: string) {
 		_ = os.write_entire_file(fmt.tprintf("%s.f32", base), slice.to_bytes(px))
 		oksl.destroy(m)
 	}
+}
+
+snapshot_compute :: proc(base: string, m: ^oksl.Module) {
+	refl := strings.builder_make(context.temp_allocator)
+	fmt.sbprintf(&refl, "threadcount=%v\n", m.threadcount)
+	fmt.sbprintf(&refl, "num_samplers=%d\nnum_readonly_storage_textures=%d\nnum_readonly_storage_buffers=%d\n", m.num_samplers, m.num_readonly_storage_textures, m.num_readonly_storage_buffers)
+	fmt.sbprintf(&refl, "num_readwrite_storage_textures=%d\nnum_readwrite_storage_buffers=%d\nnum_uniform_buffers=%d\n", m.num_readwrite_storage_textures, m.num_readwrite_storage_buffers, m.num_uniform_buffers)
+	fmt.sbprintf(&refl, "channels_used=%v\nchannel_names=%v\nchannel_arrays=%v\nblock_size=%d\n", m.channels_used, m.channel_names, m.channel_arrays, m.block_size)
+	fmt.sbprintf(&refl, "storage_images=%v\nstorage_buffers=%v\n", m.storage_images, m.storage_buffers)
+	for un in m.uniforms {
+		fmt.sbprintf(&refl, "uniform %v\n", un)
+	}
+	_ = os.write_entire_file(fmt.tprintf("%s.reflect", base), refl.buf[:])
+	_ = os.write_entire_file(fmt.tprintf("%s.spv", base), slice.to_bytes(m.spirv))
+	_ = os.write_entire_file(fmt.tprintf("%s.metal", base), transmute([]u8)m.msl)
+
+	CW, CH :: 32, 16
+	block := make([]u8, m.block_size, context.temp_allocator)
+	oksl.set_uniform(m, block, "uScale", {1.25})
+	oksl.set_uniform(m, block, "uDt", {0.25})
+	oksl.set_uniform(m, block, "uCount", {64})
+	oksl.set_uniform(m, block, "ky", {13933, 46871, 4732, 1081344})
+	oksl.set_uniform(m, block, "ku", {-7509, -25259, 32768, 33685504})
+	oksl.set_uniform(m, block, "kv", {32768, -29763, -3005, 255})
+	oksl.set_uniform(m, block, "size", {CW, CH, CW, CW * CH})
+
+	buffers := make([][]u32, len(m.storage_buffers), context.temp_allocator)
+	for _, bi in m.storage_buffers {
+		words := make([]u32, 1024, context.temp_allocator)
+		for &w, i in words {
+			w = transmute(u32)(f32(((bi * 29 + i * 37 + 11) % 255) + 1) / 64.0)
+		}
+		buffers[bi] = words
+	}
+	images := make([]oksl.Storage_Image, len(m.storage_images), context.temp_allocator)
+	for im, ii in m.storage_images {
+		tb := 4
+		#partial switch im.format {
+		case .Rgba16f:
+			tb = 8
+		case .Rgba32f:
+			tb = 16
+		}
+		data := make([]u8, CW * CH * tb, context.temp_allocator)
+		switch im.format {
+		case .None:
+		case .Rgba8:
+			for &b, i in data {
+				b = u8((ii * 53 + i * 41 + 17) & 255)
+			}
+		case .Rgba16f:
+			u16s := slice.reinterpret([]u16, data)
+			for &h, i in u16s {
+				// Normal positive f16 values in [0.5, 2.0).
+				h = u16(0x3800 + ((ii * 31 + i * 19) & 0x07ff))
+			}
+		case .Rgba32f, .R32f:
+			f32s := slice.reinterpret([]f32, data)
+			for &f, i in f32s {
+				f = f32((ii * 23 + i * 43 + 7) % 256) / 255.0
+			}
+		case .R32ui, .R32i:
+			u32s := slice.reinterpret([]u32, data)
+			for &v, i in u32s {
+				v = u32((ii * 13 + i * 17 + 5) & 1023)
+			}
+		}
+		images[ii] = {data = data, width = CW, height = CH, format = im.format}
+	}
+	sizes: [oksl.SAMPLER_COUNT][3]i32
+	for &s in sizes {
+		s = {64, 64, 1}
+	}
+	scratch: oksl.Scratch
+	defer oksl.scratch_destroy(&scratch)
+	oksl.run_compute(&m.program, block, {4, 4, 2}, &scratch, {
+		sampler       = sampler,
+		channel_sizes = sizes[:],
+		buffers       = buffers,
+		images        = images,
+	})
+	bin := make([dynamic]u8, context.temp_allocator)
+	for sb, bi in m.storage_buffers {
+		if !sb.readonly {
+			append(&bin, ..slice.to_bytes(buffers[bi]))
+		}
+	}
+	for im, ii in m.storage_images {
+		if !im.readonly {
+			append(&bin, ..images[ii].data)
+		}
+	}
+	_ = os.write_entire_file(fmt.tprintf("%s.bin", base), bin[:])
 }
 
 // ---- compare ----------------------------------------------------------------------------

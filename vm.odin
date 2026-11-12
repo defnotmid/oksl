@@ -128,8 +128,8 @@ VM_Op :: enum u8 {
 	// dst ivec2 = channel k's size at lod a (n = 3: ivec3, z the layers).
 	Texture_Size,
 	// dst + i = buffer k's word a * b + c + i for i < n (a: the element
-	// index in each lane, b: the element's words, c: the word in it); 0
-	// past the buffer.
+	// index in each lane, b: the element's words, c: the word in it, d: 1
+	// when the buffer is writable); 0 past the buffer.
 	Load_Buf,
 	// Masks: dst = a.
 	Mask_Copy,
@@ -146,6 +146,13 @@ VM_Op :: enum u8 {
 	Jump,
 	// Jump to a when exec is empty.
 	Jump_If_None,
+	// buffer k's word a * c + d + i = b + i for i < n, in exec.
+	Store_Buf,
+	// dst (4 slots) = image k at ivec2 a; image k at ivec2 a = b (4 slots)
+	// in exec; dst ivec2 = image k's size.
+	Image_Load,
+	Image_Store,
+	Image_Size,
 }
 
 // The ops that take a Builtin in k.
@@ -182,6 +189,10 @@ Program :: struct {
 	outputs:    []Program_Var,
 	// Floats per vertex in the varyings' record.
 	varying_floats: int,
+	stage:          Stage,
+	local_size:     [3]u32,
+	num_buffers:    int,
+	image_formats:  []Image_Format,
 	// Optional native machine code compiled from `code` (`vm_jit.odin`).
 	jit_mem:  []byte,
 	jit_init: rawptr,
@@ -225,8 +236,9 @@ Lower :: struct {
 	next_slot: i32,
 	next_mask: i32,
 	sym_slot:  []i32,
-	// Channel each sampler symbol refers to.
+	// Channel / image index each sampler / image symbol refers to.
 	sym_chan:  []i32,
+	sym_img:   []i32,
 	consts:    map[u32]i32,
 	const_list: [dynamic][2]u32,
 	fills:     [dynamic]Uniform_Fill,
@@ -256,6 +268,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 		next_mask  = 2,
 		sym_slot  = make([]i32, len(u.syms)),
 		sym_chan  = make([]i32, len(u.syms)),
+		sym_img   = make([]i32, len(u.syms)),
 		consts    = make(map[u32]i32),
 		const_list = make([dynamic][2]u32),
 		fills     = make([dynamic]Uniform_Fill),
@@ -268,8 +281,20 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	for &ch in l.sym_chan {
 		ch = -1
 	}
+	for &im in l.sym_img {
+		im = -1
+	}
 	l.written = written_syms(u)
 	p: Program
+	p.stage = u.stage
+	p.local_size = c.local_size
+	p.num_buffers = len(c.buffers)
+	if len(c.images) > 0 {
+		p.image_formats = make([]Image_Format, len(c.images))
+		for im, i in c.images {
+			p.image_formats[i] = image_format_of(sym_type(u, im))
+		}
+	}
 	inputs := make([dynamic]Program_Var)
 	outputs := make([dynamic]Program_Var)
 	stage_var :: proc(l: ^Lower, row: Interface_Var) -> Program_Var {
@@ -283,8 +308,16 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 		#partial switch row.kind {
 		case .Channel:
 			l.sym_chan[row.sym] = row.binding
-		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID:
+		case .Storage_Image:
+			l.sym_img[row.sym] = i32(u.syms[row.sym].index)
+		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID,
+		     .Global_Invocation_ID, .Local_Invocation_ID, .Work_Group_ID, .Num_Work_Groups, .Local_Invocation_Index:
 			append(&inputs, stage_var(&l, row))
+		}
+	}
+	for sym, i in u.syms {
+		if i > 0 && sym.storage == .Work_Group_Size {
+			l.sym_slot[i] = const_vec(&l, {c.local_size[0], c.local_size[1], c.local_size[2]})
 		}
 	}
 	p.inputs = inputs[:]
@@ -467,7 +500,7 @@ const_val :: proc(l: ^Lower, base: Base, v: f64) -> Val {
 		bits = u32(i32(v))
 	case .Uint, .Bool:
 		bits = u32(v)
-	case .Void, .Sampler, .Struct:
+	case .Void, .Sampler, .Image, .Struct:
 	}
 	return {const_slot(l, bits), {base = base, rows = 1}}
 }
@@ -644,21 +677,110 @@ store_lv :: proc(l: ^Lower, lv: LV, v: Val) {
 // each) into dst: a Load_Buf per scalar or vector, at its std430 offset.
 // Returns the slot after it.
 @(private)
-buffer_loads :: proc(l: ^Lower, t: Type, dst, idx, stride: i32, word, buf: int) -> i32 {
+buffer_loads :: proc(l: ^Lower, t: Type, dst, idx, stride: i32, word, buf: int, writable := false) -> i32 {
 	if t.base != .Struct {
-		emit(l, .Load_Buf, n = int(t.rows), k = buf, dst = dst, a = idx, b = stride, c = i32(word))
+		emit(l, .Load_Buf, n = int(t.rows), k = buf, dst = dst, a = idx, b = stride, c = i32(word), d = 1 if writable else 0)
 		return dst + i32(t.rows)
 	}
-	off := 0
 	next := dst
-	for f in struct_fields(l.u, t.strukt) {
+	for f, i in struct_fields(l.u, t.strukt) {
 		ft := ty(l.u, f.type)
-		size, align, _ := std430(l.u, ft)
-		off = round_up(off, align)
-		next = buffer_loads(l, ft, next, idx, stride, word + off / 4, buf)
-		off += size
+		off := std430_field_offset(l.u, t.strukt, i32(i))
+		next = buffer_loads(l, ft, next, idx, stride, word + off / 4, buf, writable)
 	}
 	return next
+}
+
+@(private)
+buffer_stores :: proc(l: ^Lower, t: Type, src, idx, stride: i32, word, buf: int) -> i32 {
+	if t.base != .Struct {
+		emit(l, .Store_Buf, n = int(t.rows), k = buf, a = idx, b = src, c = stride, d = i32(word))
+		return src + i32(t.rows)
+	}
+	next := src
+	for f, i in struct_fields(l.u, t.strukt) {
+		ft := ty(l.u, f.type)
+		off := std430_field_offset(l.u, t.strukt, i32(i))
+		next = buffer_stores(l, ft, next, idx, stride, word + off / 4, buf)
+	}
+	return next
+}
+
+@(private)
+VM_Buf_LV :: struct {
+	path:     Buf_Path,
+	buf_idx:  int,
+	writable: bool,
+	idx_slot: i32,
+	stride:   i32,
+	word_off: int,
+}
+
+@(private)
+lower_buf_lvalue :: proc(l: ^Lower, p: Buf_Path) -> VM_Buf_LV {
+	u := l.u
+	buf_idx := u.syms[p.sym].index
+	writable := !u.buffer_decls[l.checked.buffer_decls[buf_idx]].readonly
+	mark := l.next_slot
+	idx := lower_expr(l, p.elem_idx)
+	if p.dyn_comp == 0 {
+		idx = snapshot_val(l, idx, mark)
+		return {path = p, buf_idx = buf_idx, writable = writable, idx_slot = idx.slot, stride = i32(p.stride_words), word_off = p.word_off}
+	}
+	base := alloc_slots(l, 1)
+	emit(l, .I_Mul, dst = base, a = idx.slot, b = const_slot(l, u32(p.stride_words)))
+	if p.word_off != 0 {
+		sum := alloc_slots(l, 1)
+		emit(l, .I_Add, dst = sum, a = base, b = const_slot(l, u32(p.word_off)))
+		base = sum
+	}
+	comp := lower_expr(l, p.dyn_comp)
+	clamped := alloc_slots(l, 1)
+	emit(l, .I_Fn3, k = int(Builtin.Clamp), dst = clamped, a = comp.slot, b = const_val(l, .Int, 0).slot, c = const_val(l, .Int, f64(p.dyn_rows - 1)).slot)
+	cu := clamped
+	if p.dyn_swz_len > 0 {
+		mapped := const_slot(l, u32(p.dyn_swz[0]))
+		for k in 1 ..< p.dyn_rows {
+			cond := alloc_slots(l, 1)
+			emit(l, .I_Eq, dst = cond, a = cu, b = const_slot(l, u32(k)))
+			sel := alloc_slots(l, 1)
+			emit(l, .Select, k = 1, dst = sel, a = const_slot(l, u32(p.dyn_swz[k])), b = mapped, c = cond)
+			mapped = sel
+		}
+		cu = mapped
+	}
+	word := alloc_slots(l, 1)
+	emit(l, .I_Add, dst = word, a = base, b = cu)
+	return {path = p, buf_idx = buf_idx, writable = writable, idx_slot = word, stride = 1, word_off = 0}
+}
+
+@(private)
+load_buf_lv :: proc(l: ^Lower, blv: VM_Buf_LV) -> Val {
+	p := blv.path
+	if p.swz_len == 0 {
+		s := alloc_slots(l, cc(l, p.type))
+		buffer_loads(l, p.type, s, blv.idx_slot, blv.stride, blv.word_off, blv.buf_idx, blv.writable)
+		return {s, p.type}
+	}
+	s := alloc_slots(l, p.swz_len)
+	for k in 0 ..< p.swz_len {
+		emit(l, .Load_Buf, n = 1, k = blv.buf_idx, dst = s + i32(k), a = blv.idx_slot, b = blv.stride, c = i32(blv.word_off + int(p.swz[k])), d = 1 if blv.writable else 0)
+	}
+	return {s, p.type}
+}
+
+@(private)
+store_buf_lv :: proc(l: ^Lower, blv: VM_Buf_LV, v: Val) {
+	p := blv.path
+	if p.swz_len == 0 {
+		src := widen(l, v, cc(l, p.type))
+		buffer_stores(l, p.type, src, blv.idx_slot, blv.stride, blv.word_off, blv.buf_idx)
+		return
+	}
+	src := widen(l, v, p.swz_len)
+	for k in 0 ..< p.swz_len {
+		emit(l, .Store_Buf, n = 1, k = blv.buf_idx, a = blv.idx_slot, b = src + i32(k), c = blv.stride, d = i32(blv.word_off + int(p.swz[k])))
+	}
 }
 
 @(private)
@@ -666,7 +788,8 @@ addressable_vm :: proc(l: ^Lower, id: Expr_Id) -> bool {
 	e := l.u.exprs[id]
 	#partial switch e.kind {
 	case .Ident:
-		return l.u.syms[e.sym].storage != .Channel
+		st := l.u.syms[e.sym].storage
+		return st != .Channel && st != .Storage_Image
 	case .Index:
 		return addressable_vm(l, e.a)
 	case .Field:
@@ -982,9 +1105,9 @@ lower_switch :: proc(l: ^Lower, st: Stmt) {
 	emit(l, .Mask_Restore, dst = MASK_EXEC, a = entry, b = b, c = cn, d = r)
 }
 
-// Inlines a call: `vals` for `in` arguments, `lvs` for out/inout ones.
+// Inlines a call: `vals` for `in` arguments, `lvs` / `buf_lvs` for out/inout ones.
 @(private)
-inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args: []i32 = nil) -> Val {
+inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, res_args: []i32 = nil, buf_lvs: []VM_Buf_LV = nil, is_buf_lv: []bool = nil) -> Val {
 	u := l.u
 	mark := l.next_slot
 	ps := fparams(u, f)
@@ -994,7 +1117,11 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args:
 		}
 		t := ty(u, p.type)
 		if t.base == .Sampler {
-			l.sym_chan[p.sym] = sampler_args[i] if sampler_args != nil else -1
+			l.sym_chan[p.sym] = res_args[i] if res_args != nil else -1
+			continue
+		}
+		if t.base == .Image {
+			l.sym_img[p.sym] = res_args[i] if res_args != nil else -1
 			continue
 		}
 		n := cc(l, t)
@@ -1015,7 +1142,13 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args:
 		l.sym_slot[p.sym] = slot
 		#partial switch p.qual {
 		case .Inout:
-			emit(l, .Store, n = n, dst = slot, a = load_lv(l, lvs[i]).slot)
+			src_slot: i32
+			if vals[i].slot >= 0 {
+				src_slot = vals[i].slot
+			} else {
+				src_slot = load_buf_lv(l, buf_lvs[i]).slot if is_buf_lv != nil && is_buf_lv[i] else load_lv(l, lvs[i]).slot
+			}
+			emit(l, .Store, n = n, dst = slot, a = src_slot)
 		case .Out:
 			emit(l, .Store_Zero, n = n, dst = slot)
 		}
@@ -1059,8 +1192,12 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, sampler_args:
 	}
 	for p, i in ps {
 		t := ty(u, p.type)
-		if p.qual != .In && t.base != .Sampler && p.sym != 0 {
-			store_lv(l, lvs[i], {l.sym_slot[p.sym], t})
+		if p.qual != .In && t.base != .Sampler && t.base != .Image && p.sym != 0 {
+			if is_buf_lv != nil && is_buf_lv[i] {
+				store_buf_lv(l, buf_lvs[i], {l.sym_slot[p.sym], t})
+			} else {
+				store_lv(l, lvs[i], {l.sym_slot[p.sym], t})
+			}
 		}
 	}
 	return result
@@ -1091,9 +1228,11 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		return convert_val(l, v, t)
 	case .Buffer_Load:
 		idx := lower_expr(l, e.b)
-		size, _, _ := std430(u, t)
+		stride := std430_stride(u, t)
 		s := alloc_slots(l, cc(l, t))
-		buffer_loads(l, t, s, idx.slot, i32(size / 4), 0, u.syms[e.sym].index)
+		buf_idx := u.syms[e.sym].index
+		writable := !u.buffer_decls[l.checked.buffer_decls[buf_idx]].readonly
+		buffer_loads(l, t, s, idx.slot, i32(stride / 4), 0, buf_idx, writable)
 		return {s, t}
 	case .Comma:
 		lower_expr(l, e.a)
@@ -1122,10 +1261,24 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		case .And_And, .Or_Or:
 			return lower_short_circuit(l, e)
 		}
+		mark := l.next_slot
 		a := lower_expr(l, e.a)
+		if may_write(u, e.b) {
+			a = snapshot_val(l, a, mark)
+		}
 		b := lower_expr(l, e.b)
 		return binop_vm(l, e.op, a, b, t)
 	case .Assign:
+		if bp, is_buf := buf_path(u, e.a); is_buf {
+			blv := lower_buf_lvalue(l, bp)
+			v := lower_expr(l, e.b)
+			if e.op != .Eq {
+				old := load_buf_lv(l, blv)
+				v = binop_vm(l, compound_op(e.op), old, v, expr_type(u, e.a))
+			}
+			store_buf_lv(l, blv, v)
+			return v
+		}
 		lv := lower_lvalue(l, e.a)
 		v := lower_expr(l, e.b)
 		if e.op != .Eq {
@@ -1135,6 +1288,14 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		store_lv(l, lv, v)
 		return v
 	case .Pre_Inc, .Pre_Dec, .Post_Inc, .Post_Dec:
+		if bp, is_buf := buf_path(u, e.a); is_buf {
+			blv := lower_buf_lvalue(l, bp)
+			cur := load_buf_lv(l, blv)
+			inc := e.kind == .Pre_Inc || e.kind == .Post_Inc
+			nv := binop_vm(l, .Plus if inc else .Minus, cur, const_val(l, t.base, 1), t)
+			store_buf_lv(l, blv, nv)
+			return nv if e.kind == .Pre_Inc || e.kind == .Pre_Dec else cur
+		}
 		lv := lower_lvalue(l, e.a)
 		cur := load_lv(l, lv)
 		inc := e.kind == .Pre_Inc || e.kind == .Post_Inc
@@ -1152,6 +1313,23 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	case .Ternary:
 		c := lower_expr(l, e.a)
 		n := cc(l, t)
+		if n == 0 {
+			save := alloc_mask(l)
+			then_m := alloc_mask(l)
+			emit(l, .Mask_Copy, dst = save, a = MASK_EXEC)
+			emit(l, .Mask_Cond, dst = then_m, a = save, b = c.slot)
+			emit(l, .Mask_Copy, dst = MASK_EXEC, a = then_m)
+			skip_a := emit(l, .Jump_If_None)
+			lower_expr(l, e.b)
+			l.code[skip_a].a = here(l)
+			emit(l, .Mask_Restore, dst = MASK_EXEC, a = save, b = then_m, c = -1, d = -1)
+			skip_b := emit(l, .Jump_If_None)
+			lower_expr(l, e.c)
+			l.code[skip_b].a = here(l)
+			b, cn, r := kills(l)
+			emit(l, .Mask_Restore, dst = MASK_EXEC, a = save, b = b, c = cn, d = r)
+			return {-1, T_VOID}
+		}
 		budget := 12
 		if can_select_expr(u, e.b, &budget) && can_select_expr(u, e.c, &budget) {
 			va := widen(l, lower_expr(l, e.b), n)
@@ -1182,7 +1360,11 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		if addressable_vm(l, e.a) {
 			return load_lv(l, lower_lvalue(l, id))
 		}
+		mark := l.next_slot
 		base := lower_expr(l, e.a)
+		if may_write(u, e.b) {
+			base = snapshot_val(l, base, mark)
+		}
 		bt := base.t
 		size := cc(l, t)
 		ix := u.exprs[e.b]
@@ -1281,7 +1463,7 @@ can_select_expr :: proc(u: ^Unit, id: Expr_Id, budget: ^int) -> bool {
 		if e.call == .User {
 			return false
 		}
-		if e.call == .Builtin && (e.builtin == .Texture || e.builtin == .Texture_Lod || e.builtin == .Texture_Grad || e.builtin == .Texture_Size) {
+		if e.call == .Builtin && (e.builtin == .Texture || e.builtin == .Texture_Lod || e.builtin == .Texture_Grad || e.builtin == .Texture_Size || e.builtin == .Image_Load || e.builtin == .Image_Store || e.builtin == .Image_Size) {
 			return false
 		}
 		for a in args_of(u, id) {
@@ -1424,22 +1606,61 @@ lower_user_call :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	args := args_of(u, id)
 	ps := fparams(u, f)
 	vals := make([]Val, len(args), context.temp_allocator)
+	for &v in vals {
+		v.slot = -1
+	}
 	lvs := make([]LV, len(args), context.temp_allocator)
-	chans := make([]i32, len(args), context.temp_allocator)
+	buf_lvs := make([]VM_Buf_LV, len(args), context.temp_allocator)
+	is_buf_lv := make([]bool, len(args), context.temp_allocator)
+	res_args := make([]i32, len(args), context.temp_allocator)
+	any_arg_writes := false
+	for a in args {
+		if may_write(u, a) {
+			any_arg_writes = true
+			break
+		}
+	}
 	for p, i in ps {
 		t := ty(u, p.type)
 		switch {
 		case t.base == .Sampler:
-			chans[i] = l.sym_chan[u.exprs[args[i]].sym]
+			res_args[i] = l.sym_chan[u.exprs[args[i]].sym]
+		case t.base == .Image:
+			res_args[i] = l.sym_img[u.exprs[args[i]].sym]
 		case p.qual == .In:
+			mark := l.next_slot
 			v := lower_expr(l, args[i])
-			// Copy: the callee may write its parameter.
+			for k in i + 1 ..< len(args) {
+				if may_write(u, args[k]) {
+					v = snapshot_val(l, v, mark)
+					break
+				}
+			}
 			vals[i] = v
 		case:
-			lvs[i] = lower_lvalue(l, args[i])
+			if bp, is_buf := buf_path(u, args[i]); is_buf {
+				buf_lvs[i] = lower_buf_lvalue(l, bp)
+				is_buf_lv[i] = true
+				if p.qual == .Inout && any_arg_writes {
+					vals[i] = load_buf_lv(l, buf_lvs[i])
+				}
+			} else {
+				mark := l.next_slot
+				lvs[i] = lower_lvalue(l, args[i])
+				if p.qual == .Inout && any_arg_writes {
+					v := load_lv(l, lvs[i])
+					for k in i + 1 ..< len(args) {
+						if may_write(u, args[k]) {
+							v = snapshot_val(l, v, mark)
+							break
+						}
+					}
+					vals[i] = v
+				}
+			}
 		}
 	}
-	return inline_call(l, f, vals, lvs, chans)
+	return inline_call(l, f, vals, lvs, res_args, buf_lvs, is_buf_lv)
 }
 
 // Components of `v` converted to `base`, as slots.
@@ -1467,7 +1688,14 @@ lower_constructor :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	start := make([]int, len(args), context.temp_allocator)
 	for a, i in args {
 		mark := l.next_slot
-		vals[i] = lower_expr(l, a)
+		v := lower_expr(l, a)
+		for k in i + 1 ..< len(args) {
+			if may_write(u, args[k]) {
+				v = snapshot_val(l, v, mark)
+				break
+			}
+		}
+		vals[i] = v
 		made[i] = producer(l, vals[i], mark)
 	}
 	n := cc(l, t)
@@ -1595,6 +1823,22 @@ owned :: proc(l: ^Lower, v: Val, mark: i32) -> bool {
 	return v.slot >= mark && !is_const
 }
 
+// Copies `v` into fresh slots when it is a mutable variable/global slot that
+// a subsequent sibling expression could overwrite before `v` is consumed.
+@(private)
+snapshot_val :: proc(l: ^Lower, v: Val, mark: i32) -> Val {
+	if owned(l, v, mark) || v.slot < l.globals[0] {
+		return v
+	}
+	if _, is_const := slot_const(l, v.slot); is_const {
+		return v
+	}
+	n := cc(l, v.t)
+	s := alloc_slots(l, n)
+	emit(l, .Mov, n = n, dst = s, a = v.slot)
+	return {s, v.t}
+}
+
 // The instruction that has just made `v`, owned: the last one, writing
 // every lane of v's slots, which are the last allocated (so v is not part
 // of a larger value). It can write where the value is going instead (-1:
@@ -1615,7 +1859,7 @@ producer :: proc(l: ^Lower, v: Val, mark: i32) -> int {
 // Instructions whose dst is not a value they make whole: masked stores,
 // masks and jumps.
 @(private)
-MASKED_OPS :: bit_set[VM_Op;u128]{.Nop, .Store, .Store_Zero, .Store_Dyn, .Mask_Copy, .Mask_Cond, .Mask_Restore, .Mask_Or, .Mask_Clear, .Mask_Kill, .Jump, .Jump_If_None}
+MASKED_OPS :: bit_set[VM_Op;u128]{.Nop, .Store, .Store_Zero, .Store_Dyn, .Store_Buf, .Image_Store, .Mask_Copy, .Mask_Cond, .Mask_Restore, .Mask_Or, .Mask_Clear, .Mask_Kill, .Jump, .Jump_If_None}
 
 // A run of registers.
 @(private)
@@ -1678,14 +1922,20 @@ instr_slots :: proc(in_: Instr) -> (writes: Slots, reads: [4]Slots, pure: bool) 
 		// sampler.
 		reads[0] = {a, 1}
 	case .Load_Buf:
-		// The run's buffers, which do not change during it.
-		reads[0] = {a, 1}
-	case .Texture, .Texture_Bias:
+		// Read-only buffers do not change during a run; writable ones can.
+		if d != 0 {
+			pure = false
+		} else {
+			reads[0] = {a, 1}
+		}
+	case .Image_Size:
+		writes.n = 2
+	case .Texture, .Texture_Bias, .Image_Load:
 		writes.n, pure = 4, false
 	case .Store, .Store_Zero, .Store_Dyn, .Load_Dyn, .Deriv_X, .Deriv_Y, .Fwidth:
 		pure = false
 	case:
-		// Masks, jumps and Nop write no registers.
+		// Masks, jumps, Store_Buf, Image_Store and Nop write no registers.
 		writes.n, pure = 0, false
 	}
 	return
@@ -1829,6 +2079,16 @@ trim_buffer_loads :: proc(p: ^Program, blocks: []Slots) {
 			mark(used, {in_.b, 1})
 		case .Store, .Deriv_X, .Deriv_Y, .Fwidth:
 			mark(used, {in_.a, n})
+		case .Load_Buf:
+			mark(used, {in_.a, 1})
+		case .Store_Buf:
+			mark(used, {in_.a, 1})
+			mark(used, {in_.b, n})
+		case .Image_Load:
+			mark(used, {in_.a, 2})
+		case .Image_Store:
+			mark(used, {in_.a, 2})
+			mark(used, {in_.b, 4})
 		case .Load_Dyn:
 			mark(used, blocks[block_of[in_.a]])
 			mark(used, {in_.b, 1})
@@ -1893,13 +2153,15 @@ instr_reg_fields :: proc(in_: ^Instr) -> (ptrs: [5]^i32, count: int) {
 		return {}, 0
 	case .Mask_Cond:
 		return {&in_.b, nil, nil, nil, nil}, 1
-	case .Store_Zero:
+	case .Store_Zero, .Image_Size:
 		return {&in_.dst, nil, nil, nil, nil}, 1
+	case .Store_Buf, .Image_Store:
+		return {&in_.a, &in_.b, nil, nil, nil}, 2
 	case .Mov, .Splat, .Store, .F_Neg, .I_Neg, .B_Not, .Bit_Not,
 	     .F_To_I, .F_To_U, .I_To_F, .U_To_F, .B_To_F, .F_To_B, .I_To_B,
 	     .All, .Any, .F_Fn1, .I_Fn1, .Length, .Normalize,
 	     .Transpose, .Determinant, .Inverse,
-	     .Deriv_X, .Deriv_Y, .Fwidth, .Texture_Size, .Load_Buf:
+	     .Deriv_X, .Deriv_Y, .Fwidth, .Texture_Size, .Load_Buf, .Image_Load:
 		return {&in_.dst, &in_.a, nil, nil, nil}, 2
 	case .Load_Dyn, .Store_Dyn,
 	     .F_Add, .F_Sub, .F_Mul, .F_Div,
@@ -2163,11 +2425,26 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	argx := args_of(u, id)
 	vals := make([]Val, len(argx), context.temp_allocator)
 	for a, i in argx {
-		if expr_type(u, a).base == .Sampler {
+		at := expr_type(u, a)
+		if at.base == .Sampler {
 			vals[i] = {l.sym_chan[u.exprs[a].sym], T_SAMPLER}
+		} else if at.base == .Image {
+			vals[i] = {l.sym_img[u.exprs[a].sym], at}
 		} else {
-			vals[i] = lower_expr(l, a)
+			mark := l.next_slot
+			v := lower_expr(l, a)
+			for k in i + 1 ..< len(argx) {
+				if may_write(u, argx[k]) {
+					v = snapshot_val(l, v, mark)
+					break
+				}
+			}
+			vals[i] = v
 		}
+	}
+	if b == .Image_Store {
+		emit(l, .Image_Store, n = 4, k = int(vals[0].slot), a = vals[1].slot, b = vals[2].slot)
+		return {}
 	}
 	at := vals[0].t
 	n := cc(l, t)
@@ -2202,6 +2479,10 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		emit(l, .Texture_Bias, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
 	case .Texture_Size:
 		emit(l, .Texture_Size, n = n, k = int(vals[0].slot), dst = s, a = vals[1].slot)
+	case .Image_Load:
+		emit(l, .Image_Load, n = 4, k = int(vals[0].slot), dst = s, a = vals[1].slot)
+	case .Image_Size:
+		emit(l, .Image_Size, n = 2, k = int(vals[0].slot), dst = s)
 	case .Texture_Grad:
 		// The level the derivatives pick in level 0's texels, as texture()
 		// picks it from the quad's: half the log2 of the longer one's

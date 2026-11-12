@@ -183,7 +183,7 @@ write_values :: proc(block: []u8, offset: int, t: Type, values: []f32) {
 			case .Uint, .Bool:
 				uv := u32(v) if t.base == .Uint else u32(v != 0)
 				copy(block[off:off + 4], ([^]u8)(&uv)[:4])
-			case .Void, .Sampler, .Struct:
+			case .Void, .Sampler, .Image, .Struct:
 			}
 		}
 	}

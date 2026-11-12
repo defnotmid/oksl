@@ -2092,6 +2092,8 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			emit_bytes(&e.buf, 0x0F, 0x84)       // jz target
 			append(&e.patches, Jump_Patch{len(e.buf), a})
 			emit_i32(&e.buf, 0)
+
+		case .Store_Buf, .Image_Load, .Image_Store, .Image_Size:
 		}
 	}
 
@@ -2115,7 +2117,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 
 @(private)
 jit_compile :: proc(p: ^Program) {
-	if !jit_avx2_ready || len(p.code) == 0 {
+	if !jit_avx2_ready || len(p.code) == 0 || p.stage == .Compute {
 		return
 	}
 	heap := runtime.default_allocator()

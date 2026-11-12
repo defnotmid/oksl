@@ -1,0 +1,27 @@
+#version 310 es
+precision highp uimage2D;
+
+// Write-after-read stress on a read-write storage image within each invocation:
+// every imageLoad must observe the preceding imageStore, never a subsequent
+// imageStore in the next loop iteration (catches missing pre-write Metal fence
+// at >= 128x128 dispatch).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32ui) uniform highp uimage2D ui;
+layout(std430) buffer Out {
+    uint w[];
+} b;
+
+void main() {
+    ivec2 sz = imageSize(ui);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= sz.x || p.y >= sz.y) {
+        return;
+    }
+    uint acc = 0u;
+    for (int k = 0; k < 16; ++k) {
+        imageStore(ui, p, uvec4(uint(k) * 7u + 1u));
+        acc = acc * 31u + imageLoad(ui, p).x;
+    }
+    b.w[p.y * sz.x + p.x] = acc;
+}

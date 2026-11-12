@@ -143,16 +143,21 @@ Var_Decl :: struct {
 	spec:       Spec_Id,
 	// `name[n]` after the declarator.
 	array_size: Expr_Id,
+	// A stage variable (`in`, `out`), its `layout(location = N)` (-1 when
+	// absent) and `flat`.
+	location:   i32,
+	init:       Expr_Id,
+	sym:        Sym_Id,
 	unsized:    bool,
 	is_const:   bool,
 	is_uniform: bool,
-	// A stage variable (`in`, `out`), its `layout(location = N)` (-1 when
-	// absent) and `flat`.
 	io:         Var_Io,
-	location:   i32,
 	flat:       bool,
-	init:       Expr_Id,
-	sym:        Sym_Id,
+	// Storage image qualifiers (`layout(rgba8)`, `readonly`, `writeonly`).
+	readonly:   bool,
+	writeonly:  bool,
+	bad_layout: bool,
+	format:     Image_Format,
 }
 
 Var_Io :: enum u8 {
@@ -174,6 +179,8 @@ Param :: struct {
 	array_size: Expr_Id,
 	qual:       Param_Qual,
 	is_const:   bool,
+	readonly:   bool,
+	writeonly:  bool,
 }
 
 Func_Decl :: struct {
@@ -196,15 +203,24 @@ Struct_Decl :: struct {
 // `readonly buffer Block { T name[]; } instance;`: its members are
 // Var_Decls in `Unit.vars` (the checker takes one runtime-sized array).
 Buffer_Decl :: struct {
-	pos:      Pos,
-	block:    string,
+	pos:        Pos,
+	block:      string,
 	// "" when the members are global names.
-	instance: string,
+	instance:   string,
 	// layout(...)'s packing ("" when none is given).
-	packing:  string,
-	readonly: bool,
+	packing:    string,
+	readonly:   bool,
+	writeonly:  bool,
+	bad_layout: bool,
 	// Into `Unit.vars` directly.
-	members:  Range,
+	members:    Range,
+}
+
+// One item of `layout(local_size_x = X, ...) in;` (`axis` 0..2 for x..z).
+Workgroup_Item :: struct {
+	pos:   Pos,
+	value: i64,
+	axis:  i8,
 }
 
 Top_Kind :: enum u8 {
@@ -212,6 +228,7 @@ Top_Kind :: enum u8 {
 	Vars,
 	Struct,
 	Buffer,
+	Workgroup,
 }
 
 Top :: struct {
@@ -219,9 +236,14 @@ Top :: struct {
 	fn:     Func_Decl_Id,
 	strukt: Struct_Decl_Id,
 	buffer: Buffer_Decl_Id,
-	// Declarators (Var_Ids).
+	// Vars: declarators (Var_Ids in Unit.ids). Workgroup: into Unit.workgroups.
 	vars:   Range,
 }
+
+#assert(size_of(Var_Decl) <= 64)
+#assert(size_of(Param) <= 48)
+#assert(size_of(Buffer_Decl) <= 80)
+#assert(size_of(Top) <= 24)
 
 // ---- semantic tables ------------------------------------------------------------------
 
@@ -235,13 +257,17 @@ Storage :: enum u8 {
 	Builtin_Uniform,
 	// A `uniform shader` child or a sampler (index: its channel).
 	Channel,
-	// A read-only storage buffer's runtime-sized array, typed as its
-	// element (index: the buffer's place among the shader's buffers). Only
-	// Buffer_Load reads it.
+	// A storage buffer's runtime-sized array, typed as its element (index:
+	// the buffer's place among Module.storage_buffers).
 	Buffer,
 	// The stage's inputs and outputs (Checked.interface).
 	Stage_In,
 	Stage_Out,
+	// A `uniform image2D` / `uimage2D` / `iimage2D` (index: place among
+	// Module.storage_images).
+	Storage_Image,
+	// Compute's `gl_WorkGroupSize` (`const uvec3`).
+	Work_Group_Size,
 }
 
 Symbol :: struct {
@@ -261,12 +287,13 @@ Symbol :: struct {
 }
 
 Func :: struct {
-	name:    string,
-	ret:     Type_Id,
+	name:         string,
+	ret:          Type_Id,
 	// Into `Unit.func_params`.
-	params:  Range,
-	decl:    Func_Decl_Id,
-	defined: bool,
+	params:       Range,
+	decl:         Func_Decl_Id,
+	defined:      bool,
+	writes_state: bool,
 }
 
 Func_Param :: struct {
@@ -309,6 +336,7 @@ Unit :: struct {
 	func_decls:   [dynamic]Func_Decl,
 	struct_decls: [dynamic]Struct_Decl,
 	buffer_decls: [dynamic]Buffer_Decl,
+	workgroups:   [dynamic]Workgroup_Item,
 	tops:         [dynamic]Top,
 	ids:          [dynamic]u32,
 	// Semantics.
@@ -341,6 +369,7 @@ unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass 
 	u.func_decls = make([dynamic]Func_Decl)
 	u.struct_decls = make([dynamic]Struct_Decl)
 	u.buffer_decls = make([dynamic]Buffer_Decl)
+	u.workgroups = make([dynamic]Workgroup_Item)
 	u.tops = make([dynamic]Top)
 	u.ids = make([dynamic]u32)
 	u.types = make([dynamic]Type)
@@ -380,6 +409,7 @@ unit_copy_syntax :: proc(dst, src: ^Unit) {
 	copy_array(&dst.func_decls, src.func_decls)
 	copy_array(&dst.struct_decls, src.struct_decls)
 	copy_array(&dst.buffer_decls, src.buffer_decls)
+	copy_array(&dst.workgroups, src.workgroups)
 	copy_array(&dst.tops, src.tops)
 	copy_array(&dst.ids, src.ids)
 }
@@ -443,8 +473,150 @@ target_sym :: proc "contextless" (u: ^Unit, id: Expr_Id) -> Sym_Id {
 	return u.exprs[id].sym if u.exprs[id].kind == .Ident else 0
 }
 
+// The root Buffer_Load expression and buffer symbol of a buffer element
+// target (`buf[i]`, `buf[i].field`, `buf[i].v.xy`, `buf[i].v[k]`), or 0.
+target_buffer :: proc "contextless" (u: ^Unit, id: Expr_Id) -> (Expr_Id, Sym_Id) {
+	id := id
+	for u.exprs[id].kind == .Index || u.exprs[id].kind == .Field {
+		id = u.exprs[id].a
+	}
+	if u.exprs[id].kind == .Buffer_Load {
+		return id, u.exprs[id].sym
+	}
+	return 0, 0
+}
+
+// Decomposed storage-buffer lvalue: element `elem_idx` of `sym` (`stride_words`
+// words per element), plus static `word_off` words, addressing either a whole
+// `type` (`swz_len == 0 && dyn_comp == 0`), a multi-component vector swizzle
+// (`swz[0 ..< swz_len]`), or a dynamically indexed vector component (`dyn_comp`).
+Buf_Path :: struct {
+	sym:          Sym_Id,
+	elem_idx:     Expr_Id,
+	stride_words: int,
+	word_off:     int,
+	type:         Type,
+	swz:          [4]u8,
+	swz_len:      int,
+	dyn_comp:     Expr_Id,
+	dyn_rows:     int,
+	dyn_swz:      [4]u8,
+	dyn_swz_len:  int,
+}
+
+buf_path :: proc(u: ^Unit, id: Expr_Id) -> (p: Buf_Path, ok: bool) {
+	steps := make([dynamic]Expr_Id, 0, 8, context.temp_allocator)
+	cur := id
+	for cur != 0 {
+		ce := u.exprs[cur]
+		if ce.kind == .Buffer_Load {
+			p.sym = ce.sym
+			p.elem_idx = ce.b
+			et := ty(u, ce.type)
+			p.stride_words = std430_stride(u, et) / 4
+			p.type = et
+			ok = true
+			break
+		}
+		if ce.kind == .Field || ce.kind == .Index {
+			append(&steps, cur)
+			cur = ce.a
+		} else {
+			return {}, false
+		}
+	}
+	if !ok {
+		return {}, false
+	}
+	#reverse for step in steps {
+		se := u.exprs[step]
+		#partial switch se.kind {
+		case .Field:
+			if se.swizzle_len == 0 {
+				p.word_off += std430_field_offset(u, p.type.strukt, se.field) / 4
+				p.type = ty(u, se.type)
+			} else if is_scalar(p.type) {
+				p.type = ty(u, se.type)
+			} else if se.swizzle_len == 1 {
+				c := int(se.swizzle[0])
+				p.word_off += int(p.swz[c]) if p.swz_len > 0 else c
+				p.swz_len = 0
+				p.type = ty(u, se.type)
+			} else {
+				if p.swz_len == 0 {
+					p.swz = se.swizzle
+				} else {
+					composed: [4]u8
+					for k in 0 ..< int(se.swizzle_len) {
+						composed[k] = p.swz[se.swizzle[k]]
+					}
+					p.swz = composed
+				}
+				p.swz_len = int(se.swizzle_len)
+				p.type = ty(u, se.type)
+			}
+		case .Index:
+			ix := u.exprs[se.b]
+			if ix.kind == .Int_Lit || ix.kind == .Uint_Lit {
+				c := clamp(int(ix.value), 0, int(p.type.rows) - 1)
+				p.word_off += int(p.swz[c]) if p.swz_len > 0 else c
+				p.swz_len = 0
+			} else {
+				p.dyn_comp = se.b
+				p.dyn_rows = int(p.type.rows)
+				p.dyn_swz = p.swz
+				p.dyn_swz_len = p.swz_len
+				p.swz_len = 0
+			}
+			p.type = ty(u, se.type)
+		}
+	}
+	return p, true
+}
+
 lit_f64 :: #force_inline proc "contextless" (e: Expr) -> f64 {
 	return transmute(f64)e.value
+}
+
+// True when evaluating `id` may mutate a variable, global, storage buffer or
+// storage image (assignment, ++/--, imageStore, or a user call with out/inout
+// parameters or side effects).
+may_write :: proc "contextless" (u: ^Unit, id: Expr_Id) -> bool {
+	if id == 0 {
+		return false
+	}
+	e := u.exprs[id]
+	#partial switch e.kind {
+	case .Assign, .Pre_Inc, .Pre_Dec, .Post_Inc, .Post_Dec:
+		return true
+	case .Unary, .Convert, .Field, .Length:
+		return may_write(u, e.a)
+	case .Binary, .Index, .Comma, .Buffer_Load:
+		return may_write(u, e.a) || may_write(u, e.b)
+	case .Ternary:
+		return may_write(u, e.a) || may_write(u, e.b) || may_write(u, e.c)
+	case .Call:
+		if e.call == .Builtin && e.builtin == .Image_Store {
+			return true
+		}
+		if e.call == .User {
+			fn := u.funcs[e.func]
+			if fn.writes_state {
+				return true
+			}
+			for p in u.func_params[fn.params.start:][:fn.params.count] {
+				if p.qual != .In {
+					return true
+				}
+			}
+		}
+		for i in u.ids[e.args.start:][:e.args.count] {
+			if may_write(u, Expr_Id(i)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ---- traversal ------------------------------------------------------------------------
