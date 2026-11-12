@@ -1,5 +1,6 @@
 package oksl
 
+import "base:intrinsics"
 import "core:math"
 import "core:math/linalg"
 
@@ -177,6 +178,10 @@ BATCH_H :: LANES / BATCH_W
 
 @(private)
 runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) {
+	if p.jit_body != nil {
+		jit_runner_run(p, uniforms, width, height, opts, out, stride, targets, scratch)
+		return
+	}
 	x0, y0 := opts.x, opts.y
 	w, h := opts.w, opts.h
 	if w <= 0 || h <= 0 {
@@ -347,6 +352,10 @@ run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: 
 	if count <= 0 {
 		return
 	}
+	if p.jit_body != nil {
+		jit_run_vertex(p, uniforms, attributes, count, position, varyings, scratch, opts)
+		return
+	}
 	r := runner_begin(p, scratch, uniforms, opts)
 	n := p.varying_floats
 	for first := 0; first < count; first += LANES {
@@ -446,6 +455,10 @@ run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, targets
 	if quads.count <= 0 {
 		return
 	}
+	if p.jit_body != nil {
+		jit_run_fragment(p, uniforms, quads, targets, shaded, scratch, opts, sample_masks)
+		return
+	}
 	r := runner_begin(p, scratch, uniforms, opts)
 	total := quads.count * 4
 	// The output at each location (n == 0: none).
@@ -539,7 +552,7 @@ run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, targets
 // already integral.
 @(private)
 ffloor :: #force_inline proc "contextless" (x: f32) -> f32 {
-	if !(abs(x) < 8388608) {
+	if !(abs(x) < 8388608) || x == 0 {
 		return x
 	}
 	t := f32(i32(x))
@@ -554,6 +567,12 @@ fceil :: #force_inline proc "contextless" (x: f32) -> f32 {
 // A register's lanes as floats.
 @(private)
 F_Lanes :: [LANES]f32
+
+@(private)
+Simd_U8 :: #simd[8]u32
+
+@(private)
+LANE_BIT :: Simd_U8{1, 2, 4, 8, 16, 32, 64, 128}
 
 @(private)
 fl :: #force_inline proc "contextless" (r: ^Reg) -> ^F_Lanes {
@@ -971,10 +990,17 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 			if exec == {} {
 				break
 			}
+			ebits := u64(transmute(Lane_Bits)exec)
+			km: [LANES / 8]Simd_U8
+			#unroll for k in 0 ..< LANES / 8 {
+				km[k] = intrinsics.simd_lanes_ne(Simd_U8(u32(u8(ebits >> uint(k * 8)))) & LANE_BIT, Simd_U8(0))
+			}
 			for i in 0 ..< i32(n) {
-				for l in 0 ..< LANES {
-					keep := u32(0) - u32(l in exec)
-					regs[dst + i][l] = (regs[a + i][l] & keep) | (regs[dst + i][l] & ~keep)
+				d, x := &regs[dst + i], &regs[a + i]
+				#unroll for k in 0 ..< LANES / 8 {
+					dp := (^Simd_U8)(&d[k * 8])
+					xp := (^Simd_U8)(&x[k * 8])
+					intrinsics.unaligned_store(dp, intrinsics.simd_select(km[k], intrinsics.unaligned_load(xp), intrinsics.unaligned_load(dp)))
 				}
 			}
 		case .Store_Zero:
@@ -987,9 +1013,16 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 			if exec == {} {
 				break
 			}
+			ebits := u64(transmute(Lane_Bits)exec)
+			km: [LANES / 8]Simd_U8
+			#unroll for k in 0 ..< LANES / 8 {
+				km[k] = intrinsics.simd_lanes_eq(Simd_U8(u32(u8(ebits >> uint(k * 8)))) & LANE_BIT, Simd_U8(0))
+			}
 			for i in 0 ..< i32(n) {
-				for l in 0 ..< LANES {
-					regs[dst + i][l] &= u32(0) - u32(l not_in exec)
+				d := &regs[dst + i]
+				#unroll for k in 0 ..< LANES / 8 {
+					dp := (^Simd_U8)(&d[k * 8])
+					intrinsics.unaligned_store(dp, intrinsics.unaligned_load(dp) & km[k])
 				}
 			}
 		case .Load_Dyn:
@@ -1188,7 +1221,8 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 			un_lanes(regs, in_, .I_To_B)
 		case .Select:
 			for i in 0 ..< i32(n) {
-				ra, rb, rc, rd := &regs[a + i], &regs[b + i], &regs[c + i], &regs[dst + i]
+				ra, rb, rd := &regs[a + i], &regs[b + i], &regs[dst + i]
+				rc := &regs[c] if in_.k == 1 else &regs[c + i]
 				for l in 0 ..< LANES {
 					m := u32(0) - u32(rc[l] != 0)
 					rd[l] = (ra[l] & m) | (rb[l] & ~m)
@@ -1247,14 +1281,15 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 				}
 			}
 		case .Dot:
-			sum: F_Lanes
-			for i in 0 ..< i32(n) {
+			sum := fl(&regs[a])^ * fl(&regs[b])^
+			for i in 1 ..< i32(n) {
 				sum += fl(&regs[a + i])^ * fl(&regs[b + i])^
 			}
 			fl(&regs[dst])^ = sum
 		case .Length:
-			sum: F_Lanes
-			for i in 0 ..< i32(n) {
+			x0 := fl(&regs[a])^
+			sum := x0 * x0
+			for i in 1 ..< i32(n) {
 				x := fl(&regs[a + i])^
 				sum += x * x
 			}
@@ -1263,8 +1298,9 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 			}
 			fl(&regs[dst])^ = sum
 		case .Distance:
-			sum: F_Lanes
-			for i in 0 ..< i32(n) {
+			d0 := fl(&regs[a])^ - fl(&regs[b])^
+			sum := d0 * d0
+			for i in 1 ..< i32(n) {
 				d := fl(&regs[a + i])^ - fl(&regs[b + i])^
 				sum += d * d
 			}
@@ -1273,8 +1309,9 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 			}
 			fl(&regs[dst])^ = sum
 		case .Normalize:
-			sum: F_Lanes
-			for i in 0 ..< i32(n) {
+			x0 := fl(&regs[a])^
+			sum := x0 * x0
+			for i in 1 ..< i32(n) {
 				x := fl(&regs[a + i])^
 				sum += x * x
 			}
@@ -1293,9 +1330,9 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 		case .Faceforward, .Reflect, .Refract:
 			// N/I in a, I/N in b (GLSL argument order); faceforward's
 			// dot is Nref's (c) with I.
-			d: F_Lanes
 			x := c if in_.op == .Faceforward else a
-			for i in 0 ..< i32(n) {
+			d := fl(&regs[x])^ * fl(&regs[b])^
+			for i in 1 ..< i32(n) {
 				d += fl(&regs[x + i])^ * fl(&regs[b + i])^
 			}
 			#partial switch in_.op {
@@ -1330,8 +1367,8 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 			rows, inner, cols := n, int(in_.k), int(in_.d)
 			for col in 0 ..< cols {
 				for row in 0 ..< rows {
-					sum: F_Lanes
-					for k in 0 ..< inner {
+					sum := fl(&regs[a + i32(row)])^ * fl(&regs[b + i32(col * inner)])^
+					for k in 1 ..< inner {
 						sum += fl(&regs[a + i32(k * rows + row)])^ * fl(&regs[b + i32(col * inner + k)])^
 					}
 					fl(&regs[dst + i32(col * rows + row)])^ = sum
@@ -1340,8 +1377,8 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 		case .Vec_Mat:
 			rows, cols := n, int(in_.k)
 			for col in 0 ..< cols {
-				sum: F_Lanes
-				for row in 0 ..< rows {
+				sum := fl(&regs[a])^ * fl(&regs[b + i32(col * rows)])^
+				for row in 1 ..< rows {
 					sum += fl(&regs[a + i32(row)])^ * fl(&regs[b + i32(col * rows + row)])^
 				}
 				fl(&regs[dst + i32(col)])^ = sum
@@ -1440,6 +1477,9 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 		case .Mask_Kill:
 			masks[dst] += exec
 			masks[MASK_EXEC] = {}
+			if dst == MASK_DISCARD && r.lanes <= masks[MASK_DISCARD] {
+				return
+			}
 		case .Jump:
 			pc = int(a)
 		case .Jump_If_None:

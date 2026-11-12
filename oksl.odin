@@ -307,6 +307,7 @@ destroy :: proc(m: ^Module) {
 	if m == nil {
 		return
 	}
+	jit_destroy(&m.program)
 	virtual.arena_destroy(&m.arena)
 	free(m)
 }

@@ -1,11 +1,15 @@
 package oksl
 
+import "base:runtime"
+
 // CPU backend, part 1: lowering. Functions are inlined (recursion is
 // rejected) into one flat instruction array over SoA registers: a slot is
-// one scalar component for LANES pixels. Divergent control flow runs every
-// path with execution masks; only stores to variables honour the mask, so
+// one scalar component across a batch of pixels, and dead slots are reused
+// across non-overlapping live ranges. Divergent control flow runs every path
+// with execution masks; only stores to variables honour the mask, so
 // temporaries are computed for all lanes (helper lanes keep derivatives
-// right).
+// right). On supported hosts, `jit_compile` lowers the program directly into
+// native SIMD machine code (`vm_jit.odin`).
 
 LANES :: 64
 // A set of lanes (execution, discard, break, ... masks).
@@ -80,7 +84,7 @@ VM_Op :: enum u8 {
 	B_To_F,
 	F_To_B,
 	I_To_B,
-	// dst = c-lane ? a : b, per component (cond has n components).
+	// dst = c-lane ? a : b, per component (k = 1: cond c is scalar).
 	Select,
 	// Scalar bool: all / any of n components.
 	All,
@@ -178,6 +182,10 @@ Program :: struct {
 	outputs:    []Program_Var,
 	// Floats per vertex in the varyings' record.
 	varying_floats: int,
+	// Optional native machine code compiled from `code` (`vm_jit.odin`).
+	jit_mem:  []byte,
+	jit_init: rawptr,
+	jit_body: rawptr,
 }
 
 // A stage variable's registers.
@@ -213,6 +221,7 @@ Lower :: struct {
 	u:         ^Unit,
 	checked:   ^Checked,
 	code:      [dynamic]Instr,
+	blocks:    [dynamic]Slots,
 	next_slot: i32,
 	next_mask: i32,
 	sym_slot:  []i32,
@@ -238,11 +247,13 @@ Lower :: struct {
 }
 
 build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
+	heap := runtime.default_allocator()
 	l := Lower {
-		u         = u,
-		checked   = c,
-		code      = make([dynamic]Instr),
-		next_mask = 2,
+		u          = u,
+		checked    = c,
+		code       = make([dynamic]Instr),
+		blocks     = make([dynamic]Slots, 0, len(u.exprs) + 32, heap),
+		next_mask  = 2,
 		sym_slot  = make([]i32, len(u.syms)),
 		sym_chan  = make([]i32, len(u.syms)),
 		consts    = make(map[u32]i32),
@@ -327,7 +338,11 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	p.num_masks = int(l.next_mask)
 	p.consts = l.const_list[:]
 	p.fills = l.fills[:]
+	trim_buffer_loads(&p, l.blocks[:])
 	hoist_uniform(&p)
+	pack_slots(&p, l.blocks[:])
+	delete(l.blocks)
+	jit_compile(&p)
 	return p
 }
 
@@ -372,7 +387,9 @@ here :: proc(l: ^Lower) -> i32 {
 @(private)
 alloc_slots :: proc(l: ^Lower, n: int) -> i32 {
 	s := l.next_slot
-	l.next_slot += i32(max(n, 1))
+	w := i32(max(n, 1))
+	l.next_slot += w
+	append(&l.blocks, Slots{s, w})
 	return s
 }
 
@@ -668,9 +685,21 @@ lower_stmt :: proc(l: ^Lower, id: Stmt_Id) {
 	}
 	st := u.stmts[id]
 	switch st.kind {
-	case .Empty, .Block:
-		for b in list(u, st.body) {
+	case .Empty:
+	case .Block:
+		stmts := list(u, st.body)
+		skips: [32]int
+		n_skips := 0
+		for b, i in stmts {
 			lower_stmt(l, Stmt_Id(b))
+			if i + 1 < len(stmts) && n_skips < len(skips) && kills_lanes(u, Stmt_Id(b), false, false) {
+				skips[n_skips] = emit(l, .Jump_If_None)
+				n_skips += 1
+			}
+		}
+		end := here(l)
+		for j in skips[:n_skips] {
+			l.code[j].a = end
 		}
 	case .Decl:
 		for d in list(u, st.decls) {
@@ -702,12 +731,19 @@ lower_stmt :: proc(l: ^Lower, id: Stmt_Id) {
 		c := lower_expr(l, st.expr)
 		save := alloc_mask(l)
 		emit(l, .Mask_Copy, dst = save, a = MASK_EXEC)
-		emit(l, .Mask_Cond, dst = MASK_EXEC, a = save, b = c.slot)
-		skip_then := emit(l, .Jump_If_None)
-		lower_stmt(l, st.then_)
-		l.code[skip_then].a = here(l)
-		if st.else_ != 0 {
-			emit(l, .Mask_Cond, k = 1, dst = MASK_EXEC, a = save, b = c.slot)
+		if st.else_ == 0 {
+			emit(l, .Mask_Cond, dst = MASK_EXEC, a = save, b = c.slot)
+			skip_then := emit(l, .Jump_If_None)
+			lower_stmt(l, st.then_)
+			l.code[skip_then].a = here(l)
+		} else {
+			then_m := alloc_mask(l)
+			emit(l, .Mask_Cond, dst = then_m, a = save, b = c.slot)
+			emit(l, .Mask_Copy, dst = MASK_EXEC, a = then_m)
+			skip_then := emit(l, .Jump_If_None)
+			lower_stmt(l, st.then_)
+			l.code[skip_then].a = here(l)
+			emit(l, .Mask_Restore, dst = MASK_EXEC, a = save, b = then_m, c = -1, d = -1)
 			skip_else := emit(l, .Jump_If_None)
 			lower_stmt(l, st.else_)
 			l.code[skip_else].a = here(l)
@@ -805,6 +841,41 @@ always_returns :: proc(u: ^Unit, id: Stmt_Id) -> bool {
 		}
 	case .If:
 		return st.else_ != 0 && always_returns(u, st.then_) && always_returns(u, st.else_)
+	}
+	return false
+}
+
+// Whether `id` can remove lanes from the enclosing block's MASK_EXEC
+// (return, discard, or a break/continue not caught inside `id`).
+@(private)
+kills_lanes :: proc(u: ^Unit, id: Stmt_Id, in_loop, in_switch: bool) -> bool {
+	if id == 0 {
+		return false
+	}
+	st := u.stmts[id]
+	#partial switch st.kind {
+	case .Return, .Discard:
+		return true
+	case .Break:
+		return !in_loop && !in_switch
+	case .Continue:
+		return !in_loop
+	case .Block:
+		for s in list(u, st.body) {
+			if kills_lanes(u, Stmt_Id(s), in_loop, in_switch) {
+				return true
+			}
+		}
+	case .If:
+		return kills_lanes(u, st.then_, in_loop, in_switch) || kills_lanes(u, st.else_, in_loop, in_switch)
+	case .Switch:
+		for s in list(u, st.body) {
+			if kills_lanes(u, Stmt_Id(s), in_loop, true) {
+				return true
+			}
+		}
+	case .For, .While, .Do_While:
+		return kills_lanes(u, st.then_, true, in_switch)
 	}
 	return false
 }
@@ -1066,25 +1137,40 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	case .Pre_Inc, .Pre_Dec, .Post_Inc, .Post_Dec:
 		lv := lower_lvalue(l, e.a)
 		cur := load_lv(l, lv)
+		inc := e.kind == .Pre_Inc || e.kind == .Post_Inc
+		if e.kind == .Pre_Inc || e.kind == .Pre_Dec {
+			nv := binop_vm(l, .Plus if inc else .Minus, cur, const_val(l, t.base, 1), t)
+			store_lv(l, lv, nv)
+			return nv
+		}
 		n := cc(l, t)
 		old := alloc_slots(l, n)
 		emit(l, .Mov, n = n, dst = old, a = cur.slot)
-		inc := e.kind == .Pre_Inc || e.kind == .Post_Inc
-		nv := binop_vm(l, .Plus if inc else .Minus, {old, t}, const_val(l, t.base, 1), t)
+		nv := binop_vm(l, .Plus if inc else .Minus, cur, const_val(l, t.base, 1), t)
 		store_lv(l, lv, nv)
-		return nv if e.kind == .Pre_Inc || e.kind == .Pre_Dec else Val{old, t}
+		return {old, t}
 	case .Ternary:
 		c := lower_expr(l, e.a)
 		n := cc(l, t)
+		budget := 12
+		if can_select_expr(u, e.b, &budget) && can_select_expr(u, e.c, &budget) {
+			va := widen(l, lower_expr(l, e.b), n)
+			vb := widen(l, lower_expr(l, e.c), n)
+			res := alloc_slots(l, n)
+			emit(l, .Select, n = n, k = 1, dst = res, a = va, b = vb, c = c.slot)
+			return {res, t}
+		}
 		res := alloc_slots(l, n)
 		save := alloc_mask(l)
+		then_m := alloc_mask(l)
 		emit(l, .Mask_Copy, dst = save, a = MASK_EXEC)
-		emit(l, .Mask_Cond, dst = MASK_EXEC, a = save, b = c.slot)
+		emit(l, .Mask_Cond, dst = then_m, a = save, b = c.slot)
+		emit(l, .Mask_Copy, dst = MASK_EXEC, a = then_m)
 		skip_a := emit(l, .Jump_If_None)
 		va := lower_expr(l, e.b)
 		emit(l, .Store, n = n, dst = res, a = widen(l, va, n))
 		l.code[skip_a].a = here(l)
-		emit(l, .Mask_Cond, k = 1, dst = MASK_EXEC, a = save, b = c.slot)
+		emit(l, .Mask_Restore, dst = MASK_EXEC, a = save, b = then_m, c = -1, d = -1)
 		skip_b := emit(l, .Jump_If_None)
 		vb := lower_expr(l, e.c)
 		emit(l, .Store, n = n, dst = res, a = widen(l, vb, n))
@@ -1167,6 +1253,45 @@ lower_short_circuit :: proc(l: ^Lower, e: Expr) -> Val {
 	bk, cn, r := kills(l)
 	emit(l, .Mask_Restore, dst = MASK_EXEC, a = save, b = bk, c = cn, d = r)
 	return {res, T_BOOL}
+}
+
+// Whether a ternary branch is side-effect-free and small enough to evaluate
+// unconditionally for a branchless Select (no assignments, user calls,
+// texture ops, buffer loads or dynamic indexing).
+@(private)
+can_select_expr :: proc(u: ^Unit, id: Expr_Id, budget: ^int) -> bool {
+	if id == 0 || budget^ <= 0 {
+		return false
+	}
+	budget^ -= 1
+	e := u.exprs[id]
+	#partial switch e.kind {
+	case .Int_Lit, .Uint_Lit, .Float_Lit, .Bool_Lit, .Ident, .Length:
+		return true
+	case .Convert, .Unary, .Field:
+		return can_select_expr(u, e.a, budget)
+	case .Index:
+		ix := u.exprs[e.b]
+		return (ix.kind == .Int_Lit || ix.kind == .Uint_Lit) && can_select_expr(u, e.a, budget)
+	case .Binary:
+		return e.op != .And_And && e.op != .Or_Or && can_select_expr(u, e.a, budget) && can_select_expr(u, e.b, budget)
+	case .Ternary:
+		return can_select_expr(u, e.a, budget) && can_select_expr(u, e.b, budget) && can_select_expr(u, e.c, budget)
+	case .Call:
+		if e.call == .User {
+			return false
+		}
+		if e.call == .Builtin && (e.builtin == .Texture || e.builtin == .Texture_Lod || e.builtin == .Texture_Grad || e.builtin == .Texture_Size) {
+			return false
+		}
+		for a in args_of(u, id) {
+			if !can_select_expr(u, a, budget) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 @(private)
@@ -1524,7 +1649,9 @@ instr_slots :: proc(in_: Instr) -> (writes: Slots, reads: [4]Slots, pure: bool) 
 		reads[1] = {b, 1 if k & 2 != 0 else n}
 	case .I_Add, .I_Sub, .I_Mul, .I_Div, .U_Div, .I_Rem, .U_Rem, .Bit_And, .Bit_Or, .Bit_Xor, .Shl, .Shr_I, .Shr_U, .F_Lt, .F_Le, .F_Gt, .F_Ge, .F_Eq, .F_Ne, .I_Lt, .I_Le, .I_Gt, .I_Ge, .U_Lt, .U_Le, .U_Gt, .U_Ge, .I_Eq, .I_Ne, .B_And, .B_Or, .F_Fn2, .I_Fn2, .U_Fn2, .Reflect:
 		reads[0], reads[1] = {a, n}, {b, n}
-	case .Select, .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward:
+	case .Select:
+		reads[0], reads[1], reads[2] = {a, n}, {b, n}, {c, 1 if k == 1 else n}
+	case .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward:
 		reads[0], reads[1], reads[2] = {a, n}, {b, n}, {c, n}
 	case .Refract:
 		reads[0], reads[1], reads[2] = {a, n}, {b, n}, {c, 1}
@@ -1653,6 +1780,378 @@ hoist_uniform :: proc(p: ^Program) {
 		back += 1
 	}
 	p.init_len = count
+}
+
+// Shrinks each Load_Buf to the [lo, hi] component span the program actually
+// reads (e.g. `P(10).w`, `members.rows[i].clip`), dropping unread loads.
+@(private)
+trim_buffer_loads :: proc(p: ^Program, blocks: []Slots) {
+	has_load := false
+	for in_ in p.code {
+		if in_.op == .Load_Buf {
+			has_load = true
+			break
+		}
+	}
+	if !has_load || p.num_slots == 0 {
+		return
+	}
+	heap := runtime.default_allocator()
+	block_of := make([]i32, p.num_slots, heap)
+	defer delete(block_of, heap)
+	for b, bi in blocks {
+		for k in 0 ..< b.n {
+			block_of[b.start + k] = i32(bi)
+		}
+	}
+	used := make([]bool, p.num_slots, heap)
+	defer delete(used, heap)
+	mark :: proc(used: []bool, s: Slots) {
+		for i in s.start ..< s.start + s.n {
+			used[i] = true
+		}
+	}
+	for v in p.outputs {
+		mark(used, {v.slot, v.n})
+	}
+	for in_ in p.code {
+		_, reads, pure := instr_slots(in_)
+		if pure {
+			for r in reads {
+				mark(used, r)
+			}
+			continue
+		}
+		n := i32(in_.n)
+		#partial switch in_.op {
+		case .Texture, .Texture_Bias:
+			mark(used, {in_.a, n})
+			mark(used, {in_.b, 1})
+		case .Store, .Deriv_X, .Deriv_Y, .Fwidth:
+			mark(used, {in_.a, n})
+		case .Load_Dyn:
+			mark(used, blocks[block_of[in_.a]])
+			mark(used, {in_.b, 1})
+		case .Store_Dyn:
+			mark(used, {in_.a, n})
+			mark(used, {in_.b, 1})
+		case .Mask_Cond:
+			mark(used, {in_.b, 1})
+		}
+	}
+	dropped := false
+	for &in_ in p.code {
+		if in_.op != .Load_Buf {
+			continue
+		}
+		n := i32(in_.n)
+		lo, hi := i32(-1), i32(-1)
+		for i in 0 ..< n {
+			if used[in_.dst + i] {
+				if lo < 0 {
+					lo = i
+				}
+				hi = i
+			}
+		}
+		if lo < 0 {
+			in_ = Instr{op = .Nop}
+			dropped = true
+		} else {
+			in_.dst += lo
+			in_.c = i32(u32(in_.c) + u32(lo))
+			in_.n = u8(hi - lo + 1)
+		}
+	}
+	if dropped {
+		remap := make([]i32, len(p.code) + 1, heap)
+		defer delete(remap, heap)
+		out := 0
+		for in_, i in p.code {
+			remap[i] = i32(out)
+			if in_.op != .Nop {
+				p.code[out] = in_
+				out += 1
+			}
+		}
+		remap[len(p.code)] = i32(out)
+		p.code = p.code[:out]
+		for &in_ in p.code {
+			if in_.op == .Jump || in_.op == .Jump_If_None {
+				in_.a = remap[in_.a]
+			}
+		}
+	}
+}
+
+// Pointers to the register-slot fields in `in_` (excluding mask indices,
+// jump targets, buffer strides/offsets and matrix column counts).
+@(private)
+instr_reg_fields :: proc(in_: ^Instr) -> (ptrs: [5]^i32, count: int) {
+	switch in_.op {
+	case .Nop, .Mask_Copy, .Mask_Restore, .Mask_Or, .Mask_Clear, .Mask_Kill, .Jump, .Jump_If_None:
+		return {}, 0
+	case .Mask_Cond:
+		return {&in_.b, nil, nil, nil, nil}, 1
+	case .Store_Zero:
+		return {&in_.dst, nil, nil, nil, nil}, 1
+	case .Mov, .Splat, .Store, .F_Neg, .I_Neg, .B_Not, .Bit_Not,
+	     .F_To_I, .F_To_U, .I_To_F, .U_To_F, .B_To_F, .F_To_B, .I_To_B,
+	     .All, .Any, .F_Fn1, .I_Fn1, .Length, .Normalize,
+	     .Transpose, .Determinant, .Inverse,
+	     .Deriv_X, .Deriv_Y, .Fwidth, .Texture_Size, .Load_Buf:
+		return {&in_.dst, &in_.a, nil, nil, nil}, 2
+	case .Load_Dyn, .Store_Dyn,
+	     .F_Add, .F_Sub, .F_Mul, .F_Div,
+	     .I_Add, .I_Sub, .I_Mul, .I_Div, .U_Div, .I_Rem, .U_Rem,
+	     .F_Lt, .F_Le, .F_Gt, .F_Ge, .F_Eq, .F_Ne,
+	     .I_Lt, .I_Le, .I_Gt, .I_Ge, .U_Lt, .U_Le, .U_Gt, .U_Ge,
+	     .I_Eq, .I_Ne, .B_And, .B_Or,
+	     .Bit_And, .Bit_Or, .Bit_Xor, .Shl, .Shr_I, .Shr_U,
+	     .F_Fn2, .I_Fn2, .U_Fn2,
+	     .Dot, .Distance, .Cross, .Reflect,
+	     .Mat_Mul, .Vec_Mat, .Outer,
+	     .Texture, .Texture_Bias:
+		return {&in_.dst, &in_.a, &in_.b, nil, nil}, 3
+	case .Select, .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward, .Refract:
+		return {&in_.dst, &in_.a, &in_.b, &in_.c, nil}, 4
+	case .Gather:
+		ptrs = {&in_.dst, &in_.a, &in_.b, &in_.c, &in_.d}
+		return ptrs, 1 + int(in_.n)
+	}
+	return {}, 0
+}
+
+// Reuses dead temporary and local-variable register blocks across `code`
+// while keeping every `alloc_slots` block contiguous (so multi-component
+// ops, swizzle sub-slices, struct field offsets and dynamic array indexing
+// stay intact). Blocks touched by constants, uniforms, stage I/O or hoisted
+// `init` code are pinned (`last == -2`); per-batch blocks are packed by
+// linear-scan first-fit over their loop-extended live intervals.
+@(private)
+pack_slots :: proc(p: ^Program, blocks: []Slots) {
+	if len(blocks) == 0 || p.num_slots == 0 {
+		return
+	}
+	heap := runtime.default_allocator()
+	nb := len(blocks)
+	body := p.code[p.init_len:]
+	work := make([]i32, p.num_slots + 3 * nb + len(body), heap)
+	defer delete(work, heap)
+	block_of := work[:p.num_slots]
+	first := work[p.num_slots : p.num_slots + nb]
+	last := work[p.num_slots + nb : p.num_slots + 2 * nb]
+	next_bi := work[p.num_slots + 2 * nb : p.num_slots + 3 * nb]
+	head := work[p.num_slots + 3 * nb:]
+
+	for b, bi in blocks {
+		for k in 0 ..< b.n {
+			block_of[b.start + k] = i32(bi)
+		}
+	}
+	for i in 0 ..< nb {
+		first[i] = max(i32)
+		last[i] = -1
+	}
+	for c in p.consts {
+		last[block_of[c[0]]] = -2
+	}
+	for f in p.fills {
+		last[block_of[f.slot]] = -2
+	}
+	for v in p.inputs {
+		last[block_of[v.slot]] = -2
+	}
+	for v in p.outputs {
+		last[block_of[v.slot]] = -2
+	}
+	for &in_ in p.code[:p.init_len] {
+		ptrs, n := instr_reg_fields(&in_)
+		for i in 0 ..< n {
+			last[block_of[ptrs[i]^]] = -2
+		}
+	}
+
+	for &in_, pc in body {
+		ptrs, n := instr_reg_fields(&in_)
+		for i in 0 ..< n {
+			bi := block_of[ptrs[i]^]
+			if last[bi] != -2 {
+				first[bi] = min(first[bi], i32(pc))
+				last[bi] = max(last[bi], i32(pc))
+			}
+		}
+	}
+
+	Loop_Span :: struct {
+		target, end: i32,
+	}
+	loops := make([dynamic]Loop_Span, 0, 16, heap)
+	defer delete(loops)
+	for in_, pc in body {
+		if (in_.op == .Jump || in_.op == .Jump_If_None) && in_.a <= i32(pc) {
+			append(&loops, Loop_Span{in_.a, i32(pc)})
+		}
+	}
+	if len(loops) > 0 {
+		for bi in 0 ..< nb {
+			f, l := first[bi], last[bi]
+			if l < 0 {
+				continue
+			}
+			for {
+				changed := false
+				for lp in loops {
+					if f <= lp.end && l >= lp.target && (f < lp.target || l > lp.end) {
+						if f > lp.target {
+							f = lp.target
+							changed = true
+						}
+						if l < lp.end {
+							l = lp.end
+							changed = true
+						}
+					}
+				}
+				if !changed {
+					break
+				}
+			}
+			first[bi], last[bi] = f, l
+		}
+	}
+
+	for &h in head {
+		h = -1
+	}
+	for bi := nb - 1; bi >= 0; bi -= 1 {
+		if last[bi] >= 0 {
+			f := first[bi]
+			next_bi[bi] = head[f]
+			head[f] = i32(bi)
+		}
+	}
+
+	// Reuse `first` in-place to store each block's packed base slot once
+	// its start position has been read.
+	new_base := first
+	next_pinned := i32(0)
+	for b, bi in blocks {
+		if last[bi] == -2 {
+			new_base[bi] = next_pinned
+			next_pinned += b.n
+		}
+	}
+
+	free_after := make([dynamic]i32, 0, 256, heap)
+	defer delete(free_after)
+	min_end: [32]i32
+	for &m in min_end {
+		m = -1
+	}
+	for pc in 0 ..< len(body) {
+		for bi := head[pc]; bi >= 0; bi = next_bi[bi] {
+			w := int(blocks[bi].n)
+			f, l := i32(pc), last[bi]
+			placed := -1
+			if w == 1 {
+				n_slots := len(free_after)
+				n_groups := min((n_slots + 15) >> 4, len(min_end))
+				for g in 0 ..< n_groups {
+					if min_end[g] >= f {
+						continue
+					}
+					hi := min((g + 1) * 16, n_slots)
+					for pos in g * 16 ..< hi {
+						if free_after[pos] < f {
+							placed = pos
+							break
+						}
+					}
+					if placed >= 0 {
+						break
+					}
+				}
+				if placed < 0 && n_slots > len(min_end) * 16 {
+					for pos in len(min_end) * 16 ..< n_slots {
+						if free_after[pos] < f {
+							placed = pos
+							break
+						}
+					}
+				}
+			} else {
+				scan: for pos := 0; pos + w <= len(free_after); pos += 1 {
+					for k in 0 ..< w {
+						if free_after[pos + k] >= f {
+							pos += k
+							continue scan
+						}
+					}
+					placed = pos
+					break
+				}
+			}
+			if placed < 0 {
+				placed = len(free_after)
+				for placed > 0 && free_after[placed - 1] < f {
+					placed -= 1
+				}
+				for len(free_after) < placed + w {
+					append(&free_after, -1)
+				}
+			}
+			for k in 0 ..< w {
+				free_after[placed + k] = l
+			}
+			g0, g1 := placed >> 4, min((placed + w - 1) >> 4, len(min_end) - 1)
+			for g in g0 ..= g1 {
+				hi := min((g + 1) * 16, len(free_after))
+				me := free_after[g * 16]
+				for pos in g * 16 + 1 ..< hi {
+					me = min(me, free_after[pos])
+				}
+				if hi < (g + 1) * 16 {
+					me = -1
+				}
+				min_end[g] = me
+			}
+			new_base[bi] = next_pinned + i32(placed)
+		}
+	}
+
+	remap := block_of
+	for b, bi in blocks {
+		if last[bi] == -2 || last[bi] >= 0 {
+			base := new_base[bi]
+			for k in 0 ..< b.n {
+				remap[b.start + k] = base + k
+			}
+		} else {
+			for k in 0 ..< b.n {
+				remap[b.start + k] = 0
+			}
+		}
+	}
+	for &c in p.consts {
+		c[0] = u32(remap[c[0]])
+	}
+	for &f in p.fills {
+		f.slot = remap[f.slot]
+	}
+	for &v in p.inputs {
+		v.slot = remap[v.slot]
+	}
+	for &v in p.outputs {
+		v.slot = remap[v.slot]
+	}
+	for &in_ in p.code {
+		ptrs, n := instr_reg_fields(&in_)
+		for i in 0 ..< n {
+			ptrs[i]^ = remap[ptrs[i]^]
+		}
+	}
+	p.num_slots = int(next_pinned) + len(free_after)
 }
 
 @(private)

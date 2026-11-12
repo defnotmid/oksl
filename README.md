@@ -470,6 +470,15 @@ show both.
   branches on the operation. Execution masks are
   `bit_set`s of lanes. Masked stores and selects are branchless, and
   `floor` avoids `core:math`'s modf.
+- **JIT:** on x86-64 Linux and macOS when the CPU has AVX2, `compile` also
+  translates the flat program into 8-lane (two 2x2 quads per 256-bit YMM
+  register) native AVX2 code in W^X pages (allocated read-write, switched
+  read-execute, and released by `destroy`). Elsewhere, without AVX2, when
+  the OS refuses executable memory (`PROT_EXEC`), or when built with
+  `-define:OKSL_JIT=false`, runs fall back to the 64-lane interpreter with
+  the same results, apart from NaN bit patterns and values computed in
+  lanes that aren't running (both undefined on GPUs too). CI runs the tests
+  and goldens both ways and requires identical output.
 - **Uniform work:** what follows from constants and uniforms alone moves
   to the front of the program and runs once per run, before the batches,
   even from inside loops and branches: a raymarcher's `rot(iTime)` is
@@ -534,8 +543,8 @@ Data-oriented throughout:
 - **Backends:** keep per-id scratch arrays (SPIR-V ids, register slots)
   rather than fields on nodes.
 - **Memory:** a compile allocates from one arena owned by the `Module`,
-  released by `destroy`; the preprocessor expands into a scratch arena of
-  its own.
+  released by `destroy` (along with any executable pages the JIT mapped);
+  the preprocessor expands into a scratch arena of its own.
 
 The pipeline: `lexer.odin` (tokens) -> `preprocess.odin` (macro table
 indexed by id, a frame stack for rescans, flat tokens out) -> `parser.odin`
@@ -543,7 +552,8 @@ indexed by id, a frame stack for rescans, flat tokens out) -> `parser.odin`
 `inputs.odin` and `builtins.odin` tables, the Shadertoy entry adapter in
 `shadertoy.odin`, the stage entry and interface in `stage.odin`, both
 built with `nodes.odin`) ->
-`spirv.odin` / `spirv_emit.odin`, `msl.odin` and `vm.odin` / `vm_run.odin`.
+`spirv.odin` / `spirv_emit.odin`, `msl.odin` and `vm.odin` / `vm_run.odin`
+/ `vm_jit.odin`.
 `errors.odin` holds the error codes and their text. `switch` reaches each
 backend natively: SPIR-V as `OpSwitch` (fallthrough as the following
 labels' code, since structured SPIR-V only falls into the next operand),
@@ -563,6 +573,7 @@ odin test . -vet -strict-style                      # SkSL, GLSL/Shadertoy, the 
                                                     # built-ins on the CPU, control flow and switch, discard,
                                                     # uniforms, children and channels, programs, corpus
                                                     # (+ spirv-val when installed)
+odin test . -vet -strict-style -define:OKSL_JIT=false # force the portable interpreter on x86-64
 odin run tools/gpu_parity -- out_dir                # SDL_GPU vs CPU interpreter on testdata/ through the layer vertex shader, and a tap of it
 odin run tools/okslc -- a.sksl b.glsl ...           # compile (by extension: SOURCE_EXTENSIONS); -o prefix writes .spv / .metal
 odin run tools/cpu_render -- shader.sksl out.png    # CPU render

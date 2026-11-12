@@ -60,9 +60,18 @@ jobs:
         run: |
           mkdir -p build
           odin test . -vet -strict-style -out:build/oksl_test
+          odin test . -vet -strict-style -define:OKSL_JIT=false -out:build/oksl_test_vm
+
+      - name: Golden parity (JIT vs interpreter)
+        run: |
+          odin run tools/golden -o:speed -- snapshot build/golden_jit
+          odin run tools/golden -o:speed -define:OKSL_JIT=false -- snapshot build/golden_vm
+          odin run tools/golden -- compare build/golden_jit build/golden_vm
 
       - name: Build okslc
         run: odin build tools/okslc -out:build/okslc
 
-      - name: Check the macOS target
-        run: odin check . -no-entry-point -target:darwin_arm64
+      - name: Check the macOS and Windows targets
+        run: |
+          odin check . -no-entry-point -vet -strict-style -target:darwin_arm64
+          odin check . -no-entry-point -vet -strict-style -target:windows_amd64

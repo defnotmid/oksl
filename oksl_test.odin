@@ -2741,3 +2741,189 @@ void main() { vColor = color; vJoints = joints + 1u; gl_Position = vec4(0.0); }`
 		testing.expect_value(t, got, [4]u32{u32(v.joints[0]) + 1, u32(v.joints[1]) + 1, u32(v.joints[2]) + 1, u32(v.joints[3]) + 1})
 	}
 }
+
+@(test)
+test_if_and_ternary_cond_mutation :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	src := `
+uniform float u0;
+out vec4 fragColor;
+
+void main() {
+    bool b = gl_FragCoord.x < 8.0;
+    float r = 0.0;
+    if (b) {
+        b = false;
+        r += 1.0;
+    } else {
+        r += 10.0;
+    }
+    bool c = gl_FragCoord.y < 4.0;
+    float q = c ? ((c = false) ? 100.0 : 2.0) : 20.0;
+    fragColor = vec4(r, q, b ? 1.0 : 0.0, c ? 1.0 : 0.0) + u0 * 0.0;
+}
+`
+	m, errs, ok := compile_glsl(src, {no_spirv = true, no_msl = true})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	out := make([][4]f32, 16 * 8, context.temp_allocator)
+	run_f32(&m.program, block, 16, 8, out, temp_scratch())
+	for y in 0 ..< 8 {
+		for x in 0 ..< 16 {
+			got := out[y * 16 + x]
+			want_r := f32(1) if x < 8 else f32(10)
+			want_q := f32(2) if y < 4 else f32(20)
+			near(t, got, {want_r, want_q, 0, 0})
+		}
+	}
+}
+
+@(test)
+test_nan_and_jit_parity :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	src := `
+layout(std430) readonly buffer Buf { uint words[]; } buf;
+uniform float uZero;
+uniform float uVal;
+uniform uint uBig0;
+uniform uint uBig1;
+out vec4 fragColor;
+
+void main() {
+    float nan_v = uZero / uZero;
+    float pos_inf = 1.0 / uZero;
+    float neg_inf = -1.0 / uZero;
+
+    float c_nan = clamp(nan_v, 0.25, 0.75);
+    float ss_nan = smoothstep(0.0, 1.0, nan_v);
+    float mn_nan_first = min(nan_v, uVal);
+    float mn_nan_second = min(uVal, nan_v);
+    float mx_nan_first = max(nan_v, uVal);
+    float mx_nan_second = max(uVal, nan_v);
+
+    int i_nan = int(nan_v);
+    int i_hi = int(pos_inf);
+    int i_lo = int(neg_inf);
+    uint u_nan = uint(nan_v);
+    uint u_neg = uint(-3.0 + uZero);
+    uint u_hi = uint(pos_inf);
+    float uf0 = float(uBig0);
+    float uf1 = float(uBig1);
+
+    uint lane = uint(gl_FragCoord.x) + uint(gl_FragCoord.y) * 4u;
+    uint bw = buf.words[lane];
+    float arr[4] = float[4](1.0, 2.0, 3.0, 4.0);
+    float dyn_v = arr[int(lane & 3u)];
+
+    float flags = float(
+        (isnan(mn_nan_first) ? 1 : 0) +
+        (isnan(mx_nan_first) ? 2 : 0) +
+        (i_nan == 0 ? 4 : 0) +
+        (i_hi == 2147483647 ? 8 : 0) +
+        (i_lo == (-2147483647 - 1) ? 16 : 0) +
+        (u_nan == 0u ? 32 : 0) +
+        (u_neg == 0u ? 64 : 0) +
+        (u_hi == 4294967295u ? 128 : 0)
+    );
+    fragColor = vec4(
+        c_nan + ss_nan,
+        mn_nan_second + mx_nan_second,
+        flags + float(bw) + dyn_v,
+        uf0 - uf1
+    );
+}
+`
+	m, errs, ok := compile_glsl(src, {no_spirv = true, no_msl = true})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	block := make([]u8, max(m.block_size, 64), context.temp_allocator)
+	set_uniform(m, block, "uZero", {0.0})
+	set_uniform(m, block, "uVal", {1.5})
+	if u0, found := find_uniform(m, "uBig0"); found {
+		(^u32)(&block[u0.offset])^ = 0xffff_ffff
+	}
+	if u1, found := find_uniform(m, "uBig1"); found {
+		(^u32)(&block[u1.offset])^ = 0x8000_0001
+	}
+
+	words := [6]u32{10, 20, 30, 40, 50, 60}
+	bufs := [1][]u32{words[:]}
+	opts := Run_Options{buffers = bufs[:]}
+
+	out_jit := make([][4]f32, 6 * 3, context.temp_allocator)
+	out_vm := make([][4]f32, 6 * 3, context.temp_allocator)
+	run_f32(&m.program, block, 6, 3, out_jit, temp_scratch(), opts)
+
+	p_vm := m.program
+	p_vm.jit_body = nil
+	p_vm.jit_init = nil
+	run_f32(&p_vm, block, 6, 3, out_vm, temp_scratch(), opts)
+
+	for i in 0 ..< len(out_jit) {
+		x, y := i % 6, i / 6
+		lane := u32(x + y * 4)
+		want_bw := f32(words[lane]) if int(lane) < len(words) else 0
+		want_dyn := f32((lane & 3) + 1)
+		near(t, out_jit[i], {0.25, 3.0, 255.0 + want_bw + want_dyn, f32(u32(0xffff_ffff)) - f32(u32(0x8000_0001))})
+		testing.expect_value(t, transmute([4]u32)out_jit[i], transmute([4]u32)out_vm[i])
+	}
+
+	// Clamp with NaN bounds and sampler host context preservation.
+	{
+		tex_src := `
+uniform float uz;
+uniform sampler2D tex;
+out vec4 fragColor;
+void main() {
+	float n = uz / uz;
+	float x = gl_FragCoord.x - 2.0;
+	vec4 s = texture(tex, gl_FragCoord.xy * 0.25);
+	fragColor = vec4(clamp(x, n, 1.0), clamp(x, -1.0, n), clamp(n, n, 2.0), s.x);
+}
+`
+		mt, terrs, tok := compile_glsl(tex_src, {no_spirv = true, no_msl = true})
+		defer destroy(mt)
+		if !testing.expectf(t, tok, "%s", format_errors(terrs, context.temp_allocator)) {
+			return
+		}
+		tblock := make([]u8, max(mt.block_size, 16), context.temp_allocator)
+		set_uniform(mt, tblock, "uz", {0.0})
+
+		Samp_State :: struct {
+			calls: int,
+			bad:   int,
+		}
+		sampler_cb :: proc(user: rawptr, ch: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+			st := (^Samp_State)(user)
+			st.calls += 1
+			if context.user_index != 0x5eed_cafe {
+				st.bad += 1
+			}
+			return {f32(context.user_index & 0xff), 0, 0, 1}
+		}
+
+		saved_idx := context.user_index
+		context.user_index = 0x5eed_cafe
+		defer context.user_index = saved_idx
+
+		st_jit, st_vm: Samp_State
+		tout_jit := make([][4]f32, 4 * 2, context.temp_allocator)
+		tout_vm := make([][4]f32, 4 * 2, context.temp_allocator)
+		run_f32(&mt.program, tblock, 4, 2, tout_jit, temp_scratch(), {sampler = sampler_cb, user = &st_jit})
+		pm := mt.program
+		pm.jit_body = nil
+		pm.jit_init = nil
+		run_f32(&pm, tblock, 4, 2, tout_vm, temp_scratch(), {sampler = sampler_cb, user = &st_vm})
+
+		testing.expect(t, st_jit.calls == 8 && st_jit.bad == 0)
+		testing.expect(t, st_vm.calls == 8 && st_vm.bad == 0)
+		for i in 0 ..< len(tout_jit) {
+			testing.expect_value(t, transmute([4]u32)tout_jit[i], transmute([4]u32)tout_vm[i])
+		}
+	}
+}
