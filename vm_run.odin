@@ -44,7 +44,96 @@ Run_Options :: struct {
 	// The storage images for run_compute, in SDL_GPU binding order
 	// (Module.storage_images: read-only first, then read-write/writeonly).
 	// Out-of-bounds loads read 0 and out-of-bounds stores are dropped.
-	images:  []Storage_Image,
+	images:         []Storage_Image,
+	// Optional single-level 2D float images indexed by channel. Channels with
+	// `len(data) > 0` sample directly from the image (all mip levels reading
+	// level 0, `texelFetch` returning 0 out of range, `textureSize` returning
+	// `width x height`); unbound channels continue to call `sampler`.
+	channel_images: []Channel_Image,
+}
+
+Channel_Filter :: enum u8 {
+	Nearest,
+	Linear,
+}
+
+// A 2D single-level float image bound to a sampled channel on the CPU:
+// `width x height` tightly packed texels of `components` (1, 2 or 4) floats
+// in `data`, clamped to the edge, missing components reading (0, 0, 0, 1).
+// An entry with `len(data) == 0` leaves the channel unbound so
+// `Run_Options.sampler` is used.
+Channel_Image :: struct {
+	data:          []f32,
+	width, height: int,
+	components:    int,
+	filter:        Channel_Filter,
+}
+
+channel_image :: proc "contextless" (texels: []$T, width, height: int, filter := Channel_Filter.Nearest) -> Channel_Image
+	where T == f32 || T == [2]f32 || T == [4]f32 {
+	N :: size_of(T) / size_of(f32)
+	return {
+		data       = ([^]f32)(raw_data(texels))[:len(texels) * N],
+		width      = width,
+		height     = height,
+		components = N,
+		filter     = filter,
+	}
+}
+
+@(private)
+Chan_Img :: struct {
+	ptr:    [^]f32,
+	fw:     f32,
+	fh:     f32,
+	w:      i32,
+	max_x:  i32,
+	max_y:  i32,
+	comps:  u8,
+	shift:  u8,
+	filter: Channel_Filter,
+	_pad:   u8,
+}
+
+#assert(size_of(Chan_Img) == 32)
+
+@(private)
+validate_channel_images :: proc(p: ^Program, opts: Run_Options) {
+	for im, ch in opts.channel_images {
+		if len(im.data) == 0 {
+			continue
+		}
+		ensure(ch not_in p.channel_arrays, "oksl: Channel_Image cannot bind to a sampler2DArray channel")
+		ensure(im.components == 1 || im.components == 2 || im.components == 4, "oksl: Channel_Image.components must be 1, 2 or 4")
+		ensure(im.filter == .Nearest || im.filter == .Linear, "oksl: invalid Channel_Image.filter")
+		ensure(im.width > 0 && im.height > 0, "oksl: Channel_Image dimensions out of range")
+		px, p_ovf := intrinsics.overflow_mul(im.width, im.height)
+		need, n_ovf := intrinsics.overflow_mul(px, im.components)
+		ensure(!p_ovf && !n_ovf && need <= int(max(i32)), "oksl: Channel_Image dimensions out of range")
+		ensure(len(im.data) >= need, "oksl: Channel_Image.data is shorter than width * height * components")
+	}
+}
+
+@(private)
+fill_chan_imgs :: proc "contextless" (dst: ^[SAMPLER_COUNT]Chan_Img, images: []Channel_Image) {
+	n := min(len(images), SAMPLER_COUNT)
+	for i in 0 ..< n {
+		im := images[i]
+		if len(im.data) == 0 {
+			continue
+		}
+		dst[i] = {
+			ptr    = raw_data(im.data),
+			fw     = f32(im.width),
+			fh     = f32(im.height),
+			w      = i32(im.width),
+			max_x  = i32(im.width - 1),
+			max_y  = i32(im.height - 1),
+			comps  = u8(im.components),
+			shift  = u8(im.components >> 1),
+			filter = im.filter,
+		}
+	}
 }
 
 // A 2D storage image for run_compute: `width x height` texels in `data`,
@@ -105,13 +194,14 @@ scratch_destroy :: proc(s: ^Scratch) {
 
 @(private)
 Runner :: struct {
-	p:        ^Program,
-	regs:     []Reg,
-	masks:    []Lane_Mask,
-	uniforms: []u8,
-	opts:     Run_Options,
+	p:         ^Program,
+	regs:      []Reg,
+	masks:     []Lane_Mask,
+	uniforms:  []u8,
+	opts:      Run_Options,
+	chan_imgs: [SAMPLER_COUNT]Chan_Img,
 	// The batch's lanes: the exec mask it starts with.
-	lanes:    Lane_Mask,
+	lanes:     Lane_Mask,
 }
 
 // A runner over `scratch` with the program's constants and uniforms loaded,
@@ -125,6 +215,7 @@ runner_begin :: proc(p: ^Program, scratch: ^Scratch, uniforms: []u8, opts: Run_O
 		resize(&scratch.masks, max(p.num_masks, 2))
 	}
 	r := Runner{p = p, regs = scratch.regs[:], masks = scratch.masks[:], uniforms = uniforms, opts = opts}
+	fill_chan_imgs(&r.chan_imgs, opts.channel_images)
 	for c in p.consts {
 		r.regs[c[0]] = c[1]
 	}
@@ -194,6 +285,7 @@ BATCH_H :: LANES / BATCH_W
 @(private)
 runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) {
 	ensure(p.stage == .Fragment, "oksl: run requires a fragment program")
+	validate_channel_images(p, opts)
 	if p.jit_body != nil {
 		jit_runner_run(p, uniforms, width, height, opts, out, stride, targets, scratch)
 		return
@@ -366,6 +458,7 @@ Attribute :: struct {
 // at once, each with its own scratch.
 run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: int, position: [][4]f32, varyings: []f32, scratch: ^Scratch, opts := Run_Options{}) {
 	ensure(p.stage == .Vertex, "oksl: run_vertex requires a vertex program")
+	validate_channel_images(p, opts)
 	if count <= 0 {
 		return
 	}
@@ -470,6 +563,7 @@ Fragment_Quads :: struct {
 // own scratch.
 run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, targets: [][][4]f32, shaded: []Quad_Lanes, scratch: ^Scratch, opts := Run_Options{}, sample_masks: []u32 = nil) {
 	ensure(p.stage == .Fragment, "oksl: run_fragment requires a fragment program")
+	validate_channel_images(p, opts)
 	if quads.count <= 0 {
 		return
 	}
@@ -579,6 +673,7 @@ run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, scratch: ^Scrat
 	ensure(p.stage == .Compute, "oksl: run_compute requires a compute program")
 	ensure(len(opts.buffers) >= p.num_buffers, "oksl: Run_Options.buffers has fewer buffers than declared")
 	ensure(len(opts.images) >= len(p.image_formats), "oksl: Run_Options.images has fewer images than declared")
+	validate_channel_images(p, opts)
 	for want_fmt, i in p.image_formats {
 		im := opts.images[i]
 		ensure(im.format == want_fmt, "oksl: Storage_Image.format does not match shader declaration")
@@ -1580,7 +1675,7 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 					}
 				}
 			}
-		case .Texture, .Texture_Bias:
+		case .Texture, .Texture_Bias, .Texel_Fetch:
 			sample_texture(r, in_, exec)
 		case .Load_Buf:
 			// The word index in 32 bits, wrapping as SPIR-V's and Metal's
@@ -1626,7 +1721,14 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 			regs[dst] = u32(w)
 			regs[dst + 1] = u32(h)
 		case .Texture_Size:
-			size := channel_size(r, int(in_.k))
+			ch := int(in_.k)
+			if r.chan_imgs[ch].ptr != nil {
+				im := &r.chan_imgs[ch]
+				regs[dst] = u32(im.w)
+				regs[dst + 1] = u32(im.max_y + 1)
+				break
+			}
+			size := channel_size(r, ch)
 			for l in 0 ..< LANES {
 				// Negative lods shift everything out.
 				lod := regs[a][l]
@@ -1673,25 +1775,227 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 	}
 }
 
+@(private)
+MAX_TEXEL_F32 :: f32(2147483520.0) // 0x4effffff, largest exact f32 < 2^31
+
+@(private)
+coord_nearest :: #force_inline proc "contextless" (u, size_f: f32, max_i: i32) -> i32 {
+	p := u * size_f
+	p = p if p > 0 else 0
+	p = p if p < MAX_TEXEL_F32 else MAX_TEXEL_F32
+	i := i32(p)
+	return i if i < max_i else max_i
+}
+
+@(private)
+coord_linear :: #force_inline proc "contextless" (u, size_f: f32, max_i: i32) -> (i0, i1: i32, f: f32) {
+	p := u * size_f - 0.5
+	fl := ffloor(p)
+	df := p - fl
+	f = df if df > 0 else 0
+	fl_c := fl if fl > -1 else -1
+	fl_c = fl_c if fl_c < MAX_TEXEL_F32 else MAX_TEXEL_F32
+	iv := i32(fl_c)
+	c0 := iv if iv > 0 else 0
+	i0 = c0 if c0 < max_i else max_i
+	c1 := iv + 1
+	i1 = c1 if c1 < max_i else max_i
+	return
+}
+
+@(private)
+sample_bound_nearest :: #force_inline proc "contextless" (im: ^Chan_Img, regs: []Reg, a, dst: i32, $C: int) #no_bounds_check {
+	u, v := fl(&regs[a]), fl(&regs[a + 1])
+	d0 := fl(&regs[dst])
+	when C >= 2 {d1 := fl(&regs[dst + 1])}
+	when C == 4 {d2, d3 := fl(&regs[dst + 2]), fl(&regs[dst + 3])}
+	fw, fh, w, max_x, max_y, ptr := im.fw, im.fh, im.w, im.max_x, im.max_y, im.ptr
+	for l in 0 ..< LANES {
+		x := coord_nearest(u[l], fw, max_x)
+		y := coord_nearest(v[l], fh, max_y)
+		off := int(y * w + x) * C
+		d0[l] = ptr[off]
+		when C >= 2 {d1[l] = ptr[off + 1]}
+		when C == 4 {
+			d2[l] = ptr[off + 2]
+			d3[l] = ptr[off + 3]
+		}
+	}
+	when C == 1 {
+		regs[dst + 1] = 0
+		regs[dst + 2] = 0
+		regs[dst + 3] = 0x3f800000
+	} else when C == 2 {
+		regs[dst + 2] = 0
+		regs[dst + 3] = 0x3f800000
+	}
+}
+
+@(private)
+sample_bound_linear :: #force_inline proc "contextless" (im: ^Chan_Img, regs: []Reg, a, dst: i32, $C: int) #no_bounds_check {
+	u, v := fl(&regs[a]), fl(&regs[a + 1])
+	d0 := fl(&regs[dst])
+	when C >= 2 {d1 := fl(&regs[dst + 1])}
+	when C == 4 {d2, d3 := fl(&regs[dst + 2]), fl(&regs[dst + 3])}
+	fw, fh, w, max_x, max_y, ptr := im.fw, im.fh, im.w, im.max_x, im.max_y, im.ptr
+	for l in 0 ..< LANES {
+		x0, x1, fx := coord_linear(u[l], fw, max_x)
+		y0, y1, fy := coord_linear(v[l], fh, max_y)
+		r0, r1 := y0 * w, y1 * w
+		o00, o10 := int(r0 + x0) * C, int(r0 + x1) * C
+		o01, o11 := int(r1 + x0) * C, int(r1 + x1) * C
+		when C == 1 {
+			top := ptr[o00] + (ptr[o10] - ptr[o00]) * fx
+			bot := ptr[o01] + (ptr[o11] - ptr[o01]) * fx
+			d0[l] = top + (bot - top) * fy
+		} else when C == 2 {
+			c00, c10 := ((^[2]f32)(&ptr[o00]))^, ((^[2]f32)(&ptr[o10]))^
+			c01, c11 := ((^[2]f32)(&ptr[o01]))^, ((^[2]f32)(&ptr[o11]))^
+			top := c00 + (c10 - c00) * fx
+			bot := c01 + (c11 - c01) * fx
+			res := top + (bot - top) * fy
+			d0[l], d1[l] = res[0], res[1]
+		} else {
+			c00, c10 := ((^[4]f32)(&ptr[o00]))^, ((^[4]f32)(&ptr[o10]))^
+			c01, c11 := ((^[4]f32)(&ptr[o01]))^, ((^[4]f32)(&ptr[o11]))^
+			top := c00 + (c10 - c00) * fx
+			bot := c01 + (c11 - c01) * fx
+			res := top + (bot - top) * fy
+			d0[l], d1[l], d2[l], d3[l] = res[0], res[1], res[2], res[3]
+		}
+	}
+	when C == 1 {
+		regs[dst + 1] = 0
+		regs[dst + 2] = 0
+		regs[dst + 3] = 0x3f800000
+	} else when C == 2 {
+		regs[dst + 2] = 0
+		regs[dst + 3] = 0x3f800000
+	}
+}
+
+@(private)
+fetch_bound_lanes :: #force_inline proc "contextless" (im: ^Chan_Img, regs: []Reg, a, dst: i32, flip: bool, $C: int) #no_bounds_check {
+	px, py := &regs[a], &regs[a + 1]
+	d0, d1, d2, d3 := fl(&regs[dst]), fl(&regs[dst + 1]), fl(&regs[dst + 2]), fl(&regs[dst + 3])
+	w, max_x, max_y, ptr := im.w, im.max_x, im.max_y, im.ptr
+	for l in 0 ..< LANES {
+		x := i32(px[l])
+		y := i32(u32(max_y) - py[l]) if flip else i32(py[l])
+		if u32(x) > u32(max_x) || u32(y) > u32(max_y) {
+			d0[l], d1[l], d2[l], d3[l] = 0, 0, 0, 0
+			continue
+		}
+		off := int(y * w + x) * C
+		when C == 1 {
+			d0[l], d1[l], d2[l], d3[l] = ptr[off], 0, 0, 1
+		} else when C == 2 {
+			d0[l], d1[l], d2[l], d3[l] = ptr[off], ptr[off + 1], 0, 1
+		} else {
+			t := ((^[4]f32)(&ptr[off]))^
+			d0[l], d1[l], d2[l], d3[l] = t[0], t[1], t[2], t[3]
+		}
+	}
+}
+
+@(private)
+texel_fetch_mip :: #force_inline proc "contextless" (size: [3]i32, lod_bits: u32) -> (sx, sy: f32) {
+	return f32(max(size.x >> lod_bits, 1) if size.x > 0 else 0), f32(max(size.y >> lod_bits, 1) if size.y > 0 else 0)
+}
+
+@(private)
+texel_fetch_uv :: #force_inline proc "contextless" (px, py: i32, sx, sy: f32, flags: i32) -> [2]f32 {
+	ux := (f32(px) + 0.5) / sx
+	uy := (f32(py) + 0.5) / sy
+	if (flags & 1) != 0 {
+		uy = uy * -1 + 1
+	}
+	return {ux, uy}
+}
+
 // A sample: dst = channel k at uv a, lod b (Texture_Bias: b plus the
 // level the uv derivatives pick in the channel's texels, one per quad from
 // its top row and left column, as GPUs' texture units pick it). Quads
 // with a running lane (`exec`) are sampled; the others read 0.
 @(private)
-sample_texture :: proc(r: ^Runner, in_: Instr, exec: Lane_Mask) {
+sample_texture :: proc(r: ^Runner, in_: Instr, exec: Lane_Mask) #no_bounds_check {
 	regs := r.regs
 	ch := int(in_.k)
-	dst, a, b := in_.dst, in_.a, in_.b
+	dst := in_.dst
+	if r.chan_imgs[ch].ptr != nil {
+		im := &r.chan_imgs[ch]
+		if in_.op == .Texel_Fetch {
+			flip := (in_.d & 1) != 0
+			switch im.comps {
+			case 1: fetch_bound_lanes(im, regs, in_.a, dst, flip, 1)
+			case 2: fetch_bound_lanes(im, regs, in_.a, dst, flip, 2)
+			case:   fetch_bound_lanes(im, regs, in_.a, dst, flip, 4)
+			}
+		} else if im.filter == .Nearest {
+			switch im.comps {
+			case 1: sample_bound_nearest(im, regs, in_.a, dst, 1)
+			case 2: sample_bound_nearest(im, regs, in_.a, dst, 2)
+			case:   sample_bound_nearest(im, regs, in_.a, dst, 4)
+			}
+		} else {
+			switch im.comps {
+			case 1: sample_bound_linear(im, regs, in_.a, dst, 1)
+			case 2: sample_bound_linear(im, regs, in_.a, dst, 2)
+			case:   sample_bound_linear(im, regs, in_.a, dst, 4)
+			}
+		}
+		return
+	}
 	for i in 0 ..< i32(4) {
 		regs[dst + i] = {}
 	}
-	if r.opts.sampler == nil || ch < 0 {
+	if r.opts.sampler == nil {
 		return
 	}
 	size := channel_size(r, ch)
+	running, have := transmute(Lane_Bits)exec, transmute(Lane_Bits)r.lanes
+	if in_.op == .Texel_Fetch {
+		px, py, lb := &regs[in_.a], &regs[in_.a + 1], &regs[in_.b]
+		uint_lod := (in_.d & 4) != 0
+		if r.p.stage == .Compute {
+			for l in 0 ..< LANES {
+				if (running >> uint(l)) & 1 == 0 {
+					continue
+				}
+				sx, sy := texel_fetch_mip(size, lb[l])
+				flod := f32(lb[l]) if uint_lod else f32(i32(lb[l]))
+				c := r.opts.sampler(r.opts.user, ch, texel_fetch_uv(i32(px[l]), i32(py[l]), sx, sy, 0), flod, 0)
+				for i in 0 ..< i32(4) {
+					regs[dst + i][l] = fbits(c[i])
+				}
+			}
+			return
+		}
+		hdr := (in_.d & 2) != 0
+		for o := 0; o < LANES; o += 4 {
+			if (running >> uint(o)) & 0xf == 0 {
+				continue
+			}
+			for l in o ..< o + 4 {
+				if (have >> uint(l)) & 1 == 0 {
+					continue
+				}
+				sx, sy := texel_fetch_mip(size, lb[l])
+				if hdr {
+					sx, sy = fval(regs[in_.c][l]), fval(regs[in_.c + 1][l])
+				}
+				flod := f32(lb[l]) if uint_lod else f32(i32(lb[l]))
+				c := r.opts.sampler(r.opts.user, ch, texel_fetch_uv(i32(px[l]), i32(py[l]), sx, sy, in_.d), flod, 0)
+				for i in 0 ..< i32(4) {
+					regs[dst + i][l] = fbits(c[i])
+				}
+			}
+		}
+		return
+	}
+	a, b := in_.a, in_.b
 	lod := fl(&regs[b])
 	u, v := fl(&regs[a]), fl(&regs[a + 1])
-	running, have := transmute(Lane_Bits)exec, transmute(Lane_Bits)r.lanes
 	if r.p.stage == .Compute {
 		if in_.n == 3 {
 			z := &regs[a + 2]

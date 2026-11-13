@@ -153,6 +153,9 @@ VM_Op :: enum u8 {
 	Image_Load,
 	Image_Store,
 	Image_Size,
+	// dst vec4 = channel k fetched at ivec2 a, lod b, header size c
+	// (d: bit 0 flip_y, bit 1 header, bit 2 uint lod).
+	Texel_Fetch,
 }
 
 // The ops that take a Builtin in k.
@@ -190,6 +193,7 @@ Program :: struct {
 	// Floats per vertex in the varyings' record.
 	varying_floats: int,
 	stage:          Stage,
+	channel_arrays: bit_set[0 ..< SAMPLER_COUNT],
 	local_size:     [3]u32,
 	num_buffers:    int,
 	image_formats:  []Image_Format,
@@ -278,6 +282,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 		ret_slot  = -1,
 		ret_val   = -1,
 	}
+	defer delete(l.blocks)
 	for &ch in l.sym_chan {
 		ch = -1
 	}
@@ -308,6 +313,9 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 		#partial switch row.kind {
 		case .Channel:
 			l.sym_chan[row.sym] = row.binding
+			if sym_type(u, row.sym) == T_SAMPLER_ARRAY {
+				p.channel_arrays += {int(row.binding)}
+			}
 		case .Storage_Image:
 			l.sym_img[row.sym] = i32(u.syms[row.sym].index)
 		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID,
@@ -374,7 +382,6 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	trim_buffer_loads(&p, l.blocks[:])
 	hoist_uniform(&p)
 	pack_slots(&p, l.blocks[:])
-	delete(l.blocks)
 	jit_compile(&p)
 	return p
 }
@@ -1463,7 +1470,7 @@ can_select_expr :: proc(u: ^Unit, id: Expr_Id, budget: ^int) -> bool {
 		if e.call == .User {
 			return false
 		}
-		if e.call == .Builtin && (e.builtin == .Texture || e.builtin == .Texture_Lod || e.builtin == .Texture_Grad || e.builtin == .Texture_Size || e.builtin == .Image_Load || e.builtin == .Image_Store || e.builtin == .Image_Size) {
+		if e.call == .Builtin && (e.builtin == .Texture || e.builtin == .Texture_Lod || e.builtin == .Texel_Fetch || e.builtin == .Texture_Grad || e.builtin == .Texture_Size || e.builtin == .Image_Load || e.builtin == .Image_Store || e.builtin == .Image_Size) {
 			return false
 		}
 		for a in args_of(u, id) {
@@ -1930,7 +1937,7 @@ instr_slots :: proc(in_: Instr) -> (writes: Slots, reads: [4]Slots, pure: bool) 
 		}
 	case .Image_Size:
 		writes.n = 2
-	case .Texture, .Texture_Bias, .Image_Load:
+	case .Texture, .Texture_Bias, .Texel_Fetch, .Image_Load:
 		writes.n, pure = 4, false
 	case .Store, .Store_Zero, .Store_Dyn, .Load_Dyn, .Deriv_X, .Deriv_Y, .Fwidth:
 		pure = false
@@ -2074,9 +2081,12 @@ trim_buffer_loads :: proc(p: ^Program, blocks: []Slots) {
 		}
 		n := i32(in_.n)
 		#partial switch in_.op {
-		case .Texture, .Texture_Bias:
+		case .Texture, .Texture_Bias, .Texel_Fetch:
 			mark(used, {in_.a, n})
 			mark(used, {in_.b, 1})
+			if in_.d & 2 != 0 {
+				mark(used, {in_.c, 2})
+			}
 		case .Store, .Deriv_X, .Deriv_Y, .Fwidth:
 			mark(used, {in_.a, n})
 		case .Load_Buf:
@@ -2175,7 +2185,7 @@ instr_reg_fields :: proc(in_: ^Instr) -> (ptrs: [5]^i32, count: int) {
 	     .Mat_Mul, .Vec_Mat, .Outer,
 	     .Texture, .Texture_Bias:
 		return {&in_.dst, &in_.a, &in_.b, nil, nil}, 3
-	case .Select, .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward, .Refract:
+	case .Select, .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward, .Refract, .Texel_Fetch:
 		return {&in_.dst, &in_.a, &in_.b, &in_.c, nil}, 4
 	case .Gather:
 		ptrs = {&in_.dst, &in_.a, &in_.b, &in_.c, &in_.d}
@@ -2427,7 +2437,9 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	for a, i in argx {
 		at := expr_type(u, a)
 		if at.base == .Sampler {
-			vals[i] = {l.sym_chan[u.exprs[a].sym], T_SAMPLER}
+			ch := l.sym_chan[u.exprs[a].sym]
+			assert(ch >= 0 && ch < SAMPLER_COUNT, "oksl: sampler channel out of range")
+			vals[i] = {ch, T_SAMPLER}
 		} else if at.base == .Image {
 			vals[i] = {l.sym_img[u.exprs[a].sym], at}
 		} else {
@@ -2475,6 +2487,10 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		return {vals[0].slot, t}
 	case .Texture_Lod:
 		emit(l, .Texture, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
+	case .Texel_Fetch:
+		rules := PROFILE_RULES[u.profile]
+		flags := i32(rules.flip_y) | (i32(rules.header) << 1) | (i32(vals[2].t.base == .Uint) << 2)
+		emit(l, .Texel_Fetch, n = 2, k = int(vals[0].slot), d = flags, dst = s, a = vals[1].slot, b = vals[2].slot, c = vals[3].slot if rules.header else vals[2].slot)
 	case .Texture:
 		emit(l, .Texture_Bias, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
 	case .Texture_Size:

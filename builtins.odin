@@ -89,6 +89,8 @@ Builtin :: enum u8 {
 	Image_Load,
 	Image_Store,
 	Image_Size,
+	// texelFetch(sampler, p, lod, header_size): integer texel coordinate, no uv round-trip on CPU.
+	Texel_Fetch,
 }
 
 // How a built-in's arguments are checked (and converted). Each rule runs
@@ -248,6 +250,7 @@ BUILTINS := [Builtin]Builtin_Info {
 	.Image_Load         = {"", 2, .None, .Vec4, {}, {}, {}},
 	.Image_Store        = {"", 3, .None, .First, {}, {}, {}},
 	.Image_Size         = {"", 1, .None, .Image_Size, {}, {}, {}},
+	.Texel_Fetch        = {"", 3, .None, .Vec4, {}, {}, {}},
 	.Float_Bits_To_Int  = {"floatBitsToInt", 1, .Float_Exact, .Int_Shape, {}, {}, {}},
 	.Float_Bits_To_Uint = {"floatBitsToUint", 1, .Float_Exact, .Uint_Shape, {}, {}, {}},
 	.Int_Bits_To_Float  = {"intBitsToFloat", 1, .Exact_Base, .Float_Shape, {}, .Int, {}},

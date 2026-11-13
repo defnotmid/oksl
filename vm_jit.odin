@@ -60,6 +60,8 @@ Jit_Ctx :: struct {
 	lanes:    u8,
 }
 
+#assert(size_of(Chan_Img) == size_of(Jit_Slot))
+
 @(private)
 Jit_Fn :: #type proc "c" (ctx: ^Jit_Ctx)
 
@@ -85,7 +87,11 @@ Jit_Tables :: struct #align(32) {
 	rad_to_deg: [8]f32,
 	f2i_hi:     [8]f32,
 	f2u_hi:     [8]f32,
+	half_f:     [8]f32,
+	i32_max_f:  [8]f32,
 }
+
+#assert(offset_of(Jit_Tables, sign_mask) % 32 == 0)
 
 @(private)
 jit_avx2_ready: bool
@@ -108,12 +114,14 @@ init_jit :: proc "contextless" () {
 	jit_tables.mask31_u = 31
 	jit_tables.all_ones = 0xffff_ffff
 	jit_tables.lane_iota = {0, 1, 2, 3, 4, 5, 6, 7}
+	jit_tables.half_f = 0.5
 	jit_tables.one_f = 1.0
 	jit_tables.neg_one_f = -1.0
 	jit_tables.two_f = 2.0
 	jit_tables.three_f = 3.0
 	jit_tables.deg_to_rad = math.PI / 180.0
 	jit_tables.rad_to_deg = 180.0 / math.PI
+	jit_tables.i32_max_f = MAX_TEXEL_F32
 	jit_tables.f2i_hi = 2147483648.0
 	jit_tables.f2u_hi = 4294967296.0
 
@@ -163,6 +171,8 @@ GPR_RDX :: u8(2)
 @(private)
 GPR_RBX :: u8(3)
 @(private)
+GPR_RSP :: u8(4)
+@(private)
 GPR_RBP :: u8(5)
 @(private)
 GPR_RSI :: u8(6)
@@ -187,6 +197,25 @@ OFF_CTX_BUF_LEN :: i32(offset_of(Jit_Ctx, buf_len))
 OFF_CTX_LANES :: i32(offset_of(Jit_Ctx, lanes))
 
 @(private)
+OFF_CHAN_PTR :: i32(offset_of(Chan_Img, ptr))
+@(private)
+OFF_CHAN_FW :: i32(offset_of(Chan_Img, fw))
+@(private)
+OFF_CHAN_FH :: i32(offset_of(Chan_Img, fh))
+@(private)
+OFF_CHAN_W :: i32(offset_of(Chan_Img, w))
+@(private)
+OFF_CHAN_MAX_X :: i32(offset_of(Chan_Img, max_x))
+@(private)
+OFF_CHAN_MAX_Y :: i32(offset_of(Chan_Img, max_y))
+@(private)
+OFF_CHAN_COMPS :: i32(offset_of(Chan_Img, comps))
+@(private)
+OFF_CHAN_SHIFT :: i32(offset_of(Chan_Img, shift))
+@(private)
+OFF_CHAN_FILTER :: i32(offset_of(Chan_Img, filter))
+
+@(private)
 OFF_TAB_SIGN :: i32(offset_of(Jit_Tables, sign_mask))
 @(private)
 OFF_TAB_ABS :: i32(offset_of(Jit_Tables, abs_mask))
@@ -203,6 +232,8 @@ OFF_TAB_ALL1 :: i32(offset_of(Jit_Tables, all_ones))
 @(private)
 OFF_TAB_IOTA :: i32(offset_of(Jit_Tables, lane_iota))
 @(private)
+OFF_TAB_HALF_F :: i32(offset_of(Jit_Tables, half_f))
+@(private)
 OFF_TAB_ONE_F :: i32(offset_of(Jit_Tables, one_f))
 @(private)
 OFF_TAB_NEG1_F :: i32(offset_of(Jit_Tables, neg_one_f))
@@ -214,6 +245,8 @@ OFF_TAB_THREE_F :: i32(offset_of(Jit_Tables, three_f))
 OFF_TAB_DEG2RAD :: i32(offset_of(Jit_Tables, deg_to_rad))
 @(private)
 OFF_TAB_RAD2DEG :: i32(offset_of(Jit_Tables, rad_to_deg))
+@(private)
+OFF_TAB_I32MAX :: i32(offset_of(Jit_Tables, i32_max_f))
 @(private)
 OFF_TAB_F2I_HI :: i32(offset_of(Jit_Tables, f2i_hi))
 @(private)
@@ -418,6 +451,185 @@ emit_exec_ymask :: #force_inline proc(buf: ^[dynamic]u8, dst: u8) {
 }
 
 @(private)
+vbroadcastss_mem :: #force_inline proc(buf: ^[dynamic]u8, dst, base: u8, disp: i32) {
+	emit_vex_rm(buf, 2, 1, 1, 0, 0x18, dst, 0, base, disp)
+}
+
+@(private)
+vpbroadcastd_mem :: #force_inline proc(buf: ^[dynamic]u8, dst, base: u8, disp: i32) {
+	emit_vex_rm(buf, 2, 1, 1, 0, 0x58, dst, 0, base, disp)
+}
+
+// Gathers 1, 2 or 4 float components from `[rsi + yidx*4]` under `ymask` into
+// `ymm0..3`, filling missing components with `(0, 0, 0, 1)` on masked-in lanes.
+@(private)
+emit_chan_gather_rgba :: proc(buf: ^[dynamic]u8, chan_base: u8, chan_disp: i32, yidx, ymask: u8) {
+	vmovaps_rr(buf, 7, ymask)
+	vzero(buf, 0)
+	emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 0, 7, GPR_RSI, yidx, 2, 0)
+
+	emit_bytes(buf, 0x0F, 0xB6) // movzx ecx, byte [chan_base + chan_disp + OFF_CHAN_COMPS]
+	emit_modrm_mem(buf, GPR_RCX, chan_base, chan_disp + OFF_CHAN_COMPS)
+	emit_bytes(buf, 0x83, 0xF9, 0x02) // cmp ecx, 2
+	emit_b(buf, 0x72)                 // jb comp1
+	comp1_patch := len(buf^)
+	emit_b(buf, 0)
+
+	vmovaps_rr(buf, 7, ymask)
+	vzero(buf, 1)
+	emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 1, 7, GPR_RSI, yidx, 2, 4)
+	emit_b(buf, 0x74) // je comp2
+	comp2_patch := len(buf^)
+	emit_b(buf, 0)
+
+	vmovaps_rr(buf, 7, ymask)
+	vzero(buf, 2)
+	emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 2, 7, GPR_RSI, yidx, 2, 8)
+	vmovaps_rr(buf, 7, ymask)
+	vzero(buf, 3)
+	emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 3, 7, GPR_RSI, yidx, 2, 12)
+	emit_b(buf, 0xEB) // jmp done
+	end_patch := len(buf^)
+	emit_b(buf, 0)
+
+	buf[comp1_patch] = u8(len(buf^) - (comp1_patch + 1))
+	vzero(buf, 1)
+	buf[comp2_patch] = u8(len(buf^) - (comp2_patch + 1))
+	vzero(buf, 2)
+	vop_ps_tab(buf, 0x54, 3, ymask, OFF_TAB_ONE_F)
+	buf[end_patch] = u8(len(buf^) - (end_patch + 1))
+}
+
+// Internal AVX2 subroutine for bilinear bound-channel taps:
+//   in:  ymm0 = u, ymm1 = v, rsi = im.ptr, rdi = ^Chan_Img
+//   out: ymm0..3 = RGBA; preserves rbp, rbx, r12..r14 and ymm8..15.
+@(private)
+emit_bilinear_sub :: proc(buf: ^[dynamic]u8) {
+	emit_bytes(buf, 0x48, 0x81, 0xEC) // sub rsp, 192
+	emit_u32(buf, 192)
+
+	// (x0, x1, fx) from ymm0 (u); keep ymm1 (v) live.
+	vbroadcastss_mem(buf, 2, GPR_RDI, OFF_CHAN_FW)
+	vop_ps(buf, 0x59, 2, 0, 2)
+	vop_ps_tab(buf, 0x5C, 2, 2, OFF_TAB_HALF_F)
+	vroundps(buf, 3, 2, 0x09)
+	vop_ps(buf, 0x5C, 4, 2, 3)
+	vzero(buf, 6)
+	vop_ps(buf, 0x5F, 4, 4, 6)
+	emit_vex_rm(buf, 1, 0, 1, 0, 0x11, 4, 0, GPR_RSP, 128) // [rsp + 128] = fx
+	vop_ps_tab(buf, 0x5F, 3, 3, OFF_TAB_NEG1_F)
+	vop_ps_tab(buf, 0x5D, 3, 3, OFF_TAB_I32MAX)
+	emit_vex_rr(buf, 1, 2, 1, 0, 0x5B, 3, 0, 3)
+	vpbroadcastd_mem(buf, 5, GPR_RDI, OFF_CHAN_MAX_X)
+	vop38_d(buf, 0x3D, 0, 3, 6)
+	vop38_d(buf, 0x39, 0, 0, 5) // ymm0 = x0
+	vop_d_tab(buf, 0xFE, 2, 3, OFF_TAB_ONE_U)
+	vop38_d(buf, 0x39, 2, 2, 5) // ymm2 = x1
+
+	// (y0, y1, fy) from ymm1 (v).
+	vbroadcastss_mem(buf, 3, GPR_RDI, OFF_CHAN_FH)
+	vop_ps(buf, 0x59, 3, 1, 3)
+	vop_ps_tab(buf, 0x5C, 3, 3, OFF_TAB_HALF_F)
+	vroundps(buf, 4, 3, 0x09)
+	vop_ps(buf, 0x5C, 5, 3, 4)
+	vop_ps(buf, 0x5F, 5, 5, 6)
+	emit_vex_rm(buf, 1, 0, 1, 0, 0x11, 5, 0, GPR_RSP, 160) // [rsp + 160] = fy
+	vop_ps_tab(buf, 0x5F, 4, 4, OFF_TAB_NEG1_F)
+	vop_ps_tab(buf, 0x5D, 4, 4, OFF_TAB_I32MAX)
+	emit_vex_rr(buf, 1, 2, 1, 0, 0x5B, 4, 0, 4)
+	vpbroadcastd_mem(buf, 5, GPR_RDI, OFF_CHAN_MAX_Y)
+	vop38_d(buf, 0x3D, 1, 4, 6)
+	vop38_d(buf, 0x39, 1, 1, 5) // ymm1 = y0
+	vop_d_tab(buf, 0xFE, 3, 4, OFF_TAB_ONE_U)
+	vop38_d(buf, 0x39, 3, 3, 5) // ymm3 = y1
+
+	// Scaled float indices [rsp + 0, 32, 64, 96] = (y*w + x) << shift.
+	vpbroadcastd_mem(buf, 4, GPR_RDI, OFF_CHAN_W)
+	vop38_d(buf, 0x40, 1, 1, 4) // y0 * w
+	vop38_d(buf, 0x40, 3, 3, 4) // y1 * w
+	emit_bytes(buf, 0x0F, 0xB6) // movzx ecx, byte [rdi + OFF_CHAN_SHIFT]
+	emit_modrm_mem(buf, GPR_RCX, GPR_RDI, OFF_CHAN_SHIFT)
+	emit_vex_rr(buf, 1, 1, 0, 0, 0x6E, 4, 0, GPR_RCX)
+	emit_vex_rr(buf, 2, 1, 1, 0, 0x58, 4, 0, 4)
+
+	corners := [4][3]i32{{1, 0, 0}, {1, 2, 32}, {3, 0, 64}, {3, 2, 96}}
+	for co in corners {
+		vop_d(buf, 0xFE, 5, u8(co[0]), u8(co[1]))
+		vop38_d(buf, 0x47, 5, 5, 4)
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x11, 5, 0, GPR_RSP, co[2])
+	}
+
+	emit_bytes(buf, 0x0F, 0xB6) // movzx ecx, byte [rdi + OFF_CHAN_COMPS]
+	emit_modrm_mem(buf, GPR_RCX, GPR_RDI, OFF_CHAN_COMPS)
+
+	comp1_patch, comp2_patch := 0, 0
+	for c in 0 ..< i32(4) {
+		yd := u8(c)
+		// c00 -> yd, c10 -> ymm4, top -> yd
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x10, 6, 0, GPR_RSP, 0)
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x28, 7, 0, GPR_R14, OFF_TAB_ALL1)
+		vzero(buf, yd)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, yd, 7, GPR_RSI, 6, 2, c * 4)
+
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x10, 6, 0, GPR_RSP, 32)
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x28, 7, 0, GPR_R14, OFF_TAB_ALL1)
+		vzero(buf, 4)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 4, 7, GPR_RSI, 6, 2, c * 4)
+
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x10, 6, 0, GPR_RSP, 128) // fx
+		vop_ps(buf, 0x5C, 4, 4, yd)
+		vop_ps(buf, 0x59, 4, 4, 6)
+		vop_ps(buf, 0x58, yd, yd, 4)
+
+		// c01 -> ymm4, c11 -> ymm5, bot -> ymm4, out -> yd
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x10, 6, 0, GPR_RSP, 64)
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x28, 7, 0, GPR_R14, OFF_TAB_ALL1)
+		vzero(buf, 4)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 4, 7, GPR_RSI, 6, 2, c * 4)
+
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x10, 6, 0, GPR_RSP, 96)
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x28, 7, 0, GPR_R14, OFF_TAB_ALL1)
+		vzero(buf, 5)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 5, 7, GPR_RSI, 6, 2, c * 4)
+
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x10, 6, 0, GPR_RSP, 128) // fx
+		vop_ps(buf, 0x5C, 5, 5, 4)
+		vop_ps(buf, 0x59, 5, 5, 6)
+		vop_ps(buf, 0x58, 4, 4, 5)
+
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x10, 6, 0, GPR_RSP, 160) // fy
+		vop_ps(buf, 0x5C, 4, 4, yd)
+		vop_ps(buf, 0x59, 4, 4, 6)
+		vop_ps(buf, 0x58, yd, yd, 4)
+
+		if c == 0 {
+			emit_bytes(buf, 0x83, 0xF9, 0x02) // cmp ecx, 2
+			emit_bytes(buf, 0x0F, 0x82)       // jb comp1
+			comp1_patch = len(buf^)
+			emit_i32(buf, 0)
+		} else if c == 1 {
+			emit_bytes(buf, 0x0F, 0x84) // je comp2 (flags preserved from cmp ecx, 2)
+			comp2_patch = len(buf^)
+			emit_i32(buf, 0)
+		}
+	}
+	emit_b(buf, 0xEB) // jmp done
+	done_patch := len(buf^)
+	emit_b(buf, 0)
+
+	patch_i32(buf[:], comp1_patch, i32(len(buf^) - (comp1_patch + 4)))
+	vzero(buf, 1)
+	patch_i32(buf[:], comp2_patch, i32(len(buf^) - (comp2_patch + 4)))
+	vzero(buf, 2)
+	emit_vex_rm(buf, 1, 0, 1, 0, 0x28, 3, 0, GPR_R14, OFF_TAB_ONE_F)
+
+	buf[done_patch] = u8(len(buf^) - (done_patch + 1))
+	emit_bytes(buf, 0x48, 0x81, 0xC4) // add rsp, 192
+	emit_u32(buf, 192)
+	emit_b(buf, 0xC3) // ret
+}
+
+@(private)
 emit_load_mask_eax :: proc(buf: ^[dynamic]u8, m: i32) {
 	if m == MASK_EXEC {
 		emit_bytes(buf, 0x44, 0x89, 0xE8) // mov eax, r13d
@@ -466,6 +678,13 @@ Instr_RW :: struct {
 }
 
 @(private)
+Bound_Tex_Stub :: struct {
+	bound_patch: int,
+	ret_off:     int,
+	pc:          i32,
+}
+
+@(private)
 Jit_Emitter :: struct {
 	buf:          [dynamic]u8,
 	cross_bb:     []bool,
@@ -474,9 +693,11 @@ Jit_Emitter :: struct {
 	bb_start:     []bool,
 	pc_off:       []int,
 	rw:           []Instr_RW,
-	patches:      [dynamic]Jump_Patch,
-	epilogues:    [dynamic]int,
-	cache:        [8]Cache_Slot,
+	patches:        [dynamic]Jump_Patch,
+	epilogues:      [dynamic]int,
+	bilinear_calls: [dynamic]int,
+	bound_tex:      [dynamic]Bound_Tex_Stub,
+	cache:          [8]Cache_Slot,
 	stamp:        u32,
 	pc:           i32,
 }
@@ -586,7 +807,7 @@ is_helper_instr :: proc(in_: Instr) -> bool {
 	     .I_Div, .U_Div, .I_Rem, .U_Rem,
 	     .Faceforward, .Refract,
 	     .Determinant, .Inverse,
-	     .Texture, .Texture_Bias, .Texture_Size:
+	     .Texture, .Texture_Bias, .Texel_Fetch, .Texture_Size:
 		return true
 	case .Load_Dyn:
 		return int(in_.n) > 4
@@ -615,9 +836,12 @@ instr_read_write :: proc(in_: Instr) -> (writes: Slots, full_write: bool, reads:
 	}
 	n := i32(in_.n)
 	#partial switch in_.op {
-	case .Texture, .Texture_Bias:
+	case .Texture, .Texture_Bias, .Texel_Fetch:
 		reads[0] = {in_.a, n}
 		reads[1] = {in_.b, 1}
+		if in_.d & 2 != 0 {
+			reads[2] = {in_.c, 2}
+		}
 		return {in_.dst, 4}, true, reads
 	case .Deriv_X, .Deriv_Y, .Fwidth:
 		reads[0] = {in_.a, n}
@@ -906,10 +1130,10 @@ jit_help_texture :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_
 		slots[dst + i] = {}
 	}
 	opts := ctx.opts
-	ch := int(in_.k)
-	if opts.sampler == nil || ch < 0 {
+	if opts.sampler == nil {
 		return
 	}
+	ch := int(in_.k)
 	context = ctx.host_ctx
 	size := opts.channel_sizes[ch] if ch < len(opts.channel_sizes) else [3]i32{}
 	lod := (^Jit_Floats)(&slots[b])
@@ -939,12 +1163,74 @@ jit_help_texture :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_
 	}
 }
 
+@(private, enable_target_feature = "avx2")
+jit_help_texel_fetch :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
+	slots := ctx.slots
+	dst := in_.dst
+	for i in 0 ..< i32(4) {
+		slots[dst + i] = {}
+	}
+	opts := ctx.opts
+	if opts.sampler == nil {
+		return
+	}
+	ch := int(in_.k)
+	context = ctx.host_ctx
+	size := opts.channel_sizes[ch] if ch < len(opts.channel_sizes) else [3]i32{}
+	px := (^Simd_I8)(&slots[in_.a])^
+	py := (^Simd_I8)(&slots[in_.a + 1])^
+	lb := &slots[in_.b]
+	lb_v := (^Simd_U8)(lb)^
+	sx, sy: Simd_F8
+	if (in_.d & 2) != 0 {
+		sx = (^Simd_F8)(&slots[in_.c])^
+		sy = (^Simd_F8)(&slots[in_.c + 1])^
+	} else {
+		if size.x > 0 {
+			sx = (Simd_F8)((Simd_I8)(intrinsics.simd_max(intrinsics.simd_shr(Simd_U8(u32(size.x)), lb_v), Simd_U8(1))))
+		}
+		if size.y > 0 {
+			sy = (Simd_F8)((Simd_I8)(intrinsics.simd_max(intrinsics.simd_shr(Simd_U8(u32(size.y)), lb_v), Simd_U8(1))))
+		}
+	}
+	ux := transmute([8]f32)(((Simd_F8)(px) + 0.5) / sx)
+	uy_v := (((Simd_F8)(py) + 0.5) / sy)
+	if (in_.d & 1) != 0 {
+		uy_v = uy_v * -1 + 1
+	}
+	uy := transmute([8]f32)uy_v
+	uint_lod := (in_.d & 4) != 0
+	have := u32(ctx.lanes)
+	for o := 0; o < JIT_LANES; o += 4 {
+		if (exec >> uint(o)) & 0xf == 0 {
+			continue
+		}
+		for l in o ..< o + 4 {
+			if (have >> uint(l)) & 1 == 0 {
+				continue
+			}
+			flod := f32(lb[l]) if uint_lod else f32(i32(lb[l]))
+			c := opts.sampler(opts.user, ch, {ux[l], uy[l]}, flod, 0)
+			for i in 0 ..< i32(4) {
+				slots[dst + i][l] = fbits(c[i])
+			}
+		}
+	}
+}
+
 @(private)
 jit_help_texture_size :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
 	slots := ctx.slots
-	opts := ctx.opts
 	ch := int(in_.k)
-	size := opts.channel_sizes[ch] if ch >= 0 && ch < len(opts.channel_sizes) else [3]i32{}
+	chan_imgs := ([^]Chan_Img)(uintptr(slots) - SAMPLER_COUNT * size_of(Chan_Img))
+	if chan_imgs[ch].ptr != nil {
+		im := &chan_imgs[ch]
+		slots[in_.dst] = u32(im.w)
+		slots[in_.dst + 1] = u32(im.max_y + 1)
+		return
+	}
+	opts := ctx.opts
+	size := opts.channel_sizes[ch] if ch < len(opts.channel_sizes) else [3]i32{}
 	for l in 0 ..< JIT_LANES {
 		lod := slots[in_.a][l]
 		for i in 0 ..< i32(2) {
@@ -1049,6 +1335,8 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 	pc_off := e.pc_off[:n_code + 1]
 	clear(&e.patches)
 	clear(&e.epilogues)
+	clear(&e.bilinear_calls)
+	clear(&e.bound_tex)
 
 	// Prologue: 5 callee-saved GPRs (40 B + 8 B ret addr = 48 B -> 16-byte aligned rsp).
 	emit_bytes(&e.buf, 0x55, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56)
@@ -1883,8 +2171,20 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				write_slot(e, dst + i, 0)
 			}
 
-		case .Texture, .Texture_Bias:
-			emit_helper_call(&e.buf, jit_help_texture, &code[pc])
+		case .Texture, .Texture_Bias, .Texel_Fetch:
+			chan_disp := (i32(in_.k) - SAMPLER_COUNT) * size_of(Chan_Img)
+			emit_bytes(&e.buf, 0x48, 0x8B) // mov rsi, [rbx + chan_disp + OFF_CHAN_PTR]
+			emit_modrm_mem(&e.buf, GPR_RSI, GPR_RBX, chan_disp + OFF_CHAN_PTR)
+			emit_bytes(&e.buf, 0x48, 0x85, 0xF6) // test rsi, rsi
+			emit_bytes(&e.buf, 0x0F, 0x85)       // jnz bound_tex
+			bound_patch := len(e.buf)
+			emit_i32(&e.buf, 0)
+			emit_helper_call(&e.buf, jit_help_texel_fetch if in_.op == .Texel_Fetch else jit_help_texture, &code[pc])
+			append(&e.bound_tex, Bound_Tex_Stub {
+				bound_patch = bound_patch,
+				ret_off     = len(e.buf),
+				pc          = i32(pc),
+			})
 
 		case .Texture_Size:
 			emit_helper_call(&e.buf, jit_help_texture_size, &code[pc])
@@ -2113,6 +2413,98 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 		rel := i32(epilogue_off - (ep + 4))
 		patch_i32(e.buf[:], ep, rel)
 	}
+	for stub in e.bound_tex {
+		patch_i32(e.buf[:], stub.bound_patch, i32(len(e.buf) - (stub.bound_patch + 4)))
+		in_ := code[stub.pc]
+		chan_disp := (i32(in_.k) - SAMPLER_COUNT) * size_of(Chan_Img)
+		vmovaps_load(&e.buf, 0, in_.a)
+		vmovaps_load(&e.buf, 1, in_.a + 1)
+		if in_.op == .Texel_Fetch {
+			if (in_.d & 1) != 0 {
+				vpbroadcastd_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_MAX_Y)
+				vop_d(&e.buf, 0xFA, 1, 6, 1) // max_y - py
+			}
+			vpbroadcastd_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_MAX_X)
+			vop38_d(&e.buf, 0x3B, 2, 0, 6) // min_u(px, max_x) == px iff u32(px) <= u32(max_x)
+			vop_d(&e.buf, 0x76, 2, 2, 0)
+			vpbroadcastd_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_MAX_Y)
+			vop38_d(&e.buf, 0x3B, 3, 1, 6)
+			vop_d(&e.buf, 0x76, 3, 3, 1)
+			vop_d(&e.buf, 0xDB, 5, 2, 3) // ymm5 = in_bounds
+			vpbroadcastd_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_W)
+			vop38_d(&e.buf, 0x40, 1, 1, 6)
+			vop_d(&e.buf, 0xFE, 4, 1, 0)
+			emit_bytes(&e.buf, 0x0F, 0xB6)
+			emit_modrm_mem(&e.buf, GPR_RCX, GPR_RBX, chan_disp + OFF_CHAN_SHIFT)
+			emit_vex_rr(&e.buf, 1, 1, 0, 0, 0x6E, 6, 0, GPR_RCX)
+			emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x58, 6, 0, 6)
+			vop38_d(&e.buf, 0x47, 4, 4, 6)
+			emit_chan_gather_rgba(&e.buf, GPR_RBX, chan_disp, 4, 5)
+		} else {
+			emit_b(&e.buf, 0x80) // cmp byte [rbx + chan_disp + OFF_CHAN_FILTER], 0
+			emit_modrm_mem(&e.buf, 7, GPR_RBX, chan_disp + OFF_CHAN_FILTER)
+			emit_b(&e.buf, 0)
+			emit_bytes(&e.buf, 0x0F, 0x85) // jne linear
+			lin_patch := len(e.buf)
+			emit_i32(&e.buf, 0)
+
+			// Nearest fast path.
+			vbroadcastss_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_FW)
+			vop_ps(&e.buf, 0x59, 0, 0, 6)
+			vbroadcastss_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_FH)
+			vop_ps(&e.buf, 0x59, 1, 1, 6)
+			vroundps(&e.buf, 0, 0, 0x09)
+			vroundps(&e.buf, 1, 1, 0x09)
+			vzero(&e.buf, 6)
+			vop_ps(&e.buf, 0x5F, 0, 0, 6)
+			vop_ps(&e.buf, 0x5F, 1, 1, 6)
+			vop_ps_tab(&e.buf, 0x5D, 0, 0, OFF_TAB_I32MAX)
+			vop_ps_tab(&e.buf, 0x5D, 1, 1, OFF_TAB_I32MAX)
+			emit_vex_rr(&e.buf, 1, 2, 1, 0, 0x5B, 0, 0, 0)
+			emit_vex_rr(&e.buf, 1, 2, 1, 0, 0x5B, 1, 0, 1)
+			vpbroadcastd_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_MAX_X)
+			vop38_d(&e.buf, 0x39, 0, 0, 6)
+			vpbroadcastd_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_MAX_Y)
+			vop38_d(&e.buf, 0x39, 1, 1, 6)
+			vpbroadcastd_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_W)
+			vop38_d(&e.buf, 0x40, 1, 1, 6)
+			vop_d(&e.buf, 0xFE, 4, 1, 0)
+			emit_bytes(&e.buf, 0x0F, 0xB6)
+			emit_modrm_mem(&e.buf, GPR_RCX, GPR_RBX, chan_disp + OFF_CHAN_SHIFT)
+			emit_vex_rr(&e.buf, 1, 1, 0, 0, 0x6E, 6, 0, GPR_RCX)
+			emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x58, 6, 0, 6)
+			vop38_d(&e.buf, 0x47, 4, 4, 6)
+			emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x28, 5, 0, GPR_R14, OFF_TAB_ALL1)
+			emit_chan_gather_rgba(&e.buf, GPR_RBX, chan_disp, 4, 5)
+			emit_b(&e.buf, 0xE9) // jmp bound_done
+			done_near := len(e.buf)
+			emit_i32(&e.buf, 0)
+
+			// Bilinear path via per-function register-ABI subroutine.
+			patch_i32(e.buf[:], lin_patch, i32(len(e.buf) - (lin_patch + 4)))
+			emit_bytes(&e.buf, 0x48, 0x8D) // lea rdi, [rbx + chan_disp]
+			emit_modrm_mem(&e.buf, GPR_RDI, GPR_RBX, chan_disp)
+			emit_b(&e.buf, 0xE8) // call bilinear_sub
+			append(&e.bilinear_calls, len(e.buf))
+			emit_i32(&e.buf, 0)
+
+			patch_i32(e.buf[:], done_near, i32(len(e.buf) - (done_near + 4)))
+		}
+		for i in 0 ..< i32(4) {
+			vmovaps_store(&e.buf, in_.dst + i, u8(i))
+		}
+		emit_b(&e.buf, 0xE9) // jmp ret_off
+		ret_patch := len(e.buf)
+		emit_i32(&e.buf, 0)
+		patch_i32(e.buf[:], ret_patch, i32(stub.ret_off - (ret_patch + 4)))
+	}
+	if len(e.bilinear_calls) > 0 {
+		bilinear_off := len(e.buf)
+		emit_bilinear_sub(&e.buf)
+		for cp in e.bilinear_calls {
+			patch_i32(e.buf[:], cp, i32(bilinear_off - (cp + 4)))
+		}
+	}
 }
 
 @(private)
@@ -2131,8 +2523,10 @@ jit_compile :: proc(p: ^Program) {
 		bb_start  = make([]bool, max_code + 1, heap),
 		pc_off    = make([]int, max_code + 1, heap),
 		rw        = make([]Instr_RW, max_code, heap),
-		patches   = make([dynamic]Jump_Patch, 0, 64, heap),
-		epilogues = make([dynamic]int, 0, 8, heap),
+		patches        = make([dynamic]Jump_Patch, 0, 64, heap),
+		epilogues      = make([dynamic]int, 0, 8, heap),
+		bilinear_calls = make([dynamic]int, 0, 8, heap),
+		bound_tex      = make([dynamic]Bound_Tex_Stub, 0, 8, heap),
 	}
 	defer delete(e.buf)
 	defer delete(e.cross_bb, heap)
@@ -2143,6 +2537,8 @@ jit_compile :: proc(p: ^Program) {
 	defer delete(e.rw, heap)
 	defer delete(e.patches)
 	defer delete(e.epilogues)
+	defer delete(e.bilinear_calls)
+	defer delete(e.bound_tex)
 
 	has_init := p.init_len > 0
 	if has_init {
@@ -2176,7 +2572,7 @@ jit_compile :: proc(p: ^Program) {
 
 @(private, enable_target_feature = "avx2")
 jit_begin :: proc(p: ^Program, scratch: ^Scratch, uniforms: []u8, opts: ^Run_Options) -> Jit_Ctx #no_bounds_check {
-	needed_regs := (max(p.num_slots, 1) + 7) / 8 + 1
+	needed_regs := (max(p.num_slots, 1) + SAMPLER_COUNT + 7) / 8 + 1
 	if len(scratch.regs) < needed_regs {
 		resize(&scratch.regs, needed_regs)
 	}
@@ -2185,7 +2581,10 @@ jit_begin :: proc(p: ^Program, scratch: ^Scratch, uniforms: []u8, opts: ^Run_Opt
 		resize(&scratch.masks, needed_masks)
 	}
 	aligned := (uintptr(raw_data(scratch.regs)) + 31) &~ uintptr(31)
-	slots := ([^]Jit_Slot)(aligned)
+	chan_imgs := (^[SAMPLER_COUNT]Chan_Img)(aligned)
+	chan_imgs^ = {}
+	fill_chan_imgs(chan_imgs, opts.channel_images)
+	slots := ([^]Jit_Slot)(aligned + SAMPLER_COUNT * size_of(Chan_Img))
 	masks := ([^]u8)(raw_data(scratch.masks))
 
 	ctx := Jit_Ctx {

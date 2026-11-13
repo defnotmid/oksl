@@ -2429,22 +2429,9 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		append(&c.u.exprs, Expr{kind = .Binary, op = op, pos = c.u.exprs[a].pos, a = a, b = b, type = intern(c.u, t)})
 		return id
 	}
-	// textureSize(sampler, lod) as the image reports it.
-	image_size :: proc(c: ^Checker, e: Expr, sampler, lod: Expr_Id) -> Expr_Id {
+	// With the inputs header, iChannelResolution[n].xy of `sampler`'s channel.
+	channel_size :: proc(c: ^Checker, e: Expr, sampler: Expr_Id) -> (Expr_Id, bool) {
 		u := c.u
-		args := push_ids(u, {u32(sampler), u32(lod)})
-		id := Expr_Id(len(u.exprs))
-		append(&u.exprs, Expr{kind = .Call, pos = e.pos, name = "textureSize", args = args, call = .Builtin})
-		u.exprs[id].type = intern(u, check_builtin(c, id, .Texture_Size))
-		return id
-	}
-	// The channel's size in texels at `lod` as a vec2: the image's, or
-	// with the inputs header iChannelResolution[n].xy of the channel.
-	channel_size :: proc(c: ^Checker, e: Expr, sampler, lod: Expr_Id) -> (Expr_Id, bool) {
-		u := c.u
-		if !c.rules.header {
-			return make_convert(c, image_size(c, e, sampler, lod), vec_type(.Float, 2)), true
-		}
 		s := u.exprs[sampler]
 		if s.kind != .Ident || s.sym == 0 || u.syms[s.sym].storage != .Channel {
 			add_error(c, s.pos, .Texture_Channel, e.name)
@@ -2470,7 +2457,7 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 			u.exprs[id].call = .Builtin
 			return check_builtin(c, id, .Texture_Size)
 		}
-		size, ok := channel_size(c, e, args[0], args[1])
+		size, ok := channel_size(c, e, args[0])
 		if !ok {
 			return T_ERROR
 		}
@@ -2514,18 +2501,23 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		if !ok || !is_integer_base(expr_type(u, args[2]).base) || !is_scalar(expr_type(u, args[2])) {
 			return no_overload(c, e, args)
 		}
-		size: Expr_Id
-		if size, ok = channel_size(c, e, sampler, lod); !ok {
-			return T_ERROR
+		if c.rules.header {
+			size: Expr_Id
+			if size, ok = channel_size(c, e, sampler); !ok {
+				return T_ERROR
+			}
+			u.exprs[id].args = push_ids(u, {u32(sampler), u32(p), u32(lod), u32(size)})
+		} else {
+			u.exprs[id].args = push_ids(u, {u32(sampler), u32(p), u32(lod)})
 		}
-		centre := binary(c, .Plus, make_convert(c, p, v2), add_lit(c, 0.5, e.pos), v2)
-		uv = binary(c, .Slash, centre, size, v2)
-	} else {
-		ok: bool
-		uv, ok = coerce(c, args[1], texture_coord(st))
-		if !ok || (len(args) == 3 && !is_scalar(expr_type(u, args[2]))) {
-			return no_overload(c, e, args)
-		}
+		u.exprs[id].call = .Builtin
+		u.exprs[id].builtin = .Texel_Fetch
+		return vec_type(.Float, 4)
+	}
+	ok: bool
+	uv, ok = coerce(c, args[1], texture_coord(st))
+	if !ok || (len(args) == 3 && !is_scalar(expr_type(u, args[2]))) {
+		return no_overload(c, e, args)
 	}
 	if c.rules.flip_y {
 		// Only the header profiles flip, and their channels are 2D.

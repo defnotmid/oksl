@@ -879,6 +879,42 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		r := new_id(s)
 		inst(&s.body, .Image_Sample_Explicit_Lod, rt, r, img, args[1], 0x2, args[2]) // Lod
 		return r
+	case .Texel_Fetch:
+		rules := PROFILE_RULES[u.profile]
+		v2 := vec_type(.Float, 2)
+		v2t := type_id(s, v2)
+		pf := convert(s, args[1], types[1], v2)
+		half := const_f32(s, 0.5)
+		centre := binop_raw(s, .F_Add, v2t, pf, construct(s, v2t, half, half))
+		sz: u32
+		if rules.header {
+			sz = args[3]
+		} else {
+			if !s.image_query {
+				inst(&s.caps, .Capability, 50) // ImageQuery
+				s.image_query = true
+			}
+			sampled := new_id(s)
+			inst(&s.body, .Load, type_id(s, at), sampled, args[0])
+			qimg := new_id(s)
+			inst(&s.body, .Image, s.t_image[0], qimg, sampled)
+			iv2 := vec_type(.Int, 2)
+			isz := new_id(s)
+			inst(&s.body, .Image_Query_Size_Lod, type_id(s, iv2), isz, qimg, args[2])
+			sz = convert(s, isz, iv2, v2)
+		}
+		uv := binop_raw(s, .F_Div, v2t, centre, sz)
+		if rules.flip_y {
+			scale := construct(s, v2t, const_f32(s, 1), const_f32(s, -1))
+			offset := construct(s, v2t, const_f32(s, 0), const_f32(s, 1))
+			uv = binop_raw(s, .F_Add, v2t, binop_raw(s, .F_Mul, v2t, uv, scale), offset)
+		}
+		flod := convert(s, args[2], types[2], T_FLOAT)
+		img := new_id(s)
+		inst(&s.body, .Load, type_id(s, at), img, args[0])
+		r := new_id(s)
+		inst(&s.body, .Image_Sample_Explicit_Lod, rt, r, img, uv, 0x2, flod)
+		return r
 	case .Texture:
 		img := new_id(s)
 		inst(&s.body, .Load, type_id(s, at), img, args[0])

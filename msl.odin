@@ -1591,6 +1591,15 @@ msl_builtin :: proc(m: ^Msl, id: Expr_Id) -> string {
 			return wrap_pre(pre[:], fmt.aprintf("%s.sample(%s, %s, bias(%s))", tex, smp, a[1], a[2]))
 		}
 		return wrap_pre(pre[:], fmt.aprintf("%s.sample(%s, %s, gradient2d(%s, %s))", tex, smp, a[1], a[2], a[3]))
+	case .Texel_Fetch:
+		rules := PROFILE_RULES[u.profile]
+		tex, smp := msl_sampler(m, args[0])
+		sz := a[3] if rules.header else fmt.aprintf("float2(int2(%s.get_width(uint(%s)), %s.get_height(uint(%s))))", tex, a[2], tex, a[2])
+		uv := fmt.aprintf("((float2(%s) + float2(0.5f)) / %s)", a[1], sz)
+		if rules.flip_y {
+			uv = fmt.aprintf("((%s * float2(1.0f, -1.0f)) + float2(0.0f, 1.0f))", uv)
+		}
+		return wrap_pre(pre[:], fmt.aprintf("%s.sample(%s, %s, level(float(%s)))", tex, smp, uv, a[2]))
 	case .Texture_Size:
 		tex, _ := msl_sampler(m, args[0])
 		if expr_type(u, args[0]) == T_SAMPLER_ARRAY {

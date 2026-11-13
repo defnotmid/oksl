@@ -503,7 +503,8 @@ so runs that reuse one allocate nothing. `Run_Options` takes a
 sampler callback (`proc(user, channel, uv, lod, layer) -> [4]f32`; `.eval`
 passes lod 0; `layer` is a `sampler2DArray`'s, rounded to nearest even,
 for the host to clamp to its layers), the channels' sizes in texels (and
-layers), the storage buffers' words (`buffers`, one `[]u32` per buffer in
+layers), optional bound 2D float images (`channel_images`, below), the
+storage buffers' words (`buffers`, one `[]u32` per buffer in
 `Module.storage_buffers` order; a read past one gives 0 and a write past
 one is dropped), the compute storage images (`images`, one `Storage_Image`
 per image in `Module.storage_images` order), an optional sub-rectangle and
@@ -571,6 +572,25 @@ differently (on a bent mapping radv and Apple pick up to 0.17 levels
 higher), and where uv jumps inside a quad (a `fract` seam) which pixels
 they difference decides it; `tools/gpu_parity` samples a mip chain to
 show both.
+
+For flat 2D float maps owned by the caller, `Run_Options.channel_images`
+(`[]Channel_Image`, indexed by channel; `oksl.channel_image(texels, width,
+height, filter)` accepts `[]f32`, `[][2]f32` or `[][4]f32`) binds tightly
+packed 1-, 2- or 4-component `f32` texels directly to any `run*` entry
+point without calling `sampler` per lane (lowered to in-JIT AVX2 gathers
+on x86-64). Missing components read `(0, 0, 0, 1)`. Both filters clamp to
+the edge (`.Nearest`: `clamp(floor(uv * size), 0, size - 1)`; `.Linear`:
+`uv * size - 0.5` with fractional weights). A bound image has one level:
+`texture`, `textureLod` and `textureGrad` at any lod read level 0,
+`texelFetch` reads its texel or `(0, 0, 0, 0)` out of range (flipping `y`
+in the Shadertoy profile), and `textureSize` returns `(width, height)`.
+Bindings are validated up front via `ensure`, which panics on a
+`sampler2DArray` channel, invalid component count, filter or dimensions,
+or `data` shorter than `width * height * components`. Any channel with
+`len(data) == 0` or past `len(channel_images)` stays unbound and continues
+to use `Run_Options.sampler` (for mipmaps, wrap modes, `sampler2DArray` or
+sRGB `u8` textures), and bound and unbound channels may mix in the same
+pass.
 
 - **Inlining:** every function is inlined into one flat `[]Instr` program
   over SoA registers. A slot is one scalar component for `LANES` (64)
@@ -707,7 +727,7 @@ textured tunnel, swizzles, out parameters, structs and arrays, defines,
 derivatives, premultiplied alpha, SkSL types and built-ins, matrices,
 integer hashing, loops, uniforms, ternaries and short-circuiting,
 matrix comparison, children, storage buffers, RGBA-to-NV12 conversion,
-storage images and explicit-LOD compute sampling, and Shadertoy-style snippets (`st_*.glsl`) with function-like
+storage images, explicit-LOD compute sampling and bound float channels, and Shadertoy-style snippets (`st_*.glsl`) with function-like
 macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 
 ## Limitations
