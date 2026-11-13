@@ -209,6 +209,7 @@ Error_Code :: enum u8 {
 	Opaque_Ternary,
 	Opaque_Return,
 	Invalid_Int_Literal,
+	Case_Type,
 }
 
 // A diagnostic at `pos` (the user's line and column: macro expansions keep
@@ -409,6 +410,7 @@ ERROR_TEXT := [Error_Code]string {
 	.Opaque_Ternary        = "{a} values can not be selected with ?:",
 	.Opaque_Return         = "{a} values can not be returned from functions",
 	.Invalid_Int_Literal   = "invalid 32-bit integer literal {q:a}",
+	.Case_Type             = "case label must be {a}, not {b}",
 }
 
 // The text of a diagnostic (without its position).

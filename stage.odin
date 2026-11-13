@@ -183,7 +183,8 @@ declare_stage_var :: proc(c: ^Checker, v: Var_Id, t: Type) {
 	if interpolated && t.base != .Float && !d.flat {
 		add_error(c, d.pos, .Flat_Required, d.name, a = what)
 	}
-	s := Symbol{name = d.name, type = intern(u, t), pos = d.pos, decl = v, index = int(d.location)}
+	loc := (int(u32(d.location)) if d.location_uint else int(d.location)) if d.has_location else -1
+	s := Symbol{name = d.name, type = intern(u, t), pos = d.pos, decl = v, index = loc}
 	s.storage = .Stage_In if d.io == .In else .Stage_Out
 	s.is_const = d.io == .In
 	id := add_sym(c, s)
@@ -280,13 +281,13 @@ stage_var_rows :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 		sym := u.syms[s]
 		io := io_of(u, s)
 		what := "input" if io == .In else "output"
-		if sym.index < 0 {
+		if !u.vars[sym.decl].has_location {
 			if io == .Out && outputs > 1 && c.u.stage == .Fragment {
 				add_error(c, sym.pos, .Location_Required, sym.name)
 			}
 			continue
 		}
-		if sym.index >= int(limit(stage, io)) {
+		if sym.index < 0 || sym.index >= int(limit(stage, io)) {
 			add_error(c, sym.pos, .Location_Range, a = what, n = i64(sym.index), m = i64(limit(stage, io) - 1))
 			continue
 		}
@@ -299,7 +300,7 @@ stage_var_rows :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 	for s in vars {
 		sym := &u.syms[s]
 		io := io_of(u, s)
-		if sym.index < 0 {
+		if !u.vars[sym.decl].has_location {
 			for l in 0 ..< int(limit(stage, io)) {
 				if taken[io][l] == 0 {
 					sym.index = l
@@ -307,9 +308,11 @@ stage_var_rows :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 					break
 				}
 			}
-		}
-		if sym.index < 0 {
-			add_error(c, sym.pos, .Location_Range, a = "input" if io == .In else "output", n = i64(limit(stage, io)), m = i64(limit(stage, io) - 1))
+			if sym.index < 0 {
+				add_error(c, sym.pos, .Location_Range, a = "input" if io == .In else "output", n = i64(limit(stage, io)), m = i64(limit(stage, io) - 1))
+				continue
+			}
+		} else if sym.index < 0 || sym.index >= int(limit(stage, io)) {
 			continue
 		}
 		kind := Interface_Kind.Stage_In if io == .In else .Stage_Out

@@ -492,7 +492,7 @@ resolve_type :: proc(c: ^Checker, spec_id: Spec_Id, array_size: Expr_Id = 0, uns
 			add_error(c, u.exprs[size_expr].pos, .Array_Size_Constant)
 			return T_ERROR
 		}
-		if n <= 0 {
+		if n <= 0 || n > i64(max(i32)) {
 			add_error(c, u.exprs[size_expr].pos, .Array_Size_Positive)
 			return T_ERROR
 		}
@@ -919,8 +919,8 @@ declare_global :: proc(c: ^Checker, v: Var_Id) {
 		return
 	}
 	s.type = intern(u, t)
-	if d.is_const && (t == T_INT || t == T_UINT) {
-		s.const_i, s.const_ok = const_int(c, u.vars[v].init)
+	if d.is_const && (t == T_INT || t == T_UINT || t == T_BOOL) {
+		s.const_bits, s.const_ok = fold_bits(c, u.vars[v].init)
 	}
 	id := add_sym(c, s)
 	u.vars[v].sym = id
@@ -1329,18 +1329,15 @@ check_switch :: proc(c: ^Checker, id: Stmt_Id) {
 		st := u.stmts[sid]
 		switch st.kind {
 		case .Case:
-			check_expr(c, st.expr)
-			label := st.expr
-			if !is_error(t) {
-				label, _ = coerce(c, st.expr, t)
-			}
-			v, ok := const_int(c, label)
+			lt := check_expr(c, st.expr)
+			v, ok := const_int(c, st.expr)
 			if !ok {
 				add_error(c, u.exprs[st.expr].pos, .Case_Constant)
 				continue
 			}
-			if t == T_UINT {
-				v = i64(u32(v))
+			if !is_error(t) && lt != t {
+				add_error(c, u.exprs[st.expr].pos, .Case_Type, a = tn(c, t), b = tn(c, lt))
+				continue
 			}
 			for prev in values {
 				if prev == v {
@@ -1348,7 +1345,6 @@ check_switch :: proc(c: ^Checker, id: Stmt_Id) {
 				}
 			}
 			append(&values, v)
-			u.stmts[sid].expr = label
 			u.stmts[sid].value = v
 		case .Default:
 			if has_default {
@@ -1404,8 +1400,8 @@ check_local :: proc(c: ^Checker, v: Var_Id) {
 		return
 	}
 	s := Symbol{name = d.name, type = intern(u, t), storage = .Local, pos = d.pos, is_const = d.is_const, decl = v}
-	if d.is_const && (t == T_INT || t == T_UINT) {
-		s.const_i, s.const_ok = const_int(c, u.vars[v].init)
+	if d.is_const && (t == T_INT || t == T_UINT || t == T_BOOL) {
+		s.const_bits, s.const_ok = fold_bits(c, u.vars[v].init)
 	}
 	id := add_sym(c, s)
 	u.vars[v].sym = id
@@ -1510,42 +1506,50 @@ unify_bases :: proc(c: ^Checker, a, b: ^Expr_Id) -> bool {
 
 // ---- constants -----------------------------------------------------------------------
 
+// Evaluates a constant scalar int, uint or bool expression in its own 32-bit
+// GLSL ES 3.10 type (two's-complement wrap for int, unsigned for uint; shifts
+// outside 0..31 and division by zero are undefined and do not fold).
 @(private)
-const_int :: proc(c: ^Checker, id: Expr_Id) -> (i64, bool) {
+fold_bits :: proc(c: ^Checker, id: Expr_Id) -> (u32, bool) {
 	u := c.u
 	if id == 0 {
 		return 0, false
 	}
 	e := u.exprs[id]
+	t := ty(u, e.type)
+	if t != T_INT && t != T_UINT && t != T_BOOL {
+		return 0, false
+	}
 	#partial switch e.kind {
-	case .Int_Lit:
-		return i64(i32(e.value)), true
-	case .Uint_Lit:
-		return i64(u32(e.value)), true
+	case .Int_Lit, .Uint_Lit, .Bool_Lit:
+		return u32(e.value), true
 	case .Ident:
 		s := e.sym if e.sym != 0 else lookup(c, e.name)
 		if s != 0 && u.syms[s].const_ok {
-			return u.syms[s].const_i, true
+			return u.syms[s].const_bits, true
 		}
 	case .Unary:
-		v, ok := const_int(c, e.a)
+		v, ok := fold_bits(c, e.a)
 		if !ok {
 			return 0, false
 		}
 		#partial switch e.op {
-		case .Minus:
-			return -v, true
 		case .Plus:
 			return v, true
+		case .Minus:
+			return 0 - v, true
 		case .Tilde:
 			return ~v, true
+		case .Bang:
+			return u32(v == 0), true
 		}
 	case .Binary:
-		a, aok := const_int(c, e.a)
-		b, bok := const_int(c, e.b)
+		a, aok := fold_bits(c, e.a)
+		b, bok := fold_bits(c, e.b)
 		if !aok || !bok {
 			return 0, false
 		}
+		ta := expr_type(u, e.a)
 		#partial switch e.op {
 		case .Plus:
 			return a + b, true
@@ -1554,46 +1558,86 @@ const_int :: proc(c: ^Checker, id: Expr_Id) -> (i64, bool) {
 		case .Star:
 			return a * b, true
 		case .Slash:
-			return a / b if b != 0 else 0, b != 0
+			if b == 0 {
+				return 0, false
+			}
+			if ta == T_UINT {
+				return a / b, true
+			}
+			sa, sb := i32(a), i32(b)
+			return a if sa == min(i32) && sb == -1 else u32(sa / sb), true
 		case .Percent:
-			return a % b if b != 0 else 0, b != 0
+			if b == 0 {
+				return 0, false
+			}
+			if ta == T_UINT {
+				return a % b, true
+			}
+			sa, sb := i32(a), i32(b)
+			return 0 if sb == -1 else u32(sa % sb), true
 		case .Shl:
-			return a << u64(b & 63), true
+			return (a << b if b < 32 else 0), b < 32
 		case .Shr:
-			return a >> u64(b & 63), true
+			if b >= 32 {
+				return 0, false
+			}
+			return a >> b if ta == T_UINT else u32(i32(a) >> b), true
 		case .Amp:
 			return a & b, true
 		case .Pipe:
 			return a | b, true
 		case .Caret:
 			return a ~ b, true
+		case .Eq_Eq:
+			return u32(a == b), true
+		case .Not_Eq:
+			return u32(a != b), true
+		case .Lt:
+			return u32(a < b) if ta == T_UINT else u32(i32(a) < i32(b)), true
+		case .Lt_Eq:
+			return u32(a <= b) if ta == T_UINT else u32(i32(a) <= i32(b)), true
+		case .Gt:
+			return u32(a > b) if ta == T_UINT else u32(i32(a) > i32(b)), true
+		case .Gt_Eq:
+			return u32(a >= b) if ta == T_UINT else u32(i32(a) >= i32(b)), true
+		case .And_And:
+			return u32(a != 0 && b != 0), true
+		case .Or_Or:
+			return u32(a != 0 || b != 0), true
+		case .Xor_Xor:
+			return u32((a != 0) != (b != 0)), true
+		}
+	case .Ternary:
+		cond, cok := fold_bits(c, e.a)
+		a, aok := fold_bits(c, e.b)
+		b, bok := fold_bits(c, e.c)
+		if cok && aok && bok {
+			return a if cond != 0 else b, true
 		}
 	case .Length:
-		t := expr_type(u, e.a)
-		if is_array(t) {
-			return i64(t.array), true
+		at := expr_type(u, e.a)
+		if is_array(at) {
+			return u32(at.array), true
 		}
-		if is_matrix(t) {
-			return i64(t.cols), true
+		if is_matrix(at) {
+			return u32(at.cols), true
 		}
-		if is_vector(t) {
-			return i64(t.rows), true
+		if is_vector(at) {
+			return u32(at.rows), true
 		}
 	case .Call:
-		t := ty(u, e.type)
-		if e.call == .Constructor && e.args.count == 1 && (t == T_INT || t == T_UINT) {
-			return const_int(c, Expr_Id(list(u, e.args)[0]))
+		if e.call == .Constructor && e.args.count == 1 {
+			if v, ok := fold_bits(c, Expr_Id(list(u, e.args)[0])); ok {
+				return u32(v != 0) if t == T_BOOL else v, true
+			}
 		}
 	case .Convert:
-		t := ty(u, e.type)
-		if t == T_INT || t == T_UINT {
-			return const_int(c, e.a)
-		}
+		return fold_bits(c, e.a)
 	case .Field:
 		if e.swizzle_len == 1 && u.exprs[e.a].kind == .Ident {
 			bs := u.exprs[e.a].sym
 			if bs != 0 && u.syms[bs].storage == .Work_Group_Size && c.has_workgroup && e.swizzle[0] < 3 {
-				return i64(c.local_size[e.swizzle[0]]), true
+				return u32(c.local_size[e.swizzle[0]]), true
 			}
 		}
 	case .Index:
@@ -1601,12 +1645,25 @@ const_int :: proc(c: ^Checker, id: Expr_Id) -> (i64, bool) {
 			bs := u.exprs[e.a].sym
 			if bs != 0 && u.syms[bs].storage == .Work_Group_Size && c.has_workgroup {
 				if ix, ok := const_int(c, e.b); ok && ix >= 0 && ix < 3 {
-					return i64(c.local_size[ix]), true
+					return u32(c.local_size[ix]), true
 				}
 			}
 		}
 	}
 	return 0, false
+}
+
+@(private)
+const_int :: proc(c: ^Checker, id: Expr_Id) -> (i64, bool) {
+	t := expr_type(c.u, id)
+	if t != T_INT && t != T_UINT {
+		return 0, false
+	}
+	bits, ok := fold_bits(c, id)
+	if !ok {
+		return 0, false
+	}
+	return i64(bits) if t == T_UINT else i64(i32(bits)), true
 }
 
 // ---- expressions ---------------------------------------------------------------------

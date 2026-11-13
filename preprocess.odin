@@ -303,13 +303,26 @@ run_directive :: proc(pp: ^Preprocessor, line: []Token) {
 		}
 		delete_key(&pp.by_name, args[0].text)
 	case "line":
+		if len(args) > 0 && (args[0].kind == .Int_Lit || args[0].kind == .Uint_Lit) {
+			if _, ok := parse_int_text(args[0].text); !ok {
+				pp_error(pp, args[0].pos, .Invalid_Int_Literal, a = args[0].text)
+				return
+			}
+		}
 		if len(args) == 0 || args[0].kind != .Int_Lit {
 			pp_error(pp, hash.pos, .Line_Number)
 			return
 		}
+		if len(args) > 1 && (args[1].kind == .Int_Lit || args[1].kind == .Uint_Lit) {
+			if _, ok := parse_int_text(args[1].text); !ok {
+				pp_error(pp, args[1].pos, .Invalid_Int_Literal, a = args[1].text)
+				return
+			}
+		}
 		// The next line is line N.
+		val, _ := parse_int_text(args[0].text)
 		physical := hash.pos.line - pp.line_delta + 1
-		pp.line_delta = i32(parse_int_text(args[0].text)) - physical
+		pp.line_delta = i32(val) - physical
 	case "version", "extension", "pragma":
 	case "error":
 		b := strings.builder_make(pp.keep)
@@ -537,7 +550,15 @@ if_unary :: proc(e: ^If_Eval) -> i64 {
 	#partial switch t.kind {
 	case .Int_Lit, .Uint_Lit:
 		e.i += 1
-		return i64(parse_int_text(t.text))
+		val, ok := parse_int_text(t.text)
+		if !ok {
+			if !e.failed {
+				e.failed = true
+				pp_error(e.pp, t.pos, .Invalid_Int_Literal, a = t.text)
+			}
+			return 0
+		}
+		return i64(i32(val)) if t.kind == .Int_Lit else i64(val)
 	case .L_Paren:
 		e.i += 1
 		v := if_ternary(e)

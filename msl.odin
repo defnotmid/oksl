@@ -794,6 +794,8 @@ msl_stmt :: proc(m: ^Msl, id: Stmt_Id) {
 				tabs(m)
 				if expr_type(u, sub.expr) == T_UINT {
 					w(m, "case %du:\n", u32(sub.value))
+				} else if i32(sub.value) == min(i32) {
+					w(m, "case (-2147483647 - 1):\n")
 				} else {
 					w(m, "case %d:\n", i32(sub.value))
 				}
@@ -1026,7 +1028,7 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
 		n := u.syms[e.sym].name
 		return fmt.aprintf("oksl_buffer_%s(oksl_buf_%s, uint(%s))", n, n, msl_expr(m, e.b))
 	case .Int_Lit:
-		return fmt.aprintf("%d", i32(e.value))
+		return "(-2147483647 - 1)" if i32(e.value) == min(i32) else fmt.aprintf("%d", i32(e.value))
 	case .Uint_Lit:
 		return fmt.aprintf("%du", u32(e.value))
 	case .Float_Lit:

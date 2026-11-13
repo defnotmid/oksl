@@ -4625,3 +4625,320 @@ void main() {
 		}
 	}
 }
+
+@(test)
+test_int32_const_fold_and_literals :: proc(t: ^testing.T) {
+	run_words :: proc(t: ^testing.T, src: string, n_words: int, loc := #caller_location) -> ([]u32, ^Module) {
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Compute})
+		testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator), loc = loc)
+		if !ok {
+			destroy(m)
+			return nil, nil
+		}
+		if have_spirv_val() {
+			expect_valid_spirv(t, "int32_cf", m.spirv, loc = loc)
+		}
+		words := make([]u32, n_words, context.temp_allocator)
+		run_compute(&m.program, nil, {1, 1, 1}, temp_scratch(), {buffers = {words}})
+		return words, m
+	}
+
+	// 1. cf_index.comp: unsigned 32-bit folded array indices and const variables.
+	{
+		src := `#version 310 es
+layout(local_size_x = 1) in;
+layout(std430) buffer B { uint w[]; } b;
+const uint K = (0u - 1u) % 4u;
+void main() {
+    uint arr[4] = uint[4](10u, 11u, 12u, 13u);
+    b.w[0] = arr[(~10u) % 4u];
+    b.w[1] = arr[K];
+}`
+		w, m := run_words(t, src, 4)
+		defer destroy(m)
+		if w != nil {
+			testing.expect_value(t, w[0], u32(11))
+			testing.expect_value(t, w[1], u32(13))
+		}
+	}
+
+	// 2. cf_switch.comp: uint switch labels folded in 32-bit unsigned (matches glslang on RADV: 10, 20, 30, 40, 99).
+	{
+		src := `#version 310 es
+layout(local_size_x = 1) in;
+layout(std430) buffer B { uint w[]; } b;
+uint pick(uint x) {
+    switch (x) {
+    case (~10u) % 4u: return 10u;
+    case (0u - 1u) / 2u: return 20u;
+    case (~0u) >> 4: return 30u;
+    case (2147483648u + 2147483648u) + 5u: return 40u;
+    default: return 99u;
+    }
+}
+void main() {
+    b.w[0] = pick(1u);
+    b.w[1] = pick(0x7fffffffu);
+    b.w[2] = pick(0x0fffffffu);
+    b.w[3] = pick(5u);
+    b.w[4] = pick(0xfffffffdu);
+}`
+		w, m := run_words(t, src, 8)
+		defer destroy(m)
+		if w != nil {
+			testing.expect_value(t, w[0], u32(10))
+			testing.expect_value(t, w[1], u32(20))
+			testing.expect_value(t, w[2], u32(30))
+			testing.expect_value(t, w[3], u32(40))
+			testing.expect_value(t, w[4], u32(99))
+			testing.expect(t, strings.contains(m.msl, "case 1u:"))
+			testing.expect(t, strings.contains(m.msl, "case 2147483647u:"))
+			testing.expect(t, strings.contains(m.msl, "case 268435455u:"))
+			testing.expect(t, strings.contains(m.msl, "case 5u:"))
+		}
+	}
+
+	// 3. cf_dup.comp and duplicate case labels after 32-bit int/uint folding.
+	for tc in ([][2]string {
+		{
+			"layout(local_size_x = 1) in;\nlayout(std430) buffer B { int w[]; } b;\nvoid main() {\n    switch (b.w[0]) {\n    case -2147483647 - 1: b.w[1] = 1; break;\n    case 2147483647 + 1: b.w[1] = 2; break;\n    }\n}",
+			"case -2147483648 is already handled",
+		},
+		{
+			"layout(local_size_x = 1) in;\nvoid main() {\n    switch (0) {\n    case 2147483648: break;\n    case 2147483647 + 1: break;\n    }\n}",
+			"case -2147483648 is already handled",
+		},
+		{
+			"layout(local_size_x = 1) in;\nvoid main() {\n    switch (0u) {\n    case (2147483648u + 2147483648u) + 5u: break;\n    case 5u: break;\n    }\n}",
+			"case 5 is already handled",
+		},
+		{
+			"layout(local_size_x = 1) in;\nvoid main() {\n    switch (0) {\n    case -1: break;\n    case 0xffffffff: break;\n    }\n}",
+			"case -1 is already handled",
+		},
+		{
+			"layout(local_size_x = 1) in;\nvoid main() {\n    switch (0u) {\n    case 0u - 1u: break;\n    case ~0u: break;\n    }\n}",
+			"case 4294967295 is already handled",
+		},
+	}) {
+		m, errs, ok := compile(fmt.tprintf("#version 310 es\n%s", tc[0]), {profile = .Glsl, stage = .Compute})
+		defer destroy(m)
+		msg := format_errors(errs, context.temp_allocator)
+		testing.expectf(t, !ok && len(errs) == 1 && errs[0].code == .Case_Duplicate && strings.contains(msg, tc[1]), "expected %q, got:\n%s", tc[1], msg)
+	}
+
+	// 3b. GLSL ES 3.10 §6.2: case label type must match switch selector type (no int/uint mixing).
+	for tc in ([][2]string {
+		{
+			"layout(local_size_x = 1) in;\nlayout(std430) buffer B { uint w[]; } b;\nvoid main() { switch (b.w[0]) { case -2: b.w[1] = 1u; break; default: break; } }",
+			"case label must be uint, not int",
+		},
+		{
+			"layout(local_size_x = 1) in;\nlayout(std430) buffer B { uint w[]; } b;\nvoid main() { switch (int(b.w[0])) { case 0xffffffffu: b.w[1] = 1u; break; default: break; } }",
+			"case label must be int, not uint",
+		},
+		{
+			"layout(local_size_x = 1) in;\nconst uint K = 1u;\nvoid main() { switch (0) { case K: break; } }",
+			"case label must be int, not uint",
+		},
+		{
+			"layout(local_size_x = 1) in;\nconst int K = 1;\nvoid main() { switch (0u) { case K: break; } }",
+			"case label must be uint, not int",
+		},
+	}) {
+		m, errs, ok := compile(fmt.tprintf("#version 310 es\n%s", tc[0]), {profile = .Glsl, stage = .Compute})
+		defer destroy(m)
+		msg := format_errors(errs, context.temp_allocator)
+		testing.expectf(t, !ok && len(errs) == 1 && errs[0].code == .Case_Type && strings.contains(msg, tc[1]), "expected %q, got:\n%s", tc[1], msg)
+	}
+	{
+		m, errs, ok := compile("#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { switch (1.0) { case 1: break; } }", {profile = .Glsl, stage = .Compute})
+		defer destroy(m)
+		testing.expect(t, !ok && len(errs) == 1 && errs[0].code == .Switch_Type)
+	}
+
+	// 4. 32-bit wrap-around and signedness across ~, -, +, *, /, %, >>, <<, comparisons, bools and ?:.
+	{
+		src := `#version 310 es
+layout(local_size_x = 1) in;
+layout(std430) buffer B { uint w[]; } b;
+const bool U_CMP = (~0u > 1u) && !(1u > ~0u) && (1u < ~0u) && !(~0u < 1u) && (~0u >= 1u) && !(1u >= ~0u) && (1u <= ~0u) && !(~0u <= 1u);
+const bool S_CMP = ((2147483647 + 1) < 0) && (-1 < 1) && !(1 < -1) && (1 > -1) && !(-1 > 1) && (-1 <= 1) && !(1 <= -1) && (1 >= -1) && !(-1 >= 1) && ((~0) == -1) && ((2147483648) == (-2147483647 - 1));
+const bool T_BOOL_NORM = bool(5u);
+uint fold_u(uint x) {
+    switch (x) {
+    case ~10u: return 1u;                              // 0xfffffff5u (~)
+    case -10u: return 2u;                              // 0xfffffff6u (unary -)
+    case 0u - 3u: return 3u;                           // 0xfffffffdu (binary -)
+    case 0x80000001u * 2u: return 4u;                  // 2u (*)
+    case 0xfffffffeu / 3u: return 5u;                  // 0x55555554u (/)
+    case 0xfffffffeu % 5u: return 6u;                  // 4u (%)
+    case 0x80000000u >> 28: return 7u;                 // 8u (>> logical)
+    case 0xf0000001u << 4: return 8u;                  // 16u (<< wrap)
+    case U_CMP ? 100u : 200u: return 9u;               // unsigned comparisons (<, <=, >, >=)
+    default: return 0u;
+    }
+}
+int fold_i(int x) {
+    switch (x) {
+    case ~10: return 11;                               // -11 (~)
+    case -(-2147483647 - 1): return 12;                // -2147483648 (unary - wrap)
+    case (-2147483647 - 1) - 1: return 13;             // 2147483647 (binary - wrap)
+    case 0x40000001 * 4: return 14;                    // 4 (* wrap)
+    case (-2147483647 - 1) / -1 + 1: return 15;        // -2147483647 (INT_MIN / -1 wrap)
+    case (-2147483647 - 1) % -1: return 16;            // 0 (INT_MIN % -1)
+    case (-32) >> 3: return 17;                        // -4 (>> arithmetic)
+    case 0x40000003 << 2: return 18;                   // 12 (<< wrap)
+    case S_CMP ? 100 : 200: return 19;                 // signed comparisons (<, <=, >, >=)
+    default: return 0;
+    }
+}
+void main() {
+    b.w[0] = fold_u(0xfffffff5u);
+    b.w[1] = fold_u(0xfffffff6u);
+    b.w[2] = fold_u(0xfffffffdu);
+    b.w[3] = fold_u(2u);
+    b.w[4] = fold_u(0x55555554u);
+    b.w[5] = fold_u(4u);
+    b.w[6] = fold_u(8u);
+    b.w[7] = fold_u(16u);
+    b.w[8] = fold_u(100u);
+    b.w[9] = uint(fold_i(-11));
+    b.w[10] = uint(fold_i(2147483648));
+    b.w[11] = uint(fold_i(2147483647));
+    b.w[12] = uint(fold_i(4));
+    b.w[13] = uint(fold_i(-2147483647));
+    b.w[14] = uint(fold_i(0));
+    b.w[15] = uint(fold_i(-4));
+    b.w[16] = uint(fold_i(12));
+    b.w[17] = uint(fold_i(100));
+    uint a_bool[int(bool(2)) + 1] = uint[2](7u, 9u);
+    uint b_bool[uint(T_BOOL_NORM) + 1u] = uint[2](3u, 4u);
+    b.w[18] = a_bool[1] * 10u + b_bool[1];
+    uint a_mindiv[(((-2147483647 - 1) / -1) == 2147483648 && ((-2147483647 - 1) % -1) == 0 && (7 % -1) == 0) ? 2 : 1] = uint[2](5u, 6u);
+    b.w[19] = a_mindiv[1];
+}`
+		w, m := run_words(t, src, 24)
+		defer destroy(m)
+		if w != nil {
+			want := [?]u32{1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 94, 6}
+			for v, i in want {
+				testing.expect_value(t, w[i], v)
+			}
+			testing.expect(t, strings.contains(m.msl, "case (-2147483647 - 1):"))
+		}
+	}
+
+	// 4b. Array sizes above max(i32) report Array_Size_Positive.
+	for big_arr in ([]string {
+		"layout(local_size_x = 1) in;\nvoid main() { uint a[0x80000000u]; }",
+		"layout(local_size_x = 1) in;\nvoid main() { uint a[0xffffffffu]; }",
+	}) {
+		m, errs, ok := compile(fmt.tprintf("#version 310 es\n%s", big_arr), {profile = .Glsl, stage = .Compute})
+		defer destroy(m)
+		testing.expectf(t, !ok && len(errs) == 1 && errs[0].code == .Array_Size_Positive, "expected Array_Size_Positive on %q, got %v", big_arr, errs)
+	}
+
+	// 5. Undefined shifts (< 0 or >= 32) do not fold as constant expressions.
+	for bad_sh in ([]string {
+		"layout(local_size_x = 1) in;\nvoid main() { switch (0) { case 1 << 32: break; } }",
+		"layout(local_size_x = 1) in;\nvoid main() { switch (0u) { case 1u >> 32u: break; } }",
+		"layout(local_size_x = 1) in;\nvoid main() { switch (0) { case 1 << -1: break; } }",
+		"layout(local_size_x = 1) in;\nvoid main() { switch (0) { case 1 >> -1: break; } }",
+	}) {
+		m, errs, ok := compile(fmt.tprintf("#version 310 es\n%s", bad_sh), {profile = .Glsl, stage = .Compute})
+		defer destroy(m)
+		testing.expectf(t, !ok && len(errs) > 0 && errs[0].code == .Case_Constant, "expected Case_Constant on %q, got %v", bad_sh, errs)
+	}
+
+	// 6. Integer literal validation across parse_primary, location, local_size, #if and #line,
+	// plus GLSL ES 3.10 §4.1.3 handling of `2147483648` without `u` (signed -2147483648).
+	for bad_lit in ([]string {
+		// parse_primary
+		"#version 310 es\nlayout(local_size_x = 1) in;\nlayout(std430) buffer B { uint w[]; } b;\nvoid main() { b.w[0] = 4294967304u; }",
+		"#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { int x = 4294967296; }",
+		"#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { uint x = 0x100000000u; }",
+		"#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { int x = 040000000000; }",
+		"#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { int x = 08; }",
+		"#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { uint x = 09u; }",
+		"#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { int x = 0x; }",
+		"#version 310 es\nlayout(local_size_x = 1) in;\nvoid main() { uint x = 0xu; }",
+		// layout(location = ...)
+		"#version 310 es\nprecision highp float;\nlayout(location = 4294967296) out vec4 c;\nvoid main() { c = vec4(1.0); }",
+		"#version 310 es\nprecision highp float;\nlayout(location = 4294967296u) out vec4 c;\nvoid main() { c = vec4(1.0); }",
+		"#version 310 es\nprecision highp float;\nlayout(location = 08) out vec4 c;\nvoid main() { c = vec4(1.0); }",
+		"#version 310 es\nprecision highp float;\nlayout(location = 0x) out vec4 c;\nvoid main() { c = vec4(1.0); }",
+		// #if / #elif
+		"#version 310 es\n#if 4294967296\n#endif\nlayout(local_size_x = 1) in;\nvoid main() {}",
+		"#version 310 es\n#if 08\n#endif\nlayout(local_size_x = 1) in;\nvoid main() {}",
+		"#version 310 es\n#if 0x\n#endif\nlayout(local_size_x = 1) in;\nvoid main() {}",
+		"#version 310 es\n#if 0\n#elif 08\n#endif\nlayout(local_size_x = 1) in;\nvoid main() {}",
+		// #line
+		"#version 310 es\n#line 4294967296\nlayout(local_size_x = 1) in;\nvoid main() {}",
+		"#version 310 es\n#line 4294967296u\nlayout(local_size_x = 1) in;\nvoid main() {}",
+		"#version 310 es\n#line 08\nlayout(local_size_x = 1) in;\nvoid main() {}",
+		"#version 310 es\n#line 0x\nlayout(local_size_x = 1) in;\nvoid main() {}",
+		"#version 310 es\n#line 10 08\nlayout(local_size_x = 1) in;\nvoid main() {}",
+	}) {
+		stage := Stage.Fragment if strings.contains(bad_lit, "out vec4") else Stage.Compute
+		m, errs, ok := compile(bad_lit, {profile = .Glsl, stage = stage})
+		defer destroy(m)
+		testing.expectf(t, !ok && len(errs) > 0 && errs[0].code == .Invalid_Int_Literal, "expected Invalid_Int_Literal on %q, got %v", bad_lit, errs)
+	}
+
+	// `2147483648` without `u` is signed -2147483648 (§4.1.3), while `2147483648u` is +2147483648.
+	{
+		m1, e1, ok1 := compile("#version 310 es\nlayout(local_size_x = 2147483648) in;\nvoid main() {}", {profile = .Glsl, stage = .Compute})
+		defer destroy(m1)
+		testing.expect(t, !ok1 && len(e1) == 1 && e1[0].code == .Local_Size_Positive && e1[0].n == -2147483648)
+
+		m2, e2, ok2 := compile("#version 310 es\nlayout(local_size_x = 2147483648u) in;\nvoid main() {}", {profile = .Glsl, stage = .Compute})
+		defer destroy(m2)
+		testing.expect(t, !ok2 && len(e2) == 1 && e2[0].code == .Local_Size_Max && e2[0].n == 2147483648)
+
+		m3, e3, ok3 := compile("#version 310 es\nprecision highp float;\nlayout(location = 0xffffffff) out vec4 c;\nvoid main() { c = vec4(1.0); }", {profile = .Glsl, stage = .Fragment})
+		defer destroy(m3)
+		testing.expect(t, !ok3 && len(e3) == 1 && e3[0].code == .Location_Range && e3[0].n == -1)
+
+		m4, e4, ok4 := compile("#version 310 es\nprecision highp float;\nlayout(location = 2147483648) out vec4 c;\nvoid main() { c = vec4(1.0); }", {profile = .Glsl, stage = .Fragment})
+		defer destroy(m4)
+		testing.expect(t, !ok4 && len(e4) == 1 && e4[0].code == .Location_Range && e4[0].n == -2147483648)
+
+		m5, e5, ok5 := compile("#version 310 es\nprecision highp float;\nlayout(location = 2147483648u) out vec4 c;\nvoid main() { c = vec4(1.0); }", {profile = .Glsl, stage = .Fragment})
+		defer destroy(m5)
+		testing.expect(t, !ok5 && len(e5) == 1 && e5[0].code == .Location_Range && e5[0].n == 2147483648)
+
+		// #if treats `2147483648` and `0xffffffff` as signed 32-bit (-2147483648 and -1).
+		pp_src := `#version 310 es
+#if 2147483648 < 0 && 0xffffffff == -1 && 037777777777 == -1 && 00 == 0
+layout(local_size_x = 1) in;
+layout(std430) buffer B { int w[]; } b;
+void main() {
+    int k = 5;
+    b.w[0] = (2147483648 < 0 && 4294967295 == -1) ? max(k, 2147483648) : -99;
+}
+#else
+#error wrong_sign
+#endif`
+		w, m := run_words(t, pp_src, 4)
+		defer destroy(m)
+		if w != nil {
+			testing.expect_value(t, i32(w[0]), i32(5))
+			testing.expect(t, strings.contains(m.msl, "max(ok_k, (-2147483647 - 1))"))
+		}
+	}
+
+	// 7. testdata/const_fold.comp compiles cleanly and passes spirv-val.
+	{
+		cf_bytes, rerr := os.read_entire_file("testdata/const_fold.comp", context.temp_allocator)
+		testing.expect(t, rerr == nil)
+		if rerr == nil {
+			cm, cerrs, cok := compile(string(cf_bytes), {profile = .Glsl, stage = .Compute})
+			defer destroy(cm)
+			testing.expectf(t, cok, "const_fold.comp failed:\n%s", format_errors(cerrs, context.temp_allocator))
+			if cok && have_spirv_val() {
+				expect_valid_spirv(t, "const_fold.comp", cm.spirv)
+			}
+		}
+	}
+}

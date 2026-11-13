@@ -150,16 +150,18 @@ add_var :: proc(p: ^Parser, v: Var_Decl) -> Var_Id {
 
 @(private = "file")
 Layout_Qual :: struct {
-	has_layout:  bool,
-	bad:         bool,
-	empty:       bool,
-	non_default: bool,
-	count:       i32,
-	layout_pos:  Pos,
-	location:    i32,
-	packing:     string,
-	format:      Image_Format,
-	workgroups:  [dynamic]Workgroup_Item,
+	has_layout:    bool,
+	has_location:  bool,
+	location_uint: bool,
+	bad:           bool,
+	empty:         bool,
+	non_default:   bool,
+	count:         i32,
+	layout_pos:    Pos,
+	location:      i32,
+	packing:       string,
+	format:        Image_Format,
+	workgroups:    [dynamic]Workgroup_Item,
 }
 
 @(private = "file")
@@ -187,8 +189,17 @@ parse_layout :: proc(p: ^Parser, lay: ^Layout_Qual) {
 		}
 		need_comma = true
 		lay.count += 1
-		if is_ident(p, "location") && peek(p, 1) == .Eq && peek(p, 2) == .Int_Lit {
-			lay.location = i32(parse_int_text(tok(p, 2).text))
+		if is_ident(p, "location") && peek(p, 1) == .Eq && (peek(p, 2) == .Int_Lit || peek(p, 2) == .Uint_Lit) {
+			vt := tok(p, 2)
+			val, ok := parse_int_text(vt.text)
+			if !ok {
+				error_at(p, vt.pos, .Invalid_Int_Literal, a = vt.text)
+				lay.bad = true
+				return
+			}
+			lay.location = i32(val)
+			lay.has_location = true
+			lay.location_uint = vt.kind == .Uint_Lit
 			lay.non_default = true
 			p.i += 3
 			continue
@@ -215,7 +226,8 @@ parse_layout :: proc(p: ^Parser, lay: ^Layout_Qual) {
 				if lay.workgroups.allocator.procedure == nil {
 					lay.workgroups = make([dynamic]Workgroup_Item, 0, 4, context.temp_allocator)
 				}
-				append(&lay.workgroups, Workgroup_Item{pos = t.pos, value = i64(val), axis = axis})
+				lv := i64(val) if vt.kind == .Uint_Lit else i64(i32(val))
+				append(&lay.workgroups, Workgroup_Item{pos = t.pos, value = lv, axis = axis})
 				continue
 			}
 			error_at(p, vt.pos, .Local_Size_Constant, t.text)
@@ -379,6 +391,7 @@ parse_top :: proc(p: ^Parser) {
 	for k in 0 ..< vars.count {
 		v := &u.vars[u.ids[vars.start + k]]
 		v.io, v.location, v.flat = io, lay.location, flat
+		v.has_location, v.location_uint = lay.has_location, lay.location_uint
 		v.readonly, v.writeonly = readonly, writeonly
 		v.format, v.bad_layout = lay.format, lay.bad
 	}
@@ -1030,7 +1043,12 @@ parse_primary :: proc(p: ^Parser) -> Expr_Id {
 	#partial switch t.kind {
 	case .Int_Lit, .Uint_Lit:
 		p.i += 1
-		return add_expr(p, Expr{kind = .Int_Lit if t.kind == .Int_Lit else .Uint_Lit, pos = t.pos, value = u64(parse_int_text(t.text))})
+		val, ok := parse_int_text(t.text)
+		if !ok {
+			error_at(p, t.pos, .Invalid_Int_Literal, a = t.text)
+			return 0
+		}
+		return add_expr(p, Expr{kind = .Int_Lit if t.kind == .Int_Lit else .Uint_Lit, pos = t.pos, value = u64(val)})
 	case .Float_Lit:
 		p.i += 1
 		text := t.text
@@ -1076,7 +1094,7 @@ parse_primary :: proc(p: ^Parser) -> Expr_Id {
 // optional u suffix), wrapped to 32 bits; `ok` reports whether every digit is
 // valid for the base and the value fits in 32 bits.
 @(private)
-parse_int_text :: proc(text: string) -> (val: u32, ok: bool) #optional_ok {
+parse_int_text :: proc(text: string) -> (val: u32, ok: bool) {
 	s := text
 	if len(s) > 0 && (s[len(s) - 1] == 'u' || s[len(s) - 1] == 'U') {
 		s = s[:len(s) - 1]

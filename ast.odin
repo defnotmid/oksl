@@ -154,10 +154,12 @@ Var_Decl :: struct {
 	io:         Var_Io,
 	flat:       bool,
 	// Storage image qualifiers (`layout(rgba8)`, `readonly`, `writeonly`).
-	readonly:   bool,
-	writeonly:  bool,
-	bad_layout: bool,
-	format:     Image_Format,
+	readonly:      bool,
+	writeonly:     bool,
+	bad_layout:    bool,
+	has_location:  bool,
+	location_uint: bool,
+	format:        Image_Format,
 }
 
 Var_Io :: enum u8 {
@@ -281,9 +283,9 @@ Symbol :: struct {
 	// Uniform/Builtin_Uniform: byte offset in the block. Channel: channel
 	// index.
 	index:    int,
-	// Folded value of an integer constant, for array sizes.
-	const_i:  i64,
-	decl:     Var_Id,
+	// Folded 32-bit pattern of a scalar int, uint or bool constant.
+	const_bits: u32,
+	decl:       Var_Id,
 }
 
 Func :: struct {

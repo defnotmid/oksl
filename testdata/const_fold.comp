@@ -1,0 +1,66 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 4, local_size_y = 4) in;
+
+layout(std430) buffer OutBuf {
+    uint w[];
+} out_buf;
+
+const uint K_MOD = (0u - 1u) % 4u;             // 3u
+const bool BIG_U = (~0u) > 1u;                 // true
+const bool NEG_LIT = 2147483648 < 0;           // true (-2147483648 < 0)
+
+uint pick_u(uint x) {
+    switch (x) {
+    case (~10u) % 4u: return 10u;                      // 1u
+    case (0u - 1u) / 2u: return 20u;                   // 0x7fffffffu
+    case (~0u) >> 4: return 30u;                       // 0x0fffffffu
+    case (2147483648u + 2147483648u) + 5u: return 40u; // 5u
+    case (0x80000000u * 3u) + 7u: return 50u;          // 0x80000007u
+    case (1u << 31) | 3u: return 60u;                  // 0x80000003u
+    case BIG_U ? 9u : 0u: return 70u;                  // 9u
+    case 0xfffffffeu: return 80u;                      // 0xfffffffeu
+    default: return 99u;
+    }
+}
+
+int pick_i(int x) {
+    switch (x) {
+    case 2147483648: return 100;                       // -2147483648 (no u suffix)
+    case 2147483647 + 2: return 200;                   // -2147483647
+    case (-16) >> 2: return 300;                       // -4
+    case (1 << 30) * 3: return 400;                    // -1073741824
+    case ((2147483647 + 1) < 0 && NEG_LIT) ? 12 : 0: return 500; // 12
+    case 0xffffffff: return 600;                       // -1 (no u suffix)
+    default: return 999;
+    }
+}
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+    if (gid.x >= 4u || gid.y >= 4u || gid.z != 0u) {
+        return;
+    }
+    uint id = gid.y * 4u + gid.x;
+    uint base = id * 8u;
+
+    uint keys_u[9] = uint[9](1u, 0x7fffffffu, 0x0fffffffu, 5u, 0x80000007u, 0x80000003u, 9u, 0xfffffffeu, 0xfffffffdu);
+    int keys_i[7] = int[7](2147483648, -2147483647, -4, -1073741824, 12, -1, 77);
+
+    out_buf.w[base + 0u] = pick_u(keys_u[id % 9u]);
+    out_buf.w[base + 1u] = pick_u(keys_u[(id + 4u) % 9u]);
+    out_buf.w[base + 2u] = uint(pick_i(keys_i[id % 7u]));
+    out_buf.w[base + 3u] = uint(pick_i(keys_i[(id + 3u) % 7u]));
+
+    uint arr[(~10u) % 4u + K_MOD] = uint[4](10u, 11u, 12u, 13u);
+    out_buf.w[base + 4u] = arr[(~10u) % 4u] * 100u + arr[K_MOD];
+
+    int si = int(id) - 8;
+    int m = max(si, 2147483648);
+    out_buf.w[base + 5u] = uint(m + 20);
+    uint pair[((2147483647 + 1) < 0) ? 2 : 1] = uint[2](7u, 9u);
+    out_buf.w[base + 6u] = pair[int(BIG_U) * int(NEG_LIT)];
+    out_buf.w[base + 7u] = (2147483648 < 0) ? 42u : 0u;
+}
