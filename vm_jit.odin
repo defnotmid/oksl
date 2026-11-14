@@ -54,10 +54,10 @@ Jit_Ctx :: struct {
 	slots:    [^]Jit_Slot,
 	masks:    [^]u8,
 	opts:     ^Run_Options,
+	lanes:    u8,
 	buf_ptr:  [4][^]u32,
 	buf_len:  [4]uint,
 	host_ctx: runtime.Context,
-	lanes:    u8,
 }
 
 #assert(size_of(Chan_Img) == size_of(Jit_Slot))
@@ -79,6 +79,7 @@ Jit_Tables :: struct #align(32) {
 	mask31_u:   [8]u32,
 	all_ones:   [8]u32,
 	lane_iota:  [8]u32,
+	zero_f:     [8]f32,
 	one_f:      [8]f32,
 	neg_one_f:  [8]f32,
 	two_f:      [8]f32,
@@ -89,9 +90,11 @@ Jit_Tables :: struct #align(32) {
 	f2u_hi:     [8]f32,
 	half_f:     [8]f32,
 	i32_max_f:  [8]f32,
+	two52_d:    [4]u64,
 }
 
 #assert(offset_of(Jit_Tables, sign_mask) % 32 == 0)
+#assert(offset_of(Jit_Tables, two52_d) % 32 == 0)
 
 @(private)
 jit_avx2_ready: bool
@@ -124,6 +127,7 @@ init_jit :: proc "contextless" () {
 	jit_tables.i32_max_f = MAX_TEXEL_F32
 	jit_tables.f2i_hi = 2147483648.0
 	jit_tables.f2u_hi = 4294967296.0
+	jit_tables.two52_d = 0x4330_0000_0000_0000
 
 	max_id, _, _, _ := intrinsics.x86_cpuid(0, 0)
 	if max_id < 7 {
@@ -143,12 +147,43 @@ init_jit :: proc "contextless" () {
 }
 
 @(private)
+Jit_Var_Span :: struct {
+	offset: i32,
+	slot:   i32,
+	n:      i32,
+}
+
+@(private)
+Jit_Meta :: struct {
+	var_spans:        []Jit_Var_Span,
+	max_var_col:      i32,
+	fc_slot:          i32,
+	fc_n:             i32,
+	fc_base:          Base,
+	ff_slot:          i32,
+	ff_n:             i32,
+	ff_base:          Base,
+	outs:             [FRAGMENT_OUTPUTS]Program_Var,
+	has_sample_mask:  bool,
+	sample_mask_slot: i32,
+	num_chans:        u8,
+	num_buf_binds:    u8,
+}
+
+@(private)
 jit_destroy :: proc(p: ^Program) {
 	if p.jit_mem != nil {
 		virtual.release(raw_data(p.jit_mem), len(p.jit_mem))
 		p.jit_mem = nil
 		p.jit_init = nil
 		p.jit_body = nil
+	}
+	if p.jit_meta != nil {
+		heap := runtime.default_allocator()
+		meta := (^Jit_Meta)(p.jit_meta)
+		delete(meta.var_spans, heap)
+		free(meta, heap)
+		p.jit_meta = nil
 	}
 }
 
@@ -157,8 +192,8 @@ jit_destroy :: proc(p: ^Program) {
 // Pinned registers inside generated functions (System V AMD64 ABI):
 //   rbp (5)  : ^Jit_Ctx
 //   rbx (3)  : [^]Jit_Slot (32-byte aligned)
-//   r12 (12) : [^]u8       (masks; masks[0] = EXEC, masks[1] = DISCARD)
-//   r13 (13) : u32         (live masks[MASK_EXEC] in 0..255)
+//   r12 (12) : [^]u8       (masks; masks[1] = DISCARD, masks[2..] = saved masks)
+//   r13 (13) : u32         (live MASK_EXEC in 0..255, loaded from ctx.lanes)
 //   r14 (14) : ^Jit_Tables (32-byte aligned lookup tables & vector constants)
 //   ymm0..7  : scratch / work registers
 //   ymm8..15 : basic-block slot register cache
@@ -251,6 +286,8 @@ OFF_TAB_I32MAX :: i32(offset_of(Jit_Tables, i32_max_f))
 OFF_TAB_F2I_HI :: i32(offset_of(Jit_Tables, f2i_hi))
 @(private)
 OFF_TAB_F2U_HI :: i32(offset_of(Jit_Tables, f2u_hi))
+@(private)
+OFF_TAB_TWO52_D :: i32(offset_of(Jit_Tables, two52_d))
 
 @(private)
 emit_b :: #force_inline proc(buf: ^[dynamic]u8, b0: u8) {
@@ -804,7 +841,6 @@ write_slot :: proc(e: ^Jit_Emitter, slot: i32, src: u8, pinned: u8 = 0) {
 is_helper_instr :: proc(in_: Instr) -> bool {
 	#partial switch in_.op {
 	case .Store_Dyn,
-	     .I_Div, .U_Div, .I_Rem, .U_Rem,
 	     .Faceforward, .Refract,
 	     .Determinant, .Inverse,
 	     .Texture, .Texture_Bias, .Texel_Fetch, .Texture_Size:
@@ -891,24 +927,6 @@ jit_help_store_dyn :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bound
 		off := i32(slots[in_.b][l])
 		for i in 0 ..< n {
 			slots[in_.dst + off + i][l] = slots[in_.a + i][l]
-		}
-	}
-}
-
-@(private, enable_target_feature = "avx2")
-jit_help_idiv :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
-	slots := ctx.slots
-	for i in 0 ..< i32(in_.n) {
-		a, b, d := &slots[in_.a + i], &slots[in_.b + i], &slots[in_.dst + i]
-		#partial switch in_.op {
-		case .I_Div:
-			for l in 0 ..< JIT_LANES {d[l] = bin_lane(a[l], b[l], .I_Div)}
-		case .U_Div:
-			for l in 0 ..< JIT_LANES {d[l] = bin_lane(a[l], b[l], .U_Div)}
-		case .I_Rem:
-			for l in 0 ..< JIT_LANES {d[l] = bin_lane(a[l], b[l], .I_Rem)}
-		case .U_Rem:
-			for l in 0 ..< JIT_LANES {d[l] = bin_lane(a[l], b[l], .U_Rem)}
 		}
 	}
 }
@@ -1345,7 +1363,8 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 	emit_modrm_mem(&e.buf, GPR_RBX, GPR_RBP, OFF_CTX_SLOTS)
 	emit_bytes(&e.buf, 0x4C, 0x8B)       // mov r12, [rbp + OFF_CTX_MASKS]
 	emit_modrm_mem(&e.buf, GPR_R12, GPR_RBP, OFF_CTX_MASKS)
-	emit_bytes(&e.buf, 0x45, 0x0F, 0xB6, 0x2C, 0x24) // movzx r13d, byte [r12]
+	emit_bytes(&e.buf, 0x44, 0x0F, 0xB6) // movzx r13d, byte [rbp + OFF_CTX_LANES]
+	emit_modrm_mem(&e.buf, GPR_R13, GPR_RBP, OFF_CTX_LANES)
 	emit_bytes(&e.buf, 0x49, 0xBE)       // movabs r14, &jit_tables
 	emit_u64(&e.buf, u64(uintptr(&jit_tables)))
 
@@ -1494,7 +1513,49 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			}
 
 		case .I_Div, .U_Div, .I_Rem, .U_Rem:
-			emit_helper_call(&e.buf, jit_help_idiv, &code[pc])
+			is_u := in_.op == .U_Div || in_.op == .U_Rem
+			is_rem := in_.op == .I_Rem || in_.op == .U_Rem
+			cvt_pd :: #force_inline proc(buf: ^[dynamic]u8, y_dst, x_src: u8, unsigned: bool) {
+				if unsigned {
+					emit_vex_rr(buf, 2, 1, 1, 0, 0x35, y_dst, 0, x_src)     // vpmovzxdq ymm, xmm
+					vop_d_tab(buf, 0xEB, y_dst, y_dst, OFF_TAB_TWO52_D)     // vpor ymm, [two52_d]
+					vop_d_tab(buf, 0x5C, y_dst, y_dst, OFF_TAB_TWO52_D)     // vsubpd ymm, [two52_d]
+				} else {
+					emit_vex_rr(buf, 1, 2, 1, 0, 0xE6, y_dst, 0, x_src)     // vcvtdq2pd ymm, xmm
+				}
+			}
+			for i in 0 ..< n {
+				ya := read_slot(e, a + i, 6)
+				yb := read_slot(e, b + i, 7, pin_bit(ya))
+				// Low 4 lanes -> xmm0, high 4 lanes -> xmm3, combined in ymm0.
+				cvt_pd(&e.buf, 1, ya, is_u)
+				cvt_pd(&e.buf, 2, yb, is_u)
+				vop_d(&e.buf, 0x5E, 0, 1, 2)                            // vdivpd ymm0, ymm1, ymm2
+				emit_vex_rr(&e.buf, 1, 1, 1, 0, 0xE6, 0, 0, 0)          // vcvttpd2dq xmm0, ymm0
+				emit_vex_rr(&e.buf, 3, 1, 1, 0, 0x39, ya, 0, 1)         // vextracti128 xmm1, ya, 1
+				emit_b(&e.buf, 1)
+				emit_vex_rr(&e.buf, 3, 1, 1, 0, 0x39, yb, 0, 2)         // vextracti128 xmm2, yb, 1
+				emit_b(&e.buf, 1)
+				cvt_pd(&e.buf, 1, 1, is_u)
+				cvt_pd(&e.buf, 2, 2, is_u)
+				vop_d(&e.buf, 0x5E, 3, 1, 2)                            // vdivpd ymm3, ymm1, ymm2
+				emit_vex_rr(&e.buf, 1, 1, 1, 0, 0xE6, 3, 0, 3)          // vcvttpd2dq xmm3, ymm3
+				emit_vex_rr(&e.buf, 3, 1, 1, 0, 0x38, 0, 0, 3)          // vinserti128 ymm0, ymm0, xmm3, 1
+				emit_b(&e.buf, 1)
+				if is_u {
+					// u32 quotients >= 2^31 occur iff yb == 1 and ya >= 2^31 (where ya / 1 == ya).
+					vop_d_tab(&e.buf, 0x76, 4, yb, OFF_TAB_ONE_U)       // vpcmpeqd ymm4, yb, [one_u]
+					vpblendvb(&e.buf, 0, 0, ya, 4)
+				}
+				if is_rem {
+					vop38_d(&e.buf, 0x40, 1, 0, yb)                     // vpmulld ymm1, ymm0, yb
+					vop_d(&e.buf, 0xFA, 0, ya, 1)                       // vpsubd ymm0, ya, ymm1
+				}
+				vzero(&e.buf, 4)
+				vop_d(&e.buf, 0x76, 4, yb, 4)                           // vpcmpeqd ymm4, yb, 0
+				vop_d(&e.buf, 0xDF, 0, 4, 0)                            // vpandn ymm0, ymm4, ymm0
+				write_slot(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+			}
 
 		case .I_Neg:
 			vzero(&e.buf, 2)
@@ -2400,9 +2461,8 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 	pc_off[n_code] = len(e.buf)
 	epilogue_off := len(e.buf)
 
-	// Epilogue: persist r13b -> masks[MASK_EXEC], vzeroupper, restore callee-saved GPRs.
-	emit_bytes(&e.buf, 0x45, 0x88, 0x2C, 0x24) // mov byte [r12], r13b
-	emit_bytes(&e.buf, 0xC5, 0xF8, 0x77)       // vzeroupper
+	// Epilogue: vzeroupper, restore callee-saved GPRs.
+	emit_bytes(&e.buf, 0xC5, 0xF8, 0x77) // vzeroupper
 	emit_bytes(&e.buf, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0x5D, 0xC3)
 
 	for jp in e.patches {
@@ -2560,6 +2620,60 @@ jit_compile :: proc(p: ^Program) {
 		virtual.release(raw_data(mem_slice), uint(len(mem_slice)))
 		return
 	}
+
+	meta := new(Jit_Meta, heap)
+	for in_ in p.code {
+		#partial switch in_.op {
+		case .Texture, .Texture_Bias, .Texel_Fetch, .Texture_Size:
+			if in_.k + 1 > meta.num_chans {
+				meta.num_chans = in_.k + 1
+			}
+		case .Load_Buf:
+			if in_.k < 4 && in_.k + 1 > meta.num_buf_binds {
+				meta.num_buf_binds = in_.k + 1
+			}
+		}
+	}
+
+	if p.stage == .Fragment {
+		spans := make([dynamic]Jit_Var_Span, 0, len(p.inputs), heap)
+		for v in p.inputs {
+			#partial switch v.kind {
+			case .Stage_In:
+				if v.n <= 0 {
+					continue
+				}
+				meta.max_var_col = max(meta.max_var_col, v.offset + v.n)
+				if len(spans) > 0 {
+					last := &spans[len(spans) - 1]
+					if last.offset + last.n == v.offset && last.slot + last.n == v.slot {
+						last.n += v.n
+						continue
+					}
+				}
+				append(&spans, Jit_Var_Span{offset = v.offset, slot = v.slot, n = v.n})
+			case .Frag_Coord:
+				meta.fc_slot = v.slot
+				meta.fc_n = v.n
+				meta.fc_base = v.base
+			case .Front_Facing:
+				meta.ff_slot = v.slot
+				meta.ff_n = v.n
+				meta.ff_base = v.base
+			}
+		}
+		meta.var_spans = spans[:]
+		for v in p.outputs {
+			if v.kind == .Stage_Out && int(v.location) < len(meta.outs) {
+				meta.outs[v.location] = v
+			} else if v.kind == .Sample_Mask {
+				meta.has_sample_mask = true
+				meta.sample_mask_slot = v.slot
+			}
+		}
+	}
+
+	p.jit_meta = meta
 	p.jit_mem = mem_slice
 	base := uintptr(raw_data(mem_slice))
 	if has_init {
@@ -2580,26 +2694,38 @@ jit_begin :: proc(p: ^Program, scratch: ^Scratch, uniforms: []u8, opts: ^Run_Opt
 	if len(scratch.masks) < needed_masks {
 		resize(&scratch.masks, needed_masks)
 	}
+	meta := (^Jit_Meta)(p.jit_meta)
 	aligned := (uintptr(raw_data(scratch.regs)) + 31) &~ uintptr(31)
-	chan_imgs := (^[SAMPLER_COUNT]Chan_Img)(aligned)
-	chan_imgs^ = {}
-	fill_chan_imgs(chan_imgs, opts.channel_images)
+	if meta.num_chans > 0 {
+		chan_imgs := (^[SAMPLER_COUNT]Chan_Img)(aligned)
+		n_ch := int(meta.num_chans)
+		for i in 0 ..< n_ch {
+			chan_imgs[i].ptr = nil
+		}
+		if len(opts.channel_images) > 0 {
+			fill_chan_imgs(chan_imgs, opts.channel_images[:min(len(opts.channel_images), n_ch)])
+		}
+	}
 	slots := ([^]Jit_Slot)(aligned + SAMPLER_COUNT * size_of(Chan_Img))
 	masks := ([^]u8)(raw_data(scratch.masks))
 
 	ctx := Jit_Ctx {
-		slots    = slots,
-		masks    = masks,
-		opts     = opts,
-		host_ctx = context,
-		lanes    = 0xFF,
+		slots = slots,
+		masks = masks,
+		opts  = opts,
+		lanes = 0xFF,
 	}
-	n_buf := min(len(opts.buffers), 4)
-	for i in 0 ..< n_buf {
-		b := opts.buffers[i]
-		ctx.buf_ptr[i] = raw_data(b)
-		// Word indices wrap in 32 bits, so clamping len at 2^32 is exact for all u32 indices.
-		ctx.buf_len[i] = min(uint(len(b)), uint(1) << 32)
+	if meta.num_chans > 0 && opts.sampler != nil {
+		ctx.host_ctx = context
+	}
+	if meta.num_buf_binds > 0 {
+		n_buf := min(len(opts.buffers), int(meta.num_buf_binds))
+		for i in 0 ..< n_buf {
+			b := opts.buffers[i]
+			ctx.buf_ptr[i] = raw_data(b)
+			// Word indices wrap in 32 bits, so clamping len at 2^32 is exact for all u32 indices.
+			ctx.buf_len[i] = min(uint(len(b)), uint(1) << 32)
+		}
 	}
 
 	for c in p.consts {
@@ -2616,7 +2742,6 @@ jit_begin :: proc(p: ^Program, scratch: ^Scratch, uniforms: []u8, opts: ^Run_Opt
 		slots[f.slot] = bits
 	}
 	if p.jit_init != nil {
-		masks[MASK_EXEC] = 0xFF
 		masks[MASK_DISCARD] = 0
 		(Jit_Fn(p.jit_init))(&ctx)
 	}
@@ -2696,30 +2821,23 @@ jit_validate_vertex :: proc(p: ^Program, count: int, position: [][4]f32, varying
 }
 
 @(private)
-jit_validate_fragment :: proc(p: ^Program, quads: Fragment_Quads, targets: [][][4]f32, shaded: []Quad_Lanes, sample_masks: []u32) {
+jit_validate_fragment :: proc(p: ^Program, meta: ^Jit_Meta, quads: Fragment_Quads, targets: [][][4]f32, shaded: []Quad_Lanes, sample_masks: []u32) {
 	total := quads.count * 4
 	_ = shaded[quads.count - 1]
 	if quads.helpers != nil {
 		_ = quads.helpers[quads.count - 1]
 	}
-	for v in p.inputs {
-		#partial switch v.kind {
-		case .Stage_In:
-			if v.n > 0 {
-				_ = quads.varyings[(int(v.offset) + int(v.n)) * total - 1]
-			}
-		case .Frag_Coord:
-			if v.n > 0 {
-				_ = quads.origin[quads.count - 1]
-			}
-			if v.n > 2 && quads.depth != nil {
-				_ = quads.depth[total - 1]
-			}
-		case .Front_Facing:
-			if v.n > 0 && quads.front_facing != nil {
-				_ = quads.front_facing[quads.count - 1]
-			}
+	if meta.max_var_col > 0 {
+		_ = quads.varyings[int(meta.max_var_col) * total - 1]
+	}
+	if meta.fc_n > 0 {
+		_ = quads.origin[quads.count - 1]
+		if meta.fc_n > 2 && quads.depth != nil {
+			_ = quads.depth[total - 1]
 		}
+	}
+	if meta.ff_n > 0 && quads.front_facing != nil {
+		_ = quads.front_facing[quads.count - 1]
 	}
 	for target in targets {
 		if target != nil {
@@ -2807,7 +2925,6 @@ jit_runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Ru
 					exec |= 0xF0
 				}
 			}
-			masks[MASK_EXEC] = exec
 			ctx.lanes = exec
 			masks[MASK_DISCARD] = 0
 			body_fn(&ctx)
@@ -2928,9 +3045,7 @@ jit_run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, cou
 				}
 			}
 		}
-		exec := u8((u32(1) << uint(lanes)) - 1)
-		masks[MASK_EXEC] = exec
-		ctx.lanes = exec
+		ctx.lanes = u8((u32(1) << uint(lanes)) - 1)
 		masks[MASK_DISCARD] = 0
 		body_fn(&ctx)
 
@@ -2951,9 +3066,114 @@ jit_run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, cou
 	}
 }
 
+@(private)
+Simd_F4 :: #simd[4]f32
+
+@(private)
+Jit_Out_Target :: struct {
+	dst: [^][4]f32,
+	c0:  ^Jit_Floats,
+	c1:  ^Jit_Floats,
+	c2:  ^Jit_Floats,
+	c3:  ^Jit_Floats,
+}
+
+@(private, enable_target_feature = "avx2")
+jit_store_pair :: #force_inline proc "contextless" (t: Jit_Out_Target, base_out: int) #no_bounds_check {
+	r := (^Simd_F8)(t.c0)^
+	g := (^Simd_F8)(t.c1)^
+	b := (^Simd_F8)(t.c2)^
+	a := (^Simd_F8)(t.c3)^
+	rg_lo := intrinsics.simd_shuffle(r, g, 0, 8, 1, 9, 4, 12, 5, 13)
+	ba_lo := intrinsics.simd_shuffle(b, a, 0, 8, 1, 9, 4, 12, 5, 13)
+	rg_hi := intrinsics.simd_shuffle(r, g, 2, 10, 3, 11, 6, 14, 7, 15)
+	ba_hi := intrinsics.simd_shuffle(b, a, 2, 10, 3, 11, 6, 14, 7, 15)
+	p04 := intrinsics.simd_shuffle(rg_lo, ba_lo, 0, 1, 8, 9, 4, 5, 12, 13)
+	p15 := intrinsics.simd_shuffle(rg_lo, ba_lo, 2, 3, 10, 11, 6, 7, 14, 15)
+	p26 := intrinsics.simd_shuffle(rg_hi, ba_hi, 0, 1, 8, 9, 4, 5, 12, 13)
+	p37 := intrinsics.simd_shuffle(rg_hi, ba_hi, 2, 3, 10, 11, 6, 7, 14, 15)
+	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 0]), intrinsics.simd_shuffle(p04, p15, 0, 1, 2, 3, 8, 9, 10, 11))
+	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 2]), intrinsics.simd_shuffle(p26, p37, 0, 1, 2, 3, 8, 9, 10, 11))
+	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 4]), intrinsics.simd_shuffle(p04, p15, 4, 5, 6, 7, 12, 13, 14, 15))
+	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 6]), intrinsics.simd_shuffle(p26, p37, 4, 5, 6, 7, 12, 13, 14, 15))
+}
+
+@(private, enable_target_feature = "avx2")
+jit_store_quad :: #force_inline proc "contextless" (t: Jit_Out_Target, base_out, qi: int, qalive: u8) #no_bounds_check {
+	r := ((^[2]Simd_F4)(t.c0))[qi]
+	g := ((^[2]Simd_F4)(t.c1))[qi]
+	b := ((^[2]Simd_F4)(t.c2))[qi]
+	a := ((^[2]Simd_F4)(t.c3))[qi]
+	rg_lo := intrinsics.simd_shuffle(r, g, 0, 4, 1, 5)
+	ba_lo := intrinsics.simd_shuffle(b, a, 0, 4, 1, 5)
+	rg_hi := intrinsics.simd_shuffle(r, g, 2, 6, 3, 7)
+	ba_hi := intrinsics.simd_shuffle(b, a, 2, 6, 3, 7)
+	p0 := intrinsics.simd_shuffle(rg_lo, ba_lo, 0, 1, 4, 5)
+	p1 := intrinsics.simd_shuffle(rg_lo, ba_lo, 2, 3, 6, 7)
+	p2 := intrinsics.simd_shuffle(rg_hi, ba_hi, 0, 1, 4, 5)
+	p3 := intrinsics.simd_shuffle(rg_hi, ba_hi, 2, 3, 6, 7)
+	if qalive == 0xF {
+		intrinsics.unaligned_store((^Simd_F4)(&t.dst[base_out + 0]), p0)
+		intrinsics.unaligned_store((^Simd_F4)(&t.dst[base_out + 1]), p1)
+		intrinsics.unaligned_store((^Simd_F4)(&t.dst[base_out + 2]), p2)
+		intrinsics.unaligned_store((^Simd_F4)(&t.dst[base_out + 3]), p3)
+		return
+	}
+	if (qalive & 1) != 0 {intrinsics.unaligned_store((^Simd_F4)(&t.dst[base_out + 0]), p0)}
+	if (qalive & 2) != 0 {intrinsics.unaligned_store((^Simd_F4)(&t.dst[base_out + 1]), p1)}
+	if (qalive & 4) != 0 {intrinsics.unaligned_store((^Simd_F4)(&t.dst[base_out + 2]), p2)}
+	if (qalive & 8) != 0 {intrinsics.unaligned_store((^Simd_F4)(&t.dst[base_out + 3]), p3)}
+}
+
+@(private)
+JIT_FRAG_DX :: Simd_F8{0.5, 1.5, 0.5, 1.5, 0.5, 1.5, 0.5, 1.5}
+@(private)
+JIT_FRAG_DY :: Simd_F8{0.5, 0.5, 1.5, 1.5, 0.5, 0.5, 1.5, 1.5}
+
+@(private)
+jit_write_fragment_slow :: proc(meta: ^Jit_Meta, slots: [^]Jit_Slot, quads: Fragment_Quads, targets: [][][4]f32, shaded: []Quad_Lanes, sample_masks: []u32, first, nq: int, alive: u8) #no_bounds_check {
+	if alive == 0 {
+		shaded[first] = {}
+		if nq == 2 {
+			shaded[first + 1] = {}
+		}
+		return
+	}
+	for qi in 0 ..< nq {
+		q := first + qi
+		lanes_out: Quad_Lanes
+		helpers := quads.helpers[q] if quads.helpers != nil else {}
+		for i in 0 ..< 4 {
+			l := qi * 4 + i
+			if i in helpers || (alive & (1 << uint(l))) == 0 {
+				continue
+			}
+			lanes_out += {i}
+			for target, n_t in targets {
+				if target == nil {
+					continue
+				}
+				c := [4]f32{0, 0, 0, 1}
+				if n_t < len(meta.outs) {
+					v := meta.outs[n_t]
+					for k in 0 ..< int(v.n) {
+						c[k] = float_of(slots[v.slot + i32(k)][l], v.base)
+					}
+				}
+				target[q * 4 + i] = c
+			}
+			if sample_masks != nil {
+				sample_masks[q * 4 + i] = slots[meta.sample_mask_slot][l] if meta.has_sample_mask else ~u32(0)
+			}
+		}
+		shaded[q] = lanes_out
+	}
+}
+
 @(private, enable_target_feature = "avx2")
 jit_run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, targets: [][][4]f32, shaded: []Quad_Lanes, scratch: ^Scratch, opts: Run_Options, sample_masks: []u32) #no_bounds_check {
-	jit_validate_fragment(p, quads, targets, shaded, sample_masks)
+	meta := (^Jit_Meta)(p.jit_meta)
+	jit_validate_fragment(p, meta, quads, targets, shaded, sample_masks)
 	opts_local := opts
 	ctx := jit_begin(p, scratch, uniforms, &opts_local)
 	slots := ctx.slots
@@ -2961,143 +3181,187 @@ jit_run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, tar
 	body_fn := Jit_Fn(p.jit_body)
 	total := quads.count * 4
 
-	outs: [FRAGMENT_OUTPUTS]Program_Var
-	mask_v: Program_Var
-	has_mask := false
-	for v in p.outputs {
-		if v.kind == .Stage_Out && int(v.location) < len(outs) {
-			outs[v.location] = v
-		}
-		if v.kind == .Sample_Mask {
-			mask_v = v
-			has_mask = true
-		}
-	}
-	fast_rgba := len(targets) == 1 && targets[0] != nil && sample_masks == nil && outs[0].n == 4 && outs[0].base == .Float
-	out0_slot := outs[0].slot
-
-	for first := 0; first < quads.count; first += 2 {
-		nq := min(quads.count - first, 2)
-		lanes := nq * 4
-		for v in p.inputs {
-			if v.kind == .Stage_In {
-				base_idx := int(v.offset) * total + first * 4
-				vptr := raw_data(quads.varyings)
-				if nq == 2 {
-					for k in 0 ..< int(v.n) {
-						(^Jit_Floats)(&slots[v.slot + i32(k)])^ = intrinsics.unaligned_load((^Jit_Floats)(&vptr[base_idx + k * total]))
-					}
-				} else {
-					for k in 0 ..< int(v.n) {
-						src := &vptr[base_idx + k * total]
-						reg := (^Jit_Floats)(&slots[v.slot + i32(k)])
-						for l in 0 ..< 4 {reg[l] = ([^]f32)(src)[l]}
-					}
-				}
+	active_outs: [FRAGMENT_OUTPUTS]Jit_Out_Target
+	n_active := 0
+	fast_outs := sample_masks == nil && len(targets) <= FRAGMENT_OUTPUTS
+	if fast_outs {
+		for target, n_t in targets {
+			if target == nil {
 				continue
 			}
-			for k in 0 ..< int(v.n) {
-				col: Jit_Floats
-				#partial switch v.kind {
-				case .Frag_Coord:
-					switch k {
-					case 0:
-						ox0 := f32(quads.origin[first].x)
-						ox1 := f32(quads.origin[first + 1].x) if nq == 2 else 0
-						col = {ox0 + 0.5, ox0 + 1.5, ox0 + 0.5, ox0 + 1.5, ox1 + 0.5, ox1 + 1.5, ox1 + 0.5, ox1 + 1.5}
-					case 1:
-						oy0 := f32(quads.origin[first].y)
-						oy1 := f32(quads.origin[first + 1].y) if nq == 2 else 0
-						col = {oy0 + 0.5, oy0 + 0.5, oy0 + 1.5, oy0 + 1.5, oy1 + 0.5, oy1 + 0.5, oy1 + 1.5, oy1 + 1.5}
-					case 2:
-						if quads.depth != nil {
-							for l in 0 ..< lanes {col[l] = quads.depth[first * 4 + l]}
-						}
-					case 3:
-						col = 1
-					}
-				case .Front_Facing:
-					if quads.front_facing == nil {
-						col = 1
-					} else {
-						f0 := f32(1) if quads.front_facing[first] else 0
-						f1 := (f32(1) if quads.front_facing[first + 1] else 0) if nq == 2 else 0
-						col = {f0, f0, f0, f0, f1, f1, f1, f1}
+			v := meta.outs[n_t]
+			if v.n > 0 && v.base != .Float {
+				fast_outs = false
+				break
+			}
+			active_outs[n_active] = {
+				dst = raw_data(target),
+				c0  = (^Jit_Floats)(&slots[v.slot]) if v.n > 0 else &jit_tables.zero_f,
+				c1  = (^Jit_Floats)(&slots[v.slot + 1]) if v.n > 1 else &jit_tables.zero_f,
+				c2  = (^Jit_Floats)(&slots[v.slot + 2]) if v.n > 2 else &jit_tables.zero_f,
+				c3  = (^Jit_Floats)(&slots[v.slot + 3]) if v.n > 3 else &jit_tables.one_f,
+			}
+			n_active += 1
+		}
+	}
+
+	fc_n := meta.fc_n
+	fc_slot := meta.fc_slot
+	fc_base := meta.fc_base
+	ff_n := meta.ff_n
+	ff_slot := meta.ff_slot
+	ff_base := meta.ff_base
+	dptr := raw_data(quads.depth)
+	ffptr := raw_data(quads.front_facing)
+
+	// Hoist constant Frag_Coord z/w and Front_Facing fills out of the quad loop.
+	if fc_n > 2 {
+		if dptr == nil {
+			jit_fill_slot(&slots[fc_slot + 2], 0, fc_base)
+		}
+		if fc_n > 3 {
+			jit_fill_slot(&slots[fc_slot + 3], 1, fc_base)
+		}
+	}
+	if ff_n > 0 && ffptr == nil {
+		for k in 0 ..< ff_n {
+			jit_fill_slot(&slots[ff_slot + k], 1, ff_base)
+		}
+	}
+
+	var_spans := meta.var_spans
+	vptr := uintptr(raw_data(quads.varyings))
+	col_stride := uintptr(total) * size_of(f32)
+	optr := raw_data(quads.origin)
+	hptr := raw_data(quads.helpers)
+	sptr := raw_data(shaded)
+
+	first := 0
+	for ; first + 2 <= quads.count; first += 2 {
+		pair_off := uintptr(first * 4) * size_of(f32)
+		for sp in var_spans {
+			src := vptr + uintptr(sp.offset) * col_stride + pair_off
+			dst := slots[sp.slot:]
+			for k in 0 ..< int(sp.n) {
+				(^Simd_F8)(&dst[k])^ = intrinsics.unaligned_load((^Simd_F8)(src))
+				src += col_stride
+			}
+		}
+		if fc_n > 0 {
+			if fc_base == .Float {
+				of := (Simd_F4)(intrinsics.unaligned_load((^#simd[4]i32)(&optr[first])))
+				(^Simd_F8)(&slots[fc_slot])^ = intrinsics.simd_shuffle(of, of, 0, 0, 0, 0, 2, 2, 2, 2) + JIT_FRAG_DX
+				if fc_n > 1 {
+					(^Simd_F8)(&slots[fc_slot + 1])^ = intrinsics.simd_shuffle(of, of, 1, 1, 1, 1, 3, 3, 3, 3) + JIT_FRAG_DY
+					if fc_n > 2 && dptr != nil {
+						(^Simd_F8)(&slots[fc_slot + 2])^ = intrinsics.unaligned_load((^Simd_F8)(&dptr[first * 4]))
 					}
 				}
-				jit_fill_slot(&slots[v.slot + i32(k)], col, v.base)
+			} else {
+				o0, o1 := optr[first], optr[first + 1]
+				ox0, ox1 := f32(o0.x), f32(o1.x)
+				jit_fill_slot(&slots[fc_slot], {ox0 + 0.5, ox0 + 1.5, ox0 + 0.5, ox0 + 1.5, ox1 + 0.5, ox1 + 1.5, ox1 + 0.5, ox1 + 1.5}, fc_base)
+				if fc_n > 1 {
+					oy0, oy1 := f32(o0.y), f32(o1.y)
+					jit_fill_slot(&slots[fc_slot + 1], {oy0 + 0.5, oy0 + 0.5, oy0 + 1.5, oy0 + 1.5, oy1 + 0.5, oy1 + 0.5, oy1 + 1.5, oy1 + 1.5}, fc_base)
+					if fc_n > 2 && dptr != nil {
+						jit_fill_slot(&slots[fc_slot + 2], intrinsics.unaligned_load((^Jit_Floats)(&dptr[first * 4])), fc_base)
+					}
+				}
+			}
+		}
+		if ff_n > 0 && ffptr != nil {
+			f0 := f32(1) if ffptr[first] else 0
+			f1 := f32(1) if ffptr[first + 1] else 0
+			col := Jit_Floats{f0, f0, f0, f0, f1, f1, f1, f1}
+			for k in 0 ..< ff_n {
+				jit_fill_slot(&slots[ff_slot + k], col, ff_base)
 			}
 		}
 
-		exec := u8(0xFF) if nq == 2 else u8(0x0F)
-		masks[MASK_EXEC] = exec
-		ctx.lanes = exec
 		masks[MASK_DISCARD] = 0
 		body_fn(&ctx)
 
-		alive := ~masks[MASK_DISCARD] & exec
-		if alive == 0 {
-			shaded[first] = {}
-			if nq == 2 {
-				shaded[first + 1] = {}
+		alive := ~masks[MASK_DISCARD]
+		if fast_outs {
+			if hptr != nil {
+				alive &= ~((transmute(u8)hptr[first] & 0xF) | ((transmute(u8)hptr[first + 1] & 0xF) << 4))
 			}
-			continue
+			sptr[first] = transmute(Quad_Lanes)(alive & 0xF)
+			sptr[first + 1] = transmute(Quad_Lanes)(alive >> 4)
+			if alive == 0xFF {
+				base_out := first * 4
+				for ti in 0 ..< n_active {
+					jit_store_pair(active_outs[ti], base_out)
+				}
+			} else if alive != 0 {
+				if q0 := alive & 0xF; q0 != 0 {
+					base_out := first * 4
+					for ti in 0 ..< n_active {
+						jit_store_quad(active_outs[ti], base_out, 0, q0)
+					}
+				}
+				if q1 := alive >> 4; q1 != 0 {
+					base_out := (first + 1) * 4
+					for ti in 0 ..< n_active {
+						jit_store_quad(active_outs[ti], base_out, 1, q1)
+					}
+				}
+			}
+		} else {
+			jit_write_fragment_slow(meta, slots, quads, targets, shaded, sample_masks, first, 2, alive)
+		}
+	}
+
+	if first < quads.count {
+		quad_off := uintptr(first * 4) * size_of(f32)
+		for sp in var_spans {
+			src := vptr + uintptr(sp.offset) * col_stride + quad_off
+			dst := slots[sp.slot:]
+			for k in 0 ..< int(sp.n) {
+				((^[2]Simd_F4)(&dst[k]))[0] = intrinsics.unaligned_load((^Simd_F4)(src))
+				src += col_stride
+			}
+		}
+		if fc_n > 0 {
+			ox := f32(optr[first].x)
+			jit_fill_slot(&slots[fc_slot], {ox + 0.5, ox + 1.5, ox + 0.5, ox + 1.5, 0, 0, 0, 0}, fc_base)
+			if fc_n > 1 {
+				oy := f32(optr[first].y)
+				jit_fill_slot(&slots[fc_slot + 1], {oy + 0.5, oy + 0.5, oy + 1.5, oy + 1.5, 0, 0, 0, 0}, fc_base)
+				if fc_n > 2 && dptr != nil {
+					col: Jit_Floats
+					for l in 0 ..< 4 {col[l] = dptr[first * 4 + l]}
+					jit_fill_slot(&slots[fc_slot + 2], col, fc_base)
+				}
+			}
+		}
+		if ff_n > 0 && ffptr != nil {
+			f0 := f32(1) if ffptr[first] else 0
+			col := Jit_Floats{f0, f0, f0, f0, 0, 0, 0, 0}
+			for k in 0 ..< ff_n {
+				jit_fill_slot(&slots[ff_slot + k], col, ff_base)
+			}
 		}
 
-		if fast_rgba {
-			t0 := targets[0]
-			r0 := (^Jit_Floats)(&slots[out0_slot])
-			r1 := (^Jit_Floats)(&slots[out0_slot + 1])
-			r2 := (^Jit_Floats)(&slots[out0_slot + 2])
-			r3 := (^Jit_Floats)(&slots[out0_slot + 3])
-			for qi in 0 ..< nq {
-				q := first + qi
-				hbits := transmute(u8)(quads.helpers[q]) if quads.helpers != nil else 0
-				qalive := ((alive >> uint(qi * 4)) & 0xF) &~ hbits
-				shaded[q] = transmute(Quad_Lanes)qalive
-				if qalive == 0 {
-					continue
-				}
-				base_l := qi * 4
-				base_out := q * 4
-				for i in 0 ..< 4 {
-					if (qalive & (1 << uint(i))) != 0 {
-						l := base_l + i
-						t0[base_out + i] = {r0[l], r1[l], r2[l], r3[l]}
-					}
-				}
-			}
-			continue
-		}
+		ctx.lanes = 0x0F
+		masks[MASK_DISCARD] = 0
+		body_fn(&ctx)
 
-		for qi in 0 ..< nq {
-			q := first + qi
-			lanes_out: Quad_Lanes
-			helpers := quads.helpers[q] if quads.helpers != nil else {}
-			for i in 0 ..< 4 {
-				l := qi * 4 + i
-				if i in helpers || (alive & (1 << uint(l))) == 0 {
-					continue
-				}
-				lanes_out += {i}
-				for target, n_t in targets {
-					if target == nil {
-						continue
-					}
-					c := [4]f32{0, 0, 0, 1}
-					if n_t < len(outs) {
-						v := outs[n_t]
-						for k in 0 ..< int(v.n) {
-							c[k] = float_of(slots[v.slot + i32(k)][l], v.base)
-						}
-					}
-					target[q * 4 + i] = c
-				}
-				if sample_masks != nil {
-					sample_masks[q * 4 + i] = slots[mask_v.slot][l] if has_mask else ~u32(0)
+		alive := ~masks[MASK_DISCARD] & 0x0F
+		if fast_outs {
+			if hptr != nil {
+				alive &= ~(transmute(u8)hptr[first] & 0xF)
+			}
+			sptr[first] = transmute(Quad_Lanes)alive
+			if alive != 0 {
+				base_out := first * 4
+				for ti in 0 ..< n_active {
+					jit_store_quad(active_outs[ti], base_out, 0, alive)
 				}
 			}
-			shaded[q] = lanes_out
+		} else {
+			jit_write_fragment_slow(meta, slots, quads, targets, shaded, sample_masks, first, 1, alive)
 		}
 	}
 }

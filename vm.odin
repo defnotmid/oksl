@@ -226,6 +226,7 @@ Program :: struct {
 	jit_mem:  []byte,
 	jit_init: rawptr,
 	jit_body: rawptr,
+	jit_meta: rawptr,
 }
 
 // A stage variable's registers.

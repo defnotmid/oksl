@@ -6992,5 +6992,683 @@ void main() {
 	}
 }
 
+@(test)
+test_run_fragment_targets_and_shapes :: proc(t: ^testing.T) {
+	MAX_Q :: 17
+	MAX_PX :: MAX_Q * 4
+	SENTINEL :: [4]f32{-9, -11, -13, -17}
+	MASK_SENTINEL :: u32(0xDEAD_BEEF)
+	SHADED_SENTINEL :: transmute(Quad_Lanes)u8(0x0F)
+
+	// 1. Multi-target vec4 shader with non-contiguous varyings (2 spans), gl_FragCoord, gl_FrontFacing, derivatives, and discard.
+	{
+		src := `#version 310 es
+precision highp float;
+layout(location = 0) in vec2 vA;
+layout(location = 3) in vec3 vB;
+uniform int uDiscardMask;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
+void main() {
+    float dx = dFdx(vA.x) + dFdy(vB.y);
+    int laneId = int(vB.z);
+    if (((uDiscardMask >> laneId) & 1) != 0) {
+        discard;
+    }
+    float ff = gl_FrontFacing ? 1.0 : -1.0;
+    o0 = vec4(vA, gl_FragCoord.xy * 0.125);
+    o1 = vec4(vB.xy, gl_FragCoord.z, gl_FragCoord.w * ff);
+    o2 = vec4(dx, vA.x + vB.x, vA.y - vB.y, ff);
+    o3 = vec4(float(laneId), vB.z * 0.5, gl_FragCoord.x + gl_FragCoord.z, 2.5);
+}`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		p_int := m.program
+		p_int.jit_body, p_int.jit_init = nil, nil
+
+		// Determine varying column offsets from `m.program.inputs`.
+		off_a, off_b: int
+		for iv in m.program.inputs {
+			if iv.kind == .Stage_In && iv.location == 0 {
+				off_a = int(iv.offset)
+			} else if iv.kind == .Stage_In && iv.location == 3 {
+				off_b = int(iv.offset)
+			}
+		}
+		vfloats := m.varying_floats
+
+		origin: [MAX_Q][2]i32
+		helpers_arr: [MAX_Q]Quad_Lanes
+		ff_arr: [MAX_Q]bool
+		col_a0, col_a1, col_b0, col_b1, col_b2, depth_col: [MAX_PX]f32
+		for q in 0 ..< MAX_Q {
+			origin[q] = {i32(q * 2 + 4), i32(10 + (q % 5) * 2)}
+			// Mix: no helpers (0x0), partial (0xA, 0x5, 0x1), and full-helper quad (0xF at q == 2).
+			h_pat := [5]u8{0x0, 0xA, 0xF, 0x1, 0x6}
+			helpers_arr[q] = transmute(Quad_Lanes)h_pat[q % len(h_pat)]
+			ff_arr[q] = (q % 3) != 1
+			for c in 0 ..< 4 {
+				idx := q * 4 + c
+				col_a0[idx] = f32(idx) * 0.25 + 1.0
+				col_a1[idx] = f32(idx) * -0.5 + 3.0
+				col_b0[idx] = f32(q) * 1.5 + f32(c) * 0.125
+				col_b1[idx] = f32(c * c) * 0.75 - f32(q) * 0.25
+				col_b2[idx] = f32(idx % 20)
+				depth_col[idx] = f32(idx + 1) * 0.03125
+			}
+		}
+
+		ublk := make([]u8, m.block_size, context.temp_allocator)
+		q_counts := [?]int{0, 1, 2, 3, 5, 17}
+		discard_masks := [?]i32{
+			0,
+			0b0010_0101, // partial quads
+			0x0000_000F, // full quad 0 discarded inside pair (0, 1)
+			0x0000_00FF, // full 2-quad pair (0, 1) discarded
+			0x0005_5555, // alternating lanes across many quads
+		}
+		// Target modes: 0=nil, 1..4=1..4 targets, 5=sparse {nil, t1, nil, t3}, 6=unbound 5th target, 7=9 targets (> FRAGMENT_OUTPUTS).
+		for qc in q_counts {
+			total := qc * 4
+			vars := make([]f32, vfloats * total, context.temp_allocator)
+			if total > 0 {
+				copy(vars[(off_a + 0) * total:], col_a0[:total])
+				copy(vars[(off_a + 1) * total:], col_a1[:total])
+				copy(vars[(off_b + 0) * total:], col_b0[:total])
+				copy(vars[(off_b + 1) * total:], col_b1[:total])
+				copy(vars[(off_b + 2) * total:], col_b2[:total])
+			}
+			for use_helpers in ([2]bool{false, true}) {
+				for use_depth_ff in ([2]bool{false, true}) {
+					for use_smask in ([2]bool{false, true}) {
+						for dmask in discard_masks {
+							set_uniform(m, ublk, "uDiscardMask", {f32(dmask)})
+							for mode in 0 ..< 8 {
+								nt := mode
+								if mode == 5 {
+									nt = 4
+								} else if mode == 6 {
+									nt = 5
+								} else if mode == 7 {
+									nt = 9
+								}
+								buf_j := make([][MAX_PX][4]f32, nt, context.temp_allocator)
+								buf_i := make([][MAX_PX][4]f32, nt, context.temp_allocator)
+								tj := make([][][4]f32, nt, context.temp_allocator)
+								ti := make([][][4]f32, nt, context.temp_allocator)
+								for k in 0 ..< nt {
+									for p in 0 ..< MAX_PX {
+										buf_j[k][p] = SENTINEL
+										buf_i[k][p] = SENTINEL
+									}
+									if mode == 5 && (k == 0 || k == 2) {
+										continue
+									}
+									tj[k] = buf_j[k][:total]
+									ti[k] = buf_i[k][:total]
+								}
+								quads := Fragment_Quads {
+									count        = qc,
+									origin       = origin[:qc],
+									helpers      = helpers_arr[:qc] if use_helpers else nil,
+									depth        = depth_col[:total] if use_depth_ff else nil,
+									front_facing = ff_arr[:qc] if use_depth_ff else nil,
+									varyings     = vars,
+								}
+								shaded_j, shaded_i: [MAX_Q]Quad_Lanes
+								for q in 0 ..< MAX_Q {
+									shaded_j[q] = SHADED_SENTINEL
+									shaded_i[q] = SHADED_SENTINEL
+								}
+								sm_j, sm_i: [MAX_PX]u32
+								for p in 0 ..< MAX_PX {
+									sm_j[p] = MASK_SENTINEL
+									sm_i[p] = MASK_SENTINEL
+								}
+								run_fragment(&m.program, ublk, quads, tj if nt > 0 else nil, shaded_j[:qc], temp_scratch(), {}, sm_j[:total] if use_smask else nil)
+								run_fragment(&p_int, ublk, quads, ti if nt > 0 else nil, shaded_i[:qc], temp_scratch(), {}, sm_i[:total] if use_smask else nil)
+								if !slice.equal(shaded_j[:], shaded_i[:]) {
+									testing.expectf(t, false, "shaded mismatch qc=%d mode=%d h=%v df=%v sm=%v d=%x", qc, mode, use_helpers, use_depth_ff, use_smask, dmask)
+									return
+								}
+								for k in 0 ..< nt {
+									bj := slice.reinterpret([]u32, buf_j[k][:])
+									bi := slice.reinterpret([]u32, buf_i[k][:])
+									if !slice.equal(bj, bi) {
+										testing.expectf(t, false, "target[%d] mismatch qc=%d mode=%d h=%v df=%v sm=%v d=%x", k, qc, mode, use_helpers, use_depth_ff, use_smask, dmask)
+										return
+									}
+								}
+								if mode == 6 && !use_smask {
+									// Location 4 is unbound in shader -> shaded lanes receive {0, 0, 0, 1}, others stay SENTINEL.
+									for q in 0 ..< qc {
+										hm := helpers_arr[q] if use_helpers else {}
+										for c in 0 ..< 4 {
+											idx := q * 4 + c
+											disc := ((u32(dmask) >> u32(idx % 20)) & 1) != 0
+											want := SENTINEL if (c in hm || disc) else [4]f32{0, 0, 0, 1}
+											testing.expect_value(t, buf_j[4][idx], want)
+										}
+									}
+								}
+								if !slice.equal(sm_j[:], sm_i[:]) {
+									testing.expectf(t, false, "sample_masks mismatch qc=%d mode=%d", qc, mode)
+									return
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Narrow float outputs: float -> {r, 0, 0, 1}, vec2 -> {r, g, 0, 1}, vec3 -> {r, g, b, 1}.
+	{
+		src := `#version 310 es
+precision highp float;
+layout(location = 0) in float vX;
+layout(location = 0) out float o1;
+layout(location = 1) out vec2 o2;
+layout(location = 2) out vec3 o3;
+void main() {
+    o1 = vX + 1.5;
+    o2 = vec2(vX * 2.0, vX - 3.0);
+    o3 = vec3(vX, -vX, vX * 0.5 + 4.0);
+}`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "narrow compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		p_int := m.program
+		p_int.jit_body, p_int.jit_init = nil, nil
+
+		origin := [3][2]i32{{0, 0}, {2, 0}, {4, 0}}
+		helpers := [3]Quad_Lanes{{1}, {}, {0, 3}}
+		vx: [12]f32
+		for i in 0 ..< 12 {
+			vx[i] = f32(i) * 1.25 - 2.0
+		}
+		for qc in ([2]int{2, 3}) {
+			for use_h in ([2]bool{false, true}) {
+				for nt in 1 ..= 3 {
+					bj, bi: [3][12][4]f32
+					for k in 0 ..< 3 {
+						for p in 0 ..< 12 {
+							bj[k][p] = SENTINEL
+							bi[k][p] = SENTINEL
+						}
+					}
+					tj := make([][][4]f32, nt, context.temp_allocator)
+					ti := make([][][4]f32, nt, context.temp_allocator)
+					for k in 0 ..< nt {
+						tj[k] = bj[k][:qc * 4]
+						ti[k] = bi[k][:qc * 4]
+					}
+					sh_j, sh_i: [3]Quad_Lanes
+					quads := Fragment_Quads{count = qc, origin = origin[:qc], helpers = helpers[:qc] if use_h else nil, varyings = vx[:qc * 4]}
+					run_fragment(&m.program, nil, quads, tj, sh_j[:qc], temp_scratch())
+					run_fragment(&p_int, nil, quads, ti, sh_i[:qc], temp_scratch())
+					testing.expect(t, slice.equal(sh_j[:], sh_i[:]))
+					for k in 0 ..< nt {
+						testing.expect(t, slice.equal(slice.reinterpret([]u32, bj[k][:]), slice.reinterpret([]u32, bi[k][:])))
+					}
+					for q in 0 ..< qc {
+						hm := helpers[q] if use_h else {}
+						for c in 0 ..< 4 {
+							idx := q * 4 + c
+							x := vx[idx]
+							if c in hm {
+								testing.expect_value(t, bj[0][idx], SENTINEL)
+							} else {
+								testing.expect_value(t, bj[0][idx], [4]f32{x + 1.5, 0, 0, 1})
+								if nt >= 2 {
+									testing.expect_value(t, bj[1][idx], [4]f32{x * 2.0, x - 3.0, 0, 1})
+								}
+								if nt >= 3 {
+									testing.expect_value(t, bj[2][idx], [4]f32{x, -x, x * 0.5 + 4.0, 1})
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Integer fragment outputs (ivec2, uvec4) and explicit gl_SampleMask[0] write.
+	{
+		src := `#version 310 es
+precision highp float;
+precision highp int;
+layout(location = 0) in float vX;
+layout(location = 0) out ivec2 oI;
+layout(location = 1) out uvec4 oU;
+void main() {
+    int k = int(vX);
+    gl_SampleMask[0] = (1 << (k & 7)) | 0x100;
+    oI = ivec2(-k * 3, k + 100);
+    oU = uvec4(uint(k), uint(k * 17 + 5), 0x80000001u, 0xffffffffu);
+}`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "int-out compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		p_int := m.program
+		p_int.jit_body, p_int.jit_init = nil, nil
+
+		origin := [3][2]i32{{0, 0}, {2, 0}, {4, 0}}
+		helpers := [3]Quad_Lanes{{2}, {}, {0, 1}}
+		vx: [12]f32
+		for i in 0 ..< 12 {
+			vx[i] = f32(i + 1)
+		}
+		for use_sm in ([2]bool{false, true}) {
+			bj, bi: [2][12][4]f32
+			sm_j, sm_i: [12]u32
+			sh_j, sh_i: [3]Quad_Lanes
+			for p in 0 ..< 12 {
+				bj[0][p], bj[1][p] = SENTINEL, SENTINEL
+				bi[0][p], bi[1][p] = SENTINEL, SENTINEL
+				sm_j[p], sm_i[p] = MASK_SENTINEL, MASK_SENTINEL
+			}
+			tj := [2][][4]f32{bj[0][:], bj[1][:]}
+			ti := [2][][4]f32{bi[0][:], bi[1][:]}
+			quads := Fragment_Quads{count = 3, origin = origin[:], helpers = helpers[:], varyings = vx[:]}
+			run_fragment(&m.program, nil, quads, tj[:], sh_j[:], temp_scratch(), {}, sm_j[:] if use_sm else nil)
+			run_fragment(&p_int, nil, quads, ti[:], sh_i[:], temp_scratch(), {}, sm_i[:] if use_sm else nil)
+			testing.expect(t, slice.equal(sh_j[:], sh_i[:]))
+			testing.expect(t, slice.equal(slice.reinterpret([]u32, bj[0][:]), slice.reinterpret([]u32, bi[0][:])))
+			testing.expect(t, slice.equal(slice.reinterpret([]u32, bj[1][:]), slice.reinterpret([]u32, bi[1][:])))
+			testing.expect(t, slice.equal(sm_j[:], sm_i[:]))
+		}
+	}
+
+	// 4. Odd quad counts (1 and 3 quads) execute only the 4 real lanes on the trailing quad for both texture() and texelFetch().
+	{
+		src := `#version 310 es
+precision highp float;
+in vec2 vUV;
+uniform sampler2D s0;
+uniform sampler2D s1;
+layout(location = 0) out vec4 o;
+void main() {
+    vec4 a = texture(s0, vUV);
+    vec4 b = texelFetch(s1, ivec2(gl_FragCoord.xy), 0);
+    o = a + b;
+}`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "odd-quad sampler compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		p_int := m.program
+		p_int.jit_body, p_int.jit_init = nil, nil
+
+		Odd_Sampler_State :: struct {
+			n_pixels: int,
+			calls:    [2]int,
+			bad_uv:   int,
+			expected: [2][12][2]f32,
+			seen:     [2][12]int,
+		}
+		odd_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+			st := (^Odd_Sampler_State)(user)
+			if channel < 0 || channel >= 2 {
+				st.bad_uv += 1
+				return {}
+			}
+			st.calls[channel] += 1
+			matched := false
+			for p in 0 ..< st.n_pixels {
+				if st.expected[channel][p] == uv {
+					st.seen[channel][p] += 1
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				st.bad_uv += 1
+			}
+			return {uv.x, uv.y, f32(channel), 1}
+		}
+
+		origins := [3][2]i32{{2, 0}, {4, 0}, {6, 2}}
+		sizes := [2][3]i32{{16, 16, 1}, {16, 16, 1}}
+		scratch := temp_scratch()
+		for count in ([2]int{1, 3}) {
+			n_px := count * 4
+			vars := make([]f32, 2 * n_px, context.temp_allocator)
+			st: Odd_Sampler_State
+			st.n_pixels = n_px
+			for q in 0 ..< count {
+				for i in 0 ..< 4 {
+					p := q * 4 + i
+					u := (f32(p) + 1.5) / 16.0
+					v := f32(0.375)
+					vars[0 * n_px + p] = u
+					vars[1 * n_px + p] = v
+					st.expected[0][p] = {u, v}
+					px := origins[q].x + i32(i & 1)
+					py := origins[q].y + i32((i >> 1) & 1)
+					st.expected[1][p] = {(f32(px) + 0.5) / 16.0, (f32(py) + 0.5) / 16.0}
+				}
+			}
+			tj_buf, ti_buf: [12][4]f32
+			sh_j, sh_i: [3]Quad_Lanes
+			tj := [1][][4]f32{tj_buf[:n_px]}
+			ti := [1][][4]f32{ti_buf[:n_px]}
+			quads := Fragment_Quads{count = count, origin = origins[:count], varyings = vars}
+			opts := Run_Options{sampler = odd_cb, user = &st, channel_sizes = sizes[:]}
+			run_fragment(&m.program, nil, quads, tj[:], sh_j[:count], scratch, opts)
+			testing.expect_value(t, st.calls[0], n_px)
+			testing.expect_value(t, st.calls[1], n_px)
+			testing.expect_value(t, st.bad_uv, 0)
+			for p in 0 ..< n_px {
+				testing.expect_value(t, st.seen[0][p], 1)
+				testing.expect_value(t, st.seen[1][p], 1)
+			}
+
+			st_int := st
+			st_int.calls = {}
+			st_int.bad_uv = 0
+			st_int.seen = {}
+			opts_int := Run_Options{sampler = odd_cb, user = &st_int, channel_sizes = sizes[:]}
+			run_fragment(&p_int, nil, quads, ti[:], sh_i[:count], scratch, opts_int)
+			testing.expect_value(t, st_int.calls[0], n_px)
+			testing.expect_value(t, st_int.calls[1], n_px)
+			testing.expect_value(t, st_int.bad_uv, 0)
+			testing.expect(t, slice.equal(sh_j[:count], sh_i[:count]))
+			testing.expect(t, slice.equal(slice.reinterpret([]u32, tj_buf[:n_px]), slice.reinterpret([]u32, ti_buf[:n_px])))
+		}
+	}
+}
+
+@(test)
+test_jit_init_const_and_mixed :: proc(t: ^testing.T) {
+	scratch := temp_scratch()
+
+	// 1. Pure-constant hoisted init matches interpreter.
+	{
+		src := `#version 310 es
+precision highp float;
+layout(location = 0) out vec4 o;
+void main() {
+    mat2 m = mat2(1.5, -2.0, 3.0, 0.5) * mat2(2.0, 1.0, -0.5, 4.0);
+    vec2 p = m * (gl_FragCoord.xy * 0.25 + vec2(0.125, -0.375));
+    float s = sin(0.5) + cos(1.25) + exp2(1.5);
+    o = vec4(p, s, m[0][1] + m[1][0]);
+}`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "pure-const init compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		oj, oi: [12][4]f32
+		run_f32(&m.program, nil, 4, 3, oj[:], scratch)
+		run_f32_interp(&m.program, nil, 4, 3, oi[:], scratch, {})
+		testing.expect(t, slice.equal(slice.reinterpret([]u32, oj[:]), slice.reinterpret([]u32, oi[:])))
+	}
+
+	// 2. Mixed constant + uniform/buffer dynamic init reused across multiple draws on the same Scratch.
+	{
+		src := `#version 310 es
+precision highp float;
+uniform vec2 uScale;
+layout(std430, binding = 0) readonly buffer B { float b[]; };
+layout(location = 0) out vec4 o;
+void main() {
+    float c = sin(0.75) * 4.0 + 2.5;
+    vec2 u = uScale * 3.0 + vec2(c, -c);
+    float h = b[0] * uScale.x + b[1];
+    o = vec4(u + gl_FragCoord.xy * 0.125, h, c);
+}`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "mixed init compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		when JIT_ENABLED {
+			testing.expect(t, m.program.jit_init != nil)
+		}
+		ublk := make([]u8, m.block_size, context.temp_allocator)
+		for step in 0 ..< 4 {
+			set_uniform(m, ublk, "uScale", {f32(step) * 1.5 - 1.0, f32(step) * -0.75 + 2.0})
+			bdata := [2]f32{f32(step * 3 + 1) * 0.5, f32(step * 5 - 2) * 0.25}
+			buf_u32 := slice.reinterpret([]u32, bdata[:])
+			bufs := [1][]u32{buf_u32}
+			oj, oi: [12][4]f32
+			run_f32(&m.program, ublk, 4, 3, oj[:], scratch, {buffers = bufs[:]})
+			run_f32_interp(&m.program, ublk, 4, 3, oi[:], scratch, {buffers = bufs[:]})
+			testing.expectf(t, slice.equal(slice.reinterpret([]u32, oj[:]), slice.reinterpret([]u32, oi[:])), "mixed init mismatch at step %d", step)
+		}
+	}
+
+	// 3. Reusing the same Scratch from bound channel_images -> unbound callback sampler -> partial bound channel_images.
+	{
+		src := `#version 310 es
+precision highp float;
+uniform sampler2D s0;
+uniform sampler2D s1;
+layout(location = 0) out vec4 o;
+void main() {
+    o = textureLod(s0, vec2(0.5), 0.0) + textureLod(s1, vec2(0.5), 0.0) * 2.0;
+}`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "chan reuse compile failed:\n%s", format_errors(errs, context.temp_allocator))
+
+		tex0 := [4]f32{1, 2, 3, 4}
+		tex1 := [4]f32{10, 20, 30, 40}
+		cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+			f := f32(channel + 1) * 100.0
+			return {f, f + 1, f + 2, 1}
+		}
+		both_imgs := [2]Channel_Image{
+			{data = tex0[:], width = 1, height = 1, components = 4},
+			{data = tex1[:], width = 1, height = 1, components = 4},
+		}
+		one_img := [1]Channel_Image{
+			{data = tex0[:], width = 1, height = 1, components = 4},
+		}
+		for opts in ([3]Run_Options{
+			{sampler = cb, channel_images = both_imgs[:]},
+			{sampler = cb},
+			{sampler = cb, channel_images = one_img[:]},
+		}) {
+			oj, oi: [1][4]f32
+			run_f32(&m.program, nil, 1, 1, oj[:], scratch, opts)
+			run_f32_interp(&m.program, nil, 1, 1, oi[:], scratch, opts)
+			testing.expect_value(t, oj[0], oi[0])
+		}
+	}
+}
+
+@(test)
+test_jit_idiv_irem :: proc(t: ^testing.T) {
+	EDGES_N :: 33
+	edges := [EDGES_N]u32 {
+		0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33, 255, 65535, 65536, 65537, 1_000_003,
+		0x7FFF_FFFD, 0x7FFF_FFFE, 0x7FFF_FFFF,
+		0x8000_0000, 0x8000_0001, 0x8000_0002,
+		0xAAAA_AAAA, 0x5555_5555, 0xC000_0000, 0xFFFF_0000,
+		0xFFFF_FFF9, 0xFFFF_FFFD, 0xFFFF_FFFE, 0xFFFF_FFFF,
+	}
+	EDGE_PAIRS :: EDGES_N * EDGES_N
+	RAND_PAIRS :: 262_144
+	W :: 512
+	H :: (EDGE_PAIRS + RAND_PAIRS + W - 1) / W
+	TOTAL :: W * H
+
+	in_ab := make([]u32, TOTAL * 2, context.temp_allocator)
+	p := 0
+	for a in edges {
+		for b in edges {
+			in_ab[p * 2 + 0] = a
+			in_ab[p * 2 + 1] = b
+			p += 1
+		}
+	}
+	rng := u64(0x9E37_79B9_7F4A_7C15)
+	next_u32 :: #force_inline proc(s: ^u64) -> u32 {
+		x := s^
+		x ~= x << 13
+		x ~= x >> 7
+		x ~= x << 17
+		s^ = x
+		return u32(x >> 32) ~ u32(x)
+	}
+	for ; p < TOTAL; p += 1 {
+		a := next_u32(&rng)
+		b := next_u32(&rng)
+		// Bias part of the stream toward high-bit u32s, small divisors, and signed extremes.
+		switch p & 7 {
+		case 1:
+			a |= 0x8000_0000
+			b = b & 7 // includes 0, 1, 2..7
+		case 2:
+			b |= 0x8000_0000
+		case 3:
+			a = 0x8000_0000 + (a & 3) - 1
+			b = 0xFFFF_FFFF - (b & 3) // includes -1, -2, -3, -4
+		case 4:
+			b = (b % 31)
+		}
+		in_ab[p * 2 + 0] = a
+		in_ab[p * 2 + 1] = b
+	}
+
+	// Fragment shader (compiled by x86-64 AVX2 JIT): scalar + vector (ivec4/uvec4) + live BB cache + init-hoisted div/rem.
+	src := `#version 310 es
+precision highp float;
+precision highp int;
+uniform ivec2 uInit;
+layout(std430, binding = 0) readonly buffer In { uint ab[]; };
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+
+vec2 pack32(uint v) {
+    return vec2(float(v & 0xFFFFu), float(v >> 16u));
+}
+
+void main() {
+    uint idx = uint(int(gl_FragCoord.y) * 512 + int(gl_FragCoord.x));
+    uint ua = ab[idx * 2u + 0u];
+    uint ub = ab[idx * 2u + 1u];
+    int ia = int(ua);
+    int ib = int(ub);
+
+    // Uniform-only divisions hoist into jit_init.
+    uint init_mix = uint(uInit.x / uInit.y) ^ (uint(uInit.x % uInit.y) << 8u)
+        ^ (uint(uInit.x) / uint(uInit.y)) ^ ((uint(uInit.x) % uint(uInit.y)) << 16u);
+
+    // Keep live values around the divisions to stress the BB register cache (ymm8..15).
+    uint keep0 = ua ^ 0x13579BDFu;
+    int keep1 = ia + 12345;
+    int iq = ia / ib;
+    int ir = ia % ib;
+    uint uq = ua / ub;
+    uint ur = ua % ub;
+
+    ivec4 iv_a = ivec4(ia, -ia, ia ^ 0x55555555, ib);
+    ivec4 iv_b = ivec4(ib, ib, -ib, ia);
+    ivec4 iv_q = iv_a / iv_b;
+    ivec4 iv_r = iv_a % iv_b;
+
+    uvec4 uv_a = uvec4(ua, ~ua, ua ^ 0x80000000u, ub);
+    uvec4 uv_b = uvec4(ub, ub | 1u, ub >> 1u, ua);
+    uvec4 uv_q = uv_a / uv_b;
+    uvec4 uv_r = uv_a % uv_b;
+
+    uint vec_mix = uint(iv_q.x ^ iv_q.y ^ iv_q.z ^ iv_q.w)
+        ^ (uint(iv_r.x ^ iv_r.y ^ iv_r.z ^ iv_r.w) * 3u)
+        ^ (uv_q.x ^ (uv_q.y << 1u) ^ (uv_q.z >> 1u) ^ uv_q.w)
+        ^ ((uv_r.x ^ uv_r.y ^ uv_r.z ^ uv_r.w) * 7u)
+        ^ (keep0 + uint(keep1));
+
+    o0 = vec4(pack32(uint(iq)), pack32(uint(ir)));
+    o1 = vec4(pack32(uq), pack32(ur));
+    o2 = vec4(pack32(vec_mix), pack32(init_mix));
+}`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	testing.expectf(t, ok, "idiv fragment compile failed:\n%s", format_errors(errs, context.temp_allocator))
+	when JIT_ENABLED {
+		testing.expect(t, m.program.jit_body != nil)
+	}
+
+	p_int := m.program
+	p_int.jit_body, p_int.jit_init = nil, nil
+
+	ublk := make([]u8, m.block_size, context.temp_allocator)
+	set_uniform(m, ublk, "uInit", {-100_003, 37})
+	bufs := [1][]u32{in_ab}
+
+	t0_j := make([][4]f32, TOTAL, context.temp_allocator)
+	t1_j := make([][4]f32, TOTAL, context.temp_allocator)
+	t2_j := make([][4]f32, TOTAL, context.temp_allocator)
+	t0_i := make([][4]f32, TOTAL, context.temp_allocator)
+	t1_i := make([][4]f32, TOTAL, context.temp_allocator)
+	t2_i := make([][4]f32, TOTAL, context.temp_allocator)
+	tj := [3][][4]f32{t0_j, t1_j, t2_j}
+	ti := [3][][4]f32{t0_i, t1_i, t2_i}
+
+	run_targets(&m.program, ublk, W, H, tj[:], temp_scratch(), {buffers = bufs[:]})
+	run_targets(&p_int, ublk, W, H, ti[:], temp_scratch(), {buffers = bufs[:]})
+
+	unpack32 :: #force_inline proc(lo, hi: f32) -> u32 {
+		return u32(lo) | (u32(hi) << 16)
+	}
+	read_row :: #force_inline proc(t0, t1: [][4]f32, idx: int) -> [4]u32 {
+		c0, c1 := t0[idx], t1[idx]
+		return {unpack32(c0.x, c0.y), unpack32(c0.z, c0.w), unpack32(c1.x, c1.y), unpack32(c1.z, c1.w)}
+	}
+
+	for idx in 0 ..< TOTAL {
+		ua := in_ab[idx * 2 + 0]
+		ub := in_ab[idx * 2 + 1]
+		rj := read_row(t0_j, t1_j, idx)
+		ri := read_row(t0_i, t1_i, idx)
+		vj := unpack32(t2_j[idx].x, t2_j[idx].y)
+		vi := unpack32(t2_i[idx].x, t2_i[idx].y)
+		hj := unpack32(t2_j[idx].z, t2_j[idx].w)
+		hi := unpack32(t2_i[idx].z, t2_i[idx].w)
+		if rj != ri || vj != vi || hj != hi {
+			testing.expectf(
+				t,
+				false,
+				"idiv/irem JIT != interp at idx=%d (a=0x%08x, b=0x%08x): jit=%v/%08x/%08x interp=%v/%08x/%08x",
+				idx, ua, ub, rj, vj, hj, ri, vi, hi,
+			)
+			return
+		}
+		if rj[0] != bin_lane(ua, ub, .I_Div) ||
+		   rj[1] != bin_lane(ua, ub, .I_Rem) ||
+		   rj[2] != bin_lane(ua, ub, .U_Div) ||
+		   rj[3] != bin_lane(ua, ub, .U_Rem) {
+			testing.expectf(t, false, "bin_lane mismatch at idx=%d (a=0x%08x, b=0x%08x): got %v", idx, ua, ub, rj)
+			return
+		}
+	}
+
+	// Explicit marquee checks on the edge pairs at the front of `in_ab`.
+	find_edge :: proc(edges: []u32, t0, t1: [][4]f32, a, b: u32) -> [4]u32 {
+		for ea, ia in edges {
+			if ea == a {
+				for eb, ib in edges {
+					if eb == b {
+						return read_row(t0, t1, ia * len(edges) + ib)
+					}
+				}
+			}
+		}
+		return {}
+	}
+	testing.expect_value(t, find_edge(edges[:], t0_j, t1_j, 0x8000_0000, 0), [4]u32{0, 0, 0, 0})
+	testing.expect_value(t, find_edge(edges[:], t0_j, t1_j, 0xFFFF_FFFF, 0), [4]u32{0, 0, 0, 0})
+	testing.expect_value(t, find_edge(edges[:], t0_j, t1_j, 0x8000_0000, 0xFFFF_FFFF), [4]u32{0x8000_0000, 0, 0, 0x8000_0000})
+	testing.expect_value(t, find_edge(edges[:], t0_j, t1_j, 0xFFFF_FFFF, 1), [4]u32{0xFFFF_FFFF, 0, 0xFFFF_FFFF, 0})
+	testing.expect_value(t, find_edge(edges[:], t0_j, t1_j, 0x8000_0000, 1), [4]u32{0x8000_0000, 0, 0x8000_0000, 0})
+	testing.expect_value(t, find_edge(edges[:], t0_j, t1_j, 0xFFFF_FFFF, 2), [4]u32{0, 0xFFFF_FFFF, 0x7FFF_FFFF, 1})
+	testing.expect_value(t, find_edge(edges[:], t0_j, t1_j, 0xFFFF_FFFF, 0x8000_0000), [4]u32{0, 0xFFFF_FFFF, 1, 0x7FFF_FFFF})
+}
+
+
 
 
