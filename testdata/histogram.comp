@@ -1,0 +1,50 @@
+#version 310 es
+// Workgroup histogram in shared memory merged into a storage buffer with
+// atomicAdd, plus atomicAdd return-value triangle-number verification.
+
+layout(local_size_x = 16, local_size_y = 8) in;
+
+readonly buffer InputWords {
+    uint words[];
+} src;
+
+buffer Histogram {
+    uint bins[];
+} hist;
+
+shared uint sh_bins[256];
+shared uint sh_pair_sum;
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+
+    sh_bins[tid] = 0u;
+    sh_bins[tid + 128u] = 0u;
+    if (tid == 0u) {
+        sh_pair_sum = 0u;
+    }
+    barrier();
+
+    for (uint k = 0u; k < 4u; ++k) {
+        uint idx = (wg * 512u + k * 128u + tid) & 4095u;
+        uint w = src.words[idx];
+        uint b = (w ^ (w >> 8u) ^ (k * 37u)) & 255u;
+        uint prev = atomicAdd(sh_bins[b], 1u);
+        atomicAdd(sh_pair_sum, prev);
+    }
+    memoryBarrierShared();
+    barrier();
+
+    uint c0 = sh_bins[tid];
+    uint c1 = sh_bins[tid + 128u];
+    if (c0 > 0u) {
+        atomicAdd(hist.bins[tid], c0);
+    }
+    if (c1 > 0u) {
+        atomicAdd(hist.bins[tid + 128u], c1);
+    }
+    if (tid == 0u) {
+        atomicAdd(hist.bins[256], sh_pair_sum);
+    }
+}

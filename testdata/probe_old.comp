@@ -1,0 +1,30 @@
+#version 310 es
+// Isolates Metal's lost return value: where do the olds of a shared atomic go?
+layout(local_size_x = 4) in;
+buffer B { uint d[]; } b;
+shared uint s[16];
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint z = gl_WorkGroupID.z;
+    s[i] = 0u; s[i + 4u] = 0u; s[i + 8u] = 0u; s[i + 12u] = 0u;
+    memoryBarrierShared();
+    barrier();
+    uint oldA = atomicAdd(s[3], 1u);
+    atomicAdd(b.d[1000u + wg * 8u], oldA);          // A: olds summed into a buffer
+    atomicAdd(s[4], oldA);                          // B: constant index, as probe_eval
+    atomicAdd(s[6u + z], oldA);                     // C: runtime index
+    uint oldD = atomicAdd(s[8u + z], 1u);           // D: runtime index for the first atomic too
+    atomicAdd(s[9], oldD);
+    atomicAdd(s[10], i);                            // E: plain value, constant index
+    memoryBarrierShared();
+    barrier();
+    if (i == 0u) {
+        b.d[1001u + wg * 8u] = s[4];
+        b.d[1002u + wg * 8u] = s[6];
+        b.d[1003u + wg * 8u] = s[9];
+        b.d[1004u + wg * 8u] = s[10];
+        b.d[1005u + wg * 8u] = s[3];
+        b.d[1006u + wg * 8u] = s[8];
+    }
+}

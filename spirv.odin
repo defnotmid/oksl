@@ -120,6 +120,18 @@ Op :: enum u32 {
 	D_Pdx_Fine               = 210,
 	D_Pdy_Fine               = 211,
 	Fwidth_Fine              = 212,
+	Control_Barrier          = 224,
+	Memory_Barrier           = 225,
+	Atomic_Exchange          = 229,
+	Atomic_Compare_Exchange  = 230,
+	Atomic_I_Add             = 234,
+	Atomic_S_Min             = 236,
+	Atomic_U_Min             = 237,
+	Atomic_S_Max             = 238,
+	Atomic_U_Max             = 239,
+	Atomic_And               = 240,
+	Atomic_Or                = 241,
+	Atomic_Xor               = 242,
 	Phi                      = 245,
 	Loop_Merge               = 246,
 	Selection_Merge          = 247,
@@ -199,6 +211,8 @@ SC_INPUT :: 1
 SC_UNIFORM :: 2
 @(private)
 SC_OUTPUT :: 3
+@(private)
+SC_WORKGROUP :: 4
 @(private)
 SC_PRIVATE :: 6
 @(private)
@@ -770,6 +784,13 @@ declare_interface :: proc(s: ^Spv) {
 		inst(&s.globals, .Variable, ptr_type(s, SC_PRIVATE, t), v, SC_PRIVATE, const_null(s, t))
 		name(s, v, s.u.syms[g].name)
 		s.sym_ids[g] = v
+	}
+	for sh in c.shared_vars {
+		t := type_id(s, sym_type(s.u, sh))
+		v := new_id(s)
+		inst(&s.globals, .Variable, ptr_type(s, SC_WORKGROUP, t), v, SC_WORKGROUP)
+		name(s, v, s.u.syms[sh].name)
+		s.sym_ids[sh] = v
 	}
 }
 

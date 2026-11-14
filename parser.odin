@@ -288,8 +288,9 @@ parse_top :: proc(p: ^Parser) {
 	lay := Layout_Qual{location = -1}
 	stage_vars := .Stage_Variables in p.u.features
 	buffers := .Storage_Buffers in p.u.features
-	is_const, is_uniform, flat, readonly, writeonly := false, false, false, false, false
+	is_const, is_uniform, is_shared, flat, readonly, writeonly := false, false, false, false, false, false
 	has_mem_qual, has_prec, has_interp := false, false, false
+	shared_pos: Pos
 	io: Var_Io
 	for {
 		before_prec := p.i
@@ -297,7 +298,7 @@ parse_top :: proc(p: ^Parser) {
 		if p.i != before_prec {
 			has_prec = true
 		}
-		default_ok := lay.has_layout && !lay.empty && !lay.non_default && lay.count > 0 && !has_mem_qual && !has_prec && !has_interp && !is_const && io == .None
+		default_ok := lay.has_layout && !lay.empty && !lay.non_default && lay.count > 0 && !has_mem_qual && !has_prec && !has_interp && !is_const && !is_shared && io == .None
 		if is_ident(p, "layout") && peek(p, 1) == .L_Paren {
 			parse_layout(p, &lay)
 			if p.panicking {
@@ -315,9 +316,21 @@ parse_top :: proc(p: ^Parser) {
 			p.i += 2
 			return
 		} else if buffers && is_ident(p, "buffer") {
+			if is_shared {
+				error_at(p, shared_pos, .Shared_Qualifier, tok(p, 1).text)
+				return
+			}
 			p.i += 1
 			parse_buffer_block(p, readonly, writeonly, &lay)
 			return
+		} else if is_ident(p, "shared") {
+			if is_shared {
+				error_at(p, tok(p).pos, .Shared_Qualifier, "shared")
+				return
+			}
+			is_shared = true
+			shared_pos = tok(p).pos
+			p.i += 1
 		} else if is_ident(p, "const") {
 			is_const = true
 			p.i += 1
@@ -327,7 +340,7 @@ parse_top :: proc(p: ^Parser) {
 		} else if is_ident(p, "uniform") {
 			is_uniform = true
 			p.i += 1
-		} else if is_ident(p, "in") && peek(p, 1) == .Semicolon && u.dialect == .GLSL {
+		} else if !is_shared && is_ident(p, "in") && peek(p, 1) == .Semicolon && u.dialect == .GLSL {
 			in_pos := tok(p).pos
 			p.i += 2
 			if len(lay.workgroups) > 0 {
@@ -368,6 +381,9 @@ parse_top :: proc(p: ^Parser) {
 	if sd := u.specs[spec].strukt; sd != 0 {
 		append(&u.tops, Top{kind = .Struct, strukt = sd})
 		if accept(p, .Semicolon) {
+			if is_shared {
+				error_at(p, shared_pos, .Expected_Variable)
+			}
 			return
 		}
 	}
@@ -377,8 +393,8 @@ parse_top :: proc(p: ^Parser) {
 	}
 	name := tok(p)
 	if peek(p, 1) == .L_Paren {
-		if is_const || is_uniform || io != .None {
-			error_at(p, name.pos, .Const_Function)
+		if is_const || is_uniform || is_shared || io != .None {
+			error_at(p, name.pos, .Shared_Qualifier if is_shared else .Const_Function, name.text)
 			return
 		}
 		p.i += 2
@@ -388,8 +404,17 @@ parse_top :: proc(p: ^Parser) {
 		return
 	}
 	vars, ok := parse_declarators(p, spec, is_const, is_uniform)
+	if is_shared && u.dialect == .GLSL && u.stage == .Compute && (is_const || is_uniform || io != .None || lay.has_layout || has_mem_qual || has_interp) {
+		for k in 0 ..< vars.count {
+			v := u.vars[u.ids[vars.start + k]]
+			error_at(p, v.pos, .Shared_Qualifier, v.name)
+		}
+		expect(p, .Semicolon)
+		return
+	}
 	for k in 0 ..< vars.count {
 		v := &u.vars[u.ids[vars.start + k]]
+		v.is_shared = is_shared
 		v.io, v.location, v.flat = io, lay.location, flat
 		v.has_location, v.location_uint = lay.has_location, lay.location_uint
 		v.readonly, v.writeonly = readonly, writeonly
@@ -413,6 +438,10 @@ parse_buffer_block :: proc(p: ^Parser, readonly, writeonly: bool, lay: ^Layout_Q
 	}
 	members := make([dynamic]Var_Decl, context.temp_allocator)
 	for peek(p) != .R_Brace && peek(p) != .EOF {
+		if u.dialect == .GLSL && is_ident(p, "shared") {
+			error_at(p, tok(p).pos, .Shared_Global)
+			return
+		}
 		spec := parse_type_spec(p)
 		if spec == 0 {
 			return
@@ -482,6 +511,10 @@ parse_type_spec :: proc(p: ^Parser) -> Spec_Id {
 		// then stored contiguously.
 		fields := make([dynamic]Var_Decl, context.temp_allocator)
 		for peek(p) != .R_Brace && peek(p) != .EOF {
+			if u.dialect == .GLSL && is_ident(p, "shared") {
+				error_at(p, tok(p).pos, .Shared_Global)
+				return 0
+			}
 			fspec := parse_type_spec(p)
 			if fspec == 0 {
 				return 0
@@ -521,6 +554,8 @@ parse_type_spec :: proc(p: ^Parser) -> Spec_Id {
 			code = .Glsl_Shader_Type if .Children not_in has else code
 		case "colorFilter", "blender":
 			code = .Sksl_Child_Kind if .Children in has else code
+		case "atomic_uint":
+			code = .Unsupported_Atomic_Counter if u.dialect == .GLSL else code
 		}
 		error_at(p, t.pos, code, t.text)
 		return 0
@@ -604,6 +639,9 @@ parse_function :: proc(p: ^Parser, ret: Spec_Id, name: Token) -> Func_Decl_Id {
 			} else if u.dialect == .GLSL && (is_ident(p, "readonly") || is_ident(p, "writeonly") || is_ident(p, "coherent") || is_ident(p, "volatile") || is_ident(p, "restrict")) {
 				prm.readonly ||= is_ident(p, "readonly")
 				prm.writeonly ||= is_ident(p, "writeonly")
+			} else if u.dialect == .GLSL && is_ident(p, "shared") {
+				error_at(p, tok(p).pos, .Shared_Global)
+				return 0
 			} else {
 				break
 			}
@@ -684,11 +722,14 @@ parse_block :: proc(p: ^Parser) -> Stmt_Id {
 @(private = "file")
 starts_declaration :: proc(p: ^Parser) -> bool {
 	off := 0
-	for is_ident(p, "highp", off) || is_ident(p, "mediump", off) || is_ident(p, "lowp", off) || is_ident(p, "const", off) {
+	for is_ident(p, "highp", off) || is_ident(p, "mediump", off) || is_ident(p, "lowp", off) || is_ident(p, "const", off) || (p.u.dialect == .GLSL && is_ident(p, "shared", off)) {
 		if is_ident(p, "const", off) {
 			return true
 		}
 		off += 1
+	}
+	if p.u.dialect == .GLSL && is_ident(p, "atomic_uint", off) && peek(p, off + 1) == .Ident {
+		return true
 	}
 	if !is_type_name(p, off) {
 		return false
@@ -844,6 +885,10 @@ parse_decl_stmt :: proc(p: ^Parser) -> Stmt_Id {
 	is_const := false
 	for {
 		skip_precision(p)
+		if p.u.dialect == .GLSL && is_ident(p, "shared") {
+			error_at(p, tok(p).pos, .Shared_Global)
+			return 0
+		}
 		if !is_ident(p, "const") {
 			break
 		}

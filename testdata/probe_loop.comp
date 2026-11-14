@@ -1,0 +1,23 @@
+#version 310 es
+// 1024 invocations (16 CPU chunks): barrier() in a loop with a uniform,
+// non-constant trip count; each round reads a neighbour across chunk edges.
+layout(local_size_x = 32, local_size_y = 32) in;
+readonly buffer Cfg { uint w[]; } cfg;
+buffer O { float d[]; } o;
+shared float v[1024];
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint n = (cfg.w[0] & 7u) + 3u;
+    v[i] = float(i);
+    memoryBarrierShared();
+    barrier();
+    for (uint k = 0u; k < n; k++) {
+        float a = v[(i + 63u) % 1024u];
+        barrier();
+        v[i] = a + 1.0;
+        memoryBarrierShared();
+        barrier();
+    }
+    o.d[wg * 1024u + i] = v[i] + float(n) * 1000.0;
+}

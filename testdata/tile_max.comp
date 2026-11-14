@@ -1,0 +1,52 @@
+#version 310 es
+// Tile-max velocity / circle-of-confusion reduction (16x16 workgroup, 4 chunks
+// of 64 lanes on CPU), reducing in shared memory with barrier() inside a loop.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+readonly buffer Source {
+    vec4 samples[];
+} src;
+
+writeonly buffer Tiles {
+    vec4 tile_max[];
+} dst;
+
+shared vec4 sh_tile[256];
+
+vec4 pick_max(vec4 a, vec4 b) {
+    if (b.w > a.w) {
+        return b;
+    }
+    if (b.w < a.w) {
+        return a;
+    }
+    if (b.x != a.x) {
+        return b.x > a.x ? b : a;
+    }
+    if (b.y != a.y) {
+        return b.y > a.y ? b : a;
+    }
+    return b.z > a.z ? b : a;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint idx = (wg * 256u + tid) & 1023u;
+    vec4 s = src.samples[idx];
+    float score = dot(s.xy, s.xy) + abs(s.z) * 0.25;
+    sh_tile[tid] = vec4(s.xyz, score);
+    barrier();
+
+    for (uint step = 128u; step > 0u; step >>= 1u) {
+        if (tid < step) {
+            sh_tile[tid] = pick_max(sh_tile[tid], sh_tile[tid + step]);
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        dst.tile_max[wg] = sh_tile[0];
+    }
+}

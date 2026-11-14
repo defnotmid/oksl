@@ -52,7 +52,7 @@ eval :: proc(t: ^testing.T, body: string, prelude := "", loc := #caller_location
 // Working memory for one run, freed with the temp allocator.
 @(private = "file")
 temp_scratch :: proc() -> ^Scratch {
-	return new_clone(Scratch{make([dynamic]Reg, context.temp_allocator), make([dynamic]Lane_Mask, context.temp_allocator)}, context.temp_allocator)
+	return new_clone(Scratch{make([dynamic]Reg, context.temp_allocator), make([dynamic]Lane_Mask, context.temp_allocator), make([dynamic]u32, context.temp_allocator)}, context.temp_allocator)
 }
 
 @(private = "file")
@@ -6139,5 +6139,858 @@ when !ODIN_DISABLE_ASSERT {
 		lower_with_channel_binding(t, SAMPLER_COUNT)
 	}
 }
+
+@(test)
+test_compute_phase2_diagnostics :: proc(t: ^testing.T) {
+	expect_err :: proc(t: ^testing.T, src: string, want: Error_Code, opts := Options{profile = .Glsl, stage = .Compute}, loc := #caller_location) {
+		m, errs, ok := compile(src, opts)
+		defer destroy(m)
+		found := false
+		for e in errs {
+			if e.code == want {
+				found = true
+				break
+			}
+		}
+		testing.expectf(t, !ok && found, "expected %v for:\n%s\ngot:\n%s", want, src, format_errors(errs, context.temp_allocator), loc = loc)
+	}
+
+	// 1. `shared` outside compute (Fragment, Vertex, Shadertoy, SkSL).
+	expect_err(t, "#version 310 es\nprecision highp float;\nshared float s;\nout vec4 o;\nvoid main() { o = vec4(s); }", .Compute_Only, {profile = .Glsl, stage = .Fragment})
+	expect_err(t, "#version 310 es\nshared float s;\nvoid main() { gl_Position = vec4(s); }", .Compute_Only, {profile = .Glsl, stage = .Vertex})
+	expect_err(t, "shared float s;\nvoid mainImage(out vec4 c, in vec2 fc) { c = vec4(s); }", .Compute_Only, {profile = .Shadertoy})
+	expect_err(t, "shared float s;\nhalf4 main(float2 p) { return half4(s); }", .Compute_Only, {profile = .Sksl})
+
+	// 2. `shared` initializers.
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared int s = 1;\nvoid main() {}", .Shared_Initializer)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared vec2 a[2] = vec2[2](vec2(0.0), vec2(1.0));\nvoid main() {}", .Shared_Initializer)
+
+	// 3. `shared` combined with invalid qualifiers, layouts, functions, or buffers.
+	for bad_decl in ([?]string{
+		"const shared int s;",
+		"shared const int s;",
+		"uniform shared int s;",
+		"shared uniform int s;",
+		"readonly shared int s;",
+		"writeonly shared int s;",
+		"coherent shared int s;",
+		"volatile shared int s;",
+		"restrict shared int s;",
+		"shared shared int s;",
+		"layout(location = 0) shared int s;",
+		"shared buffer B { int a[]; };",
+		"layout(std430) shared buffer B { int a[]; };",
+		"shared void f() {}",
+	}) {
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\n%s\nvoid main() {{}}", bad_decl), .Shared_Qualifier)
+	}
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nin shared int s;\nvoid main() {}", .Compute_Stage_Var)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nout shared int s;\nvoid main() {}", .Compute_Stage_Var)
+
+	// 4. `shared` in non-global scopes (local, for-init, param, struct field, buffer member).
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nvoid main() { shared int x; }", .Shared_Global)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nvoid main() { for (shared int i = 0; i < 2; i++) {} }", .Shared_Global)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nvoid f(shared int x) {}\nvoid main() {}", .Shared_Global)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nstruct S { shared int x; };\nvoid main() {}", .Shared_Global)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nbuffer B { shared int a[]; };\nvoid main() {}", .Shared_Global)
+
+	// 5. `shared` invalid types (unsized array, opaque sampler/image, struct containing opaque).
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared int a[];\nvoid main() {}", .Shared_Type)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared sampler2D s;\nvoid main() {}", .Shared_Type)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared sampler2DArray s;\nvoid main() {}", .Shared_Type)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared image2D im;\nvoid main() {}", .Shared_Type)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nstruct Bad { sampler2D s; };\nshared Bad b;\nvoid main() {}", .Shared_Type)
+
+	// 6. Total `shared` size limit (16384 bytes) and alignment padding.
+	{
+		// Exact 16384 bytes via 1024 vec4s succeeds.
+		m_ok1, e_ok1, ok1 := compile("#version 310 es\nlayout(local_size_x = 4) in;\nshared vec4 a[1024];\nvoid main() { a[0] = vec4(1.0); }", {profile = .Glsl, stage = .Compute})
+		defer destroy(m_ok1)
+		testing.expectf(t, ok1, "16384B vec4[1024] failed: %s", format_errors(e_ok1, context.temp_allocator))
+
+		// Alignment padding: int (4B -> padded to 16B) + vec4[1023] (16368B) = 16384B exact succeeds.
+		m_ok2, e_ok2, ok2 := compile("#version 310 es\nlayout(local_size_x = 4) in;\nshared int pad;\nshared vec4 a[1023];\nvoid main() { pad = 1; a[0] = vec4(float(pad)); }", {profile = .Glsl, stage = .Compute})
+		defer destroy(m_ok2)
+		testing.expectf(t, ok2, "padded 16384B failed: %s", format_errors(e_ok2, context.temp_allocator))
+	}
+	// Adding 4 more bytes after padded 16384B -> 16388B fails (would be 16376B without 16B alignment padding).
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared int pad;\nshared vec4 a[1023];\nshared int over;\nvoid main() {}", .Shared_Size_Max)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared vec4 a[1025];\nvoid main() {}", .Shared_Size_Max)
+
+	// 7. Barrier stage rules, argument counts, and GLSL ES 3.10 §8.14 control-flow legality.
+	for fn_name in ([?]string{"barrier", "memoryBarrierShared", "groupMemoryBarrier"}) {
+		expect_err(t, fmt.tprintf("#version 310 es\nprecision highp float;\nout vec4 o;\nvoid main() {{ %s(); o = vec4(1.0); }}", fn_name), .Compute_Only, {profile = .Glsl, stage = .Fragment})
+		expect_err(t, fmt.tprintf("#version 310 es\nvoid main() {{ %s(); gl_Position = vec4(1.0); }}", fn_name), .Compute_Only, {profile = .Glsl, stage = .Vertex})
+		expect_err(t, fmt.tprintf("void mainImage(out vec4 c, in vec2 fc) {{ %s(); c = vec4(1.0); }}", fn_name), .Compute_Only, {profile = .Shadertoy})
+		expect_err(t, fmt.tprintf("half4 main(float2 p) {{ %s(); return half4(1.0); }}", fn_name), .Unknown_Function, {profile = .Sksl})
+	}
+	for fn_name in ([?]string{"memoryBarrier", "memoryBarrierBuffer", "memoryBarrierImage"}) {
+		expect_err(t, fmt.tprintf("half4 main(float2 p) {{ %s(); return half4(1.0); }}", fn_name), .Unknown_Function, {profile = .Sksl})
+		expect_err(t, fmt.tprintf("void mainImage(out vec4 c, in vec2 fc) {{ %s(); c = vec4(1.0); }}", fn_name), .Compute_Only, {profile = .Shadertoy})
+		// Allowed in GLSL ES 3.10 fragment and vertex stages per §8.15 (SPIR-V OpMemoryBarrier, MSL no-op).
+		mf, ef, okf := compile(fmt.tprintf("#version 310 es\nprecision highp float;\nout vec4 o;\nvoid main() {{ %s(); o = vec4(1.0); }}", fn_name), {profile = .Glsl, stage = .Fragment})
+		defer destroy(mf)
+		testing.expectf(t, okf, "%s in fragment failed: %s", fn_name, format_errors(ef, context.temp_allocator))
+		if okf {
+			if have_spirv_val() {
+				expect_valid_spirv(t, fn_name, mf.spirv)
+			}
+			testing.expect(t, strings.contains(mf.msl, "((void)0);"))
+		}
+		mv, ev, okv := compile(fmt.tprintf("#version 310 es\nvoid main() {{ %s(); gl_Position = vec4(1.0); }}", fn_name), {profile = .Glsl, stage = .Vertex})
+		defer destroy(mv)
+		testing.expectf(t, okv, "%s in vertex failed: %s", fn_name, format_errors(ev, context.temp_allocator))
+		if okv && have_spirv_val() {
+			expect_valid_spirv(t, fn_name, mv.spirv)
+		}
+	}
+	for fn_name in ([?]string{"barrier", "memoryBarrier", "memoryBarrierShared", "memoryBarrierBuffer", "memoryBarrierImage", "groupMemoryBarrier"}) {
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nvoid main() {{ %s(1); }}", fn_name), .Arg_Count)
+	}
+	// ES 3.10 §8.14 permits barrier() inside uniform if/else/switch/for/while/do-while, helpers, and after return.
+	{
+		CF_SRC :: `#version 310 es
+layout(local_size_x = 8) in;
+uniform int uMode;
+shared uint sh[8];
+void sync_helper() { barrier(); }
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    sh[tid] = tid;
+    if (uMode < 0) { return; }
+    barrier();
+    if (uMode == 0) {
+        barrier();
+    } else {
+        sync_helper();
+    }
+    switch (uMode) {
+    case 0:
+        barrier();
+        break;
+    default:
+        barrier();
+        break;
+    }
+    for (int i = 0; i < 2; i++) { barrier(); }
+    int w = 0;
+    while (w < 1) { barrier(); w++; }
+    do { barrier(); } while (false);
+}`
+		mcf, ecf, okcf := compile(CF_SRC, {profile = .Glsl, stage = .Compute})
+		defer destroy(mcf)
+		testing.expectf(t, okcf, "uniform control-flow barrier failed: %s", format_errors(ecf, context.temp_allocator))
+		if okcf && have_spirv_val() {
+			expect_valid_spirv(t, "cf_barrier", mcf.spirv)
+		}
+	}
+
+	// 8. Atomic operation diagnostics.
+	for op in ([?]string{"atomicAdd", "atomicMin", "atomicMax", "atomicAnd", "atomicOr", "atomicXor", "atomicExchange"}) {
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nshared int s;\nvoid main() {{ %s(s); }}", op), .Arg_Count)
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nshared int s;\nvoid main() {{ %s(s, 1, 2); }}", op), .Arg_Count)
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nshared float s;\nvoid main() {{ %s(s, 1.0); }}", op), .No_Overload)
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nshared bool s;\nvoid main() {{ %s(s, true); }}", op), .No_Overload)
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nshared ivec2 s;\nvoid main() {{ %s(s, ivec2(1)); }}", op), .No_Overload)
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nshared uint s;\nvoid main() {{ %s(s, 1); }}", op), .No_Overload)
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nvoid main() {{ int loc = 0; %s(loc, 1); }}", op), .Atomic_Target)
+	}
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared int s;\nvoid main() { atomicCompSwap(s, 0); }", .Arg_Count)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared int s;\nvoid main() { atomicCompSwap(s, 0, 1, 2); }", .Arg_Count)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared uint s;\nvoid main() { atomicCompSwap(s, 0, 1u); }", .No_Overload)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared uint s;\nvoid main() { atomicCompSwap(s, 0u, 1); }", .No_Overload)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared float s;\nvoid main() { atomicCompSwap(s, 0.0, 1.0); }", .No_Overload)
+
+	// Invalid atomic targets: global non-shared, parameter, uniform, literal, expression, repeated swizzle, readonly & writeonly buffers.
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nint g;\nvoid main() { atomicAdd(g, 1); }", .Atomic_Target)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nvoid f(inout int p) { atomicAdd(p, 1); }\nvoid main() {}", .Atomic_Target)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nuniform int u;\nvoid main() { atomicAdd(u, 1); }", .Atomic_Target)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nvoid main() { atomicAdd(1, 1); }", .Atomic_Target)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared int s;\nvoid main() { atomicAdd(s + 1, 1); }", .Atomic_Target)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nshared ivec2 s;\nvoid main() { atomicAdd(s.xx[0], 1); }", .Swizzle_Repeat)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nreadonly buffer B { int a[]; } b;\nvoid main() { atomicAdd(b.a[0], 1); }", .Read_Only)
+	{
+		m_wo, e_wo, ok_wo := compile("#version 310 es\nlayout(local_size_x = 4) in;\nwriteonly buffer B { int a[]; } b;\nvoid main() { atomicAdd(b.a[0], 1); }", {profile = .Glsl, stage = .Compute})
+		defer destroy(m_wo)
+		testing.expect(t, !ok_wo && len(e_wo) == 1 && e_wo[0].code == .Write_Only)
+	}
+
+	// 9. Outside ES 3.10 core: atomic_uint counters and imageAtomic* builtins.
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nlayout(binding = 0) uniform atomic_uint c;\nvoid main() {}", .Unsupported_Atomic_Counter)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nvoid main() { atomic_uint c; }", .Unsupported_Atomic_Counter)
+	expect_err(t, "#version 310 es\nlayout(local_size_x = 4) in;\nvoid main() { uint x = atomic_uint(0); }", .Unsupported_Atomic_Counter)
+	for fn_name in ([?]string{"atomicCounter", "atomicCounterIncrement", "atomicCounterDecrement", "memoryBarrierAtomicCounter"}) {
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nvoid main() {{ %s(); }}", fn_name), .Unsupported_Atomic_Counter)
+	}
+	for fn_name in ([?]string{"imageAtomicAdd", "imageAtomicMin", "imageAtomicMax", "imageAtomicAnd", "imageAtomicOr", "imageAtomicXor", "imageAtomicExchange", "imageAtomicCompSwap"}) {
+		expect_err(t, fmt.tprintf("#version 310 es\nlayout(local_size_x = 4) in;\nlayout(r32ui) uniform uimage2D im;\nvoid main() {{ %s(im, ivec2(0), 1u); }}", fn_name), .Unsupported_Image_Atomic)
+	}
+}
+
+@(test)
+test_compute_shared_types_and_zeroing :: proc(t: ^testing.T) {
+	// 1. All shared types (bool, int, uint, float, vectors, matrices, arrays, nested structs),
+	//    swizzle writes/compositions/indexing, out/inout helpers, and ternary short-circuiting.
+	TYPES_SRC :: `#version 310 es
+layout(local_size_x = 8) in;
+
+struct Inner {
+    bool flag;
+    ivec2 pair;
+};
+
+struct Outer {
+    Inner in_s;
+    mat2x3 m;
+    uvec4 uv;
+};
+
+shared bool sh_b;
+shared bvec3 sh_bv;
+shared int sh_i;
+shared uint sh_u;
+shared float sh_f;
+shared vec4 sh_v4;
+shared mat2 sh_m2;
+shared Outer sh_arr[8];
+shared uint sh_guard_cnt;
+
+layout(std430) writeonly buffer Out { uvec4 out_v[]; } dst;
+
+void write_out_vec2(out vec2 dst_v, float seed) {
+    dst_v = vec2(seed + 10.0, seed + 20.0);
+}
+
+void bump_inout(inout int x, int delta) {
+    x += delta;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    int dyn = int(tid & 3u);
+
+    if (tid == 0u) {
+        sh_b = true;
+        sh_bv = bvec3(false, true, true);
+        sh_i = 12;
+        bump_inout(sh_i, 5);
+        sh_u = 7u;
+        sh_u++;
+        --sh_u;
+        sh_f = 2.5;
+        sh_v4 = vec4(1.0, 2.0, 3.0, 4.0);
+        write_out_vec2(sh_v4.wzyx.yx, 100.0); // writes .z = 110, .w = 120
+        sh_v4.wzyx[1] = 50.0;                 // writes .z = 50
+        sh_m2 = mat2(1.0, 2.0, 3.0, 4.0);
+        sh_m2[1][0] += 10.0;                  // col 1 row 0: 3 -> 13
+    }
+    sh_arr[tid].in_s.flag = (tid & 1u) == 0u;
+    sh_arr[tid].in_s.pair = ivec2(int(tid) * 3, -int(tid));
+    sh_arr[tid].m = mat2x3(
+        float(tid) + 1.0, 2.0, 3.0,
+        4.0, 5.0, float(tid) + 6.0
+    );
+    sh_arr[tid].uv = uvec4(10u, 20u, 30u, 40u);
+    sh_arr[tid].uv.wzyx[dyn] += tid + 1u;
+
+    // Untaken ternary arms must NOT touch shared memory or execute atomics.
+    uint skip_sh = false ? sh_arr[tid].uv.x : 99u;
+    uint skip_at = false ? atomicAdd(sh_guard_cnt, 1u) : 77u;
+
+    barrier();
+
+    uint peer = (tid + 3u) & 7u;
+    Outer p = sh_arr[peer];
+    uint flags = (sh_b ? 1u : 0u) | (sh_bv.y ? 2u : 0u) | (p.in_s.flag ? 4u : 0u);
+    int sum_i = sh_i + p.in_s.pair.x + p.in_s.pair.y;
+    float sum_f = sh_f + sh_v4.x + sh_v4.y + sh_v4.z + sh_v4.w + sh_m2[1][0] + p.m[0][0] + p.m[1][2];
+    uint sum_u = sh_u + p.uv.x + p.uv.y + p.uv.z + p.uv.w + skip_sh + skip_at + sh_guard_cnt;
+    dst.out_v[tid] = uvec4(flags, uint(sum_i), floatBitsToUint(sum_f), sum_u);
+}`
+	mt, et, okt := compile(TYPES_SRC, {profile = .Glsl, stage = .Compute})
+	defer destroy(mt)
+	testing.expectf(t, okt, "shared types compile failed:\n%s", format_errors(et, context.temp_allocator))
+	if okt {
+		if have_spirv_val() {
+			expect_valid_spirv(t, "shared_types", mt.spirv)
+		}
+		testing.expect(t, strings.contains(mt.msl, "threadgroup uint oksl_sh["))
+		out_words := make([]u32, 8 * 4, context.temp_allocator)
+		run_compute(&mt.program, nil, {1, 1, 1}, temp_scratch(), {buffers = {out_words}})
+		for tid in u32(0) ..< 8 {
+			peer := (tid + 3) & 7
+			want_flags := u32(1 | 2 | (4 if (peer & 1) == 0 else 0))
+			want_i := i32(17) + i32(peer) * 3 - i32(peer)
+			// sh_f (2.5) + sh_v4 (1 + 2 + 50 + 120 = 173) + sh_m2[1][0] (13) + p.m[0][0] (peer+1) + p.m[1][2] (peer+6)
+			want_f := f32(2.5 + 173.0 + 13.0) + f32(peer + 1) + f32(peer + 6)
+			// p.uv started (10,20,30,40)=100, plus (peer + 1) added to one component; sh_u=7, skip_sh=99, skip_at=77, sh_guard_cnt=0.
+			want_u := u32(7 + 100 + (peer + 1) + 99 + 77 + 0)
+			base := tid * 4
+			testing.expect_value(t, out_words[base + 0], want_flags)
+			testing.expect_value(t, i32(out_words[base + 1]), want_i)
+			testing.expect_value(t, transmute(f32)out_words[base + 2], want_f)
+			testing.expect_value(t, out_words[base + 3], want_u)
+		}
+	}
+
+	// 2. Deterministic per-workgroup zeroing of uninitialized `shared` memory on both
+	//    single-chunk (local_size_x = 32) and multi-chunk barrier (local_size_x = 128) paths.
+	for lsx in ([2]int{32, 128}) {
+		zsrc := fmt.tprintf(`#version 310 es
+layout(local_size_x = %d) in;
+shared uint sh_uninit[%d];
+shared uint sh_sum;
+layout(std430) writeonly buffer Out {{ uint sums[]; }} dst;
+void main() {{
+    uint tid = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    sh_uninit[tid] += (wg + 1u);
+    barrier();
+    atomicAdd(sh_sum, sh_uninit[(tid + 7u) %% %du]);
+    barrier();
+    if (tid == 0u) {{
+        dst.sums[wg] = sh_sum;
+    }}
+}}`, lsx, lsx, lsx)
+		mz, ez, okz := compile(zsrc, {profile = .Glsl, stage = .Compute})
+		defer destroy(mz)
+		testing.expectf(t, okz, "zeroing lsx=%d failed:\n%s", lsx, format_errors(ez, context.temp_allocator))
+		if okz {
+			sc := temp_scratch()
+			resize(&sc.shared, 256)
+			slice.fill(sc.shared[:], 0xdeadbeef)
+			sums := make([]u32, 6, context.temp_allocator)
+			run_compute(&mz.program, nil, {3, 2, 1}, sc, {buffers = {sums}})
+			for g in 0 ..< 6 {
+				testing.expect_value(t, sums[g], u32((g + 1) * lsx))
+			}
+		}
+	}
+}
+
+@(test)
+test_compute_barriers_chunks_and_pool :: proc(t: ^testing.T) {
+	// 1. Barrier chunk synchronization, live local/mask survival across barrier(),
+	//    helper barriers, and uniform hoisting across workgroup sizes 64, 96, 256, and 1024.
+	for lsx in ([4]int{64, 96, 256, 1024}) {
+		bsrc := fmt.tprintf(`#version 310 es
+layout(local_size_x = %d) in;
+uniform float uScale;
+uniform int uRounds;
+shared float sh_ring[%d];
+layout(std430) writeonly buffer Out {{ float v[]; }} dst;
+
+void step_barrier(uint tid, int r, float gain) {{
+    float peer = sh_ring[(tid + uint(r * 19 + 65)) %% %du];
+    barrier();
+    sh_ring[tid] = peer + gain;
+    barrier();
+}}
+
+void main() {{
+    uint tid = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.x;
+    float hoisted = uScale * 2.0 + 1.0;
+    float live_local = float(tid) * 0.5 + float(wg) * 10.0;
+    sh_ring[tid] = float(tid + wg * 100u);
+    barrier();
+    if ((tid & 1u) == 0u) {{
+        live_local += 3.0;
+    }}
+    for (int r = 0; r < uRounds; r++) {{
+        step_barrier(tid, r, hoisted);
+    }}
+    dst.v[wg * %du + tid] = sh_ring[tid] + live_local;
+}}`, lsx, lsx, lsx, lsx)
+		mb, eb, okb := compile(bsrc, {profile = .Glsl, stage = .Compute})
+		defer destroy(mb)
+		testing.expectf(t, okb, "barrier lsx=%d compile failed:\n%s", lsx, format_errors(eb, context.temp_allocator))
+		if !okb {
+			continue
+		}
+		if have_spirv_val() {
+			expect_valid_spirv(t, "barrier_chunks", mb.spirv)
+		}
+		testing.expect(t, mb.program.init_len > 0)
+		ublock := make([]u8, mb.block_size, context.temp_allocator)
+		set_uniform(mb, ublock, "uScale", {1.5})  // hoisted = 4.0
+		set_uniform(mb, ublock, "uRounds", {3})
+		NG :: 5
+		out_single := make([]u32, NG * lsx, context.temp_allocator)
+		run_compute(&mb.program, ublock, {NG, 1, 1}, temp_scratch(), {buffers = {out_single}})
+
+		// Verify exact expected values across all chunks and lanes.
+		// Over 3 rounds, shift mod lsx is (0*19+65) + (1*19+65) + (2*19+65) = 65 + 84 + 103 = 252.
+		shift := (65 + 84 + 103) % lsx
+		f_single := slice.reinterpret([]f32, out_single)
+		for wg in 0 ..< NG {
+			for tid in 0 ..< lsx {
+				src_tid := (tid + shift) % lsx
+				want_ring := f32(src_tid + wg * 100) + 3.0 * 4.0
+				want_live := f32(tid) * 0.5 + f32(wg) * 10.0 + (3.0 if (tid & 1) == 0 else 0.0)
+				testing.expect_value(t, f_single[wg * lsx + tid], want_ring + want_live)
+			}
+		}
+
+		// Also dispatch over a 4-thread pool via first_group / group_count and verify bit-identical output.
+		if lsx == 256 {
+			Pool_Task :: struct {
+				prog:        ^Program,
+				ublock:      []u8,
+				out_words:   []u32,
+				first_group: int,
+				group_count: int,
+			}
+			worker_proc :: proc(th: ^thread.Thread) {
+				task := (^Pool_Task)(th.data)
+				sc: Scratch
+				defer scratch_destroy(&sc)
+				run_compute(task.prog, task.ublock, {NG, 1, 1}, &sc, {buffers = {task.out_words}}, task.first_group, task.group_count)
+			}
+			out_pool := make([]u32, NG * lsx, context.temp_allocator)
+			ranges := [4][2]int{{0, 1}, {1, 2}, {3, 1}, {4, 1}}
+			tasks: [4]Pool_Task
+			threads: [4]^thread.Thread
+			for i in 0 ..< 4 {
+				tasks[i] = {prog = &mb.program, ublock = ublock, out_words = out_pool, first_group = ranges[i][0], group_count = ranges[i][1]}
+				threads[i] = thread.create(worker_proc)
+				threads[i].data = &tasks[i]
+				thread.start(threads[i])
+			}
+			for th in threads {
+				thread.join(th)
+				thread.destroy(th)
+			}
+			testing.expect(t, slice.equal(out_single, out_pool))
+		}
+	}
+
+	// 2. trim_buffer_loads preserves Load_Buf operands feeding Load_Shared, Store_Shared, Atomic_Shared, and Atomic_Buf.
+	{
+		blocks := [6]Slots{{0, 1}, {1, 4}, {5, 4}, {9, 4}, {13, 4}, {17, 1}}
+		code := [8]Instr {
+			{op = .Load_Buf, n = 4, dst = 1, a = 0, b = 4},
+			{op = .Load_Buf, n = 4, dst = 5, a = 0, b = 4},
+			{op = .Load_Buf, n = 4, dst = 9, a = 0, b = 4},
+			{op = .Load_Buf, n = 4, dst = 13, a = 0, b = 4},
+			{op = .Load_Shared, n = 1, k = 1, dst = 17, a = 2, c = 0},                                   // k != 0 -> reads dyn slot a=2 -> block 1[1]
+			{op = .Store_Shared, n = 1, k = 1, a = 6, b = 8, c = 0},                                     // reads value a=6 and dyn b=8 -> block 2[1..3]
+			{op = .Atomic_Shared, n = 1, k = u8(Atomic_Op.Comp_Swap), dst = 17, a = 10, b = 11, c = 12}, // reads a,b,c = 10..12 -> block 3[1..3]
+			{op = .Atomic_Buf, n = 1, k = u8(Atomic_Op.Comp_Swap), dst = 17, a = 13, b = 14, c = 16, d = 0}, // reads a,b,c = 13,14,16 -> block 4[0..3]
+		}
+		p := Program{code = code[:], num_slots = 18}
+		trim_buffer_loads(&p, blocks[:])
+		testing.expect_value(t, len(p.code), 8)
+		testing.expect(t, p.code[0].op == .Load_Buf && p.code[0].n == 1)
+		testing.expect(t, p.code[1].op == .Load_Buf && p.code[1].n == 3)
+		testing.expect(t, p.code[2].op == .Load_Buf && p.code[2].n == 3)
+		testing.expect(t, p.code[3].op == .Load_Buf && p.code[3].n == 4)
+	}
+
+	// 3. Early `return` before `barrier()` across multiple chunks (both workgroup-uniform
+	//    early return per GLSL ES 3.10 §8.14 and CPU divergent chunk/lane early return):
+	//    returned lanes neither stall the barrier scheduler nor resume after `barrier()`.
+	{
+		RET_SRC :: `#version 310 es
+layout(local_size_x = 160) in;
+shared uint sh_data[160];
+layout(std430) writeonly buffer Out { uint out_v[]; } dst;
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.x;
+    uint out_idx = wg * 160u + tid;
+    sh_data[tid] = tid + 10u;
+    if (wg == 1u) {
+        dst.out_v[out_idx] = 9000u + tid;
+        return;
+    }
+    if (wg == 2u && (tid < 64u || (tid & 1u) == 1u)) {
+        dst.out_v[out_idx] = 5000u + tid;
+        return;
+    }
+    barrier();
+    dst.out_v[out_idx] = sh_data[(tid + 64u) % 160u] + 1000u;
+}`
+		mr, er, okr := compile(RET_SRC, {profile = .Glsl, stage = .Compute})
+		defer destroy(mr)
+		testing.expectf(t, okr, "early return barrier failed:\n%s", format_errors(er, context.temp_allocator))
+		if okr {
+			if have_spirv_val() {
+				expect_valid_spirv(t, "early_ret_barrier", mr.spirv)
+			}
+			out_r := make([]u32, 3 * 160, context.temp_allocator)
+			run_compute(&mr.program, nil, {3, 1, 1}, temp_scratch(), {buffers = {out_r}})
+			for tid in u32(0) ..< 160 {
+				testing.expect_value(t, out_r[0 * 160 + tid], ((tid + 64) % 160) + 10 + 1000)
+				testing.expect_value(t, out_r[1 * 160 + tid], 9000 + tid)
+				if tid < 64 || (tid & 1) == 1 {
+					testing.expect_value(t, out_r[2 * 160 + tid], 5000 + tid)
+				} else {
+					testing.expect_value(t, out_r[2 * 160 + tid], ((tid + 64) % 160) + 10 + 1000)
+				}
+			}
+		}
+	}
+}
+
+@(test)
+test_compute_atomics_and_testdata :: proc(t: ^testing.T) {
+	// 1. Signed vs unsigned Min/Max, Add/And/Or/Xor/Exchange/CompSwap, helper writes_state sequencing,
+	//    masked-off lanes, out-of-bounds Atomic_Buf safety, and deterministic (chunk, then lane) CPU order across 160 threads.
+	ORDER_SRC :: `#version 310 es
+layout(local_size_x = 160) in;
+
+shared uint sh_seq;
+shared int sh_imin;
+shared int sh_imax;
+shared int sh_imin_flip;
+shared int sh_imax_flip;
+shared int sh_imax_neg;
+shared int sh_cas_ord;
+shared uint sh_umin;
+shared uint sh_umax;
+shared int sh_iand;
+shared int sh_ior;
+shared int sh_ixor;
+shared int sh_iexch;
+shared int sh_icas;
+shared uint sh_uand;
+shared uint sh_uor;
+shared uint sh_uxor;
+shared uint sh_uexch;
+shared uint sh_ucas;
+shared uint sh_masked;
+shared uint sh_side_a;
+shared uint sh_side_b;
+
+layout(std430) buffer IBuf { int iw[]; } ib;
+layout(std430) buffer UBuf { uint uw[]; } ub;
+
+uint helper_write_sh() {
+    sh_side_a = 40u;
+    return 2u;
+}
+
+uint helper_atomic_sh() {
+    return atomicAdd(sh_side_b, 30u);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    if (tid == 0u) {
+        sh_imin = 5;
+        sh_imax = -5;
+        sh_imin_flip = -5;
+        sh_imax_flip = 5;
+        sh_imax_neg = -5;
+        sh_cas_ord = 12;
+        sh_umin = 0x80000010u;
+        sh_umax = 5u;
+        sh_iand = 0xff;
+        sh_ior = 0x10;
+        sh_ixor = 0x55;
+        sh_iexch = -77;
+        sh_icas = -12;
+        sh_uand = 0xffu;
+        sh_uor = 0x10u;
+        sh_uxor = 0x55u;
+        sh_uexch = 88u;
+        sh_ucas = 34u;
+        sh_side_a = 10u;
+        sh_side_b = 5u;
+    }
+    barrier();
+
+    ub.uw[16u + tid] = atomicAdd(sh_seq, 1u);
+    ub.uw[176u + tid] = atomicAdd(ub.uw[0], 1u);
+
+    if (tid < 3u) {
+        atomicAdd(sh_masked, 1u);
+    }
+    uint unreached_ternary = (tid > 999u) ? atomicAdd(sh_masked, 100u) : 0u;
+    if (unreached_ternary != 0u) {
+        atomicAdd(sh_masked, 1000u);
+    }
+    if (tid == 1u) {
+        atomicMin(sh_imin, -10);
+        atomicMax(sh_imax, 3);
+        atomicMin(sh_imin_flip, 3);
+        atomicMax(sh_imax_flip, -10);
+        atomicMax(sh_imax_neg, -2);
+        atomicMin(ib.iw[0], -10);
+        atomicMax(ib.iw[1], 3);
+        atomicMin(ib.iw[12], 3);
+        atomicMax(ib.iw[13], -10);
+        atomicMax(ib.iw[14], -2);
+        atomicMin(sh_umin, 5u);
+        atomicMax(sh_umax, 0x80000020u);
+        atomicMin(ub.uw[1], 5u);
+        atomicMax(ub.uw[2], 0x80000020u);
+
+        // atomicCompSwap evaluation order: compare is captured before data mutates it.
+        int cmp_sh = 12;
+        int cas_ord_sh = atomicCompSwap(sh_cas_ord, cmp_sh, (cmp_sh = 99) + 1);
+        int cmp_buf = 34;
+        int cas_ord_buf = atomicCompSwap(ib.iw[15], cmp_buf, (cmp_buf = 88) + 1);
+        ib.iw[16] = cas_ord_sh * 1000 + cmp_sh;
+        ib.iw[17] = cas_ord_buf * 1000 + cmp_buf;
+
+        int prev_iand = atomicAnd(sh_iand, 0x3c);
+        int prev_ior  = atomicOr(sh_ior, 0x05);
+        int prev_ixor = atomicXor(sh_ixor, 0x0f);
+        int prev_iex  = atomicExchange(sh_iexch, 42);
+        int miss_icas = atomicCompSwap(sh_icas, 99, 100);
+        int hit_icas  = atomicCompSwap(sh_icas, -12, 73);
+        ib.iw[4] = prev_iand + prev_ior + prev_ixor + prev_iex + miss_icas + hit_icas;
+
+        int bp_iand = atomicAnd(ib.iw[5], 0x3c);
+        int bp_ior  = atomicOr(ib.iw[6], 0x05);
+        int bp_ixor = atomicXor(ib.iw[7], 0x0f);
+        int bp_iex  = atomicExchange(ib.iw[8], 42);
+        int bm_icas = atomicCompSwap(ib.iw[9], 99, 100);
+        int bh_icas = atomicCompSwap(ib.iw[9], -12, 73);
+        ib.iw[10] = bp_iand + bp_ior + bp_ixor + bp_iex + bm_icas + bh_icas;
+
+        uint prev_uand = atomicAnd(sh_uand, 0x3cu);
+        uint prev_uor  = atomicOr(sh_uor, 0x05u);
+        uint prev_uxor = atomicXor(sh_uxor, 0x0fu);
+        uint prev_uex  = atomicExchange(sh_uexch, 91u);
+        uint miss_ucas = atomicCompSwap(sh_ucas, 99u, 100u);
+        uint hit_ucas  = atomicCompSwap(sh_ucas, 34u, 67u);
+        ub.uw[7] = prev_uand + prev_uor + prev_uxor + prev_uex + miss_ucas + hit_ucas;
+
+        uint bp_uand = atomicAnd(ub.uw[8], 0x3cu);
+        uint bp_uor  = atomicOr(ub.uw[9], 0x05u);
+        uint bp_uxor = atomicXor(ub.uw[10], 0x0fu);
+        uint bp_uex  = atomicExchange(ub.uw[11], 91u);
+        uint bm_ucas = atomicCompSwap(ub.uw[12], 99u, 100u);
+        uint bh_ucas = atomicCompSwap(ub.uw[12], 34u, 67u);
+        ub.uw[13] = bp_uand + bp_uor + bp_uxor + bp_uex + bm_ucas + bh_ucas;
+
+        // Left-to-right sequencing when a helper or direct atomic updates shared.
+        uint seq1 = sh_side_a * 100u + helper_write_sh() + sh_side_a;
+        uint seq2 = sh_side_b * 100u + helper_atomic_sh() + sh_side_b + atomicAdd(sh_side_b, 4u);
+        ub.uw[14] = seq1;
+        ub.uw[15] = seq2 + sh_side_b;
+
+        // Out-of-bounds buffer atomics return 0 and leave valid elements intact.
+        int hi_idx = int(tid) + 99999;
+        int neg_idx = int(tid) - 10;
+        uint oob1 = atomicAdd(ub.uw[hi_idx], 7u);
+        int oob2 = atomicCompSwap(ib.iw[neg_idx], 0, 99);
+        ub.uw[3] = oob1 + uint(oob2);
+    }
+    barrier();
+    if (tid == 0u) {
+        ib.iw[2] = sh_imin;
+        ib.iw[3] = sh_imax;
+        ib.iw[18] = sh_imin_flip;
+        ib.iw[19] = sh_imax_flip;
+        ib.iw[20] = sh_imax_neg;
+        ib.iw[21] = sh_cas_ord;
+        ib.iw[11] = sh_iand + sh_ior * 100 + sh_ixor * 10000 + sh_iexch + sh_icas;
+        ub.uw[4] = sh_umin;
+        ub.uw[5] = sh_umax;
+        ub.uw[6] = sh_masked;
+        ub.uw[336] = sh_uand + sh_uor * 100u + sh_uxor * 10000u + sh_uexch + sh_ucas;
+    }
+}`
+	mo, eo, oko := compile(ORDER_SRC, {profile = .Glsl, stage = .Compute})
+	defer destroy(mo)
+	testing.expectf(t, oko, "order_src failed:\n%s", format_errors(eo, context.temp_allocator))
+	if oko {
+		if have_spirv_val() {
+			expect_valid_spirv(t, "order_atomics", mo.spirv)
+		}
+		// Helper calls with writes_state and direct atomics must sequence operands via temporaries in MSL
+		// (note 4 added shared ints shifted sh_side_a/sh_side_b to indices 20u/21u).
+		testing.expect(t, !strings.contains(mo.msl, "oksl_sh[20u] * 100u) + ok_helper_write_sh"))
+		testing.expect(t, !strings.contains(mo.msl, "oksl_sh[21u] * 100u) + ok_helper_atomic_sh"))
+		testing.expect(t, !strings.contains(mo.msl, "oksl_sh[21u]) + atomic_fetch_add_explicit"))
+		// Used atomic results must route through volatile locals in MSL.
+		testing.expect(t, strings.contains(mo.msl, "volatile int _t"))
+		testing.expect(t, strings.contains(mo.msl, "volatile uint _t"))
+
+		iw := [22]i32{5, -5, 0, 0, 0, 0xff, 0x10, 0x55, -77, -12, 0, 0, -5, 5, -5, 34, 0, 0, 0, 0, 0, 0}
+		uw := make([]u32, 337, context.temp_allocator)
+		uw[1] = 0x80000010
+		uw[2] = 5
+		uw[3] = 0xdead
+		uw[8], uw[9], uw[10], uw[11], uw[12] = 0xff, 0x10, 0x55, 88, 34
+		run_compute(&mo.program, nil, {1, 1, 1}, temp_scratch(), {
+			buffers = {slice.reinterpret([]u32, iw[:]), uw},
+		})
+		testing.expect_value(t, uw[0], u32(160))
+		testing.expect_value(t, iw[0], i32(-10))
+		testing.expect_value(t, iw[1], i32(3))
+		testing.expect_value(t, iw[2], i32(-10))
+		testing.expect_value(t, iw[3], i32(3))
+		testing.expect_value(t, iw[12], i32(-5))
+		testing.expect_value(t, iw[13], i32(5))
+		testing.expect_value(t, iw[14], i32(-2))
+		testing.expect_value(t, iw[15], i32(89))
+		testing.expect_value(t, iw[16], i32(12 * 1000 + 99))
+		testing.expect_value(t, iw[17], i32(34 * 1000 + 88))
+		testing.expect_value(t, iw[18], i32(-5))
+		testing.expect_value(t, iw[19], i32(5))
+		testing.expect_value(t, iw[20], i32(-2))
+		testing.expect_value(t, iw[21], i32(100))
+		want_prev_i := i32(0xff + 0x10 + 0x55 + (-77) + (-12) + (-12))
+		want_post_i := i32((0xff & 0x3c) + (0x10 | 0x05) * 100 + (0x55 ~ 0x0f) * 10000 + 42 + 73)
+		testing.expect_value(t, iw[4], want_prev_i)
+		testing.expect_value(t, iw[5], i32(0xff & 0x3c))
+		testing.expect_value(t, iw[6], i32(0x10 | 0x05))
+		testing.expect_value(t, iw[7], i32(0x55 ~ 0x0f))
+		testing.expect_value(t, iw[8], i32(42))
+		testing.expect_value(t, iw[9], i32(73))
+		testing.expect_value(t, iw[10], want_prev_i)
+		testing.expect_value(t, iw[11], want_post_i)
+
+		want_prev_u := u32(0xff + 0x10 + 0x55 + 88 + 34 + 34)
+		want_post_u := u32((0xff & 0x3c) + (0x10 | 0x05) * 100 + (0x55 ~ 0x0f) * 10000 + 91 + 67)
+		testing.expect_value(t, uw[1], u32(5))
+		testing.expect_value(t, uw[2], u32(0x80000020))
+		testing.expect_value(t, uw[3], u32(0))
+		testing.expect_value(t, uw[4], u32(5))
+		testing.expect_value(t, uw[5], u32(0x80000020))
+		testing.expect_value(t, uw[6], u32(3))
+		testing.expect_value(t, uw[7], want_prev_u)
+		testing.expect_value(t, uw[8], u32(0xff & 0x3c))
+		testing.expect_value(t, uw[9], u32(0x10 | 0x05))
+		testing.expect_value(t, uw[10], u32(0x55 ~ 0x0f))
+		testing.expect_value(t, uw[11], u32(91))
+		testing.expect_value(t, uw[12], u32(67))
+		testing.expect_value(t, uw[13], want_prev_u)
+		testing.expect_value(t, uw[14], u32(10 * 100 + 2 + 40))
+		testing.expect_value(t, uw[15], u32(5 * 100 + 5 + 35 + 35 + 39))
+		testing.expect_value(t, uw[336], want_post_u)
+		for tid in u32(0) ..< 160 {
+			testing.expect_value(t, uw[16 + tid], tid)
+			testing.expect_value(t, uw[176 + tid], tid)
+		}
+	}
+
+	// 2. Compile, validate SPIR-V opcodes, verify MSL temporaries & constructs, and run all 11 Phase 2 testdata shaders.
+	spv_has_op :: proc(words: []u32, want_op: u32) -> bool {
+		i := 5
+		for i < len(words) {
+			op := words[i] & 0xffff
+			wc := int(words[i] >> 16)
+			if op == want_op {
+				return true
+			}
+			if wc <= 0 {
+				break
+			}
+			i += wc
+		}
+		return false
+	}
+	for name in ([11]string{
+		"tile_max.comp", "tile_max_odd.comp", "histogram.comp", "grid_bin.comp", "atomics.comp",
+		"probe_65.comp", "probe_eval.comp", "probe_inout.comp", "probe_loop.comp", "probe_old.comp", "probe_return.comp",
+	}) {
+		path := fmt.tprintf("testdata/%s", name)
+		src_bytes, rerr := os.read_entire_file(path, context.temp_allocator)
+		testing.expectf(t, rerr == nil, "failed to read %s", path)
+		if rerr != nil {
+			continue
+		}
+		m, errs, ok := compile(string(src_bytes), {profile = .Glsl, stage = .Compute})
+		defer destroy(m)
+		testing.expectf(t, ok, "%s failed:\n%s", name, format_errors(errs, context.temp_allocator))
+		if !ok {
+			continue
+		}
+		if have_spirv_val() {
+			expect_valid_spirv(t, name, m.spirv)
+		}
+		testing.expectf(t, strings.contains(m.msl, "threadgroup uint oksl_sh["), "%s missing oksl_sh", name)
+		testing.expectf(t, strings.contains(m.msl, "threadgroup_barrier("), "%s missing threadgroup_barrier", name)
+		if name == "grid_bin.comp" {
+			// Discarded atomic calls must not allocate volatile temporaries.
+			testing.expectf(t, !strings.contains(m.msl, "volatile "), "%s emitted unexpected volatile for discarded atomics", name)
+		}
+		if name == "histogram.comp" {
+			// 1 used atomic result + 4 discarded atomic statements -> exactly 1 volatile local.
+			testing.expect_value(t, strings.count(m.msl, "volatile uint _t"), 1)
+		}
+		if name == "probe_eval.comp" || name == "probe_old.comp" {
+			testing.expectf(t, strings.contains(m.msl, "volatile uint _t"), "%s missing volatile local workaround", name)
+		}
+		if name == "atomics.comp" {
+			for spv_op in ([?]u32{
+				224, // OpControlBarrier
+				225, // OpMemoryBarrier
+				229, // OpAtomicExchange
+				230, // OpAtomicCompareExchange
+				234, // OpAtomicIAdd
+				236, // OpAtomicSMin
+				237, // OpAtomicUMin
+				238, // OpAtomicSMax
+				239, // OpAtomicUMax
+				240, // OpAtomicAnd
+				241, // OpAtomicOr
+				242, // OpAtomicXor
+			}) {
+				testing.expectf(t, spv_has_op(m.spirv, spv_op), "atomics.comp missing SPIR-V op %d", spv_op)
+			}
+			for msl_sub in ([?]string{
+				"threadgroup_barrier(mem_flags::mem_threadgroup)",
+				"threadgroup_barrier(mem_flags::mem_device)",
+				"threadgroup_barrier(mem_flags::mem_texture)",
+				"threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture)",
+				"(threadgroup atomic_int*)&oksl_sh[",
+				"(threadgroup atomic_uint*)&oksl_sh[",
+				"(device atomic_int*)&oksl_buf_",
+				"(device atomic_uint*)&oksl_buf_",
+				"atomic_fetch_add_explicit(",
+				"atomic_fetch_min_explicit(",
+				"atomic_fetch_max_explicit(",
+				"atomic_fetch_and_explicit(",
+				"atomic_fetch_or_explicit(",
+				"atomic_fetch_xor_explicit(",
+				"atomic_exchange_explicit(",
+				"oksl_cas(",
+			}) {
+				testing.expectf(t, strings.contains(m.msl, msl_sub), "atomics.comp missing MSL %q", msl_sub)
+			}
+		}
+		// Verify every declared `_tN` temporary (plain or volatile) in `ok_main` is assigned.
+		if main_pos := strings.index(m.msl, "void ok_main("); main_pos >= 0 {
+			rest_msl := m.msl[main_pos:]
+			end_fn := strings.index(rest_msl, "\n}\n")
+			fn_msl := rest_msl[:end_fn] if end_fn >= 0 else rest_msl
+			for line in strings.split_lines(fn_msl, context.temp_allocator) {
+				trimmed := strings.trim_space(line)
+				is_plain_decl := strings.has_suffix(trimmed, " = {};")
+				is_vol_decl := strings.has_prefix(trimmed, "volatile ") && strings.has_suffix(trimmed, ";")
+				if ix := strings.index(trimmed, " _t"); ix >= 0 && (is_plain_decl || is_vol_decl) {
+					rest := trimmed[ix + 1 : len(trimmed) - 1]
+					eq := strings.index(rest, " = {}")
+					tname := rest[:eq] if eq >= 0 else rest
+					testing.expectf(t, strings.contains(fn_msl, fmt.tprintf("(%s = ", tname)), "%s: MSL temp %s declared but unassigned", name, tname)
+				}
+			}
+		}
+
+		// Dispatch a small run on CPU to exercise every instruction path.
+		bufs := make([][]u32, len(m.storage_buffers), context.temp_allocator)
+		for sb, bi in m.storage_buffers {
+			bufs[bi] = make([]u32, 8192, context.temp_allocator)
+			if sb.readonly {
+				for &w, wi in bufs[bi] {
+					w = u32((wi * 73 + 19) & 255)
+				}
+			}
+		}
+		ublk := make([]u8, m.block_size, context.temp_allocator)
+		set_uniform(m, ublk, "uSize", {32, 32})
+		set_uniform(m, ublk, "uCount", {64})
+		set_uniform(m, ublk, "uGridSize", {4, 4})
+		run_compute(&m.program, ublk, {2, 2, 1}, temp_scratch(), {buffers = bufs})
+	}
+}
+
 
 

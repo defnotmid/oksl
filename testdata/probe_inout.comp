@@ -1,0 +1,48 @@
+#version 310 es
+// Shared elements as inout arguments, shared vector swizzle writes, atomics on
+// a shared struct member at a dynamic index, a CAS float-max loop on a buffer,
+// and every signed op against negative values.
+layout(local_size_x = 8, local_size_y = 2) in;
+buffer O { uint d[]; } o;
+buffer I { int v[]; } iv;
+struct C { uint n[4]; vec4 acc; };
+shared C cs;
+shared ivec4 sv;
+void bump(inout uint x, uint by) { x += by; }
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (i == 0u) {
+        cs.n = uint[4](0u, 0u, 0u, 0u);
+        cs.acc = vec4(0.0);
+        bump(cs.n[1], 5u);
+        cs.acc.zx = vec2(3.0, 4.0);
+        sv = ivec4(-5, 7, 100, -100);
+    }
+    memoryBarrierShared();
+    barrier();
+    atomicAdd(cs.n[i % 4u], 1u);
+    atomicMin(sv.x, -int(i));
+    atomicMax(sv.y, int(i) - 3);
+    atomicAnd(sv.z, ~(1 << int(i % 6u)));
+    atomicXor(sv.w, int(i));
+    uint word = 3000u + wg;
+    float f = float(i) * 1.5 + float(wg);
+    uint cur = o.d[word];
+    for (int t = 0; t < 64; t++) {
+        float have = uintBitsToFloat(cur);
+        if (!(have < f) && !isnan(have)) break;
+        uint got = atomicCompSwap(o.d[word], cur, floatBitsToUint(f));
+        if (got == cur) break;
+        cur = got;
+    }
+    atomicMin(iv.v[2000u + wg], -int(i) * 1000);
+    memoryBarrierShared();
+    barrier();
+    if (i == 0u) {
+        uint b = wg * 12u;
+        o.d[b] = cs.n[0]; o.d[b + 1u] = cs.n[1]; o.d[b + 2u] = cs.n[2]; o.d[b + 3u] = cs.n[3];
+        o.d[b + 4u] = floatBitsToUint(cs.acc.x); o.d[b + 5u] = floatBitsToUint(cs.acc.z);
+        o.d[b + 6u] = uint(sv.x); o.d[b + 7u] = uint(sv.y); o.d[b + 8u] = uint(sv.z); o.d[b + 9u] = uint(sv.w);
+    }
+}

@@ -1,0 +1,28 @@
+#version 310 es
+// 65 invocations: two chunks, the second with one lane.
+layout(local_size_x = 65) in;
+buffer O { uint d[]; } o;
+shared uint s[65];
+shared uint sum;
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (i == 0u) {
+        sum = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    s[i] = i + 1u;
+    atomicAdd(sum, i + 1u);
+    memoryBarrierShared();
+    barrier();
+    uint mine = s[64u - i];
+    barrier();
+    s[i] = mine * 2u;
+    memoryBarrierShared();
+    barrier();
+    o.d[wg * 66u + i] = s[(i + 1u) % 65u];
+    if (i == 64u) {
+        o.d[wg * 66u + 65u] = sum;
+    }
+}

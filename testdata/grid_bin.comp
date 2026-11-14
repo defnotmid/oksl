@@ -1,0 +1,71 @@
+#version 310 es
+// Cell-grid builder: atomic per-cell piece counts, parallel prefix scan in
+// shared memory, and deterministic scatter preserving piece order.
+
+layout(local_size_x = 32, local_size_y = 4) in;
+
+readonly buffer Pieces {
+    uvec2 items[];
+} pieces;
+
+buffer Grid {
+    uint words[];
+} grid;
+
+shared uint sh_counts[16];
+shared uint sh_offsets[16];
+shared uint sh_scan_tmp[16];
+shared uint sh_cell[128];
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+
+    if (tid < 16u) {
+        sh_counts[tid] = 0u;
+    }
+    barrier();
+
+    uvec2 item = pieces.items[(wg * 128u + tid) & 2047u];
+    uint cell = (item.x ^ (item.y >> 4u) ^ tid) & 15u;
+    sh_cell[tid] = cell;
+    atomicAdd(sh_counts[cell], 1u);
+    barrier();
+
+    // Exclusive prefix scan of 16 cell counts in shared memory.
+    if (tid < 16u) {
+        sh_offsets[tid] = tid > 0u ? sh_counts[tid - 1u] : 0u;
+    }
+    barrier();
+
+    for (uint stride = 1u; stride < 16u; stride <<= 1u) {
+        if (tid < 16u) {
+            uint v = sh_offsets[tid];
+            if (tid >= stride) {
+                v += sh_offsets[tid - stride];
+            }
+            sh_scan_tmp[tid] = v;
+        }
+        barrier();
+        if (tid < 16u) {
+            sh_offsets[tid] = sh_scan_tmp[tid];
+        }
+        barrier();
+    }
+
+    // Stable rank in piece order: count earlier pieces in the same cell.
+    uint rank = 0u;
+    for (uint j = 0u; j < tid; ++j) {
+        if (sh_cell[j] == cell) {
+            rank += 1u;
+        }
+    }
+
+    uint base = (wg & 23u) * 160u;
+    if (tid < 16u) {
+        grid.words[base + tid] = sh_offsets[tid];
+        grid.words[base + 16u + tid] = sh_counts[tid];
+    }
+    uint dst = sh_offsets[cell] + rank;
+    grid.words[base + 32u + dst] = (tid << 8u) | cell;
+}

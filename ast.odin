@@ -151,6 +151,7 @@ Var_Decl :: struct {
 	unsized:    bool,
 	is_const:   bool,
 	is_uniform: bool,
+	is_shared:  bool,
 	io:         Var_Io,
 	flat:       bool,
 	// Storage image qualifiers (`layout(rgba8)`, `readonly`, `writeonly`).
@@ -270,6 +271,8 @@ Storage :: enum u8 {
 	Storage_Image,
 	// Compute's `gl_WorkGroupSize` (`const uvec3`).
 	Work_Group_Size,
+	// Compute workgroup `shared` variable.
+	Shared,
 }
 
 Symbol :: struct {
@@ -598,7 +601,7 @@ may_write :: proc "contextless" (u: ^Unit, id: Expr_Id) -> bool {
 	case .Ternary:
 		return may_write(u, e.a) || may_write(u, e.b) || may_write(u, e.c)
 	case .Call:
-		if e.call == .Builtin && e.builtin == .Image_Store {
+		if e.call == .Builtin && (e.builtin == .Image_Store || is_barrier_builtin(e.builtin) || is_atomic_builtin(e.builtin)) {
 			return true
 		}
 		if e.call == .User {

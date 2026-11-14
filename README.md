@@ -344,8 +344,33 @@ Shadertoy profiles) compiles a GLSL ES 3.1 compute shader:
   `textureProj` and derivatives (`dFdx`, `dFdy`, `fwidth`) need fragment
   quads and are diagnosed in compute, along with stage `in`/`out`
   variables, `discard` and vertex/fragment built-ins.
-- **Phase 1 scope:** `shared` workgroup memory, `barrier()` /
-  `memoryBarrier*()` and atomic operations are not implemented yet.
+- **Workgroup `shared` memory:** global `shared` variables of scalar (`bool`,
+  `int`, `uint`, `float`), vector, matrix, array and struct types, with no
+  initializers and up to 16,384 bytes in total (`MAX_COMPUTE_SHARED_MEMORY_SIZE`'s
+  GLSL ES 3.10 minimum). Non-global `shared` declarations, extra qualifiers and
+  `shared` in other stages are diagnosed. On GPUs, `shared` memory starts with
+  undefined, stale contents at each workgroup, so shaders must initialize every
+  element before reading or atomically updating it; `run_compute` zeroes
+  `shared` memory on the CPU only, for deterministic CPU runs.
+- **Barriers:** `barrier()`, `memoryBarrierShared()` and `groupMemoryBarrier()`
+  in compute shaders, plus `memoryBarrier()`, `memoryBarrierBuffer()` and
+  `memoryBarrierImage()` across GLSL stages. Per GLSL ES 3.10 §8.14, `barrier()`
+  is permitted inside dynamically uniform control flow (including reduction
+  loops, helper calls and after uniform early `return`s). Although §8.14
+  specifies execution ordering alone for `barrier()`, oksl guarantees that
+  `barrier()` also orders `shared` memory on every backend (SPIR-V
+  `WorkgroupMemory | AcquireRelease` `0x108` matching `glslang`, MSL
+  `mem_threadgroup`, and sequential chunks on the CPU), so `barrier()` makes
+  prior `shared` writes visible across the workgroup without a separate
+  `memoryBarrierShared()`.
+- **Atomics:** `atomicAdd`, `atomicMin`, `atomicMax`, `atomicAnd`, `atomicOr`,
+  `atomicXor`, `atomicExchange` and `atomicCompSwap` on scalar `int` and `uint`
+  in `shared` variables and read-write `buffer` blocks (including array
+  elements, struct fields and vector components). Locals, uniforms, `readonly`
+  / `writeonly` buffers and floats are rejected; `atomic_uint` counters
+  (`atomicCounter*`, `memoryBarrierAtomicCounter`) are rejected because Vulkan
+  disallows SPIR-V's `AtomicStorage` capability, and `imageAtomic*` is rejected
+  as outside GLSL ES 3.10 core.
 
 ### Pass graphs and programs (multipass)
 
@@ -559,8 +584,20 @@ texel_bytes`), `rgba8` writes `round(clamp(x, 0, 1) * 255)`, `rgba16f`
 rounds to nearest even (Vulkan allows drivers to round toward zero),
 integer formats are exact, single-channel `r32*` loads fill `.gba = (0, 0,
 1)` in bounds, out-of-bounds `imageLoad` returns `(0, 0, 0, 0)`, and
-out-of-bounds `imageStore` and buffer writes are dropped. Concurrent
-writes to the same word or texel have unspecified results.
+out-of-bounds `imageStore` and buffer writes are dropped. `run_compute` zeroes
+`shared` memory at the start of each workgroup on the CPU only, for determinism
+(GPUs start with stale data, so portable shaders must initialize `shared`
+memory before reading it). When a shader uses `barrier()`,
+each 64-lane chunk keeps its own register and mask slice in `Scratch` (sized
+once from workgroup size and slot count, with no per-barrier allocation) while
+chunks advance in lockstep across every barrier, including inside loops and
+across early returns. Within a workgroup, CPU lanes execute in fixed `(chunk,
+then lane)` order, making runs deterministic; GPU invocation and atomic order
+are unspecified, so portable shaders establish output order via prefix scans
+rather than atomic append order. Buffer atomics use host atomic instructions so
+worker threads splitting a dispatch can safely update shared buffers
+(out-of-bounds buffer atomics return `0` without writing). Unsynchronized
+non-atomic writes to the same word or texel have unspecified results.
 
 `texture` in a fragment shader passes the sampler the level a GPU picks:
 `0.5 * log2(max(|duv/dx|², |duv/dy|²))` in the channel's texels
@@ -727,15 +764,18 @@ textured tunnel, swizzles, out parameters, structs and arrays, defines,
 derivatives, premultiplied alpha, SkSL types and built-ins, matrices,
 integer hashing, loops, uniforms, ternaries and short-circuiting,
 matrix comparison, children, storage buffers, RGBA-to-NV12 conversion,
-storage images, explicit-LOD compute sampling and bound float channels, and Shadertoy-style snippets (`st_*.glsl`) with function-like
+storage images, explicit-LOD compute sampling, workgroup `shared` reductions,
+histograms, prefix-scan cell binning, integer atomics and bound float channels, and Shadertoy-style snippets (`st_*.glsl`) with function-like
 macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 
 ## Limitations
 
 - **Stages:** fragment, GLSL vertex and GLSL compute shaders, on the GPU
-  and the CPU (`run_vertex`, `run_fragment`, `run_compute`). Compute has no
-  `shared` workgroup memory, barriers or atomics yet (phase 2), and runs on
-  the 64-lane interpreter rather than the AVX2 JIT. Storage images and
+  and the CPU (`run_vertex`, `run_fragment`, `run_compute`). Compute runs on
+  the 64-lane interpreter rather than the AVX2 JIT, caps `shared` workgroup
+  memory at 16,384 bytes (the GLSL ES 3.10 minimum), and omits `atomic_uint`
+  counters (Vulkan disallows SPIR-V's `AtomicStorage` capability) and
+  `imageAtomic*` (outside GLSL ES 3.10 core). Storage images and
   writable storage buffers are compute-only. Programs run their passes as
   fragment shaders and the host owns the float targets and swaps them each
   frame. GLSL shaders have no `gl_FragDepth` or `gl_InstanceID` (draw
@@ -766,7 +806,6 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 What would make oksl useful well beyond onimite:
 
 - **DXIL / HLSL output** for D3D12, SDL_GPU's preferred driver on Windows.
-- **Compute shared memory, barriers and atomics** (phase 2).
 - **WGSL output** for WebGPU and browsers.
 - **A loop iteration cap** (and SkSL's ES2 loop rules enforced) so untrusted
   shaders can't hang the CPU interpreter.

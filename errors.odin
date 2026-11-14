@@ -210,6 +210,15 @@ Error_Code :: enum u8 {
 	Opaque_Return,
 	Invalid_Int_Literal,
 	Case_Type,
+	// Compute shared memory, barriers and atomics.
+	Shared_Global,
+	Shared_Initializer,
+	Shared_Qualifier,
+	Shared_Type,
+	Shared_Size_Max,
+	Atomic_Target,
+	Unsupported_Atomic_Counter,
+	Unsupported_Image_Atomic,
 }
 
 // A diagnostic at `pos` (the user's line and column: macro expansions keep
@@ -411,6 +420,14 @@ ERROR_TEXT := [Error_Code]string {
 	.Opaque_Return         = "{a} values can not be returned from functions",
 	.Invalid_Int_Literal   = "invalid 32-bit integer literal {q:a}",
 	.Case_Type             = "case label must be {a}, not {b}",
+	.Shared_Global         = "shared variables must be declared at global scope",
+	.Shared_Initializer    = "shared variable {name} can not have an initializer",
+	.Shared_Qualifier      = "shared variable {name} can not have layout, storage, memory or interpolation qualifiers",
+	.Shared_Type           = "shared variable {name} can not have type {a}",
+	.Shared_Size_Max       = "shared memory size {n} bytes exceeds the maximum of {m} bytes",
+	.Atomic_Target         = "{name} requires a shared variable or read-write buffer element",
+	.Unsupported_Atomic_Counter = "atomic_uint counters are not supported; use atomic operations on a storage buffer or shared variable",
+	.Unsupported_Image_Atomic   = "{name} is not in GLSL ES 3.10 core; use atomic operations on a storage buffer or shared variable",
 }
 
 // The text of a diagnostic (without its position).

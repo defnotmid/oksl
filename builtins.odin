@@ -91,6 +91,32 @@ Builtin :: enum u8 {
 	Image_Size,
 	// texelFetch(sampler, p, lod, header_size): integer texel coordinate, no uv round-trip on CPU.
 	Texel_Fetch,
+	// Invocation and memory barriers (checked by check_barrier_op).
+	Barrier,
+	Memory_Barrier,
+	Memory_Barrier_Shared,
+	Memory_Barrier_Buffer,
+	Memory_Barrier_Image,
+	Group_Memory_Barrier,
+	// Atomic memory operations on shared and buffer int/uint (checked by check_atomic_op).
+	Atomic_Add,
+	Atomic_Min,
+	Atomic_Max,
+	Atomic_And,
+	Atomic_Or,
+	Atomic_Xor,
+	Atomic_Exchange,
+	Atomic_Comp_Swap,
+}
+
+@(private)
+is_barrier_builtin :: #force_inline proc "contextless" (b: Builtin) -> bool {
+	return b >= .Barrier && b <= .Group_Memory_Barrier
+}
+
+@(private)
+is_atomic_builtin :: #force_inline proc "contextless" (b: Builtin) -> bool {
+	return b >= .Atomic_Add && b <= .Atomic_Comp_Swap
 }
 
 // How a built-in's arguments are checked (and converted). Each rule runs
@@ -251,6 +277,20 @@ BUILTINS := [Builtin]Builtin_Info {
 	.Image_Store        = {"", 3, .None, .First, {}, {}, {}},
 	.Image_Size         = {"", 1, .None, .Image_Size, {}, {}, {}},
 	.Texel_Fetch        = {"", 3, .None, .Vec4, {}, {}, {}},
+	.Barrier               = {"", 0, .None, .First, {}, {}, {}},
+	.Memory_Barrier        = {"", 0, .None, .First, {}, {}, {}},
+	.Memory_Barrier_Shared = {"", 0, .None, .First, {}, {}, {}},
+	.Memory_Barrier_Buffer = {"", 0, .None, .First, {}, {}, {}},
+	.Memory_Barrier_Image  = {"", 0, .None, .First, {}, {}, {}},
+	.Group_Memory_Barrier  = {"", 0, .None, .First, {}, {}, {}},
+	.Atomic_Add            = {"", 2, .None, .First, {}, {}, {}},
+	.Atomic_Min            = {"", 2, .None, .First, {}, {}, {}},
+	.Atomic_Max            = {"", 2, .None, .First, {}, {}, {}},
+	.Atomic_And            = {"", 2, .None, .First, {}, {}, {}},
+	.Atomic_Or             = {"", 2, .None, .First, {}, {}, {}},
+	.Atomic_Xor            = {"", 2, .None, .First, {}, {}, {}},
+	.Atomic_Exchange       = {"", 2, .None, .First, {}, {}, {}},
+	.Atomic_Comp_Swap      = {"", 3, .None, .First, {}, {}, {}},
 	.Float_Bits_To_Int  = {"floatBitsToInt", 1, .Float_Exact, .Int_Shape, {}, {}, {}},
 	.Float_Bits_To_Uint = {"floatBitsToUint", 1, .Float_Exact, .Uint_Shape, {}, {}, {}},
 	.Int_Bits_To_Float  = {"intBitsToFloat", 1, .Exact_Base, .Float_Shape, {}, .Int, {}},

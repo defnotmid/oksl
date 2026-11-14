@@ -1,0 +1,197 @@
+#version 310 es
+// All 8 atomic operations on int and uint across shared memory and read-write
+// storage buffers (including struct fields, vector swizzles, dynamic vector
+// indexing, atomicExchange conservation, and atomicCompSwap CAS loops).
+
+layout(local_size_x = 16, local_size_y = 8) in;
+
+struct AtomicPack {
+    ivec4 iv;
+    uvec4 uv;
+    int s_exch;
+    uint u_exch;
+    int s_cas;
+    uint u_cas;
+};
+
+buffer IntBuf {
+    int words[];
+} ibuf;
+
+buffer UintBuf {
+    uint words[];
+} ubuf;
+
+shared AtomicPack sh_pack;
+shared int sh_iarr[8];
+shared uint sh_uarr[8];
+shared uint sh_exch_sum;
+shared int sh_sexch_sum;
+shared uint sh_cas_wins;
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint bbase = 16u + (wg & 31u) * 32u;
+
+    if (tid == 0u) {
+        sh_pack.iv = ivec4(0, 100000, -100000, 0x7fffffff);
+        sh_pack.uv = uvec4(0u, 0xffffffffu, 0u, 0xffffffffu);
+        sh_pack.s_exch = -500;
+        sh_pack.u_exch = 999u;
+        sh_pack.s_cas = 10;
+        sh_pack.u_cas = 0u;
+        sh_exch_sum = 0u;
+        sh_sexch_sum = 0;
+        sh_cas_wins = 0u;
+
+        ibuf.words[bbase + 0u] = 0;
+        ibuf.words[bbase + 1u] = 100000;
+        ibuf.words[bbase + 2u] = -100000;
+        ibuf.words[bbase + 3u] = 0x7fffffff;
+        ibuf.words[bbase + 4u] = 0;
+        ibuf.words[bbase + 5u] = 0;
+        ibuf.words[bbase + 6u] = -777;
+        ibuf.words[bbase + 7u] = 0;
+        ibuf.words[bbase + 8u] = -25;
+
+        ubuf.words[bbase + 0u] = 0u;
+        ubuf.words[bbase + 1u] = 0xffffffffu;
+        ubuf.words[bbase + 2u] = 0u;
+        ubuf.words[bbase + 3u] = 0xffffffffu;
+        ubuf.words[bbase + 4u] = 0u;
+        ubuf.words[bbase + 5u] = 0u;
+        ubuf.words[bbase + 6u] = 1234u;
+        ubuf.words[bbase + 7u] = 0u;
+        ubuf.words[bbase + 8u] = 0u;
+        ubuf.words[bbase + 9u] = 0u;
+        ubuf.words[bbase + 10u] = 5u;
+    }
+    if (tid < 8u) {
+        sh_iarr[tid] = 0;
+        sh_uarr[tid] = 0u;
+    }
+    memoryBarrierBuffer();
+    memoryBarrierShared();
+    barrier();
+
+    int si = int(tid) - 64;
+    uint ui = tid + 1u;
+    int dyn_c = int(tid & 3u);
+
+    // Shared atomics: swizzles, struct fields, arrays, dynamic vector indexing.
+    atomicAdd(sh_pack.iv.x, si);
+    atomicMin(sh_pack.iv.y, si * 3 - 200);
+    atomicMax(sh_pack.iv.z, si * 3 - 200);
+    atomicAnd(sh_pack.iv.w, ~(1 << int(tid & 15u)));
+    atomicOr(sh_iarr[tid & 3u], 1 << int((tid >> 2u) & 30u));
+    atomicXor(sh_iarr[4u + (tid & 3u)], int(tid * 13u + 7u));
+
+    atomicAdd(sh_pack.uv[dyn_c], ui);
+    atomicMin(sh_uarr[0], ui * 7u);
+    atomicMax(sh_uarr[1], ui * 7u);
+    atomicAnd(sh_pack.uv.w, ~(1u << (tid & 15u)));
+    atomicOr(sh_uarr[2], 1u << (tid & 15u));
+    atomicXor(sh_uarr[3], ui * 29u);
+
+    uint prev_u = atomicExchange(sh_pack.u_exch, ui);
+    atomicAdd(sh_exch_sum, prev_u);
+    int prev_s = atomicExchange(sh_pack.s_exch, si);
+    atomicAdd(sh_sexch_sum, prev_s);
+
+    if (atomicCompSwap(sh_pack.u_cas, 0u, 77u) == 0u) {
+        atomicAdd(sh_cas_wins, 1u);
+    }
+    if (tid < 8u) {
+        int expect_s = sh_pack.s_cas;
+        for (int iter = 0; iter < 64; ++iter) {
+            int got_s = atomicCompSwap(sh_pack.s_cas, expect_s, expect_s + int(tid) - 3);
+            if (got_s == expect_s) {
+                break;
+            }
+            expect_s = got_s;
+        }
+    }
+
+    // Per-workgroup buffer atomics (all 8 ops on int and uint).
+    atomicAdd(ibuf.words[bbase + 0u], si);
+    atomicMin(ibuf.words[bbase + 1u], si * 5 - 300);
+    atomicMax(ibuf.words[bbase + 2u], si * 5 - 300);
+    atomicAnd(ibuf.words[bbase + 3u], ~(1 << int(tid & 15u)));
+    atomicOr(ibuf.words[bbase + 4u], 1 << int(tid & 15u));
+    atomicXor(ibuf.words[bbase + 5u], int(tid * 17u + 3u));
+    int bprev_s = atomicExchange(ibuf.words[bbase + 6u], si);
+    atomicAdd(ibuf.words[bbase + 7u], bprev_s);
+
+    atomicAdd(ubuf.words[bbase + 0u], ui);
+    atomicMin(ubuf.words[bbase + 1u], ui * 11u);
+    atomicMax(ubuf.words[bbase + 2u], ui * 11u);
+    atomicAnd(ubuf.words[bbase + 3u], ~(1u << (tid & 15u)));
+    atomicOr(ubuf.words[bbase + 4u], 1u << (tid & 15u));
+    atomicXor(ubuf.words[bbase + 5u], ui * 41u);
+    uint bprev_u = atomicExchange(ubuf.words[bbase + 6u], ui);
+    atomicAdd(ubuf.words[bbase + 7u], bprev_u);
+    if (atomicCompSwap(ubuf.words[bbase + 8u], 0u, 99u) == 0u) {
+        atomicAdd(ubuf.words[bbase + 9u], 1u);
+    }
+
+    if (tid < 8u) {
+        int bexp_s = ibuf.words[bbase + 8u];
+        for (int iter = 0; iter < 64; ++iter) {
+            int bgot_s = atomicCompSwap(ibuf.words[bbase + 8u], bexp_s, bexp_s + int(tid) + 1);
+            if (bgot_s == bexp_s) {
+                break;
+            }
+            bexp_s = bgot_s;
+        }
+        uint bexp_u = ubuf.words[bbase + 10u];
+        for (int iter = 0; iter < 64; ++iter) {
+            uint bgot_u = atomicCompSwap(ubuf.words[bbase + 10u], bexp_u, bexp_u + tid + 2u);
+            if (bgot_u == bexp_u) {
+                break;
+            }
+            bexp_u = bgot_u;
+        }
+    }
+
+    // Cross-workgroup commutative buffer atomics on pre-initialized words[0..5].
+    atomicAdd(ibuf.words[0], si);
+    atomicMin(ibuf.words[1], -700000000 - int(tid));
+    atomicMax(ibuf.words[2], -50 + int(tid));
+    atomicAnd(ibuf.words[3], ~int(1u << (tid & 7u)));
+    atomicOr(ibuf.words[4], int(1u << (tid & 7u)));
+    atomicXor(ibuf.words[5], int(wg * 131u + tid));
+
+    atomicAdd(ubuf.words[0], ui);
+    atomicMin(ubuf.words[1], ui + 5u);
+    atomicMax(ubuf.words[2], 0xf0000000u + ui);
+    atomicAnd(ubuf.words[3], ~(1u << (tid & 7u)));
+    atomicOr(ubuf.words[4], 1u << (tid & 7u));
+    atomicXor(ubuf.words[5], wg * 257u + ui);
+
+    groupMemoryBarrier();
+    memoryBarrierImage();
+    memoryBarrier();
+    barrier();
+
+    if (tid == 0u) {
+        // Fold exchange final value + sum of previous values into deterministic invariant.
+        ibuf.words[bbase + 6u] += ibuf.words[bbase + 7u];
+        ibuf.words[bbase + 7u] = sh_pack.s_exch + sh_sexch_sum;
+        ibuf.words[bbase + 9u] = sh_pack.iv.x;
+        ibuf.words[bbase + 10u] = sh_pack.iv.y;
+        ibuf.words[bbase + 11u] = sh_pack.iv.z;
+        ibuf.words[bbase + 12u] = sh_pack.iv.w;
+        ibuf.words[bbase + 13u] = sh_pack.s_cas;
+
+        ubuf.words[bbase + 6u] += ubuf.words[bbase + 7u];
+        ubuf.words[bbase + 7u] = sh_pack.u_exch + sh_exch_sum;
+        ubuf.words[bbase + 11u] = sh_pack.uv.x + sh_pack.uv.y + sh_pack.uv.z;
+        ubuf.words[bbase + 12u] = sh_pack.uv.w;
+        ubuf.words[bbase + 13u] = sh_uarr[1] ^ sh_uarr[2] ^ sh_uarr[3];
+        ubuf.words[bbase + 14u] = sh_pack.u_cas * 10u + sh_cas_wins;
+    }
+    if (tid < 8u) {
+        ibuf.words[bbase + 16u + tid] = sh_iarr[tid];
+    }
+}

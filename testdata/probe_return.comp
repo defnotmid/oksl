@@ -1,0 +1,43 @@
+#version 310 es
+// 96 invocations (a full and a partial chunk): a uniform early return for some
+// workgroups, barrier() in a helper called twice inside uniform control flow,
+// shared structs with vec3 and mat2, dynamic component writes.
+layout(local_size_x = 12, local_size_y = 8) in;
+readonly buffer Cfg { uint w[]; } cfg;
+buffer O { uint d[]; } o;
+struct S { vec3 p; float q; mat2 m; uint c[3]; };
+shared S st[96];
+shared uint total;
+void sync() { memoryBarrierShared(); barrier(); }
+uint mixit(uint i) {
+    st[i].p = vec3(float(i), 2.0, 3.0);
+    st[i].p[i % 3u] += 10.0;
+    st[i].m = mat2(float(i), 1.0, 2.0, 3.0);
+    st[i].c[i % 3u] = i;
+    sync();
+    uint j = (i + 37u) % 96u;
+    uint r = uint(st[j].p.x + st[j].p.y + st[j].p.z) + uint(st[j].m[0][0]) + st[j].c[j % 3u];
+    sync();
+    return r;
+}
+void main() {
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (gl_WorkGroupID.x == 1u) {
+        return;
+    }
+    uint i = gl_LocalInvocationIndex;
+    st[i].c = uint[3](0u, 0u, 0u);
+    if (i == 0u) {
+        total = 0u;
+    }
+    if (cfg.w[1] != 7u) {
+        uint a = mixit(i);
+        uint b2 = mixit((i + 5u) % 96u);
+        atomicAdd(total, a);
+        sync();
+        o.d[wg * 100u + i] = a * 3u + b2;
+        if (i == 0u) {
+            o.d[wg * 100u + 99u] = total;
+        }
+    }
+}

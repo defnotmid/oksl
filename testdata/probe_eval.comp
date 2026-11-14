@@ -1,0 +1,32 @@
+#version 310 es
+// Evaluation order of atomics: the address is taken before later arguments run.
+layout(local_size_x = 4) in;
+buffer B { uint d[]; } b;
+shared uint s[8];
+void main() {
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (gl_LocalInvocationIndex < 8u) {
+        s[gl_LocalInvocationIndex] = 0u;
+        s[gl_LocalInvocationIndex + 4u] = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    uint i = 1u;
+    atomicAdd(b.d[i], i++ + 4u);
+    uint j = 1u;
+    atomicAdd(s[j], j++ + 4u);
+    uint old = atomicAdd(s[3], 1u);
+    atomicAdd(s[4], old);
+    uint k = 2u;
+    uint prev = atomicExchange(s[k + 3u], (k = 6u) + 1u);
+    memoryBarrierShared();
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        b.d[100u + wg * 8u] = s[1];
+        b.d[101u + wg * 8u] = s[2];
+        b.d[102u + wg * 8u] = s[4];
+        b.d[103u + wg * 8u] = s[5];
+        b.d[104u + wg * 8u] = s[6];
+        b.d[105u + wg * 8u] = k;
+    }
+}

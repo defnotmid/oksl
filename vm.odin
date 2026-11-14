@@ -156,6 +156,29 @@ VM_Op :: enum u8 {
 	// dst vec4 = channel k fetched at ivec2 a, lod b, header size c
 	// (d: bit 0 flip_y, bit 1 header, bit 2 uint lod).
 	Texel_Fetch,
+	// Shared memory: dst + i = shared[c + (k != 0 ? a : 0) + i];
+	// shared[c + (k != 0 ? b : 0) + i] = a + i in exec.
+	Load_Shared,
+	Store_Shared,
+	// dst = atomic op k (Atomic_Op) at word a with b (and c for Comp_Swap)
+	// in exec (Atomic_Buf: buffer d; 0 past the buffer).
+	Atomic_Shared,
+	Atomic_Buf,
+	Barrier,
+}
+
+@(private)
+Atomic_Op :: enum u8 {
+	Add,
+	U_Min,
+	S_Min,
+	U_Max,
+	S_Max,
+	And,
+	Or,
+	Xor,
+	Exchange,
+	Comp_Swap,
 }
 
 // The ops that take a Builtin in k.
@@ -196,6 +219,8 @@ Program :: struct {
 	channel_arrays: bit_set[0 ..< SAMPLER_COUNT],
 	local_size:     [3]u32,
 	num_buffers:    int,
+	shared_words:   int,
+	has_barrier:    bool,
 	image_formats:  []Image_Format,
 	// Optional native machine code compiled from `code` (`vm_jit.odin`).
 	jit_mem:  []byte,
@@ -224,22 +249,25 @@ Val :: struct {
 // optionally swizzled.
 @(private)
 LV :: struct {
-	base:    i32,
-	dyn:     i32,
-	t:       Type,
-	swz:     [4]u8,
-	swz_len: int,
+	base:      i32,
+	dyn:       i32,
+	t:         Type,
+	swz:       [4]u8,
+	swz_len:   int,
+	is_shared: bool,
 }
 
 @(private)
 Lower :: struct {
-	u:         ^Unit,
-	checked:   ^Checked,
-	code:      [dynamic]Instr,
-	blocks:    [dynamic]Slots,
-	next_slot: i32,
-	next_mask: i32,
-	sym_slot:  []i32,
+	u:          ^Unit,
+	checked:    ^Checked,
+	code:       [dynamic]Instr,
+	blocks:     [dynamic]Slots,
+	next_slot:  i32,
+	next_mask:  i32,
+	sym_slot:   []i32,
+	sym_shared: []i32,
+	has_barrier: bool,
 	// Channel / image index each sampler / image symbol refers to.
 	sym_chan:  []i32,
 	sym_img:   []i32,
@@ -294,6 +322,13 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	p.stage = u.stage
 	p.local_size = c.local_size
 	p.num_buffers = len(c.buffers)
+	if len(c.shared_vars) > 0 {
+		l.sym_shared = make([]i32, len(u.syms))
+		for sh in c.shared_vars {
+			l.sym_shared[sh] = i32(p.shared_words)
+			p.shared_words += cc(&l, sym_type(u, sh))
+		}
+	}
 	if len(c.images) > 0 {
 		p.image_formats = make([]Image_Format, len(c.images))
 		for im, i in c.images {
@@ -375,6 +410,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	inline_call(&l, c.entry, nil, nil)
 
 	p.code = l.code[:]
+	p.has_barrier = l.has_barrier
 	p.num_slots = int(l.next_slot)
 	p.num_masks = int(l.next_mask)
 	p.consts = l.const_list[:]
@@ -397,6 +433,13 @@ written_syms :: proc(u: ^Unit) -> []bool {
 		case .Assign, .Pre_Inc, .Pre_Dec, .Post_Inc, .Post_Dec:
 			written[target_sym(u, e.a)] = true
 		case .Call:
+			if e.call == .Builtin && is_atomic_builtin(e.builtin) {
+				args := args_of(u, Expr_Id(id))
+				if len(args) > 0 {
+					written[target_sym(u, args[0])] = true
+				}
+				continue
+			}
 			if e.call != .User {
 				continue
 			}
@@ -554,12 +597,42 @@ lower_lvalue :: proc(l: ^Lower, id: Expr_Id) -> LV {
 	e := u.exprs[id]
 	#partial switch e.kind {
 	case .Ident:
+		if u.syms[e.sym].storage == .Shared {
+			return {base = l.sym_shared[e.sym], dyn = -1, t = sym_type(u, e.sym), is_shared = true}
+		}
 		return {base = l.sym_slot[e.sym], dyn = -1, t = sym_type(u, e.sym)}
 	case .Index:
 		lv := lower_lvalue(l, e.a)
+		rt := expr_type(u, id)
+		ix := u.exprs[e.b]
+		if lv.swz_len > 0 {
+			if ix.kind == .Int_Lit || ix.kind == .Uint_Lit {
+				lv.base += i32(lv.swz[int(ix.value)])
+			} else {
+				idx := lower_expr(l, e.b)
+				clamped := alloc_slots(l, 1)
+				emit(l, .I_Fn3, n = 1, k = int(Builtin.Clamp), dst = clamped, a = idx.slot, b = const_val(l, .Int, 0).slot, c = const_val(l, .Int, f64(lv.swz_len - 1)).slot)
+				mapped := const_slot(l, u32(lv.swz[0]))
+				for k in 1 ..< lv.swz_len {
+					cond := alloc_slots(l, 1)
+					emit(l, .I_Eq, dst = cond, a = clamped, b = const_slot(l, u32(k)))
+					sel := alloc_slots(l, 1)
+					emit(l, .Select, k = 1, dst = sel, a = const_slot(l, u32(lv.swz[k])), b = mapped, c = cond)
+					mapped = sel
+				}
+				if lv.dyn >= 0 {
+					sum := alloc_slots(l, 1)
+					emit(l, .I_Add, n = 1, dst = sum, a = lv.dyn, b = mapped)
+					mapped = sum
+				}
+				lv.dyn = mapped
+			}
+			lv.swz_len = 0
+			lv.t = rt
+			return lv
+		}
 		bt := lv.t
 		limit: int
-		rt := expr_type(u, id)
 		switch {
 		case is_array(bt):
 			limit = int(bt.array)
@@ -569,7 +642,6 @@ lower_lvalue :: proc(l: ^Lower, id: Expr_Id) -> LV {
 			limit = int(bt.rows)
 		}
 		size := cc(l, rt)
-		ix := u.exprs[e.b]
 		if ix.kind == .Int_Lit || ix.kind == .Uint_Lit {
 			lv.base += i32(int(ix.value) * size)
 		} else {
@@ -595,7 +667,15 @@ lower_lvalue :: proc(l: ^Lower, id: Expr_Id) -> LV {
 	case .Field:
 		lv := lower_lvalue(l, e.a)
 		if e.swizzle_len > 0 {
-			lv.swz = e.swizzle
+			if lv.swz_len == 0 {
+				lv.swz = e.swizzle
+			} else {
+				composed: [4]u8
+				for k in 0 ..< int(e.swizzle_len) {
+					composed[k] = lv.swz[e.swizzle[k]]
+				}
+				lv.swz = composed
+			}
 			lv.swz_len = int(e.swizzle_len)
 			return lv
 		}
@@ -615,6 +695,29 @@ lower_lvalue :: proc(l: ^Lower, id: Expr_Id) -> LV {
 
 @(private)
 load_lv :: proc(l: ^Lower, lv: LV) -> Val {
+	if lv.is_shared {
+		if lv.swz_len > 0 {
+			n := lv.swz_len
+			rt := vec_type(lv.t.base, n) if n > 1 else scalar_of(lv.t)
+			consecutive := true
+			for i in 1 ..< n {
+				consecutive &&= lv.swz[i] == lv.swz[0] + u8(i)
+			}
+			s := alloc_slots(l, n)
+			if consecutive {
+				emit(l, .Load_Shared, n = n, k = 1 if lv.dyn >= 0 else 0, dst = s, a = lv.dyn if lv.dyn >= 0 else 0, c = lv.base + i32(lv.swz[0]))
+				return {s, rt}
+			}
+			for i in 0 ..< n {
+				emit(l, .Load_Shared, n = 1, k = 1 if lv.dyn >= 0 else 0, dst = s + i32(i), a = lv.dyn if lv.dyn >= 0 else 0, c = lv.base + i32(lv.swz[i]))
+			}
+			return {s, rt}
+		}
+		n := cc(l, lv.t)
+		s := alloc_slots(l, n)
+		emit(l, .Load_Shared, n = n, k = 1 if lv.dyn >= 0 else 0, dst = s, a = lv.dyn if lv.dyn >= 0 else 0, c = lv.base)
+		return {s, lv.t}
+	}
 	if lv.swz_len > 0 {
 		n := lv.swz_len
 		rt := vec_type(lv.t.base, n) if n > 1 else scalar_of(lv.t)
@@ -652,6 +755,19 @@ load_lv :: proc(l: ^Lower, lv: LV) -> Val {
 
 @(private)
 store_lv :: proc(l: ^Lower, lv: LV, v: Val) {
+	if lv.is_shared {
+		if lv.swz_len > 0 {
+			src := widen(l, v, lv.swz_len)
+			for i in 0 ..< lv.swz_len {
+				emit(l, .Store_Shared, n = 1, k = 1 if lv.dyn >= 0 else 0, a = src + i32(i), b = lv.dyn if lv.dyn >= 0 else 0, c = lv.base + i32(lv.swz[i]))
+			}
+			return
+		}
+		n := cc(l, lv.t)
+		src := widen(l, v, n)
+		emit(l, .Store_Shared, n = n, k = 1 if lv.dyn >= 0 else 0, a = src, b = lv.dyn if lv.dyn >= 0 else 0, c = lv.base)
+		return
+	}
 	if lv.swz_len > 0 {
 		src := widen(l, v, lv.swz_len)
 		// A source read in place from the same variable (v.yz = v.xy) is
@@ -1229,6 +1345,9 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	case .Bool_Lit:
 		return {const_slot(l, u32(e.value)), T_BOOL}
 	case .Ident:
+		if u.syms[e.sym].storage == .Shared {
+			return load_lv(l, lower_lvalue(l, id))
+		}
 		return {l.sym_slot[e.sym], t}
 	case .Convert:
 		v := lower_expr(l, e.a)
@@ -1470,7 +1589,7 @@ can_select_expr :: proc(u: ^Unit, id: Expr_Id, budget: ^int) -> bool {
 		if e.call == .User {
 			return false
 		}
-		if e.call == .Builtin && (e.builtin == .Texture || e.builtin == .Texture_Lod || e.builtin == .Texel_Fetch || e.builtin == .Texture_Grad || e.builtin == .Texture_Size || e.builtin == .Image_Load || e.builtin == .Image_Store || e.builtin == .Image_Size) {
+		if e.call == .Builtin && (e.builtin == .Texture || e.builtin == .Texture_Lod || e.builtin == .Texel_Fetch || e.builtin == .Texture_Grad || e.builtin == .Texture_Size || e.builtin == .Image_Load || e.builtin == .Image_Store || e.builtin == .Image_Size || is_barrier_builtin(e.builtin) || is_atomic_builtin(e.builtin)) {
 			return false
 		}
 		for a in args_of(u, id) {
@@ -1866,7 +1985,7 @@ producer :: proc(l: ^Lower, v: Val, mark: i32) -> int {
 // Instructions whose dst is not a value they make whole: masked stores,
 // masks and jumps.
 @(private)
-MASKED_OPS :: bit_set[VM_Op;u128]{.Nop, .Store, .Store_Zero, .Store_Dyn, .Store_Buf, .Image_Store, .Mask_Copy, .Mask_Cond, .Mask_Restore, .Mask_Or, .Mask_Clear, .Mask_Kill, .Jump, .Jump_If_None}
+MASKED_OPS :: bit_set[VM_Op;u128]{.Nop, .Store, .Store_Zero, .Store_Dyn, .Store_Buf, .Store_Shared, .Image_Store, .Barrier, .Mask_Copy, .Mask_Cond, .Mask_Restore, .Mask_Or, .Mask_Clear, .Mask_Kill, .Jump, .Jump_If_None}
 
 // A run of registers.
 @(private)
@@ -1939,10 +2058,12 @@ instr_slots :: proc(in_: Instr) -> (writes: Slots, reads: [4]Slots, pure: bool) 
 		writes.n = 2
 	case .Texture, .Texture_Bias, .Texel_Fetch, .Image_Load:
 		writes.n, pure = 4, false
-	case .Store, .Store_Zero, .Store_Dyn, .Load_Dyn, .Deriv_X, .Deriv_Y, .Fwidth:
+	case .Atomic_Shared, .Atomic_Buf:
+		writes.n, pure = 1, false
+	case .Store, .Store_Zero, .Store_Dyn, .Load_Dyn, .Load_Shared, .Deriv_X, .Deriv_Y, .Fwidth:
 		pure = false
 	case:
-		// Masks, jumps, Store_Buf, Image_Store and Nop write no registers.
+		// Masks, jumps, Store_Buf, Store_Shared, Image_Store, Barrier and Nop write no registers.
 		writes.n, pure = 0, false
 	}
 	return
@@ -2105,6 +2226,19 @@ trim_buffer_loads :: proc(p: ^Program, blocks: []Slots) {
 		case .Store_Dyn:
 			mark(used, {in_.a, n})
 			mark(used, {in_.b, 1})
+		case .Load_Shared:
+			if in_.k != 0 {
+				mark(used, {in_.a, 1})
+			}
+		case .Store_Shared:
+			mark(used, {in_.a, n})
+			if in_.k != 0 {
+				mark(used, {in_.b, 1})
+			}
+		case .Atomic_Shared, .Atomic_Buf:
+			mark(used, {in_.a, 1})
+			mark(used, {in_.b, 1})
+			mark(used, {in_.c, 1})
 		case .Mask_Cond:
 			mark(used, {in_.b, 1})
 		}
@@ -2159,12 +2293,16 @@ trim_buffer_loads :: proc(p: ^Program, blocks: []Slots) {
 @(private)
 instr_reg_fields :: proc(in_: ^Instr) -> (ptrs: [5]^i32, count: int) {
 	switch in_.op {
-	case .Nop, .Mask_Copy, .Mask_Restore, .Mask_Or, .Mask_Clear, .Mask_Kill, .Jump, .Jump_If_None:
+	case .Nop, .Barrier, .Mask_Copy, .Mask_Restore, .Mask_Or, .Mask_Clear, .Mask_Kill, .Jump, .Jump_If_None:
 		return {}, 0
 	case .Mask_Cond:
 		return {&in_.b, nil, nil, nil, nil}, 1
 	case .Store_Zero, .Image_Size:
 		return {&in_.dst, nil, nil, nil, nil}, 1
+	case .Load_Shared:
+		return {&in_.dst, &in_.a, nil, nil, nil}, 2 if in_.k != 0 else 1
+	case .Store_Shared:
+		return {&in_.a, &in_.b, nil, nil, nil}, 2 if in_.k != 0 else 1
 	case .Store_Buf, .Image_Store:
 		return {&in_.a, &in_.b, nil, nil, nil}, 2
 	case .Mov, .Splat, .Store, .F_Neg, .I_Neg, .B_Not, .Bit_Not,
@@ -2185,7 +2323,7 @@ instr_reg_fields :: proc(in_: ^Instr) -> (ptrs: [5]^i32, count: int) {
 	     .Mat_Mul, .Vec_Mat, .Outer,
 	     .Texture, .Texture_Bias:
 		return {&in_.dst, &in_.a, &in_.b, nil, nil}, 3
-	case .Select, .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward, .Refract, .Texel_Fetch:
+	case .Select, .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward, .Refract, .Texel_Fetch, .Atomic_Shared, .Atomic_Buf:
 		return {&in_.dst, &in_.a, &in_.b, &in_.c, nil}, 4
 	case .Gather:
 		ptrs = {&in_.dst, &in_.a, &in_.b, &in_.c, &in_.d}
@@ -2432,7 +2570,17 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	e := u.exprs[id]
 	b := e.builtin
 	t := ty(u, e.type)
+	if is_barrier_builtin(b) {
+		if b == .Barrier {
+			l.has_barrier = true
+			emit(l, .Barrier)
+		}
+		return {-1, T_VOID}
+	}
 	argx := args_of(u, id)
+	if is_atomic_builtin(b) {
+		return lower_atomic(l, b, t, argx)
+	}
 	vals := make([]Val, len(argx), context.temp_allocator)
 	for a, i in argx {
 		at := expr_type(u, a)
@@ -2519,6 +2667,66 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		emit(l, .F_Mul, dst = lod, a = lg, b = const_val(l, .Float, 0.5).slot)
 		emit(l, .Texture, n = cc(l, vals[1].t), k = ch, dst = s, a = vals[1].slot, b = lod)
 	}
+	return {s, t}
+}
+
+@(private)
+lower_atomic :: proc(l: ^Lower, b: Builtin, t: Type, argx: []Expr_Id) -> Val {
+	u := l.u
+	signed := t.base == .Int
+	aop: Atomic_Op
+	#partial switch b {
+	case .Atomic_Add:       aop = .Add
+	case .Atomic_Min:       aop = .S_Min if signed else .U_Min
+	case .Atomic_Max:       aop = .S_Max if signed else .U_Max
+	case .Atomic_And:       aop = .And
+	case .Atomic_Or:        aop = .Or
+	case .Atomic_Xor:       aop = .Xor
+	case .Atomic_Exchange:  aop = .Exchange
+	case .Atomic_Comp_Swap: aop = .Comp_Swap
+	}
+	op: VM_Op
+	word_slot: i32
+	buf_idx: i32
+	if bp, is_buf := buf_path(u, argx[0]); is_buf {
+		blv := lower_buf_lvalue(l, bp)
+		w := blv.idx_slot
+		if blv.stride != 1 {
+			prod := alloc_slots(l, 1)
+			emit(l, .I_Mul, dst = prod, a = w, b = const_slot(l, u32(blv.stride)))
+			w = prod
+		}
+		off := blv.word_off + (int(bp.swz[0]) if bp.swz_len > 0 else 0)
+		if off != 0 {
+			sum := alloc_slots(l, 1)
+			emit(l, .I_Add, dst = sum, a = w, b = const_slot(l, u32(off)))
+			w = sum
+		}
+		op = .Atomic_Buf
+		word_slot = w
+		buf_idx = i32(blv.buf_idx)
+	} else {
+		lv := lower_lvalue(l, argx[0])
+		base_off := lv.base + (i32(lv.swz[0]) if lv.swz_len > 0 else 0)
+		if lv.dyn < 0 {
+			word_slot = const_slot(l, u32(base_off))
+		} else if base_off == 0 {
+			word_slot = lv.dyn
+		} else {
+			sum := alloc_slots(l, 1)
+			emit(l, .I_Add, dst = sum, a = lv.dyn, b = const_slot(l, u32(base_off)))
+			word_slot = sum
+		}
+		op = .Atomic_Shared
+	}
+	mark1 := l.next_slot
+	v1 := lower_expr(l, argx[1])
+	if len(argx) > 2 && may_write(u, argx[2]) {
+		v1 = snapshot_val(l, v1, mark1)
+	}
+	v2 := lower_expr(l, argx[2]) if len(argx) > 2 else v1
+	s := alloc_slots(l, 1)
+	emit(l, op, k = int(aop), dst = s, a = word_slot, b = v1.slot, c = v2.slot, d = buf_idx)
 	return {s, t}
 }
 

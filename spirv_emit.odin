@@ -269,6 +269,8 @@ emit_lvalue :: proc(s: ^Spv, id: Expr_Id) -> LValue {
 			return {ptr = ptr, type = t, storage = SC_UNIFORM, as_uint = as_uint}
 		case .Global:
 			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_PRIVATE}
+		case .Shared:
+			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_WORKGROUP}
 		case .Stage_In:
 			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_INPUT}
 		case .Stage_Out:
@@ -280,11 +282,35 @@ emit_lvalue :: proc(s: ^Spv, id: Expr_Id) -> LValue {
 	case .Index:
 		base := emit_lvalue(s, e.a)
 		idx := emit_expr(s, e.b)
+		if base.swz_len > 0 {
+			t_uint := type_id(s, T_UINT)
+			iu := idx if expr_type(u, e.b).base == .Uint else unop(s, .Bitcast, t_uint, idx)
+			mapped := const_u32(s, u32(base.swz[0]))
+			for k in 1 ..< base.swz_len {
+				cond := binop_raw(s, .I_Equal, type_id(s, T_BOOL), iu, const_u32(s, u32(k)))
+				sel := new_id(s)
+				inst(&s.body, .Select, t_uint, sel, cond, const_u32(s, u32(base.swz[k])), mapped)
+				mapped = sel
+			}
+			base.swz_len = 0
+			return chain(s, base, mapped, ty(u, e.type))
+		}
 		return chain(s, base, idx, ty(u, e.type))
 	case .Field:
 		base := emit_lvalue(s, e.a)
 		if e.swizzle_len > 0 {
-			base.swz = e.swizzle
+			if is_scalar(base.type) {
+				return base
+			}
+			if base.swz_len == 0 {
+				base.swz = e.swizzle
+			} else {
+				composed: [4]u8
+				for k in 0 ..< int(e.swizzle_len) {
+					composed[k] = base.swz[e.swizzle[k]]
+				}
+				base.swz = composed
+			}
 			base.swz_len = int(e.swizzle_len)
 			return base
 		}
@@ -823,6 +849,26 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 	u := s.u
 	e := u.exprs[id]
 	b := e.builtin
+	if is_barrier_builtin(b) {
+		#partial switch b {
+		case .Barrier:
+			inst(&s.body, .Control_Barrier, const_u32(s, 2), const_u32(s, 2), const_u32(s, 0x108))
+		case .Memory_Barrier:
+			inst(&s.body, .Memory_Barrier, const_u32(s, 1), const_u32(s, 0x948))
+		case .Memory_Barrier_Shared:
+			inst(&s.body, .Memory_Barrier, const_u32(s, 1), const_u32(s, 0x108))
+		case .Memory_Barrier_Buffer:
+			inst(&s.body, .Memory_Barrier, const_u32(s, 1), const_u32(s, 0x48))
+		case .Memory_Barrier_Image:
+			inst(&s.body, .Memory_Barrier, const_u32(s, 1), const_u32(s, 0x808))
+		case .Group_Memory_Barrier:
+			inst(&s.body, .Memory_Barrier, const_u32(s, 2), const_u32(s, 0x948))
+		}
+		return 0
+	}
+	if is_atomic_builtin(b) {
+		return emit_atomic(s, id)
+	}
 	t := ty(u, e.type)
 	rt := type_id(s, t)
 	argx := args_of(u, id)
@@ -962,6 +1008,75 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		return r
 	}
 	return 0
+}
+
+@(private)
+emit_atomic :: proc(s: ^Spv, id: Expr_Id) -> u32 {
+	u := s.u
+	e := u.exprs[id]
+	b := e.builtin
+	t := ty(u, e.type)
+	signed := t.base == .Int
+	argx := args_of(u, id)
+	ptr: u32
+	pointee_uint := false
+	if bp, is_buf := buf_path(u, argx[0]); is_buf {
+		blv := emit_buf_lvalue(s, bp)
+		w := blv.base_word
+		if bp.swz_len == 1 {
+			w = binop_raw(s, .I_Add, type_id(s, T_UINT), w, const_u32(s, u32(bp.swz[0])))
+		}
+		ptr = new_id(s)
+		inst(&s.body, .Access_Chain, ptr_type(s, SC_UNIFORM, type_id(s, T_UINT)), ptr, blv.buf_var, const_u32(s, 0), w)
+		pointee_uint = true
+	} else {
+		lv := emit_lvalue(s, argx[0])
+		if lv.swz_len == 1 && !is_scalar(lv.type) {
+			lv = chain(s, lv, const_u32(s, u32(lv.swz[0])), scalar_of(lv.type))
+		}
+		ptr = lv.ptr
+	}
+	t_uint := type_id(s, T_UINT)
+	op_rt := t_uint if pointee_uint && signed else type_id(s, t)
+	scope := const_u32(s, 1)
+	sem := const_u32(s, 0)
+	r := new_id(s)
+	if b == .Atomic_Comp_Swap {
+		cmp_val := emit_expr(s, argx[1])
+		data_val := emit_expr(s, argx[2])
+		if pointee_uint && signed {
+			cmp_val = unop(s, .Bitcast, t_uint, cmp_val)
+			data_val = unop(s, .Bitcast, t_uint, data_val)
+		}
+		inst(&s.body, .Atomic_Compare_Exchange, op_rt, r, ptr, scope, sem, sem, data_val, cmp_val)
+	} else {
+		data_val := emit_expr(s, argx[1])
+		if pointee_uint && signed {
+			data_val = unop(s, .Bitcast, t_uint, data_val)
+		}
+		op: Op
+		#partial switch b {
+		case .Atomic_Add:
+			op = .Atomic_I_Add
+		case .Atomic_Min:
+			op = .Atomic_S_Min if signed else .Atomic_U_Min
+		case .Atomic_Max:
+			op = .Atomic_S_Max if signed else .Atomic_U_Max
+		case .Atomic_And:
+			op = .Atomic_And
+		case .Atomic_Or:
+			op = .Atomic_Or
+		case .Atomic_Xor:
+			op = .Atomic_Xor
+		case .Atomic_Exchange:
+			op = .Atomic_Exchange
+		}
+		inst(&s.body, op, op_rt, r, ptr, scope, sem, data_val)
+	}
+	if pointee_uint && signed {
+		r = unop(s, .Bitcast, type_id(s, T_INT), r)
+	}
+	return r
 }
 
 // The GLSL.std.450 instruction each built-in is, by its first argument's

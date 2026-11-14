@@ -29,6 +29,9 @@ Msl :: struct {
 	args:    string,
 	// The sampler2DArray helpers written to `helpers`.
 	array_helpers: bit_set[Builtin],
+	sh_words:      int,
+	sh_off:        []int,
+	has_cas:       bool,
 }
 
 // A sampler's Metal texture type.
@@ -108,6 +111,17 @@ emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
 			qual := "const device uint*" if bd.readonly else "device uint*"
 			fmt.sbprintf(&pb, ", %s oksl_buf_%s", qual, sym.name)
 			fmt.sbprintf(&ab, ", oksl_buf_%s", sym.name)
+		}
+	}
+	if len(c.shared_vars) > 0 {
+		m.sh_off = make([]int, len(u.syms))
+		for sh in c.shared_vars {
+			m.sh_off[sh] = m.sh_words
+			m.sh_words += component_count(u, sym_type(u, sh))
+		}
+		if m.sh_words > 0 {
+			strings.write_string(&pb, ", threadgroup uint* oksl_sh")
+			strings.write_string(&ab, ", oksl_sh")
 		}
 	}
 	m.params = strings.to_string(pb)
@@ -671,6 +685,9 @@ emit_msl_entry :: proc(m: ^Msl) {
 	// Stage variables live with the globals (g.in_*, g.out_*), so every
 	// function reaches them; the entry copies them across.
 	w(m, "\tOksl_Globals g = {{}};\n")
+	if m.sh_words > 0 {
+		w(m, "\tthreadgroup uint oksl_sh[%d];\n", m.sh_words)
+	}
 	for row in c.interface {
 		#partial switch row.kind {
 		case .Stage_In, .Frag_Coord, .Front_Facing:
@@ -744,7 +761,7 @@ msl_stmt :: proc(m: ^Msl, id: Stmt_Id) {
 		msl_decl(m, st, false)
 	case .Expr:
 		tabs(m)
-		w(m, "%s;\n", msl_expr(m, st.expr))
+		w(m, "%s;\n", msl_expr(m, st.expr, true))
 	case .If:
 		tabs(m)
 		w(m, "if (%s)\n", msl_expr(m, st.expr))
@@ -760,7 +777,7 @@ msl_stmt :: proc(m: ^Msl, id: Stmt_Id) {
 		m.indent += 1
 		msl_stmt(m, st.init)
 		tabs(m)
-		w(m, "for (; %s; %s)\n", msl_expr(m, st.expr) if st.expr != 0 else "", msl_expr(m, st.step) if st.step != 0 else "")
+		w(m, "for (; %s; %s)\n", msl_expr(m, st.expr) if st.expr != 0 else "", msl_expr(m, st.step, true) if st.step != 0 else "")
 		msl_sub(m, st.then_)
 		m.indent -= 1
 		tabs(m)
@@ -999,6 +1016,269 @@ msl_buf_write :: proc(m: ^Msl, p: Buf_Path, buf_ptr, base_var, val_var: string, 
 	}
 }
 
+@(private)
+Sh_Dyn :: struct {
+	expr:    Expr_Id,
+	limit:   int,
+	stride:  int,
+	swz:     [4]u8,
+	swz_len: int,
+}
+
+@(private)
+Sh_Path :: struct {
+	word_off: int,
+	type:     Type,
+	dyns:     [dynamic]Sh_Dyn,
+	swz:      [4]u8,
+	swz_len:  int,
+}
+
+@(private)
+msl_sh_path :: proc(m: ^Msl, id: Expr_Id) -> (p: Sh_Path, ok: bool) {
+	if m.sh_words == 0 {
+		return {}, false
+	}
+	u := m.u
+	steps := make([dynamic]Expr_Id, 0, 8, context.temp_allocator)
+	cur := id
+	root: Sym_Id
+	for cur != 0 {
+		ce := u.exprs[cur]
+		if ce.kind == .Ident && ce.sym != 0 && u.syms[ce.sym].storage == .Shared {
+			root = ce.sym
+			ok = true
+			break
+		}
+		if ce.kind == .Field || ce.kind == .Index {
+			append(&steps, cur)
+			cur = ce.a
+		} else {
+			return {}, false
+		}
+	}
+	if !ok {
+		return {}, false
+	}
+	p.word_off = m.sh_off[root]
+	p.type = sym_type(u, root)
+	p.dyns = make([dynamic]Sh_Dyn, 0, 4, context.temp_allocator)
+	#reverse for step in steps {
+		se := u.exprs[step]
+		#partial switch se.kind {
+		case .Field:
+			if se.swizzle_len == 0 {
+				fields := struct_fields(u, p.type.strukt)
+				for i in 0 ..< int(se.field) {
+					p.word_off += component_count(u, ty(u, fields[i].type))
+				}
+				p.type = ty(u, se.type)
+			} else if is_scalar(p.type) {
+				if se.swizzle_len > 1 {
+					return {}, false
+				}
+				p.type = ty(u, se.type)
+			} else if se.swizzle_len == 1 {
+				c := int(se.swizzle[0])
+				p.word_off += int(p.swz[c]) if p.swz_len > 0 else c
+				p.swz_len = 0
+				p.type = ty(u, se.type)
+			} else {
+				if p.swz_len == 0 {
+					p.swz = se.swizzle
+				} else {
+					composed: [4]u8
+					for k in 0 ..< int(se.swizzle_len) {
+						composed[k] = p.swz[se.swizzle[k]]
+					}
+					p.swz = composed
+				}
+				p.swz_len = int(se.swizzle_len)
+				p.type = ty(u, se.type)
+			}
+		case .Index:
+			ix := u.exprs[se.b]
+			if p.swz_len > 0 {
+				if ix.kind == .Int_Lit || ix.kind == .Uint_Lit {
+					c := clamp(int(ix.value), 0, p.swz_len - 1)
+					p.word_off += int(p.swz[c])
+				} else {
+					append(&p.dyns, Sh_Dyn{expr = se.b, limit = p.swz_len, stride = 1, swz = p.swz, swz_len = p.swz_len})
+				}
+				p.swz_len = 0
+				p.type = ty(u, se.type)
+			} else {
+				rt := ty(u, se.type)
+				stride := component_count(u, rt)
+				limit := int(p.type.array) if is_array(p.type) else (int(p.type.cols) if is_matrix(p.type) else int(p.type.rows))
+				if ix.kind == .Int_Lit || ix.kind == .Uint_Lit {
+					c := clamp(int(ix.value), 0, limit - 1)
+					p.word_off += c * stride
+				} else {
+					append(&p.dyns, Sh_Dyn{expr = se.b, limit = limit, stride = stride})
+				}
+				p.type = rt
+			}
+		}
+	}
+	return p, true
+}
+
+@(private)
+msl_sh_ref :: proc(base_var: string, word: int) -> string {
+	if base_var == "" {
+		return fmt.aprintf("oksl_sh[%du]", word)
+	}
+	if word == 0 {
+		return fmt.aprintf("oksl_sh[%s]", base_var)
+	}
+	return fmt.aprintf("oksl_sh[%s + %du]", base_var, word)
+}
+
+@(private)
+msl_sh_prepare :: proc(m: ^Msl, p: Sh_Path, pre: ^[dynamic]string) -> string {
+	if len(p.dyns) == 0 {
+		return ""
+	}
+	base_var := msl_temp(m, T_UINT)
+	append(pre, fmt.aprintf("(%s = %du)", base_var, p.word_off))
+	for d in p.dyns {
+		clamped := fmt.aprintf("uint(clamp(int(%s), 0, %d))", msl_expr(m, d.expr), d.limit - 1)
+		if d.swz_len > 0 {
+			ctmp := msl_temp(m, T_UINT)
+			append(pre, fmt.aprintf("(%s = %s)", ctmp, clamped))
+			mapped := fmt.aprintf("%du", d.swz[0])
+			for k in 1 ..< d.limit {
+				mapped = fmt.aprintf("(%s == %du ? %du : %s)", ctmp, k, d.swz[k], mapped)
+			}
+			clamped = mapped
+		} else if d.stride != 1 {
+			clamped = fmt.aprintf("(%s * %du)", clamped, d.stride)
+		}
+		append(pre, fmt.aprintf("(%s += %s)", base_var, clamped))
+	}
+	return base_var
+}
+
+@(private)
+msl_sh_read_at :: proc(m: ^Msl, base_var: string, t: Type, word: int) -> string {
+	u := m.u
+	if t.array > 0 {
+		et := elem_type(t)
+		ew := component_count(u, et)
+		parts := make([dynamic]string, 0, int(t.array), context.temp_allocator)
+		for i in 0 ..< int(t.array) {
+			append(&parts, msl_sh_read_at(m, base_var, et, word + i * ew))
+		}
+		return fmt.aprintf("%s{{%s}}", msl_type(m, t), strings.join(parts[:], ", "))
+	}
+	if t.base == .Struct {
+		parts := make([dynamic]string, context.temp_allocator)
+		off := 0
+		for f in struct_fields(u, t.strukt) {
+			ft := ty(u, f.type)
+			append(&parts, msl_sh_read_at(m, base_var, ft, word + off))
+			off += component_count(u, ft)
+		}
+		return fmt.aprintf("%s{{%s}}", msl_type(m, t), strings.join(parts[:], ", "))
+	}
+	if is_matrix(t) {
+		ct := column_type(t)
+		cols := make([dynamic]string, 0, int(t.cols), context.temp_allocator)
+		for c in 0 ..< int(t.cols) {
+			append(&cols, msl_sh_read_at(m, base_var, ct, word + c * int(t.rows)))
+		}
+		return fmt.aprintf("%s(%s)", msl_type(m, t), strings.join(cols[:], ", "))
+	}
+	comps := make([dynamic]string, 0, int(t.rows), context.temp_allocator)
+	for i in 0 ..< int(t.rows) {
+		ref := msl_sh_ref(base_var, word + i)
+		#partial switch t.base {
+		case .Float:
+			append(&comps, fmt.aprintf("as_type<float>(%s)", ref))
+		case .Int:
+			append(&comps, fmt.aprintf("as_type<int>(%s)", ref))
+		case .Bool:
+			append(&comps, fmt.aprintf("(%s != 0u)", ref))
+		case:
+			append(&comps, ref)
+		}
+	}
+	if t.rows == 1 {
+		return comps[0]
+	}
+	return fmt.aprintf("%s(%s)", msl_type(m, t), strings.join(comps[:], ", "))
+}
+
+@(private)
+msl_sh_read :: proc(m: ^Msl, p: Sh_Path, base_var: string) -> string {
+	base_off := 0 if base_var != "" else p.word_off
+	if p.swz_len == 0 {
+		return msl_sh_read_at(m, base_var, p.type, base_off)
+	}
+	sc := scalar_of(p.type)
+	comps := make([dynamic]string, 0, p.swz_len, context.temp_allocator)
+	for k in 0 ..< p.swz_len {
+		append(&comps, msl_sh_read_at(m, base_var, sc, base_off + int(p.swz[k])))
+	}
+	return fmt.aprintf("%s(%s)", msl_type(m, p.type), strings.join(comps[:], ", "))
+}
+
+@(private)
+msl_sh_write_at :: proc(m: ^Msl, base_var: string, t: Type, word: int, val_ref: string, post: ^[dynamic]string) {
+	u := m.u
+	if t.array > 0 {
+		et := elem_type(t)
+		ew := component_count(u, et)
+		for i in 0 ..< int(t.array) {
+			msl_sh_write_at(m, base_var, et, word + i * ew, fmt.aprintf("%s[%d]", val_ref, i), post)
+		}
+		return
+	}
+	if t.base == .Struct {
+		off := 0
+		for f in struct_fields(u, t.strukt) {
+			ft := ty(u, f.type)
+			msl_sh_write_at(m, base_var, ft, word + off, fmt.aprintf("%s.ok_%s", val_ref, f.name), post)
+			off += component_count(u, ft)
+		}
+		return
+	}
+	if is_matrix(t) {
+		ct := column_type(t)
+		for c in 0 ..< int(t.cols) {
+			msl_sh_write_at(m, base_var, ct, word + c * int(t.rows), fmt.aprintf("%s[%d]", val_ref, c), post)
+		}
+		return
+	}
+	for i in 0 ..< int(t.rows) {
+		comp := val_ref if t.rows == 1 else fmt.aprintf("%s[%d]", val_ref, i)
+		bits: string
+		#partial switch t.base {
+		case .Uint:
+			bits = comp
+		case .Bool:
+			bits = fmt.aprintf("(%s ? 1u : 0u)", comp)
+		case:
+			bits = fmt.aprintf("as_type<uint>(%s)", comp)
+		}
+		append(post, fmt.aprintf("(%s = %s)", msl_sh_ref(base_var, word + i), bits))
+	}
+}
+
+@(private)
+msl_sh_write :: proc(m: ^Msl, p: Sh_Path, base_var, val_var: string, post: ^[dynamic]string) {
+	base_off := 0 if base_var != "" else p.word_off
+	if p.swz_len == 0 {
+		msl_sh_write_at(m, base_var, p.type, base_off, val_var, post)
+		return
+	}
+	sc := scalar_of(p.type)
+	for k in 0 ..< p.swz_len {
+		msl_sh_write_at(m, base_var, sc, base_off + int(p.swz[k]), fmt.aprintf("%s[%d]", val_var, k), post)
+	}
+}
+
 // Broadcasts scalar expression text `s` to vector type `t`.
 @(private)
 splat_text :: proc(m: ^Msl, s: string, from, to: Type) -> string {
@@ -1017,7 +1297,7 @@ wrap_pre :: proc(pre: []string, body: string) -> string {
 }
 
 @(private)
-msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
+msl_expr :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 	u := m.u
 	e := u.exprs[id]
 	t := ty(u, e.type)
@@ -1049,13 +1329,16 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
 		case .Work_Group_Size:
 			ls := m.c.local_size
 			return fmt.aprintf("uint3(%du, %du, %du)", ls[0], ls[1], ls[2])
+		case .Shared:
+			sp, _ := msl_sh_path(m, id)
+			return msl_sh_read(m, sp, "")
 		case .Local, .Param, .Channel, .Buffer, .Storage_Image:
 		}
 		return fmt.aprintf("ok_%s", sym.name)
 	case .Convert:
 		return fmt.aprintf("%s(%s)", msl_type(m, t), msl_expr(m, e.a))
 	case .Comma:
-		return fmt.aprintf("(%s, %s)", msl_expr(m, e.a), msl_expr(m, e.b))
+		return fmt.aprintf("(%s, %s)", msl_expr(m, e.a, true), msl_expr(m, e.b, discard))
 	case .Length:
 		at := expr_type(u, e.a)
 		n := at.array if is_array(at) else (i32(at.cols) if is_matrix(at) else i32(at.rows))
@@ -1085,6 +1368,19 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
 			one := "1.0f" if t.base == .Float else ("1u" if t.base == .Uint else "1")
 			append(&parts, fmt.aprintf("(%s = %s %s %s)", new_var, old_var, "+" if inc else "-", one))
 			msl_buf_write(m, bp, buf_ptr, base_var, new_var, &parts)
+			append(&parts, new_var if e.kind == .Pre_Inc || e.kind == .Pre_Dec else old_var)
+			return fmt.aprintf("(%s)", strings.join(parts[:], ", "))
+		}
+		if sp, is_sh := msl_sh_path(m, e.a); is_sh {
+			parts := make([dynamic]string, context.temp_allocator)
+			base_var := msl_sh_prepare(m, sp, &parts)
+			old_var := msl_temp(m, t)
+			new_var := msl_temp(m, t)
+			append(&parts, fmt.aprintf("(%s = %s)", old_var, msl_sh_read(m, sp, base_var)))
+			inc := e.kind == .Pre_Inc || e.kind == .Post_Inc
+			one := "1.0f" if t.base == .Float else ("1u" if t.base == .Uint else "1")
+			append(&parts, fmt.aprintf("(%s = %s %s %s)", new_var, old_var, "+" if inc else "-", one))
+			msl_sh_write(m, sp, base_var, new_var, &parts)
 			append(&parts, new_var if e.kind == .Pre_Inc || e.kind == .Pre_Dec else old_var)
 			return fmt.aprintf("(%s)", strings.join(parts[:], ", "))
 		}
@@ -1126,6 +1422,24 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
 			append(&parts, val_var)
 			return fmt.aprintf("(%s)", strings.join(parts[:], ", "))
 		}
+		if sp, is_sh := msl_sh_path(m, e.a); is_sh {
+			parts := make([dynamic]string, context.temp_allocator)
+			base_var := msl_sh_prepare(m, sp, &parts)
+			rhs := msl_expr(m, e.b)
+			val_var := msl_temp(m, t)
+			if e.op == .Eq {
+				append(&parts, fmt.aprintf("(%s = %s)", val_var, rhs))
+			} else {
+				ta, tb := expr_type(u, e.a), expr_type(u, e.b)
+				rhs_var := msl_temp(m, tb)
+				append(&parts, fmt.aprintf("(%s = %s)", rhs_var, rhs))
+				old_expr := msl_sh_read(m, sp, base_var)
+				append(&parts, fmt.aprintf("(%s = %s)", val_var, msl_binary(m, compound_op(e.op), old_expr, ta, rhs_var, tb)))
+			}
+			msl_sh_write(m, sp, base_var, val_var, &parts)
+			append(&parts, val_var)
+			return fmt.aprintf("(%s)", strings.join(parts[:], ", "))
+		}
 		if may_write(u, e.b) || may_write(u, e.a) {
 			parts := make([dynamic]string, context.temp_allocator)
 			lv := msl_lvalue(m, e.a, &parts)
@@ -1157,10 +1471,15 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
 		return fmt.aprintf("(%s %s= %s)", lhs, token_text(op), rhs)
 	case .Ternary:
 		if t == T_VOID {
-			return fmt.aprintf("(%s ? (void)%s : (void)%s)", msl_expr(m, e.a), msl_expr(m, e.b), msl_expr(m, e.c))
+			return fmt.aprintf("(%s ? (void)%s : (void)%s)", msl_expr(m, e.a), msl_expr(m, e.b, true), msl_expr(m, e.c, true))
 		}
-		return fmt.aprintf("(%s ? %s : %s)", msl_expr(m, e.a), msl_expr(m, e.b), msl_expr(m, e.c))
+		return fmt.aprintf("(%s ? %s : %s)", msl_expr(m, e.a), msl_expr(m, e.b, discard), msl_expr(m, e.c, discard))
 	case .Index:
+		if sp, is_sh := msl_sh_path(m, id); is_sh {
+			pre := make([dynamic]string, context.temp_allocator)
+			base_var := msl_sh_prepare(m, sp, &pre)
+			return wrap_pre(pre[:], msl_sh_read(m, sp, base_var))
+		}
 		a := u.exprs[e.a]
 		if a.kind == .Ident && a.sym != 0 {
 			sym := u.syms[a.sym]
@@ -1182,13 +1501,18 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id) -> string {
 		}
 		return fmt.aprintf("%s[%s]", msl_expr(m, e.a), msl_expr(m, e.b))
 	case .Field:
+		if sp, is_sh := msl_sh_path(m, id); is_sh {
+			pre := make([dynamic]string, context.temp_allocator)
+			base_var := msl_sh_prepare(m, sp, &pre)
+			return wrap_pre(pre[:], msl_sh_read(m, sp, base_var))
+		}
 		return msl_field(m, id, msl_expr(m, e.a))
 	case .Call:
 		switch e.call {
 		case .User:
 			return msl_user_call(m, id)
 		case .Builtin:
-			return msl_builtin(m, id)
+			return msl_builtin(m, id, discard)
 		case .Constructor:
 			return msl_constructor(m, id)
 		case .None:
@@ -1236,10 +1560,14 @@ msl_binary :: proc(m: ^Msl, op: Token_Kind, a: string, ta: Type, b: string, tb: 
 }
 
 @(private)
-msl_temp :: proc(m: ^Msl, t: Type) -> string {
+msl_temp :: proc(m: ^Msl, t: Type, is_volatile := false) -> string {
 	tmp := fmt.aprintf("_t%d", m.temp_id)
 	m.temp_id += 1
-	fmt.sbprintf(&m.fn_vars, "\t%s %s = {{}};\n", msl_type(m, t), tmp)
+	if is_volatile {
+		fmt.sbprintf(&m.fn_vars, "\tvolatile %s %s;\n", msl_type(m, t), tmp)
+	} else {
+		fmt.sbprintf(&m.fn_vars, "\t%s %s = {{}};\n", msl_type(m, t), tmp)
+	}
 	return tmp
 }
 
@@ -1355,6 +1683,18 @@ msl_user_call :: proc(m: ^Msl, id: Expr_Id) -> string {
 				append(&pre, fmt.aprintf("(%s = %s{{}})", tmp, msl_type(m, pt)))
 			}
 			msl_buf_write(m, bp, buf_ptr, base_var, tmp, &post)
+			strings.write_string(&b, tmp)
+			continue
+		}
+		if sp, is_sh := msl_sh_path(m, a); is_sh {
+			base_var := msl_sh_prepare(m, sp, &pre)
+			tmp := msl_temp(m, pt)
+			if ps[i].qual == .Inout {
+				append(&pre, fmt.aprintf("(%s = %s)", tmp, msl_sh_read(m, sp, base_var)))
+			} else {
+				append(&pre, fmt.aprintf("(%s = %s{{}})", tmp, msl_type(m, pt)))
+			}
+			msl_sh_write(m, sp, base_var, tmp, &post)
 			strings.write_string(&b, tmp)
 			continue
 		}
@@ -1528,12 +1868,30 @@ ctor_helper :: proc(m: ^Msl, t: Type, args: []Expr_Id) -> string {
 }
 
 @(private)
-msl_builtin :: proc(m: ^Msl, id: Expr_Id) -> string {
+msl_builtin :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 	u := m.u
 	e := u.exprs[id]
 	b := e.builtin
 	t := ty(u, e.type)
 	args := args_of(u, id)
+	if is_barrier_builtin(b) {
+		if u.stage != .Compute {
+			return "((void)0)"
+		}
+		#partial switch b {
+		case .Barrier, .Memory_Barrier_Shared:
+			return "threadgroup_barrier(mem_flags::mem_threadgroup)"
+		case .Memory_Barrier_Buffer:
+			return "threadgroup_barrier(mem_flags::mem_device)"
+		case .Memory_Barrier_Image:
+			return "threadgroup_barrier(mem_flags::mem_texture)"
+		case .Memory_Barrier, .Group_Memory_Barrier:
+			return "threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture)"
+		}
+	}
+	if is_atomic_builtin(b) {
+		return msl_atomic(m, id, discard)
+	}
 	pre := make([dynamic]string, context.temp_allocator)
 	need_seq := b == .Image_Store
 	if !need_seq && len(args) > 1 {
@@ -1616,6 +1974,78 @@ msl_builtin :: proc(m: ^Msl, id: Expr_Id) -> string {
 		return wrap_pre(pre[:], fmt.aprintf("int2(%s.get_width(), %s.get_height())", img, img))
 	}
 	return ""
+}
+
+@(private)
+msl_atomic :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
+	u := m.u
+	e := u.exprs[id]
+	b := e.builtin
+	t := ty(u, e.type)
+	args := args_of(u, id)
+	pre := make([dynamic]string, context.temp_allocator)
+	atom_t := "atomic_int" if t.base == .Int else "atomic_uint"
+	ptr_expr: string
+	if bp, is_buf := buf_path(u, args[0]); is_buf {
+		buf_ptr, base_var := msl_buf_prepare(m, bp, &pre)
+		off := int(bp.swz[0]) if bp.swz_len == 1 else 0
+		elem := fmt.aprintf("%s[%s]", buf_ptr, base_var) if off == 0 else fmt.aprintf("%s[%s + %du]", buf_ptr, base_var, off)
+		ptr_expr = fmt.aprintf("(device %s*)&%s", atom_t, elem)
+	} else {
+		sp, _ := msl_sh_path(m, args[0])
+		base_var := msl_sh_prepare(m, sp, &pre)
+		off := (0 if base_var != "" else sp.word_off) + (int(sp.swz[0]) if sp.swz_len == 1 else 0)
+		ptr_expr = fmt.aprintf("(threadgroup %s*)&%s", atom_t, msl_sh_ref(base_var, off))
+	}
+	call_expr: string
+	if b == .Atomic_Comp_Swap {
+		if !m.has_cas {
+			m.has_cas = true
+			strings.write_string(&m.helpers, "template<typename P, typename T> inline T oksl_cas(P p, T cmp, T val) {\n\tT old;\n\tdo { old = cmp; } while (!atomic_compare_exchange_weak_explicit(p, &old, val, memory_order_relaxed, memory_order_relaxed) && old == cmp);\n\treturn old;\n}\n")
+		}
+		cmp_var := msl_temp(m, t)
+		val_var := msl_temp(m, t)
+		append(&pre, fmt.aprintf("(%s = %s)", cmp_var, msl_expr(m, args[1])))
+		append(&pre, fmt.aprintf("(%s = %s)", val_var, msl_expr(m, args[2])))
+		call_expr = fmt.aprintf("oksl_cas(%s, %s, %s)", ptr_expr, cmp_var, val_var)
+	} else {
+		val_str := msl_expr(m, args[1])
+		if may_write(u, args[1]) {
+			val_var := msl_temp(m, t)
+			append(&pre, fmt.aprintf("(%s = %s)", val_var, val_str))
+			val_str = val_var
+		}
+		fn_name: string
+		#partial switch b {
+		case .Atomic_Add:
+			fn_name = "atomic_fetch_add_explicit"
+		case .Atomic_Min:
+			fn_name = "atomic_fetch_min_explicit"
+		case .Atomic_Max:
+			fn_name = "atomic_fetch_max_explicit"
+		case .Atomic_And:
+			fn_name = "atomic_fetch_and_explicit"
+		case .Atomic_Or:
+			fn_name = "atomic_fetch_or_explicit"
+		case .Atomic_Xor:
+			fn_name = "atomic_fetch_xor_explicit"
+		case .Atomic_Exchange:
+			fn_name = "atomic_exchange_explicit"
+		}
+		call_expr = fmt.aprintf("%s(%s, %s, memory_order_relaxed)", fn_name, ptr_expr, val_str)
+	}
+	if !discard {
+		// Work around an Apple Metal compiler bug (seen on M4, macOS 27.0.1;
+		// testdata/probe_eval.comp, testdata/probe_old.comp): when an atomic's
+		// return value is fed directly into another uniform-address atomic,
+		// SIMD coalescing drops the per-lane offset and passes only the SIMD
+		// group's base value. Binding used results to a volatile local forces
+		// a per-lane reload.
+		vtmp := msl_temp(m, t, true)
+		append(&pre, fmt.aprintf("(%s = %s)", vtmp, call_expr))
+		return wrap_pre(pre[:], fmt.aprintf("%s(%s)", msl_type(m, t), vtmp))
+	}
+	return wrap_pre(pre[:], call_expr)
 }
 
 // Each built-in in Metal: a function called with the arguments (those in

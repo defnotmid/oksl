@@ -2393,7 +2393,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			append(&e.patches, Jump_Patch{len(e.buf), a})
 			emit_i32(&e.buf, 0)
 
-		case .Store_Buf, .Image_Load, .Image_Store, .Image_Size:
+		case .Store_Buf, .Image_Load, .Image_Store, .Image_Size, .Load_Shared, .Store_Shared, .Atomic_Shared, .Atomic_Buf, .Barrier:
 		}
 	}
 

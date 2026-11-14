@@ -416,3 +416,61 @@ std430_field_offset :: proc(u: ^Unit, st: i32, field: i32) -> int {
 	}
 	return off
 }
+
+// GLSL ES 3.10 MAX_COMPUTE_SHARED_MEMORY_SIZE minimum (16 KB).
+MAX_SHARED_BYTES :: 16384
+
+// Natural size and alignment in bytes of a compute `shared` variable type
+// (saturating above MAX_SHARED_BYTES so large array lengths never overflow).
+shared_type_layout :: proc(u: ^Unit, t: Type) -> (size, align: int, ok: bool) {
+	if t.array < 0 {
+		return 0, 0, false
+	}
+	if t.array > 0 {
+		es, ea, eok := shared_type_layout(u, elem_type(t))
+		if !eok {
+			return 0, 0, false
+		}
+		stride := i64(round_up(es, ea))
+		total := min(i64(t.array) * stride, i64(MAX_SHARED_BYTES) + 64)
+		return int(total), ea, true
+	}
+	#partial switch t.base {
+	case .Float, .Int, .Uint, .Bool:
+		if is_matrix(t) {
+			cs, ca, _ := shared_type_layout(u, column_type(t))
+			return int(t.cols) * round_up(cs, ca), ca, true
+		}
+		switch t.rows {
+		case 1:
+			return 4, 4, true
+		case 2:
+			return 8, 8, true
+		case 3:
+			return 12, 16, true
+		case 4:
+			return 16, 16, true
+		}
+	case .Struct:
+		fields := struct_fields(u, t.strukt)
+		if len(fields) == 0 {
+			return 0, 0, false
+		}
+		off := i64(0)
+		max_align := 4
+		for f in fields {
+			fs, fa, fok := shared_type_layout(u, ty(u, f.type))
+			if !fok {
+				return 0, 0, false
+			}
+			a64 := i64(fa)
+			off = (off + a64 - 1) &~ (a64 - 1)
+			off = min(off + i64(fs), i64(MAX_SHARED_BYTES) + 64)
+			max_align = max(max_align, fa)
+		}
+		ma := i64(max_align)
+		off = min((off + ma - 1) &~ (ma - 1), i64(MAX_SHARED_BYTES) + 64)
+		return int(off), max_align, true
+	}
+	return 0, 0, false
+}

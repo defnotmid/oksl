@@ -21,6 +21,7 @@ Checked :: struct {
 	interface:     []Interface_Var,
 	// Private globals in declaration order (their decls hold initializers).
 	globals:       []Sym_Id,
+	shared_vars:   []Sym_Id,
 	uniforms:      []Sym_Id,
 	inputs_used:   Inputs,
 	// The sampler symbol bound to each channel the shader uses.
@@ -54,6 +55,8 @@ Checker :: struct {
 	resolved_decls:  []i32,
 	by_name:         map[string][dynamic]Func_Id,
 	globals:         [dynamic]Sym_Id,
+	shared_vars:     [dynamic]Sym_Id,
+	shared_bytes:    int,
 	uniforms:        [dynamic]Sym_Id,
 	// The symbol of each input (declared up front, or bound by a uniform
 	// declaration), and the ones the shader uses.
@@ -110,6 +113,7 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 		resolved_decls = make([]i32, len(u.func_decls)),
 		by_name        = make(map[string][dynamic]Func_Id),
 		globals      = make([dynamic]Sym_Id),
+		shared_vars  = make([dynamic]Sym_Id),
 		uniforms     = make([dynamic]Sym_Id),
 		local_size   = {1, 1, 1},
 		next_offset  = OFFSET_USER if PROFILE_RULES[u.profile].header else 0,
@@ -190,6 +194,7 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 		}
 	}
 	out.globals = c.globals[:]
+	out.shared_vars = c.shared_vars[:]
 	out.uniforms = c.uniforms[:]
 	out.inputs_used = c.inputs_used
 	out.channels = c.channels
@@ -788,6 +793,34 @@ declare_global :: proc(c: ^Checker, v: Var_Id) {
 		return
 	}
 	s := Symbol{name = d.name, pos = d.pos, is_const = d.is_const, decl = v}
+	if d.is_shared {
+		if u.dialect != .GLSL || u.stage != .Compute {
+			add_error(c, d.pos, .Compute_Only, "shared")
+			return
+		}
+		if d.init != 0 {
+			add_error(c, d.pos, .Shared_Initializer, d.name)
+			return
+		}
+		size, align, layout_ok := shared_type_layout(u, t)
+		if !layout_ok {
+			tname := fmt.tprintf("%s[]", tn(c, elem_type(t))) if t.array < 0 else tn(c, t)
+			add_error(c, d.pos, .Shared_Type, d.name, a = tname)
+			return
+		}
+		c.shared_bytes = round_up(c.shared_bytes, align) + size
+		if c.shared_bytes > MAX_SHARED_BYTES {
+			add_error(c, d.pos, .Shared_Size_Max, d.name, n = i64(c.shared_bytes), m = MAX_SHARED_BYTES)
+			return
+		}
+		s.storage = .Shared
+		s.type = intern(u, t)
+		id := add_sym(c, s)
+		u.vars[v].sym = id
+		append(&c.shared_vars, id)
+		declare(c, id)
+		return
+	}
 	if d.io != .None {
 		declare_stage_var(c, v, t)
 		return
@@ -2182,7 +2215,7 @@ check_lvalue :: proc(c: ^Checker, id: Expr_Id) -> bool {
 		case .Work_Group_Size:
 			add_error(c, e.pos, .Is_Const, s.name)
 			return false
-		case .Stage_Out:
+		case .Stage_Out, .Shared:
 			if c.cur_func != 0 {
 				u.funcs[c.cur_func].writes_state = true
 			}
@@ -2268,6 +2301,36 @@ check_call :: proc(c: ^Checker, id: Expr_Id) -> Type {
 			return T_ERROR
 		}
 		return check_image_op(c, id)
+	case "barrier", "memoryBarrier", "memoryBarrierShared", "memoryBarrierBuffer", "memoryBarrierImage", "groupMemoryBarrier":
+		if u.dialect == .GLSL {
+			resolve_pending(c, e.name)
+			if _, has_user := c.by_name[e.name]; has_user {
+				if f := pick_overload(c, id, false); f != 0 {
+					return finish_user_call(c, id, f)
+				}
+			}
+			return check_barrier_op(c, id)
+		}
+	case "atomicAdd", "atomicMin", "atomicMax", "atomicAnd", "atomicOr", "atomicXor", "atomicExchange", "atomicCompSwap":
+		if u.dialect == .GLSL {
+			resolve_pending(c, e.name)
+			if _, has_user := c.by_name[e.name]; has_user {
+				if f := pick_overload(c, id, false); f != 0 {
+					return finish_user_call(c, id, f)
+				}
+			}
+			return check_atomic_op(c, id)
+		}
+	case "atomic_uint", "atomicCounter", "atomicCounterIncrement", "atomicCounterDecrement", "memoryBarrierAtomicCounter":
+		if u.dialect == .GLSL {
+			add_error(c, e.pos, .Unsupported_Atomic_Counter, e.name)
+			return T_ERROR
+		}
+	case "imageAtomicAdd", "imageAtomicMin", "imageAtomicMax", "imageAtomicAnd", "imageAtomicOr", "imageAtomicXor", "imageAtomicExchange", "imageAtomicCompSwap":
+		if u.dialect == .GLSL {
+			add_error(c, e.pos, .Unsupported_Image_Atomic, e.name)
+			return T_ERROR
+		}
 	case "saturate":
 		if .Saturate not_in c.u.features {
 			break
@@ -2586,6 +2649,126 @@ check_image_op :: proc(c: ^Checker, id: Expr_Id) -> Type {
 	u.exprs[id].call = .Builtin
 	u.exprs[id].builtin = .Image_Store
 	return T_VOID
+}
+
+@(private)
+check_barrier_op :: proc(c: ^Checker, id: Expr_Id) -> Type {
+	u := c.u
+	e := u.exprs[id]
+	args := args_of(u, id)
+	b: Builtin
+	compute_only := false
+	switch e.name {
+	case "barrier":
+		b, compute_only = .Barrier, true
+	case "memoryBarrier":
+		b = .Memory_Barrier
+	case "memoryBarrierShared":
+		b, compute_only = .Memory_Barrier_Shared, true
+	case "memoryBarrierBuffer":
+		b = .Memory_Barrier_Buffer
+	case "memoryBarrierImage":
+		b = .Memory_Barrier_Image
+	case "groupMemoryBarrier":
+		b, compute_only = .Group_Memory_Barrier, true
+	}
+	if compute_only && u.stage != .Compute {
+		add_error(c, e.pos, .Compute_Only, e.name)
+		return T_ERROR
+	}
+	if !compute_only && .Storage_Buffers not_in u.features {
+		add_error(c, e.pos, .Compute_Only, e.name)
+		return T_ERROR
+	}
+	if len(args) != 0 {
+		add_error(c, e.pos, .Arg_Count, e.name, n = 0, m = i64(len(args)))
+		return T_ERROR
+	}
+	if c.cur_func != 0 {
+		u.funcs[c.cur_func].writes_state = true
+	}
+	u.exprs[id].call = .Builtin
+	u.exprs[id].builtin = b
+	return T_VOID
+}
+
+@(private)
+check_atomic_op :: proc(c: ^Checker, id: Expr_Id) -> Type {
+	u := c.u
+	e := u.exprs[id]
+	args := args_of(u, id)
+	b: Builtin
+	switch e.name {
+	case "atomicAdd":
+		b = .Atomic_Add
+	case "atomicMin":
+		b = .Atomic_Min
+	case "atomicMax":
+		b = .Atomic_Max
+	case "atomicAnd":
+		b = .Atomic_And
+	case "atomicOr":
+		b = .Atomic_Or
+	case "atomicXor":
+		b = .Atomic_Xor
+	case "atomicExchange":
+		b = .Atomic_Exchange
+	case "atomicCompSwap":
+		b = .Atomic_Comp_Swap
+	}
+	want := 3 if b == .Atomic_Comp_Swap else 2
+	if len(args) != want {
+		add_error(c, e.pos, .Arg_Count, e.name, n = i64(want), m = i64(len(args)))
+		return T_ERROR
+	}
+	t0 := expr_type(u, args[0])
+	if t0 != T_INT && t0 != T_UINT {
+		return no_overload(c, e, args)
+	}
+	for k in 1 ..< want {
+		if expr_type(u, args[k]) != t0 {
+			return no_overload(c, e, args)
+		}
+	}
+	cur := args[0]
+	for u.exprs[cur].kind == .Index || u.exprs[cur].kind == .Field {
+		ce := u.exprs[cur]
+		if ce.kind == .Field {
+			for i in 0 ..< int(ce.swizzle_len) {
+				for j in 0 ..< i {
+					if ce.swizzle[i] == ce.swizzle[j] {
+						add_error(c, ce.pos, .Swizzle_Repeat, ce.name)
+						return T_ERROR
+					}
+				}
+			}
+		}
+		cur = ce.a
+	}
+	re := u.exprs[cur]
+	switch {
+	case re.kind == .Ident && re.sym != 0 && u.syms[re.sym].storage == .Shared:
+	case re.kind == .Buffer_Load && re.sym != 0:
+		bd := u.buffer_decls[c.buffer_decls[u.syms[re.sym].index]]
+		if bd.readonly {
+			add_error(c, e.pos, .Read_Only, u.syms[re.sym].name)
+			return T_ERROR
+		}
+		if bd.writeonly {
+			u.exprs[cur].value = 1
+			add_error(c, e.pos, .Write_Only, u.syms[re.sym].name)
+			return T_ERROR
+		}
+	case:
+		add_error(c, e.pos, .Atomic_Target, e.name)
+		return T_ERROR
+	}
+	if c.cur_func != 0 {
+		u.funcs[c.cur_func].writes_state = true
+	}
+	u.exprs[id].call = .Builtin
+	u.exprs[id].builtin = b
+	return t0
 }
 
 @(private)

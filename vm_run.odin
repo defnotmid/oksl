@@ -183,25 +183,29 @@ Reg :: [LANES]u32
 // own Scratch; it grows to the largest program it has run and is reused,
 // so runs allocate nothing once it has.
 Scratch :: struct {
-	regs:  [dynamic]Reg,
-	masks: [dynamic]Lane_Mask,
+	regs:   [dynamic]Reg,
+	masks:  [dynamic]Lane_Mask,
+	shared: [dynamic]u32,
 }
 
 scratch_destroy :: proc(s: ^Scratch) {
 	delete(s.regs)
 	delete(s.masks)
+	delete(s.shared)
 }
 
 @(private)
 Runner :: struct {
-	p:         ^Program,
-	regs:      []Reg,
-	masks:     []Lane_Mask,
-	uniforms:  []u8,
-	opts:      Run_Options,
-	chan_imgs: [SAMPLER_COUNT]Chan_Img,
+	p:             ^Program,
+	regs:          []Reg,
+	masks:         []Lane_Mask,
+	shared:        []u32,
+	uniforms:      []u8,
+	opts:          Run_Options,
+	chan_imgs:     [SAMPLER_COUNT]Chan_Img,
 	// The batch's lanes: the exec mask it starts with.
-	lanes:     Lane_Mask,
+	lanes:         Lane_Mask,
+	split_barrier: bool,
 }
 
 // A runner over `scratch` with the program's constants and uniforms loaded,
@@ -719,7 +723,113 @@ run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, scratch: ^Scrat
 		}
 	}
 	r := runner_begin(p, scratch, uniforms, opts)
+	if p.shared_words > 0 {
+		if len(scratch.shared) < p.shared_words {
+			resize(&scratch.shared, p.shared_words)
+		}
+		r.shared = scratch.shared[:p.shared_words]
+	}
 	single_chunk := local_total <= LANES
+	gx_n := groups.x
+	gxy_n := groups.x * groups.y
+	body := p.code[p.init_len:]
+	if p.has_barrier && !single_chunk {
+		MAX_CHUNKS :: 1024 / LANES
+		num_chunks := (local_total + LANES - 1) / LANES
+		reg_stride := max(p.num_slots, 1)
+		mask_stride := max(p.num_masks, 2)
+		if len(scratch.regs) < num_chunks * reg_stride {
+			resize(&scratch.regs, num_chunks * reg_stride)
+		}
+		if len(scratch.masks) < num_chunks * mask_stride {
+			resize(&scratch.masks, num_chunks * mask_stride)
+		}
+		c0 := scratch.regs[:reg_stride]
+		for v in p.inputs {
+			if v.kind == .Num_Work_Groups {
+				for k in 0 ..< 3 {
+					c0[v.slot + i32(k)] = u32(groups[k])
+				}
+			}
+		}
+		for c in 1 ..< num_chunks {
+			copy(scratch.regs[c * reg_stride : (c + 1) * reg_stride], c0)
+		}
+		chunk_lanes: [MAX_CHUNKS]Lane_Mask
+		for c in 0 ..< num_chunks {
+			first := c * LANES
+			lanes := min(local_total - first, LANES)
+			chunk_lanes[c] = ALL_LANES if lanes == LANES else transmute(Lane_Mask)Lane_Bits((Lane_Bits(1) << uint(lanes)) - 1)
+			cregs := scratch.regs[c * reg_stride : (c + 1) * reg_stride]
+			for v in p.inputs {
+				#partial switch v.kind {
+				case .Local_Invocation_ID:
+					for k in 0 ..< 3 {
+						reg := &cregs[v.slot + i32(k)]
+						for l in 0 ..< LANES {
+							reg[l] = u32(local_coords[first + l][k])
+						}
+					}
+				case .Local_Invocation_Index:
+					reg := &cregs[v.slot]
+					for l in 0 ..< LANES {
+						reg[l] = u32(first + l)
+					}
+				}
+			}
+		}
+		r.split_barrier = true
+		chunk_pc: [MAX_CHUNKS]int
+		for g in start ..< end {
+			if len(r.shared) > 0 {
+				intrinsics.mem_zero(raw_data(r.shared), len(r.shared) * size_of(u32))
+			}
+			wg := [3]u32{u32(g % gx_n), u32((g / gx_n) % groups.y), u32(g / gxy_n)}
+			base_gid := [3]u32{wg[0] * u32(ls.x), wg[1] * u32(ls.y), wg[2] * u32(ls.z)}
+			for c in 0 ..< num_chunks {
+				first := c * LANES
+				cregs := scratch.regs[c * reg_stride : (c + 1) * reg_stride]
+				cmasks := scratch.masks[c * mask_stride : (c + 1) * mask_stride]
+				for v in p.inputs {
+					#partial switch v.kind {
+					case .Work_Group_ID:
+						for k in 0 ..< 3 {
+							cregs[v.slot + i32(k)] = wg[k]
+						}
+					case .Global_Invocation_ID:
+						for k in 0 ..< 3 {
+							reg := &cregs[v.slot + i32(k)]
+							bg := base_gid[k]
+							for l in 0 ..< LANES {
+								reg[l] = bg + u32(local_coords[first + l][k])
+							}
+						}
+					}
+				}
+				cmasks[MASK_EXEC] = chunk_lanes[c]
+				cmasks[MASK_DISCARD] = {}
+				chunk_pc[c] = 0
+			}
+			for {
+				any_running := false
+				for c in 0 ..< num_chunks {
+					if chunk_pc[c] < len(body) {
+						r.regs = scratch.regs[c * reg_stride : (c + 1) * reg_stride]
+						r.masks = scratch.masks[c * mask_stride : (c + 1) * mask_stride]
+						r.lanes = chunk_lanes[c]
+						chunk_pc[c] = execute(&r, body, chunk_pc[c])
+						if chunk_pc[c] < len(body) {
+							any_running = true
+						}
+					}
+				}
+				if !any_running {
+					break
+				}
+			}
+		}
+		return
+	}
 	for v in p.inputs {
 		#partial switch v.kind {
 		case .Num_Work_Groups:
@@ -744,9 +854,10 @@ run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, scratch: ^Scrat
 			}
 		}
 	}
-	gx_n := groups.x
-	gxy_n := groups.x * groups.y
 	for g in start ..< end {
+		if len(r.shared) > 0 {
+			intrinsics.mem_zero(raw_data(r.shared), len(r.shared) * size_of(u32))
+		}
 		wg := [3]u32{u32(g % gx_n), u32((g / gx_n) % groups.y), u32(g / gxy_n)}
 		base_gid := [3]u32{wg[0] * u32(ls.x), wg[1] * u32(ls.y), wg[2] * u32(ls.z)}
 		for v in p.inputs {
@@ -790,7 +901,7 @@ run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, scratch: ^Scrat
 			r.masks[MASK_EXEC] = exec
 			r.lanes = exec
 			r.masks[MASK_DISCARD] = {}
-			execute(&r, p.code[p.init_len:])
+			execute(&r, body)
 		}
 	}
 }
@@ -1198,14 +1309,68 @@ fn3 :: #force_inline proc "contextless" (x, y, z: f32, $B: Builtin) -> f32 {
 	}
 }
 
+@(private)
+atomic_word_shared :: #force_inline proc "contextless" (ptr: ^u32, op: Atomic_Op, v1, v2: u32) -> u32 {
+	old := ptr^
+	switch op {
+	case .Add:       ptr^ = old + v1
+	case .U_Min:     ptr^ = min(old, v1)
+	case .S_Min:     ptr^ = u32(min(i32(old), i32(v1)))
+	case .U_Max:     ptr^ = max(old, v1)
+	case .S_Max:     ptr^ = u32(max(i32(old), i32(v1)))
+	case .And:       ptr^ = old & v1
+	case .Or:        ptr^ = old | v1
+	case .Xor:       ptr^ = old ~ v1
+	case .Exchange:  ptr^ = v1
+	case .Comp_Swap: if old == v1 {ptr^ = v2}
+	}
+	return old
+}
+
+@(private)
+atomic_word_buf :: #force_inline proc "contextless" (ptr: ^u32, op: Atomic_Op, v1, v2: u32) -> u32 {
+	switch op {
+	case .Add:
+		return intrinsics.atomic_add_explicit(ptr, v1, .Relaxed)
+	case .And:
+		return intrinsics.atomic_and_explicit(ptr, v1, .Relaxed)
+	case .Or:
+		return intrinsics.atomic_or_explicit(ptr, v1, .Relaxed)
+	case .Xor:
+		return intrinsics.atomic_xor_explicit(ptr, v1, .Relaxed)
+	case .Exchange:
+		return intrinsics.atomic_exchange_explicit(ptr, v1, .Relaxed)
+	case .Comp_Swap:
+		old, _ := intrinsics.atomic_compare_exchange_strong_explicit(ptr, v1, v2, .Relaxed, .Relaxed)
+		return old
+	case .U_Min, .S_Min, .U_Max, .S_Max:
+		old := intrinsics.atomic_load_explicit(ptr, .Relaxed)
+		for {
+			next: u32
+			#partial switch op {
+			case .U_Min: next = min(old, v1)
+			case .S_Min: next = u32(min(i32(old), i32(v1)))
+			case .U_Max: next = max(old, v1)
+			case .S_Max: next = u32(max(i32(old), i32(v1)))
+			}
+			got, ok := intrinsics.atomic_compare_exchange_weak_explicit(ptr, old, next, .Relaxed, .Relaxed)
+			if ok {
+				return got
+			}
+			old = got
+		}
+	}
+	return 0
+}
+
 // Unchecked: every slot and mask an instruction names was allocated by the
 // lowering (dynamic offsets are clamped there), within num_slots and
 // num_masks, which runner_begin sizes the scratch to.
 @(private)
-execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
+execute :: proc(r: ^Runner, code: []Instr, start_pc := 0) -> int #no_bounds_check {
 	regs := r.regs
 	masks := r.masks
-	pc := 0
+	pc := start_pc
 	for pc < len(code) {
 		in_ := code[pc]
 		pc += 1
@@ -1763,7 +1928,7 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 			masks[dst] += exec
 			masks[MASK_EXEC] = {}
 			if dst == MASK_DISCARD && r.lanes <= masks[MASK_DISCARD] {
-				return
+				return len(code)
 			}
 		case .Jump:
 			pc = int(a)
@@ -1771,8 +1936,98 @@ execute :: proc(r: ^Runner, code: []Instr) #no_bounds_check {
 			if exec == {} {
 				pc = int(a)
 			}
+		case .Load_Shared:
+			sh := r.shared
+			if in_.k == 0 {
+				for i in 0 ..< i32(n) {
+					regs[dst + i] = sh[c + i]
+				}
+				break
+			}
+			off0 := regs[a][0]
+			uniform := true
+			for l in 1 ..< LANES {
+				if regs[a][l] != off0 {
+					uniform = false
+					break
+				}
+			}
+			if uniform {
+				base := c + i32(off0)
+				for i in 0 ..< i32(n) {
+					regs[dst + i] = sh[base + i]
+				}
+				break
+			}
+			for i in 0 ..< i32(n) {
+				d := &regs[dst + i]
+				base := c + i
+				for l in 0 ..< LANES {
+					d[l] = sh[base + i32(regs[a][l])]
+				}
+			}
+		case .Store_Shared:
+			if exec == {} {
+				break
+			}
+			sh := r.shared
+			ebits := transmute(Lane_Bits)exec
+			if in_.k == 0 {
+				for l in 0 ..< LANES {
+					if (ebits >> uint(l)) & 1 != 0 {
+						for i in 0 ..< i32(n) {
+							sh[c + i] = regs[a + i][l]
+						}
+					}
+				}
+				break
+			}
+			for l in 0 ..< LANES {
+				if (ebits >> uint(l)) & 1 == 0 {
+					continue
+				}
+				off := c + i32(regs[b][l])
+				for i in 0 ..< i32(n) {
+					sh[off + i] = regs[a + i][l]
+				}
+			}
+		case .Atomic_Shared:
+			regs[dst] = {}
+			if exec == {} {
+				break
+			}
+			sh := r.shared
+			aop := Atomic_Op(in_.k)
+			ebits := transmute(Lane_Bits)exec
+			for l in 0 ..< LANES {
+				if (ebits >> uint(l)) & 1 != 0 {
+					regs[dst][l] = atomic_word_shared(&sh[regs[a][l]], aop, regs[b][l], regs[c][l])
+				}
+			}
+		case .Atomic_Buf:
+			regs[dst] = {}
+			if exec == {} || int(in_.d) >= len(r.opts.buffers) {
+				break
+			}
+			words := r.opts.buffers[in_.d]
+			aop := Atomic_Op(in_.k)
+			ebits := transmute(Lane_Bits)exec
+			for l in 0 ..< LANES {
+				if (ebits >> uint(l)) & 1 == 0 {
+					continue
+				}
+				w := regs[a][l]
+				if uint(w) < uint(len(words)) {
+					regs[dst][l] = atomic_word_buf(&words[w], aop, regs[b][l], regs[c][l])
+				}
+			}
+		case .Barrier:
+			if r.split_barrier {
+				return pc
+			}
 		}
 	}
+	return len(code)
 }
 
 @(private)

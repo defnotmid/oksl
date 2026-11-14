@@ -1,0 +1,74 @@
+#version 310 es
+// Non-multiple-of-64 tile reduction (12x8 = 96 invocations: one full 64-lane
+// chunk and one partial 32-lane chunk), shared struct array, and barrier()
+// called inside a helper function.
+
+layout(local_size_x = 12, local_size_y = 8) in;
+
+struct TileEntry {
+    vec2 motion;
+    float coc;
+    float weight;
+};
+
+readonly buffer Source {
+    vec4 samples[];
+} src;
+
+writeonly buffer OutTiles {
+    vec4 tiles[];
+} dst;
+
+shared TileEntry sh_entries[96];
+shared float sh_sum[96];
+
+TileEntry better_entry(TileEntry a, TileEntry b) {
+    if (b.weight > a.weight) {
+        return b;
+    }
+    if (b.weight < a.weight) {
+        return a;
+    }
+    if (b.coc != a.coc) {
+        return b.coc > a.coc ? b : a;
+    }
+    return b.motion.x > a.motion.x ? b : a;
+}
+
+void sync_fold(uint tid, uint step) {
+    if (tid < step) {
+        sh_entries[tid] = better_entry(sh_entries[tid], sh_entries[tid + step]);
+        sh_sum[tid] += sh_sum[tid + step];
+    }
+    barrier();
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint idx = (wg * 96u + tid) & 1023u;
+    vec4 s = src.samples[idx];
+    TileEntry e;
+    e.motion = s.xy;
+    e.coc = s.z;
+    e.weight = dot(s.xy, s.xy) + s.w * 0.5;
+    sh_entries[tid] = e;
+    sh_sum[tid] = floor(s.x);
+    barrier();
+
+    // Fold tail [64..95] into [0..31], then power-of-two reduction from 32.
+    if (tid < 32u) {
+        sh_entries[tid] = better_entry(sh_entries[tid], sh_entries[tid + 64u]);
+        sh_sum[tid] += sh_sum[tid + 64u];
+    }
+    barrier();
+
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        sync_fold(tid, step);
+    }
+
+    if (tid == 0u) {
+        TileEntry win = sh_entries[0];
+        dst.tiles[wg] = vec4(win.motion, win.coc, sh_sum[0]);
+    }
+}
