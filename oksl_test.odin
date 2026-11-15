@@ -1,5 +1,6 @@
 package oksl
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:math"
 import "core:mem"
@@ -2958,7 +2959,12 @@ test_compute_nv12 :: proc(t: ^testing.T) {
 	testing.expect_value(t, m.num_readwrite_storage_textures, 0)
 	testing.expect_value(t, m.num_readwrite_storage_buffers, 1)
 	testing.expect_value(t, m.num_uniform_buffers, 1)
-	testing.expect(t, m.program.jit_body == nil && m.program.jit_init == nil)
+	// Barrier-free compute runs in the JIT where there is one.
+	when JIT_ENABLED {
+		testing.expect_value(t, m.program.jit_body != nil, jit_avx2_ready)
+	} else {
+		testing.expect(t, m.program.jit_body == nil)
+	}
 
 	// Non-multiple-of-8 frame (34x18) with padded row stride on both the
 	// source RGBA8 image (148 bytes/row) and NV12 output (40 bytes/row).
@@ -11064,4 +11070,1044 @@ test_dxbc_vkd3d :: proc(t: ^testing.T) {
 			expect_valid_dxbc(t, path, m.dxbc)
 		}
 	}
+}
+
+// ---- compute in the JIT ---------------------------------------------------------------
+
+// Whether the compute JIT is expected to compile `p` on this machine.
+@(private = "file")
+cjit_available :: proc() -> bool {
+	when JIT_ENABLED {
+		return jit_avx2_ready
+	} else {
+		return false
+	}
+}
+
+@(private = "file")
+cjit_rand :: proc(state: ^u32) -> u32 {
+	x := state^
+	x ~= x << 13
+	x ~= x >> 17
+	x ~= x << 5
+	state^ = x
+	return x
+}
+
+// A buffer or image of a compute run, with `CJIT_PAD` sentinel words or bytes
+// past what run_compute is given.
+CJIT_PAD :: 16
+
+@(private = "file")
+Cjit_Image :: struct {
+	w, h, stride: int, // stride 0: tight
+	format:       Image_Format,
+}
+
+@(private = "file")
+Cjit_Run :: struct {
+	bufs:    [][]u32, // backing arrays, CJIT_PAD words longer than given
+	imgs:    [][]u8,
+	opts:    Run_Options,
+}
+
+@(private = "file")
+cjit_make_run :: proc(m: ^Module, buf_words: []int, imgs: []Cjit_Image, seed: u32, init: proc(bi: int, words: []u32) = nil) -> Cjit_Run {
+	r: Cjit_Run
+	st := seed | 1
+	r.bufs = make([][]u32, len(buf_words), context.temp_allocator)
+	given := make([][]u32, len(buf_words), context.temp_allocator)
+	for n, i in buf_words {
+		r.bufs[i] = make([]u32, n + CJIT_PAD, context.temp_allocator)
+		for &w in r.bufs[i] {
+			w = cjit_rand(&st)
+		}
+		if init != nil {
+			init(i, r.bufs[i][:n])
+		}
+		given[i] = r.bufs[i][:n]
+	}
+	r.imgs = make([][]u8, len(imgs), context.temp_allocator)
+	sims := make([]Storage_Image, len(imgs), context.temp_allocator)
+	for im, i in imgs {
+		tb := image_texel_bytes(im.format)
+		stride := im.stride if im.stride != 0 else im.w * tb
+		size := (im.h - 1) * stride + im.w * tb if im.w > 0 && im.h > 0 else 0
+		r.imgs[i] = make([]u8, size + CJIT_PAD, context.temp_allocator)
+		for &b in r.imgs[i] {
+			b = u8(cjit_rand(&st))
+		}
+		sims[i] = {data = r.imgs[i][:size], width = im.w, height = im.h, stride = im.stride, format = im.format}
+	}
+	r.opts = {buffers = given, images = sims}
+	return r
+}
+
+@(private = "file")
+cjit_clone_run :: proc(r: Cjit_Run) -> Cjit_Run {
+	c := r
+	c.bufs = make([][]u32, len(r.bufs), context.temp_allocator)
+	given := make([][]u32, len(r.bufs), context.temp_allocator)
+	for b, i in r.bufs {
+		c.bufs[i] = slice.clone(b, context.temp_allocator)
+		given[i] = c.bufs[i][:len(r.opts.buffers[i])]
+	}
+	c.imgs = make([][]u8, len(r.imgs), context.temp_allocator)
+	sims := slice.clone(r.opts.images, context.temp_allocator)
+	for b, i in r.imgs {
+		c.imgs[i] = slice.clone(b, context.temp_allocator)
+		sims[i].data = c.imgs[i][:len(r.opts.images[i].data)]
+	}
+	c.opts.buffers = given
+	c.opts.images = sims
+	return c
+}
+
+@(private = "file")
+cjit_f32_same :: #force_inline proc(a, b: u32) -> bool {
+	nan_a := (a & 0x7fff_ffff) > 0x7f80_0000
+	nan_b := (b & 0x7fff_ffff) > 0x7f80_0000
+	return a == b || (nan_a && nan_b)
+}
+
+// Every word of every buffer and every byte of every image (sentinels
+// included) equal, any f32 NaN word equal to any other (and f16 NaNs in
+// rgba16f images); reports the first difference of each.
+@(private = "file")
+cjit_expect_same :: proc(t: ^testing.T, what: string, a, b: Cjit_Run, loc := #caller_location) -> bool {
+	same := true
+	for _, i in a.bufs {
+		for w, j in a.bufs[i] {
+			if !cjit_f32_same(w, b.bufs[i][j]) {
+				testing.expectf(t, false, "%s: buffer %d word %d (of %d): jit %08x interp %08x", what, i, j, len(a.opts.buffers[i]), w, b.bufs[i][j], loc = loc)
+				same = false
+				break
+			}
+		}
+	}
+	for _, i in a.imgs {
+		f := a.opts.images[i].format
+		x, y := a.imgs[i], b.imgs[i]
+		for j := 0; j < len(x); {
+			ok := true
+			step := 1
+			if (f == .R32f || f == .Rgba32f) && j % 4 == 0 && j + 4 <= len(x) {
+				step = 4
+				ok = cjit_f32_same(intrinsics.unaligned_load((^u32)(&x[j])), intrinsics.unaligned_load((^u32)(&y[j])))
+			} else if f == .Rgba16f && j % 2 == 0 && j + 2 <= len(x) {
+				step = 2
+				hx := u16(x[j]) | u16(x[j + 1]) << 8
+				hy := u16(y[j]) | u16(y[j + 1]) << 8
+				ok = hx == hy || ((hx & 0x7fff) > 0x7c00 && (hy & 0x7fff) > 0x7c00)
+			} else {
+				ok = x[j] == y[j]
+			}
+			if !ok {
+				testing.expectf(t, false, "%s: image %d (%v) byte %d (of %d): jit %v interp %v", what, i, f, j, len(a.opts.images[i].data), x[j:j + step], y[j:j + step], loc = loc)
+				same = false
+				break
+			}
+			j += step
+		}
+	}
+	return same
+}
+
+@(private = "file")
+cjit_interp :: proc(p: ^Program, uniforms: []u8, groups: [3]int, opts: Run_Options, first_group := 0, group_count := -1) {
+	sb, si := p.jit_body, p.jit_init
+	p.jit_body, p.jit_init = nil, nil
+	defer p.jit_body, p.jit_init = sb, si
+	run_compute(p, uniforms, groups, temp_scratch(), opts, first_group, group_count)
+}
+
+// Runs `m` in the JIT and in the interpreter on copies of the same inputs and
+// expects identical memory; also that the JIT compiled it (`want_jit`) when
+// this machine has one.
+@(private = "file")
+cjit_compare :: proc(t: ^testing.T, what: string, m: ^Module, block: []u8, groups: [3]int, buf_words: []int, imgs: []Cjit_Image = nil, seed: u32 = 1, extra: Run_Options = {}, want_jit := true, first_group := 0, group_count := -1, init: proc(bi: int, words: []u32) = nil, loc := #caller_location) -> bool {
+	if cjit_available() {
+		testing.expectf(t, (m.program.jit_body != nil) == want_jit, "%s: jit compiled %v, want %v", what, m.program.jit_body != nil, want_jit, loc = loc)
+	}
+	ra := cjit_make_run(m, buf_words, imgs, seed, init)
+	ra.opts.sampler = extra.sampler
+	ra.opts.user = extra.user
+	ra.opts.channel_sizes = extra.channel_sizes
+	ra.opts.channel_images = extra.channel_images
+	rb := cjit_clone_run(ra)
+	run_compute(&m.program, block, groups, temp_scratch(), ra.opts, first_group, group_count)
+	cjit_interp(&m.program, block, groups, rb.opts, first_group, group_count)
+	return cjit_expect_same(t, what, ra, rb, loc)
+}
+
+@(private = "file")
+cjit_compile :: proc(t: ^testing.T, src: string, loc := #caller_location) -> (^Module, bool) {
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Compute})
+	if !ok {
+		testing.expectf(t, false, "compile failed:\n%s\n%s", format_errors(errs, context.temp_allocator), src, loc = loc)
+		destroy(m)
+		return nil, false
+	}
+	return m, true
+}
+
+@(private = "file")
+cjit_set_u32 :: proc(m: ^Module, block: []u8, name: string, v: u32, index := 0) {
+	u, ok := find_uniform(m, name)
+	if ok {
+		(^u32)(&block[u.offset + index * u.stride])^ = v
+	}
+}
+
+// Which compute programs run in the JIT: a workgroup of at most 8 invocations
+// always (one batch, the interpreter's order), larger ones only without
+// barrier() and atomics; and the image-size rule that keeps a dispatch on the
+// interpreter.
+@(test)
+test_compute_jit_eligibility :: proc(t: ^testing.T) {
+	Case :: struct {
+		size: string,
+		body: string,
+		jit:  bool,
+	}
+	cases := [?]Case {
+		{"local_size_x = 64", "o.w[gl_LocalInvocationIndex] = 1u;", true},
+		{"local_size_x = 9", "o.w[gl_LocalInvocationIndex] = 1u;", true},
+		{"local_size_x = 9", "s[gl_LocalInvocationIndex] = 1u; barrier(); o.w[0] = s[1];", false},
+		{"local_size_x = 9", "atomicAdd(o.w[0], 1u);", false},
+		{"local_size_x = 9", "atomicAdd(s[0], 1u); o.w[0] = s[0];", false},
+		{"local_size_x = 8", "s[gl_LocalInvocationIndex] = 1u; barrier(); o.w[0] = atomicAdd(s[1], 2u);", true},
+		{"local_size_x = 2, local_size_y = 2, local_size_z = 2", "atomicAdd(o.w[0], 1u); barrier();", true},
+		{"local_size_x = 3, local_size_y = 3", "atomicAdd(o.w[0], 1u);", false},
+		{"local_size_x = 1", "barrier(); o.w[0] = atomicExchange(s[2], 1u);", true},
+		// memoryBarrier* alone are not barrier().
+		{"local_size_x = 16", "memoryBarrierShared(); memoryBarrierBuffer(); o.w[gl_LocalInvocationIndex] = 1u;", true},
+	}
+	for c in cases {
+		src := fmt.tprintf("#version 310 es\nlayout(%s) in;\nbuffer O {{ uint w[]; }} o;\nshared uint s[16];\nvoid main() {{ %s }}\n", c.size, c.body)
+		m, ok := cjit_compile(t, src)
+		if !ok {
+			continue
+		}
+		if cjit_available() {
+			testing.expectf(t, (m.program.jit_body != nil) == c.jit, "%s / %s: jit %v, want %v", c.size, c.body, m.program.jit_body != nil, c.jit)
+		} else {
+			testing.expect(t, m.program.jit_body == nil)
+		}
+		destroy(m)
+	}
+
+	// Texel byte offsets must fit the gathers' signed 32-bit indices: up to
+	// 2^31 bytes from the start of the data, nothing is read.
+	big := ([^]u8)(uintptr(64))
+	fit := [?]Storage_Image {
+		{data = big[:1 << 31], width = 1 << 14, height = 1 << 15, format = .R32ui},               // exactly 2^31 bytes
+		{data = big[:1 << 31], width = 0, height = 1 << 20, format = .Rgba32f},                    // empty
+		{data = big[:(1 << 31) - 4], width = 4, height = 1 << 27, stride = 16, format = .Rgba8},  // 2^31 - 4 + 4
+	}
+	testing.expect(t, images_fit_i32(fit[:]))
+	over := [?]Storage_Image {
+		{data = big[:(1 << 31) + 4], width = (1 << 14) + 1, height = 1 << 15, stride = (1 << 16) + 4, format = .R32ui},
+		{data = big[:(1 << 31) + 16], width = 1, height = (1 << 27) + 1, format = .Rgba32f},
+		{data = big[:(1 << 31) + 1], width = 1, height = 2, stride = 1 << 31, format = .R32f},
+	}
+	for im in over {
+		one := [1]Storage_Image{im}
+		testing.expectf(t, !images_fit_i32(one[:]), "%v fits", im)
+	}
+}
+
+// Every workgroup shape (1 to 1024 invocations, partial last batches, 1 to 3
+// dimensions) and the built-ins, over several workgroups and sub-ranges of the
+// dispatch: lanes past the workgroup in its last batch write nothing (each
+// workgroup's region has room for them).
+@(test)
+test_compute_jit_workgroup_shapes :: proc(t: ^testing.T) {
+	shapes := [?][3]int{{1, 1, 1}, {3, 1, 1}, {7, 1, 1}, {8, 1, 1}, {9, 1, 1}, {5, 3, 1}, {4, 3, 2}, {13, 3, 2}, {65, 1, 1}, {12, 8, 1}, {2, 2, 17}, {32, 32, 1}}
+	for sh in shapes {
+		src := fmt.tprintf(`#version 310 es
+layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;
+buffer O {{ uint w[]; }} o;
+void main() {{
+    uint wg = (gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint n = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+    uint base = (wg * (n + 16u) + gl_LocalInvocationIndex) * 6u;
+    o.w[base] = gl_GlobalInvocationID.x | (gl_GlobalInvocationID.y << 11u) | (gl_GlobalInvocationID.z << 22u);
+    o.w[base + 1u] = gl_LocalInvocationID.x | (gl_LocalInvocationID.y << 11u) | (gl_LocalInvocationID.z << 22u);
+    o.w[base + 2u] = gl_LocalInvocationIndex;
+    o.w[base + 3u] = gl_WorkGroupID.x | (gl_WorkGroupID.y << 11u) | (gl_WorkGroupID.z << 22u);
+    o.w[base + 4u] = gl_NumWorkGroups.x | (gl_NumWorkGroups.y << 11u) | (gl_NumWorkGroups.z << 22u);
+    o.w[base + 5u] = wg;
+}}
+`, sh.x, sh.y, sh.z)
+		m, ok := cjit_compile(t, src)
+		if !ok {
+			continue
+		}
+		defer destroy(m)
+		n := sh.x * sh.y * sh.z
+		groups := [3]int{3, 2, 2}
+		words := 12 * (n + 16) * 6
+		what := fmt.tprintf("shape %v", sh)
+		cjit_compare(t, what, m, nil, groups, {words})
+		cjit_compare(t, what, m, nil, groups, {words}, first_group = 5, group_count = 4)
+		cjit_compare(t, what, m, nil, groups, {words}, first_group = 11, group_count = 9)
+		cjit_compare(t, what, m, nil, {1, 1, 1}, {words})
+	}
+}
+
+// Storage buffer stores and read-backs of 1 to 4 words per element and of
+// struct fields, in the first four buffers (inline code) and past them
+// (helpers): indices at and past the end, straddling it, wrapping 2^32, one
+// word from many lanes of one store (the last lane's write stays), divergent
+// lanes and a partial batch. Lanes of a workgroup never touch a word another
+// store writes (that order differs, as on GPUs).
+@(test)
+test_compute_jit_buffer_stores :: proc(t: ^testing.T) {
+	srcs := [?]string {
+		`#version 310 es
+layout(local_size_x = 12) in;
+readonly buffer R { uint idx[]; } r;
+buffer B0 { uint w[]; } b0;
+buffer B1 { uvec2 v[]; } b1;
+buffer B2 { vec3 v[]; } b2;
+buffer B3 { uint w[]; } b3;
+buffer B4 { uvec2 v[]; } b4;
+uniform uint uMode;
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint g = gl_GlobalInvocationID.x;
+    uint j = r.idx[(g + uMode * 5u) % 24u];
+    if ((i & 3u) != 3u) {
+        b0.w[j] = g * 3u + 1u;
+    }
+    b1.v[j] = uvec2(g, g ^ 0xabcdu);
+    b2.v[j] = vec3(float(g), -0.0, uintBitsToFloat(0x7fc00001u + g));
+    if (i > 7u) {
+        b4.v[j + 1u].y = g + 100u;
+    }
+    b4.v[5].x = g;
+    b3.w[g] = g * 7u;
+    b3.w[g] += r.idx[g % 24u] + b3.w[g];
+}
+`,
+		`#version 310 es
+layout(local_size_x = 12) in;
+readonly buffer R { uint idx[]; } r;
+buffer B0 { vec4 v[]; } b0;
+struct S { uint a; vec2 b; uvec3 c; };
+buffer B1 { S s[]; } b1;
+buffer B2 { uint w[]; } b2;
+buffer B3 { uint w[]; } b3;
+buffer B4 { uvec2 v[]; } b4;
+buffer B5 { vec4 v[]; } b5;
+uniform uint uMode;
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint g = gl_GlobalInvocationID.x;
+    uint j = r.idx[(g + uMode * 5u) % 24u];
+    b0.v[j] = vec4(float(g), float(i), -1.5, float(j));
+    b1.s[j].c.y = g;
+    b1.s[j].b = vec2(float(g) * 0.5);
+    b1.s[j].a = j;
+    b4.v[j] = uvec2(g, j);
+    b5.v[j] = vec4(float(g));
+    if ((i & 1u) == 0u) {
+        b3.w[j] = g;
+    }
+    b5.v[g + 60u].zw = vec2(float(i), 2.0);
+    b2.w[g] = floatBitsToUint(b5.v[g + 60u].z) + b2.w[g];
+}
+`,
+	}
+	sizes := [2][]int{{24, 41, 18, 4 * 9 + 2, 12 * 5, 2 * 9 + 1}, {24, 4 * 9 + 2, 8 * 9 + 3, 12 * 5, 23, 2 * 9 + 1, 4 * 100 + 3}}
+	for src, si in srcs {
+		m, ok := cjit_compile(t, src)
+		if !ok {
+			continue
+		}
+		defer destroy(m)
+		block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+		init := proc(bi: int, words: []u32) {
+			if bi == 0 {
+				table := [24]u32{0, 1, 2, 8, 9, 10, 11, 40, 41, 42, 0xffff_ffff, 0xffff_fffe, 0x7fff_ffff, 0x8000_0000, 0x4000_0000, 3, 3, 3, 5, 7, 17, 18, 22, 4}
+				copy(words, table[:])
+			}
+		}
+		for mode in u32(0) ..< 5 {
+			cjit_set_u32(m, block, "uMode", mode)
+			cjit_compare(t, fmt.tprintf("buffers %d mode %d", si, mode), m, block, {5, 1, 1}, sizes[si], seed = 7 + mode, init = init)
+		}
+	}
+}
+
+// Every storage image format, loaded and stored in and out of bounds (negative,
+// at and past the edges, far out), with row padding, an empty image, rgba8
+// rounding edges and NaN, infinities and signed zeros, imageSize, over a
+// partial batch.
+@(test)
+test_compute_jit_images :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 8, local_size_y = 3) in;
+layout(rgba8) readonly uniform highp image2D i8;
+layout(rgba16f) readonly uniform highp image2D i16;
+layout(rgba32f) readonly uniform highp image2D i32f;
+layout(r32f) uniform highp image2D rf;
+layout(r32ui) uniform highp uimage2D ru;
+layout(r32i) uniform highp iimage2D ri;
+layout(rgba8) writeonly uniform highp image2D o8;
+layout(rgba16f) writeonly uniform highp image2D o16;
+layout(rgba32f) writeonly uniform highp image2D o32;
+layout(r32f) writeonly uniform highp image2D e0;
+readonly buffer V { vec4 v[]; } vals;
+buffer O { uvec4 w[]; } o;
+uniform ivec2 uOff;
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    uint k = gl_GlobalInvocationID.y * 24u + gl_GlobalInvocationID.x;
+    ivec2 q = ivec2(g.x * 3 - 7, g.y * 2 - 3) + uOff;
+    vec4 v = vals.v[k % 61u];
+    o.w[k * 8u] = floatBitsToUint(imageLoad(i8, q));
+    o.w[k * 8u + 1u] = floatBitsToUint(imageLoad(i16, q));
+    o.w[k * 8u + 2u] = floatBitsToUint(imageLoad(i32f, q));
+    o.w[k * 8u + 3u] = floatBitsToUint(imageLoad(rf, q)) ^ imageLoad(ru, q) ^ uvec4(imageLoad(ri, q));
+    o.w[k * 8u + 4u] = uvec4(imageSize(i8), imageSize(o16)) ^ uvec4(imageSize(e0), imageSize(ri));
+    o.w[k * 8u + 5u] = floatBitsToUint(imageLoad(i32f, q.yx).wzyx);
+    imageStore(rf, q, v.zyxw);
+    imageStore(ru, q + ivec2(1, 0), uvec4(k * 7u, 1u, 2u, 3u));
+    imageStore(ri, q.yx, ivec4(-int(k), 0, 0, 0));
+    if ((k & 3u) != 1u) {
+        imageStore(o8, q, v);
+    }
+    imageStore(o8, ivec2(g.x / 2, 5), v.wxyz);
+    imageStore(o16, q, v * 3.0);
+    imageStore(o32, q, v.yxwz);
+    imageStore(o32, ivec2(1, 1), vec4(float(k)));
+    imageStore(e0, q, v);
+    o.w[k * 8u + 6u] = floatBitsToUint(imageLoad(rf, q)) ^ imageLoad(ru, q + ivec2(1, 0));
+}
+`
+	m, ok := cjit_compile(t, src)
+	if !ok {
+		return
+	}
+	defer destroy(m)
+	// Binding order: readonly first (i8, i16, i32f), then read-write and writeonly.
+	imgs := [?]Cjit_Image {
+		{11, 7, 0, .Rgba8},
+		{9, 6, 9 * 8 + 24, .Rgba16f},
+		{10, 8, 10 * 16 + 4, .Rgba32f},
+		{13, 9, 0, .R32f},
+		{12, 9, 12 * 4 + 12, .R32ui},
+		{9, 13, 0, .R32i},
+		{12, 8, 12 * 4 + 8, .Rgba8},
+		{12, 9, 0, .Rgba16f},
+		{9, 9, 9 * 16 + 16, .Rgba32f},
+		{0, 0, 0, .R32f},
+	}
+	init := proc(bi: int, words: []u32) {
+		if bi != 0 {
+			return
+		}
+		edges := [?]f32 {
+			0, -0.0, 1, -1, 0.5, 2, math.inf_f32(1), math.inf_f32(-1), math.nan_f32(), 0.5 / 255, 1.5 / 255, 254.5 / 255,
+			127.5 / 255, 0.99999994, 1.0000001, 0.0019607842, 0.0019607845, 65504, 65520, 1e-8, -1e-8, 6.1e-5, 3e-8, 0.33333334,
+		}
+		for &w, i in words {
+			if i % 3 != 2 {
+				w = transmute(u32)edges[(i * 7) % len(edges)]
+			} else {
+				w = transmute(u32)(f32(i % 256) / 255 + f32(i % 3) * 0.0019607843)
+			}
+		}
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	offs := [?][2]i32{{0, 0}, {2, 1}, {-3, 4}, {7, -2}, {-20, -20}, {1 << 30, 0}, {0, -(1 << 30)}}
+	for off, oi in offs {
+		u, uok := find_uniform(m, "uOff")
+		if uok {
+			(^[2]i32)(&block[u.offset])^ = off
+		}
+		cjit_compare(t, fmt.tprintf("images off %v", off), m, block, {3, 2, 1}, {61 * 4, 48 * 8 * 4}, imgs[:], seed = 11 + u32(oi), init = init)
+	}
+}
+
+// Storage-image rgba8 loads in the JIT divide by 255 instead of reading
+// UNORM8_TO_F32: the same for every byte.
+@(test)
+test_jit_image_load_rgba8_lut :: proc(t: ^testing.T) {
+	for b in 0 ..< 256 {
+		testing.expectf(t, f32(b) / 255 == UNORM8_TO_F32[b], "byte %d: %v vs %v", b, f32(b) / 255, UNORM8_TO_F32[b])
+	}
+	src := `#version 310 es
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba8) readonly uniform highp image2D src;
+buffer O { uvec4 w[]; } o;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    o.w[p.y * 8 + p.x] = floatBitsToUint(imageLoad(src, p));
+}
+`
+	m, ok := cjit_compile(t, src)
+	if !ok {
+		return
+	}
+	defer destroy(m)
+	init_px := make([]u8, 8 * 8 * 4, context.temp_allocator)
+	for &b, i in init_px {
+		b = u8(i)
+	}
+	ra := cjit_make_run(m, {8 * 8 * 4}, {{8, 8, 0, .Rgba8}}, 3)
+	copy(ra.imgs[0], init_px)
+	run_compute(&m.program, nil, {1, 1, 1}, temp_scratch(), ra.opts)
+	for i in 0 ..< 256 {
+		testing.expectf(t, ra.bufs[0][i] == transmute(u32)UNORM8_TO_F32[i], "byte %d: %08x", i, ra.bufs[0][i])
+	}
+}
+
+// Shared memory without barrier(): per-invocation elements of arrays, vectors
+// and structs, dynamic indices (clamped reads past the end), and the zeroing at
+// every workgroup, over many workgroups and a partial batch.
+@(test)
+test_compute_jit_shared_no_barrier :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 20) in;
+struct P { vec2 a; uint b[3]; };
+shared uint sa[64];
+shared vec4 sv[24];
+shared P sp[20];
+buffer O { uint w[]; } o;
+readonly buffer I { uint v[]; } inp;
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.x;
+    uint base = (wg * 20u + i) * 8u;
+    uint before = sa[i] + sa[i + 20u] + floatBitsToUint(sv[i].w) + sp[i].b[2];
+    sa[i] = inp.v[(wg + i) % 32u];
+    sa[i + 40u] = i * 3u;
+    sv[i] = vec4(float(i), float(wg), 0.5, -2.0);
+    sv[i].y += 1.0;
+    sv[i][int(i % 4u)] = 9.0;
+    sp[i].a = vec2(float(i));
+    sp[i].b[i % 3u] = wg + 7u;
+    uint d = inp.v[i] % 80u;
+    o.w[base] = before;
+    o.w[base + 1u] = sa[i] + sa[i + 40u];
+    o.w[base + 2u] = sa[60u + (d & 7u)];
+    o.w[base + 3u] = floatBitsToUint(sv[i].x + sv[i].y + sv[i].z + sv[i].w);
+    o.w[base + 4u] = sp[i].b[0] + sp[i].b[1] * 3u + sp[i].b[2] * 5u + floatBitsToUint(sp[i].a.y);
+    o.w[base + 5u] = floatBitsToUint(sv[23u].x) + sa[63u] + sp[i].b[d % 3u];
+    o.w[base + 6u] = sa[max(d, 60u)];
+}
+`
+	m, ok := cjit_compile(t, src)
+	if !ok {
+		return
+	}
+	defer destroy(m)
+	cjit_compare(t, "shared", m, nil, {7, 1, 1}, {32, 7 * 20 * 8})
+}
+
+// A workgroup of at most 8 invocations is one batch, so barrier(), atomics on
+// shared memory and buffers (returned values, exchanges, compare-and-swap
+// loops) and unsynchronized shared writes come out as in the interpreter.
+@(test)
+test_compute_jit_small_workgroups :: proc(t: ^testing.T) {
+	for lx in ([?]int{1, 3, 7, 8}) {
+		src := fmt.tprintf(`#version 310 es
+layout(local_size_x = %d) in;
+shared uint s[16];
+shared int si;
+buffer O {{ uint w[]; }} o;
+buffer A {{ uint w[]; }} a;
+void main() {{
+    uint i = gl_LocalInvocationIndex;
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint base = wg * 32u + i * 4u;
+    s[i] = i * 3u + 1u;
+    s[15] = i;
+    barrier();
+    uint old = atomicAdd(s[14], i + 1u);
+    uint ex = atomicExchange(s[0], i + 100u);
+    uint cs = atomicCompSwap(s[1], 4u, i + 200u);
+    int mn = atomicMin(si, -int(i) * 7);
+    uint ob = atomicAdd(a.w[wg & 3u], 1u);
+    uint om = atomicMax(a.w[4], i * 5u + wg);
+    uint expect = a.w[5];
+    for (int it = 0; it < 16; ++it) {{
+        uint got = atomicCompSwap(a.w[5], expect, expect * 3u + i);
+        if (got == expect) {{
+            break;
+        }}
+        expect = got;
+    }}
+    barrier();
+    o.w[base] = old | (ex << 8u) | (cs << 16u);
+    o.w[base + 1u] = uint(mn) ^ ob ^ (om << 4u);
+    o.w[base + 2u] = s[15] + s[14] * 3u + s[0] * 5u + s[1] * 7u;
+    o.w[base + 3u] = s[(i + 1u) %% uint(%d)];
+}}
+`, lx, lx)
+		m, ok := cjit_compile(t, src)
+		if !ok {
+			continue
+		}
+		defer destroy(m)
+		cjit_compare(t, fmt.tprintf("small %d", lx), m, nil, {5, 3, 1}, {15 * 32 + 8, 16})
+		cjit_compare(t, fmt.tprintf("small %d range", lx), m, nil, {5, 3, 1}, {15 * 32 + 8, 16}, first_group = 4, group_count = 6)
+	}
+	// testdata shaders with barrier() and atomics at 4 invocations.
+	for name in ([?]string{"probe_old", "probe_eval"}) {
+		data, err := os.read_entire_file(fmt.tprintf("testdata/%s.comp", name), context.temp_allocator)
+		if !testing.expectf(t, err == nil, "read %s", name) {
+			continue
+		}
+		m, ok := cjit_compile(t, string(data))
+		if !ok {
+			continue
+		}
+		defer destroy(m)
+		cjit_compare(t, name, m, nil, {4, 3, 2}, {4096})
+	}
+}
+
+// Divergent control flow inside compute: loops with per-lane trip counts,
+// continue and break, early returns, switch, ?:, dynamically indexed local
+// arrays (one index for every lane and per-lane indices), round() at its
+// edges, and sampler callbacks only for running lanes.
+@(test)
+test_compute_jit_divergent :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 16) in;
+readonly buffer I { float f[]; } inp;
+buffer O { uint w[]; } o;
+uniform sampler2D tex;
+uniform uint uSel;
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    float x = inp.f[g % 40u];
+    uint arr[5] = uint[5](1u, 2u, 3u, 4u, 5u);
+    vec2 pts[3] = vec2[3](vec2(0.0), vec2(1.0), vec2(2.0));
+    for (int k = 0; k < int(g % 7u); ++k) {
+        if (k == 3 && (g & 1u) == 1u) {
+            continue;
+        }
+        arr[k % 5] += uint(k) * g;
+        arr[(g + uint(k)) % 5u] ^= 7u;
+        pts[k % 3].y += float(k);
+        if (g % 11u == uint(k)) {
+            break;
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        if ((g + uint(k)) % 3u == 0u) {
+            arr[k] = g * 16u + uint(k);
+        }
+        if ((g & 2u) == 0u) {
+            arr[int(uSel % 5u)] += 1000u;
+        }
+    }
+    if (g == 13u || g == 29u) {
+        return;
+    }
+    uint base = g * 12u;
+    switch (int(g % 4u)) {
+    case 0:
+        o.w[base] = 10u;
+        break;
+    case 1:
+        o.w[base] = arr[g % 5u];
+    case 2:
+        o.w[base + 1u] = 30u;
+        break;
+    default:
+        o.w[base] = (g & 8u) != 0u ? 40u : 41u;
+    }
+    o.w[base + 2u] = floatBitsToUint(round(x));
+    o.w[base + 3u] = floatBitsToUint(round(-x * 3.0));
+    for (int i = 0; i < 5; ++i) {
+        o.w[base + 4u + uint(i)] = arr[i];
+    }
+    o.w[base + 9u] = floatBitsToUint(pts[g % 3u].y + pts[0].y);
+    if ((g % 3u) == 1u) {
+        vec4 c = textureLod(tex, vec2(x, 0.25), 0.0) + texelFetch(tex, ivec2(int(g), 1), 0);
+        o.w[base + 10u] = floatBitsToUint(c.x + c.y * 2.0);
+    }
+}
+`
+	m, ok := cjit_compile(t, src)
+	if !ok {
+		return
+	}
+	defer destroy(m)
+	init := proc(bi: int, words: []u32) {
+		if bi != 0 {
+			return
+		}
+		edges := [?]f32 {
+			0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 0.49999997, -0.49999997, 0.50000006, 8388607.5, -8388607.5, 8388608, 16777217,
+			0.3, -0.3, 0.7, -0.7, 1e-40, -1e-40, math.inf_f32(1), math.inf_f32(-1), math.nan_f32(), 1.4999999, 2.4999998, 1e30,
+			-3.5, 4.5, 0.16666667, 1.8333333, 0.8333333, -0.16666667, 2147483648, 0.25, 0.75, 1.25, 3.4e38, -1.75, 12.5,
+		}
+		for &w, i in words {
+			w = transmute(u32)edges[i % len(edges)]
+		}
+	}
+	Counter :: struct {
+		calls: int,
+		sum:   u64,
+	}
+	cb := proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		c := (^Counter)(user)
+		c.calls += 1
+		c.sum += u64(transmute(u32)uv.x) * 3 + u64(transmute(u32)uv.y) + u64(transmute(u32)lod) * 7
+		return {uv.x * 0.5, uv.y, lod, 1}
+	}
+	sizes := [1][3]i32{{16, 4, 1}}
+	ca, cb_ := Counter{}, Counter{}
+	ra := cjit_make_run(m, {40, 5 * 16 * 12}, nil, 5, init)
+	rb := cjit_clone_run(ra)
+	ra.opts.sampler, ra.opts.user, ra.opts.channel_sizes = cb, &ca, sizes[:]
+	rb.opts.sampler, rb.opts.user, rb.opts.channel_sizes = cb, &cb_, sizes[:]
+	if cjit_available() {
+		testing.expect(t, m.program.jit_body != nil)
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	cjit_set_u32(m, block, "uSel", 8)
+	run_compute(&m.program, block, {5, 1, 1}, temp_scratch(), ra.opts)
+	cjit_interp(&m.program, block, {5, 1, 1}, rb.opts)
+	cjit_expect_same(t, "divergent", ra, rb)
+	testing.expect_value(t, ca.calls, cb_.calls)
+	testing.expect_value(t, ca.calls, 2 * 26)
+	testing.expect_value(t, ca.sum, cb_.sum)
+}
+
+// Whole-element stores at a dynamic index into local arrays of vec2, vec4,
+// mat2 (the Store_Dyn paths of 2 and 4 slots), mat3 and a 6-slot struct (more
+// than 4 slots), shared by the compute and fragment tests below: at an index
+// every lane shares (`u`, a uniform), at one per lane (`v`), at one shared by
+// each batch of 8 lanes but not by the workgroup (`w`), and all three under a
+// branch that leaves lanes off (`cond`). `x` is a vec4 that differs per lane.
+@(private = "file")
+STORE_DYN_BODY :: `
+    vec2 a2[3] = vec2[3](vec2(1.0, 2.0), vec2(3.0, 4.0), vec2(5.0, 6.0));
+    vec4 a4[3] = vec4[3](vec4(1.0, 2.0, 3.0, 4.0), vec4(5.0, 6.0, 7.0, 8.0), vec4(9.0, 10.0, 11.0, 12.0));
+    mat2 m2[3] = mat2[3](mat2(1.0, 2.0, 3.0, 4.0), mat2(5.0, 6.0, 7.0, 8.0), mat2(9.0, 10.0, 11.0, 12.0));
+    mat3 m3[2] = mat3[2](mat3(1.0), mat3(2.0));
+    S s[3] = S[3](S(vec3(1.0, 2.0, 3.0), vec2(4.0, 5.0), 6.0), S(vec3(7.0, 8.0, 9.0), vec2(10.0, 11.0), 12.0), S(vec3(13.0), vec2(14.0), 15.0));
+    a2[u % 3u] = x.yx;
+    a4[(u + 1u) % 3u] = x.wzxy;
+    m2[(u + 2u) % 3u] = mat2(x.z, x.w, x.x, x.y);
+    m3[u % 2u] = mat3(x.xyz, x.yzw, x.wxy + 1.0);
+    s[(u + 1u) % 3u] = S(x.zyx, x.ww, x.x - x.y);
+    a2[(v + 1u) % 3u] = x.zw * 2.0;
+    a4[(v + 2u) % 3u] = x * 3.0;
+    m2[v % 3u] = mat2(x.w, x.z, x.y, x.x);
+    m3[(v + 1u) % 2u] = mat3(x.w);
+    s[v % 3u] = S(x.yyy, x.zx, x.w);
+    a2[(w + 2u) % 3u] = x.xw - 4.0;
+    a4[w % 3u] = x.zxyw + 5.0;
+    m2[(w + 1u) % 3u] = mat2(x.y * 0.5, x.x, x.z * 0.5, x.w);
+    m3[w % 2u] = mat3(x.wzy, x.xxy, x.zzw);
+    s[(w + 2u) % 3u] = S(x.wxz, x.yw, x.z + 6.0);
+    if (cond) {
+        a2[(u + 2u) % 3u] = x.zx + 0.5;
+        a4[u % 3u] = x.yzwx - 1.0;
+        m2[u % 3u] = mat2(x.x + 3.0);
+        m3[(u + 1u) % 2u] = mat3(x.zyx, x.xzy, x.wwz);
+        s[(u + 2u) % 3u] = S(x.www, x.yz, x.z * 3.0);
+        a2[v % 3u] = x.wy;
+        a4[(v + 1u) % 3u] = -x;
+        m2[(v + 2u) % 3u] = mat2(x.y, x.x, x.w, x.z);
+        m3[v % 2u] = mat3(x.y - 2.0);
+        s[(v + 1u) % 3u] = S(x.xzw, x.yy, -x.z);
+        a2[(w + 1u) % 3u] = x.yz * 7.0;
+        a4[(w + 2u) % 3u] = x.wwxy;
+        m2[w % 3u] = mat2(x.z, x.z + 1.0, x.x, x.y);
+        m3[(w + 1u) % 2u] = mat3(x.x * 9.0);
+        s[w % 3u] = S(x.yxw, x.zz, x.w - 8.0);
+    }
+`
+
+// The 66 floats of STORE_DYN_BODY's arrays, read at constant indexes.
+@(private = "file")
+store_dyn_reads :: proc() -> [dynamic]string {
+	r := make([dynamic]string, context.temp_allocator)
+	for i in 0 ..< 3 {
+		for c in ([?]string{"x", "y"}) {append(&r, fmt.tprintf("a2[%d].%s", i, c))}
+	}
+	for i in 0 ..< 3 {
+		for c in ([?]string{"x", "y", "z", "w"}) {append(&r, fmt.tprintf("a4[%d].%s", i, c))}
+	}
+	for i in 0 ..< 3 {
+		for c in 0 ..< 2 {
+			for k in 0 ..< 2 {append(&r, fmt.tprintf("m2[%d][%d][%d]", i, c, k))}
+		}
+	}
+	for i in 0 ..< 2 {
+		for c in 0 ..< 3 {
+			for k in 0 ..< 3 {append(&r, fmt.tprintf("m3[%d][%d][%d]", i, c, k))}
+		}
+	}
+	for i in 0 ..< 3 {
+		for f in ([?]string{"a.x", "a.y", "a.z", "b.x", "b.y", "c"}) {append(&r, fmt.tprintf("s[%d].%s", i, f))}
+	}
+	return r
+}
+
+// Whether `p` has a whole-element Store_Dyn of each of these slot counts, so
+// the tests below reach every path of emit_store_dyn.
+@(private = "file")
+expect_store_dyn_sizes :: proc(t: ^testing.T, what: string, p: ^Program, loc := #caller_location) {
+	seen: bit_set[0 ..< 16]
+	for in_ in p.code {
+		if in_.op == .Store_Dyn && int(in_.n) < 16 {
+			seen += {int(in_.n)}
+		}
+	}
+	testing.expectf(t, seen >= {2, 4, 6, 9}, "%s: Store_Dyn sizes %v, want 2, 4, 6 and 9", what, seen, loc = loc)
+}
+
+// STORE_DYN_BODY in compute: 13 invocations a workgroup, so each workgroup's
+// second batch has 5 running lanes; every uniform value against the
+// interpreter, and a sub-range of workgroups.
+@(test)
+test_compute_jit_store_dyn_elements :: proc(t: ^testing.T) {
+	b := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(&b, `#version 310 es
+layout(local_size_x = 13) in;
+struct S { vec3 a; vec2 b; float c; };
+readonly buffer I { vec4 f[]; } inp;
+buffer O { float w[]; } o;
+uniform uint uSel;
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    vec4 x = inp.f[g % 37u];
+    uint u = uSel;
+    uint v = g * 7u + (g >> 2u);
+    uint w = gl_LocalInvocationIndex / 8u + gl_WorkGroupID.x;
+    bool cond = (g % 3u) != 1u && (g & 4u) == 0u;
+`)
+	fmt.sbprint(&b, STORE_DYN_BODY)
+	reads := store_dyn_reads()
+	for r, i in reads {
+		fmt.sbprintf(&b, "    o.w[g * %du + %du] = %s;\n", len(reads), i, r)
+	}
+	fmt.sbprint(&b, "}\n")
+	m, ok := cjit_compile(t, strings.to_string(b))
+	if !ok {
+		return
+	}
+	defer destroy(m)
+	expect_store_dyn_sizes(t, "compute", &m.program)
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	for sel in 0 ..< 6 {
+		cjit_set_u32(m, block, "uSel", u32(sel) * 0x9E37 + u32(sel))
+		cjit_compare(t, fmt.tprintf("store_dyn sel %d", sel), m, block, {4, 1, 1}, {37 * 4, 4 * 13 * len(reads)}, seed = 3 + u32(sel))
+		cjit_compare(t, fmt.tprintf("store_dyn sel %d range", sel), m, block, {4, 1, 1}, {37 * 4, 4 * 13 * len(reads)}, seed = 9 + u32(sel), first_group = 1, group_count = 2)
+	}
+}
+
+// STORE_DYN_BODY in a fragment shader through run_fragment, at 1, 2, 3, 5 and
+// 17 quads (an odd count leaves the last batch's second quad off), with
+// helper lanes, the JIT against the interpreter bit for bit; `uPick` selects
+// which 32 of the 66 floats reach the 8 outputs.
+@(test)
+test_frag_jit_store_dyn_elements :: proc(t: ^testing.T) {
+	b := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(&b, `#version 310 es
+precision highp float;
+precision highp int;
+struct S { vec3 a; vec2 b; float c; };
+layout(location = 0) in vec4 vX;
+uniform uint uSel;
+uniform uint uPick;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
+layout(location = 4) out vec4 o4;
+layout(location = 5) out vec4 o5;
+layout(location = 6) out vec4 o6;
+layout(location = 7) out vec4 o7;
+void main() {
+    vec4 x = vX;
+    uint px = uint(gl_FragCoord.x);
+    uint py = uint(gl_FragCoord.y);
+    uint u = uSel;
+    uint v = px * 5u + py * 3u;
+    uint w = uSel + py / 4u;
+    bool cond = (v % 3u) != 1u;
+`)
+	fmt.sbprint(&b, STORE_DYN_BODY)
+	reads := store_dyn_reads()
+	PICKS :: 3
+	for pick in 0 ..< PICKS {
+		fmt.sbprintf(&b, "    %sif (uPick == %du) {{\n", "" if pick == 0 else "} else ", pick)
+		for o in 0 ..< 8 {
+			comps: [4]string
+			for c in 0 ..< 4 {
+				k := pick * 32 + o * 4 + c
+				comps[c] = reads[k] if k < len(reads) else "0.0"
+			}
+			fmt.sbprintf(&b, "        o%d = vec4(%s, %s, %s, %s);\n", o, comps[0], comps[1], comps[2], comps[3])
+		}
+	}
+	fmt.sbprint(&b, "    }\n}\n")
+	src := strings.to_string(b)
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s\n%s", format_errors(errs, context.temp_allocator), src) {
+		return
+	}
+	expect_store_dyn_sizes(t, "fragment", &m.program)
+	when JIT_ENABLED {
+		if jit_avx2_ready {
+			testing.expect(t, m.program.jit_body != nil)
+		}
+	}
+	p_int := m.program
+	p_int.jit_body, p_int.jit_init = nil, nil
+	MAX_Q :: 17
+	record := m.varying_floats
+	off := -1
+	for fin in m.stage_inputs {
+		if fin.name == "vX" {off = fin.offset}
+	}
+	if !testing.expect(t, off >= 0) {
+		return
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	st := u32(0x1234_5679)
+	for count in ([?]int{1, 2, 3, 5, MAX_Q}) {
+		origin := make([][2]i32, count, context.temp_allocator)
+		helpers := make([]Quad_Lanes, count, context.temp_allocator)
+		varyings := make([]f32, record * count * 4, context.temp_allocator)
+		for q in 0 ..< count {
+			origin[q] = {i32((q * 6) % 22), i32(2 * (q / 3) + 1)}
+			helpers[q] = transmute(Quad_Lanes)u8((q * 5) & 0x9)
+		}
+		for &f in varyings[off * count * 4:][:4 * count * 4] {
+			f = f32(i32(cjit_rand(&st) % 2001) - 1000) * 0.125
+		}
+		for sel in 0 ..< 4 {
+			for pick in 0 ..< PICKS {
+				cjit_set_u32(m, block, "uSel", u32(sel * 7 + 1))
+				cjit_set_u32(m, block, "uPick", u32(pick))
+				tj, ti: [8][][4]f32
+				for o in 0 ..< 8 {
+					tj[o] = make([][4]f32, count * 4, context.temp_allocator)
+					ti[o] = make([][4]f32, count * 4, context.temp_allocator)
+				}
+				sj := make([]Quad_Lanes, count, context.temp_allocator)
+				si := make([]Quad_Lanes, count, context.temp_allocator)
+				quads := Fragment_Quads{count = count, origin = origin, helpers = helpers, varyings = varyings}
+				run_fragment(&m.program, block, quads, tj[:], sj, temp_scratch())
+				run_fragment(&p_int, block, quads, ti[:], si, temp_scratch())
+				testing.expect(t, slice.equal(sj, si))
+				for o in 0 ..< 8 {
+					for px in 0 ..< count * 4 {
+						if !jit_vec4_bits_eq(tj[o][px], ti[o][px]) {
+							testing.expectf(t, false, "store_dyn frag quads %d sel %d pick %d out %d lane %d: jit %v interp %v", count, sel, pick, o, px, tj[o][px], ti[o][px])
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// rgba16f imageStore (through jit_help_image_store) under a partial execution
+// mask: 7x3 invocations a workgroup, so its third batch has 5 running lanes,
+// and a store only some lanes reach; the values depend on
+// gl_LocalInvocationIndex, so a lane that should not store leaves a texel
+// that differs from the interpreter's.
+@(test)
+test_compute_jit_image_store_rgba16f_masked :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 7, local_size_y = 3) in;
+layout(rgba16f) writeonly uniform highp image2D oa;
+layout(rgba16f) writeonly uniform highp image2D ob;
+readonly buffer V { vec4 v[]; } vals;
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    uint i = gl_LocalInvocationIndex;
+    vec4 v = vals.v[(uint(g.x) * 5u + uint(g.y)) % 29u] + vec4(float(i), float(i) * 0.5, -float(i), 1.0);
+    imageStore(oa, g, v);
+    if ((i % 3u) != 1u && g.y != 4) {
+        imageStore(ob, g.yx, v.wzyx);
+    }
+}
+`
+	m, ok := cjit_compile(t, src)
+	if !ok {
+		return
+	}
+	defer destroy(m)
+	imgs := [?]Cjit_Image{{14, 6, 0, .Rgba16f}, {6, 14, 6 * 8 + 8, .Rgba16f}}
+	init := proc(bi: int, words: []u32) {
+		for &w, i in words {
+			w = transmute(u32)(f32(i % 23) * 0.375 - 3)
+		}
+	}
+	cjit_compare(t, "rgba16f masked", m, nil, {2, 2, 1}, {29 * 4}, imgs[:], seed = 5, init = init)
+	cjit_compare(t, "rgba16f masked range", m, nil, {2, 2, 1}, {29 * 4}, imgs[:], seed = 6, init = init, first_group = 1, group_count = 2)
+}
+
+// nv12.comp split across worker threads (each its own Scratch) over disjoint
+// workgroup ranges: the same planes as one call and as the interpreter.
+@(test)
+test_compute_jit_pool :: proc(t: ^testing.T) {
+	data, err := os.read_entire_file("testdata/nv12.comp", context.temp_allocator)
+	if !testing.expect(t, err == nil) {
+		return
+	}
+	m, ok := cjit_compile(t, string(data))
+	if !ok {
+		return
+	}
+	defer destroy(m)
+	W, H :: 70, 38
+	block := make([]u8, m.block_size, context.temp_allocator)
+	set_uniform(m, block, "ky", {16843, 33030, 6423, 1048576})
+	set_uniform(m, block, "ku", {-9699, -19071, 28770, 33554432})
+	set_uniform(m, block, "kv", {28770, -24117, -4653, 255})
+	set_uniform(m, block, "size", {W, H, 72, 72 * H})
+	groups := [3]int{(72 / 8 + 7) / 8, (H / 2 + 7) / 8, 1}
+	words := 72 * H * 3 / 8
+	imgs := [1]Cjit_Image{{W, H, W * 4 + 12, .Rgba8}}
+	cjit_compare(t, "nv12", m, block, groups, {words}, imgs[:], seed = 9)
+
+	r_one := cjit_make_run(m, {words}, imgs[:], 9)
+	r_pool := cjit_clone_run(r_one)
+	r_interp := cjit_clone_run(r_one)
+	run_compute(&m.program, block, groups, temp_scratch(), r_one.opts)
+	cjit_interp(&m.program, block, groups, r_interp.opts)
+	Job :: struct {
+		p:            ^Program,
+		block:        []u8,
+		groups:       [3]int,
+		opts:         Run_Options,
+		first, count: int,
+	}
+	total := groups.x * groups.y * groups.z
+	THREADS :: 3
+	jobs: [THREADS]Job
+	threads: [THREADS]^thread.Thread
+	per := (total + THREADS - 1) / THREADS
+	for i in 0 ..< THREADS {
+		jobs[i] = {&m.program, block, groups, r_pool.opts, i * per, per}
+		threads[i] = thread.create_and_start_with_poly_data(&jobs[i], proc(j: ^Job) {
+			sc: Scratch
+			defer scratch_destroy(&sc)
+			run_compute(j.p, j.block, j.groups, &sc, j.opts, j.first, j.count)
+		})
+	}
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	cjit_expect_same(t, "nv12 pool vs one", r_pool, r_one)
+	cjit_expect_same(t, "nv12 one vs interp", r_one, r_interp)
 }

@@ -745,6 +745,10 @@ run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, scratch: ^Scrat
 			return
 		}
 	}
+	if p.jit_body != nil && images_fit_i32(opts.images[:len(p.image_formats)]) {
+		jit_run_compute(p, uniforms, groups, start, end, scratch, opts)
+		return
+	}
 	ls := [3]int{max(int(p.local_size[0]), 1), max(int(p.local_size[1]), 1), max(int(p.local_size[2]), 1)}
 	local_total := ls.x * ls.y * ls.z
 	local_coords: [1024][3]u16
@@ -939,6 +943,24 @@ run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, scratch: ^Scrat
 			execute(&r, body)
 		}
 	}
+}
+
+// Whether every image's texels lie in its first 2^31 bytes, so the JIT's
+// gathers can address them with signed 32-bit byte offsets; a dispatch with a
+// larger image runs on the interpreter.
+@(private)
+images_fit_i32 :: proc "contextless" (images: []Storage_Image) -> bool {
+	for im in images {
+		if im.width <= 0 || im.height <= 0 {
+			continue
+		}
+		tb := image_texel_bytes(im.format)
+		row := im.stride if im.stride != 0 else im.width * tb
+		if (im.height - 1) * row + im.width * tb > 1 << 31 {
+			return false
+		}
+	}
+	return true
 }
 
 // floor without core:math's modf: values of 2^23 and up (and inf/NaN) are
@@ -1893,21 +1915,7 @@ execute :: proc(r: ^Runner, code: []Instr, start_pc := 0) -> int #no_bounds_chec
 			if exec == {} || int(in_.k) >= len(r.opts.buffers) {
 				break
 			}
-			words := r.opts.buffers[in_.k]
-			idx := &regs[in_.a]
-			ebits := transmute(Lane_Bits)exec
-			for l in 0 ..< LANES {
-				if (ebits >> uint(l)) & 1 == 0 {
-					continue
-				}
-				base_w := idx[l] * u32(in_.c) + u32(in_.d)
-				for i in 0 ..< i32(n) {
-					w := base_w + u32(i)
-					if uint(w) < uint(len(words)) {
-						words[w] = regs[b + i][l]
-					}
-				}
-			}
+			store_buf_lanes(raw_data(regs), r.opts.buffers[in_.k], in_, transmute(Lane_Bits)exec)
 		case .Image_Load:
 			load_image(r, in_, exec)
 		case .Image_Store:
@@ -2005,57 +2013,12 @@ execute :: proc(r: ^Runner, code: []Instr, start_pc := 0) -> int #no_bounds_chec
 			if exec == {} {
 				break
 			}
-			sh := r.shared
-			ebits := transmute(Lane_Bits)exec
-			if in_.k == 0 {
-				for l in 0 ..< LANES {
-					if (ebits >> uint(l)) & 1 != 0 {
-						for i in 0 ..< i32(n) {
-							sh[c + i] = regs[a + i][l]
-						}
-					}
-				}
-				break
-			}
-			for l in 0 ..< LANES {
-				if (ebits >> uint(l)) & 1 == 0 {
-					continue
-				}
-				off := c + i32(regs[b][l])
-				for i in 0 ..< i32(n) {
-					sh[off + i] = regs[a + i][l]
-				}
-			}
+			store_shared_lanes(raw_data(regs), raw_data(r.shared), in_, transmute(Lane_Bits)exec)
 		case .Atomic_Shared:
-			regs[dst] = {}
-			if exec == {} {
-				break
-			}
-			sh := r.shared
-			aop := Atomic_Op(in_.k)
-			ebits := transmute(Lane_Bits)exec
-			for l in 0 ..< LANES {
-				if (ebits >> uint(l)) & 1 != 0 {
-					regs[dst][l] = atomic_word_shared(&sh[regs[a][l]], aop, regs[b][l], regs[c][l])
-				}
-			}
+			atomic_shared_lanes(raw_data(regs), raw_data(r.shared), in_, transmute(Lane_Bits)exec)
 		case .Atomic_Buf:
-			regs[dst] = {}
-			if exec == {} || int(in_.d) >= len(r.opts.buffers) {
-				break
-			}
-			words := r.opts.buffers[in_.d]
-			aop := Atomic_Op(in_.k)
-			ebits := transmute(Lane_Bits)exec
-			for l in 0 ..< LANES {
-				if (ebits >> uint(l)) & 1 == 0 {
-					continue
-				}
-				w := regs[a][l]
-				if uint(w) < uint(len(words)) {
-					regs[dst][l] = atomic_word_buf(&words[w], aop, regs[b][l], regs[c][l])
-				}
-			}
+			words := r.opts.buffers[in_.d] if int(in_.d) < len(r.opts.buffers) else nil
+			atomic_buf_lanes(raw_data(regs), words, in_, transmute(Lane_Bits)exec)
 		case .Barrier:
 			if r.split_barrier {
 				return pc
@@ -2478,184 +2441,219 @@ UNORM8_TO_F32 := [256]f32 {
 
 // run_compute validates opts.images up front, so width/height/stride/data are
 // guaranteed in-bounds for every (x, y) in [0, width) x [0, height).
+//
+// The image, buffer, shared-memory and atomic kernels below are generic over
+// the lane count: the interpreter instantiates them with 64-lane registers and
+// the JIT's helpers with 8-lane slots, so both apply lanes in ascending order
+// with the same rules.
 @(private)
 load_image :: proc "contextless" (r: ^Runner, in_: Instr, exec: Lane_Mask) #no_bounds_check {
-	regs := r.regs
-	dst, a := in_.dst, in_.a
-	for i in 0 ..< i32(4) {
-		regs[dst + i] = {}
-	}
-	if exec == {} {
-		return
-	}
-	im := r.opts.images[in_.k]
-	if im.width <= 0 || im.height <= 0 {
-		return
-	}
-	w, h := u32(im.width), u32(im.height)
-	tb := image_texel_bytes(im.format)
-	row_stride := im.stride if im.stride != 0 else im.width * tb
-	cx, cy := &regs[a], &regs[a + 1]
-	ebits := transmute(Lane_Bits)exec
-	data := raw_data(im.data)
-	#partial switch im.format {
-	case .Rgba8:
-		r0, r1, r2, r3 := &regs[dst], &regs[dst + 1], &regs[dst + 2], &regs[dst + 3]
-		lut := &UNORM8_TO_F32
-		for l in 0 ..< LANES {
-			if (ebits >> uint(l)) & 1 == 0 {
-				continue
-			}
-			x, y := cx[l], cy[l]
-			if x >= w || y >= h {
-				continue
-			}
-			p := data[int(y) * row_stride + int(x) * 4:]
-			r0[l] = fbits(lut[p[0]])
-			r1[l] = fbits(lut[p[1]])
-			r2[l] = fbits(lut[p[2]])
-			r3[l] = fbits(lut[p[3]])
-		}
-	case .Rgba16f:
-		for l in 0 ..< LANES {
-			if (ebits >> uint(l)) & 1 == 0 {
-				continue
-			}
-			x, y := cx[l], cy[l]
-			if x >= w || y >= h {
-				continue
-			}
-			off := int(y) * row_stride + int(x) * 8
-			for i in 0 ..< i32(4) {
-				o := off + int(i) * 2
-				hv := u16(data[o]) | (u16(data[o + 1]) << 8)
-				regs[dst + i][l] = fbits(f16_to_f32(hv))
-			}
-		}
-	case .Rgba32f:
-		for l in 0 ..< LANES {
-			if (ebits >> uint(l)) & 1 == 0 {
-				continue
-			}
-			x, y := cx[l], cy[l]
-			if x >= w || y >= h {
-				continue
-			}
-			off := int(y) * row_stride + int(x) * 16
-			for i in 0 ..< i32(4) {
-				regs[dst + i][l] = intrinsics.unaligned_load((^u32)(&data[off + int(i) * 4]))
-			}
-		}
-	case .R32f:
-		r0, r3 := &regs[dst], &regs[dst + 3]
-		for l in 0 ..< LANES {
-			if (ebits >> uint(l)) & 1 == 0 {
-				continue
-			}
-			x, y := cx[l], cy[l]
-			if x >= w || y >= h {
-				continue
-			}
-			off := int(y) * row_stride + int(x) * 4
-			r0[l] = intrinsics.unaligned_load((^u32)(&data[off]))
-			r3[l] = 0x3f80_0000
-		}
-	case .R32ui, .R32i:
-		r0, r3 := &regs[dst], &regs[dst + 3]
-		for l in 0 ..< LANES {
-			if (ebits >> uint(l)) & 1 == 0 {
-				continue
-			}
-			x, y := cx[l], cy[l]
-			if x >= w || y >= h {
-				continue
-			}
-			off := int(y) * row_stride + int(x) * 4
-			r0[l] = intrinsics.unaligned_load((^u32)(&data[off]))
-			r3[l] = 1
-		}
-	}
+	image_load_lanes(raw_data(r.regs), &r.opts.images[in_.k], in_, transmute(Lane_Bits)exec)
 }
 
 @(private)
 store_image :: proc "contextless" (r: ^Runner, in_: Instr, exec: Lane_Mask) #no_bounds_check {
-	if exec == {} {
+	image_store_lanes(raw_data(r.regs), &r.opts.images[in_.k], in_, transmute(Lane_Bits)exec)
+}
+
+// dst (4 registers) = image texels at the lanes' (a, a + 1) in `ebits`, 0 in
+// the other lanes and out of bounds.
+@(private)
+image_load_lanes :: #force_inline proc "contextless" (regs: [^][$N]u32, im: ^Storage_Image, in_: Instr, ebits: $B) #no_bounds_check {
+	dst := in_.dst
+	for i in 0 ..< i32(4) {
+		regs[dst + i] = {}
+	}
+	if ebits == 0 || im.width <= 0 || im.height <= 0 {
 		return
 	}
-	im := r.opts.images[in_.k]
-	if im.width <= 0 || im.height <= 0 {
-		return
-	}
-	w, h := u32(im.width), u32(im.height)
-	tb := image_texel_bytes(im.format)
-	row_stride := im.stride if im.stride != 0 else im.width * tb
-	regs := r.regs
-	a, b := in_.a, in_.b
-	cx, cy := &regs[a], &regs[a + 1]
-	ebits := transmute(Lane_Bits)exec
-	data := raw_data(im.data)
 	#partial switch im.format {
-	case .Rgba8:
-		for l in 0 ..< LANES {
-			if (ebits >> uint(l)) & 1 == 0 {
-				continue
+	case .Rgba8:   image_load_fmt(regs, im, in_, ebits, Image_Format.Rgba8)
+	case .Rgba16f: image_load_fmt(regs, im, in_, ebits, Image_Format.Rgba16f)
+	case .Rgba32f: image_load_fmt(regs, im, in_, ebits, Image_Format.Rgba32f)
+	case .R32f:    image_load_fmt(regs, im, in_, ebits, Image_Format.R32f)
+	case .R32ui:   image_load_fmt(regs, im, in_, ebits, Image_Format.R32ui)
+	case .R32i:    image_load_fmt(regs, im, in_, ebits, Image_Format.R32i)
+	}
+}
+
+@(private)
+image_load_fmt :: #force_inline proc "contextless" (regs: [^][$N]u32, im: ^Storage_Image, in_: Instr, ebits: $B, $F: Image_Format) #no_bounds_check {
+	TB :: 4 when F == .Rgba8 || F == .R32f || F == .R32ui || F == .R32i else (8 when F == .Rgba16f else 16)
+	w, h := u32(im.width), u32(im.height)
+	row_stride := im.stride if im.stride != 0 else im.width * TB
+	dst := in_.dst
+	cx, cy := &regs[in_.a], &regs[in_.a + 1]
+	data := raw_data(im.data)
+	for l in 0 ..< N {
+		if (ebits >> uint(l)) & 1 == 0 {
+			continue
+		}
+		x, y := cx[l], cy[l]
+		if x >= w || y >= h {
+			continue
+		}
+		p := data[int(y) * row_stride + int(x) * TB:]
+		when F == .Rgba8 {
+			lut := &UNORM8_TO_F32
+			for i in 0 ..< i32(4) {
+				regs[dst + i][l] = fbits(lut[p[i]])
 			}
-			x, y := cx[l], cy[l]
-			if x >= w || y >= h {
-				continue
+		} else when F == .Rgba16f {
+			for i in 0 ..< i32(4) {
+				hv := u16(p[i * 2]) | (u16(p[i * 2 + 1]) << 8)
+				regs[dst + i][l] = fbits(f16_to_f32(hv))
 			}
-			off := int(y) * row_stride + int(x) * 4
+		} else when F == .Rgba32f {
+			for i in 0 ..< i32(4) {
+				regs[dst + i][l] = intrinsics.unaligned_load((^u32)(&p[i * 4]))
+			}
+		} else {
+			// Single-channel formats fill .gba = (0, 0, 1).
+			regs[dst][l] = intrinsics.unaligned_load((^u32)(p))
+			regs[dst + 3][l] = 0x3f80_0000 when F == .R32f else 1
+		}
+	}
+}
+
+// Image texels at the lanes' (a, a + 1) in `ebits` = b (4 registers); out of
+// bounds dropped.
+@(private)
+image_store_lanes :: #force_inline proc "contextless" (regs: [^][$N]u32, im: ^Storage_Image, in_: Instr, ebits: $B) #no_bounds_check {
+	if ebits == 0 || im.width <= 0 || im.height <= 0 {
+		return
+	}
+	#partial switch im.format {
+	case .Rgba8:   image_store_fmt(regs, im, in_, ebits, Image_Format.Rgba8)
+	case .Rgba16f: image_store_fmt(regs, im, in_, ebits, Image_Format.Rgba16f)
+	case .Rgba32f: image_store_fmt(regs, im, in_, ebits, Image_Format.Rgba32f)
+	case .R32f, .R32ui, .R32i: image_store_fmt(regs, im, in_, ebits, Image_Format.R32ui)
+	}
+}
+
+@(private)
+image_store_fmt :: #force_inline proc "contextless" (regs: [^][$N]u32, im: ^Storage_Image, in_: Instr, ebits: $B, $F: Image_Format) #no_bounds_check {
+	TB :: 4 when F == .Rgba8 || F == .R32ui else (8 when F == .Rgba16f else 16)
+	w, h := u32(im.width), u32(im.height)
+	row_stride := im.stride if im.stride != 0 else im.width * TB
+	b := in_.b
+	cx, cy := &regs[in_.a], &regs[in_.a + 1]
+	data := raw_data(im.data)
+	for l in 0 ..< N {
+		if (ebits >> uint(l)) & 1 == 0 {
+			continue
+		}
+		x, y := cx[l], cy[l]
+		if x >= w || y >= h {
+			continue
+		}
+		p := data[int(y) * row_stride + int(x) * TB:]
+		when F == .Rgba8 {
 			for i in 0 ..< i32(4) {
 				cv := fval(regs[b + i][l])
 				if !(cv > 0) {
 					cv = 0
 				}
-				data[off + int(i)] = u8(math.round(min(cv, 1) * 255))
+				p[i] = u8(math.round(min(cv, 1) * 255))
 			}
-		}
-	case .Rgba16f:
-		for l in 0 ..< LANES {
-			if (ebits >> uint(l)) & 1 == 0 {
-				continue
-			}
-			x, y := cx[l], cy[l]
-			if x >= w || y >= h {
-				continue
-			}
-			off := int(y) * row_stride + int(x) * 8
+		} else when F == .Rgba16f {
 			for i in 0 ..< i32(4) {
 				hv := f32_to_f16(fval(regs[b + i][l]))
-				o := off + int(i) * 2
-				data[o] = u8(hv)
-				data[o + 1] = u8(hv >> 8)
+				p[i * 2] = u8(hv)
+				p[i * 2 + 1] = u8(hv >> 8)
 			}
-		}
-	case .Rgba32f:
-		for l in 0 ..< LANES {
-			if (ebits >> uint(l)) & 1 == 0 {
-				continue
-			}
-			x, y := cx[l], cy[l]
-			if x >= w || y >= h {
-				continue
-			}
-			off := int(y) * row_stride + int(x) * 16
+		} else when F == .Rgba32f {
 			for i in 0 ..< i32(4) {
-				intrinsics.unaligned_store((^u32)(&data[off + int(i) * 4]), regs[b + i][l])
+				intrinsics.unaligned_store((^u32)(&p[i * 4]), regs[b + i][l])
+			}
+		} else {
+			intrinsics.unaligned_store((^u32)(p), regs[b][l])
+		}
+	}
+}
+
+// Buffer k's words a * c + d + i = b + i (i < n) in the lanes of `ebits`,
+// in ascending lane order; words past the buffer are dropped.
+@(private)
+store_buf_lanes :: #force_inline proc "contextless" (regs: [^][$N]u32, words: []u32, in_: Instr, ebits: $B) #no_bounds_check {
+	idx := &regs[in_.a]
+	n, b := i32(in_.n), in_.b
+	stride, word := u32(in_.c), u32(in_.d)
+	for l in 0 ..< N {
+		if (ebits >> uint(l)) & 1 == 0 {
+			continue
+		}
+		base_w := idx[l] * stride + word
+		for i in 0 ..< n {
+			w := base_w + u32(i)
+			if uint(w) < uint(len(words)) {
+				words[w] = regs[b + i][l]
 			}
 		}
-	case .R32f, .R32ui, .R32i:
-		b0 := &regs[b]
-		for l in 0 ..< LANES {
-			if (ebits >> uint(l)) & 1 == 0 {
-				continue
+	}
+}
+
+// shared[c + (k != 0 ? b-lane : 0) + i] = a + i in the lanes of `ebits`, in
+// ascending lane order (the lowering clamps dynamic offsets into range).
+@(private)
+store_shared_lanes :: #force_inline proc "contextless" (regs: [^][$N]u32, sh: [^]u32, in_: Instr, ebits: $B) #no_bounds_check {
+	n := i32(in_.n)
+	a, c := in_.a, in_.c
+	if in_.k == 0 {
+		for l in 0 ..< N {
+			if (ebits >> uint(l)) & 1 != 0 {
+				for i in 0 ..< n {
+					sh[c + i] = regs[a + i][l]
+				}
 			}
-			x, y := cx[l], cy[l]
-			if x >= w || y >= h {
-				continue
-			}
-			off := int(y) * row_stride + int(x) * 4
-			intrinsics.unaligned_store((^u32)(&data[off]), b0[l])
+		}
+		return
+	}
+	offs := &regs[in_.b]
+	for l in 0 ..< N {
+		if (ebits >> uint(l)) & 1 == 0 {
+			continue
+		}
+		off := c + i32(offs[l])
+		for i in 0 ..< n {
+			sh[off + i] = regs[a + i][l]
+		}
+	}
+}
+
+// dst = the old word of atomic op k at shared word a-lane with b (and c),
+// lane by lane in ascending order; 0 in the other lanes.
+@(private)
+atomic_shared_lanes :: #force_inline proc "contextless" (regs: [^][$N]u32, sh: [^]u32, in_: Instr, ebits: $B) #no_bounds_check {
+	dst, a, b, c := in_.dst, in_.a, in_.b, in_.c
+	regs[dst] = {}
+	if ebits == 0 {
+		return
+	}
+	aop := Atomic_Op(in_.k)
+	for l in 0 ..< N {
+		if (ebits >> uint(l)) & 1 != 0 {
+			regs[dst][l] = atomic_word_shared(&sh[regs[a][l]], aop, regs[b][l], regs[c][l])
+		}
+	}
+}
+
+// The same on buffer words with host atomics; 0 past the buffer.
+@(private)
+atomic_buf_lanes :: #force_inline proc "contextless" (regs: [^][$N]u32, words: []u32, in_: Instr, ebits: $B) #no_bounds_check {
+	dst, a, b, c := in_.dst, in_.a, in_.b, in_.c
+	regs[dst] = {}
+	if ebits == 0 {
+		return
+	}
+	aop := Atomic_Op(in_.k)
+	for l in 0 ..< N {
+		if (ebits >> uint(l)) & 1 == 0 {
+			continue
+		}
+		w := regs[a][l]
+		if uint(w) < uint(len(words)) {
+			regs[dst][l] = atomic_word_buf(&words[w], aop, regs[b][l], regs[c][l])
 		}
 	}
 }

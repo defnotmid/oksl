@@ -610,12 +610,16 @@ img := oksl.Storage_Image{data = rgba_bytes, width = w, height = h, stride = w *
 oksl.run_compute(&m.program, block, {groups_x, groups_y, 1}, &scratch, {images = {img}, buffers = {out_words}}, first_group, group_count)
 ```
 
-`run_compute` executes one workgroup at a time in `ceil(local_size / 64)`
-64-lane chunks (`group_count = -1` runs to the end of `groups.x * groups.y
-* groups.z`). Local sizes below 64 leave CPU lanes idle (`8x8` or `64x1`
-fill a batch), and lane layout inside a workgroup does not depend on how
-the workgroup range is split across caller threads (give each thread its
-own `Scratch`). `run_compute` validates `Run_Options` up front and panics on
+`run_compute` executes one workgroup at a time (`group_count = -1` runs to
+the end of `groups.x * groups.y * groups.z`). On x86-64 with AVX2 the JIT
+runs a workgroup in batches of 8 consecutive `gl_LocalInvocationIndex`
+values, each batch through the whole program before the next; the
+interpreter runs it in `ceil(local_size / 64)` 64-lane chunks, each
+instruction across a chunk. A workgroup whose size isn't a multiple of the
+batch (8 in the JIT, 64 in the interpreter) leaves lanes idle in its last
+one, and lane layout inside a workgroup does not depend on how the
+workgroup range is split across caller threads (give each thread its own
+`Scratch`). `run_compute` validates `Run_Options` up front and panics on
 missing buffers or images, mismatched `Image_Format`, negative dimensions or
 strides, strides smaller than `width * texel_bytes`, or undersized `data`.
 On `Storage_Image` (`stride == 0` means `width *
@@ -626,17 +630,37 @@ integer formats are exact, single-channel `r32*` loads fill `.gba = (0, 0,
 out-of-bounds `imageStore` and buffer writes are dropped. `run_compute` zeroes
 `shared` memory at the start of each workgroup on the CPU only, for determinism
 (GPUs start with stale data, so portable shaders must initialize `shared`
-memory before reading it). When a shader uses `barrier()`,
-each 64-lane chunk keeps its own register and mask slice in `Scratch` (sized
-once from workgroup size and slot count, with no per-barrier allocation) while
-chunks advance in lockstep across every barrier, including inside loops and
-across early returns. Within a workgroup, CPU lanes execute in fixed `(chunk,
-then lane)` order, making runs deterministic; GPU invocation and atomic order
-are unspecified, so portable shaders establish output order via prefix scans
-rather than atomic append order. Buffer atomics use host atomic instructions so
-worker threads splitting a dispatch can safely update shared buffers
-(out-of-bounds buffer atomics return `0` without writing). Unsynchronized
-non-atomic writes to the same word or texel have unspecified results.
+memory before reading it).
+
+The JIT takes a workgroup of at most 8 invocations whatever its program
+contains: it fits one batch, which runs in the interpreter's order
+(`barrier()` has nothing to wait for, atomics apply lane by lane in the same
+order). Larger workgroups run in the JIT only without `barrier()` (every
+batch would have to reach it before any passes) and without atomics (their
+returned values, and the results of exchange, compare-and-swap and mixed
+operations, follow the order lanes apply them); those programs stay on the
+interpreter. When a shader on the interpreter uses `barrier()`, each 64-lane
+chunk keeps its own register and mask slice in `Scratch` (sized once from
+workgroup size and slot count, with no per-barrier allocation) while chunks
+advance in lockstep across every barrier, including inside loops and across
+early returns. A dispatch with an image whose texels reach past its first
+2^31 bytes runs on the interpreter (the JIT's gathers take signed 32-bit
+offsets).
+
+Within one `run_compute` call, on one thread, lanes execute in a fixed
+order, `(batch, then lane)` in the JIT and `(chunk, then lane)` in the
+interpreter, so runs are deterministic for a given build. When a dispatch is
+split across a worker pool, buffer atomics from different threads use host
+atomic instructions and interleave by thread timing, in the JIT and the
+interpreter alike (out-of-bounds buffer atomics return `0` without writing).
+GPU invocation and atomic order are unspecified, so portable shaders
+establish output order via prefix scans rather than atomic append order.
+Unsynchronized non-atomic writes to the same word or texel have unspecified
+results. In the JIT, as on GPUs, an invocation that reads a word, texel or
+`shared` element another invocation of its workgroup writes without
+synchronization may see the value from before or after that write, and of
+two such writes either may stay; apart from that and the differences every
+stage has (see **JIT** below), the JIT matches the interpreter bit for bit.
 
 `texture` in a fragment shader passes the sampler the level a GPU picks:
 `0.5 * log2(max(|duv/dx|², |duv/dy|²))` in the channel's texels
@@ -686,13 +710,19 @@ pass.
 - **JIT:** on x86-64 Linux and macOS when the CPU has AVX2, `compile` also
   translates vertex and fragment programs into 8-lane (two 2x2 quads per
   256-bit YMM register) native AVX2 code in W^X pages (allocated
-  read-write, switched read-execute, and released by `destroy`). Compute
-  shaders, other targets, machines without AVX2, environments that refuse
-  executable memory (`PROT_EXEC`), and builds with `-define:OKSL_JIT=false`
-  run on the 64-lane interpreter with the same results, apart from NaN bit
-  patterns and values computed in lanes that aren't running (both undefined
-  on GPUs too). CI runs the tests and goldens both ways and requires
-  identical output.
+  read-write, switched read-execute, and released by `destroy`), and
+  compute programs into 8 consecutive invocations per batch (see
+  `run_compute` above for which ones). Compute shaders with `barrier()` or
+  atomics in workgroups of more than 8 invocations, other targets,
+  machines without AVX2, environments that refuse executable memory
+  (`PROT_EXEC`), and builds with `-define:OKSL_JIT=false` run on the
+  64-lane interpreter with the same results, apart from NaN bit patterns,
+  values computed in lanes that aren't running and, in compute, the
+  outcome of unsynchronized accesses (all undefined on GPUs too), and one
+  open case: `clamp` of a negative zero at a zero bound
+  (`clamp(-0.0, 0.0, x)`) gives `+0.0` in the JIT and `-0.0` in the
+  interpreter (IEEE 754 allows either sign for `max(-0.0, 0.0)`). CI runs
+  the tests and goldens both ways and requires identical output.
 - **Uniform work:** what follows from constants and uniforms alone moves
   to the front of the program and runs once per run, before the batches,
   even from inside loops and branches: a raymarcher's `rot(iTime)` is
@@ -815,11 +845,12 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 ## Limitations
 
 - **Stages:** fragment, GLSL vertex and GLSL compute shaders, on the GPU
-  and the CPU (`run_vertex`, `run_fragment`, `run_compute`). Compute runs on
-  the 64-lane interpreter rather than the AVX2 JIT, caps `shared` workgroup
-  memory at 16,384 bytes (the GLSL ES 3.10 minimum), and omits `atomic_uint`
-  counters (Vulkan disallows SPIR-V's `AtomicStorage` capability) and
-  `imageAtomic*` (outside GLSL ES 3.10 core). Storage images and
+  and the CPU (`run_vertex`, `run_fragment`, `run_compute`). Compute shaders
+  with `barrier()` or atomics in workgroups of more than 8 invocations run on
+  the 64-lane interpreter rather than the AVX2 JIT. Compute caps `shared`
+  workgroup memory at 16,384 bytes (the GLSL ES 3.10 minimum), and omits
+  `atomic_uint` counters (Vulkan disallows SPIR-V's `AtomicStorage`
+  capability) and `imageAtomic*` (outside GLSL ES 3.10 core). Storage images and
   writable storage buffers are compute-only. Programs run their passes as
   fragment shaders and the host owns the float targets and swaps them each
   frame. GLSL shaders have no `gl_FragDepth` or `gl_InstanceID` (draw

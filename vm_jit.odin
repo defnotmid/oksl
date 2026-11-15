@@ -37,6 +37,9 @@ jit_run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, cou
 @(private)
 jit_run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, targets: [][][4]f32, shaded: []Quad_Lanes, scratch: ^Scratch, opts: Run_Options, sample_masks: []u32) {}
 
+@(private)
+jit_run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, start, end: int, scratch: ^Scratch, opts: Run_Options) {}
+
 } else {
 
 JIT_LANES :: 8
@@ -58,6 +61,22 @@ Jit_Ctx :: struct {
 	buf_ptr:  [4][^]u32,
 	buf_len:  [4]uint,
 	host_ctx: runtime.Context,
+	// Compute: the workgroup's shared memory (Program.shared_words) and the
+	// storage images (Run_Options.images).
+	shared:   [^]u32,
+	imgs:     [IMAGE_COUNT]Jit_Img,
+}
+
+// A storage image as generated code reads it: width and height biased by 2^31
+// (unsigned compares as signed), the row stride in bytes. The runner keeps
+// every image's data under 2^31 bytes, so texel byte offsets fit the gathers'
+// signed 32-bit indices.
+@(private)
+Jit_Img :: struct {
+	ptr:    [^]u8,
+	wb, hb: u32,
+	stride: u32,
+	_:      u32,
 }
 
 #assert(size_of(Chan_Img) == size_of(Jit_Slot))
@@ -90,6 +109,8 @@ Jit_Tables :: struct #align(32) {
 	f2u_hi:     [8]f32,
 	half_f:     [8]f32,
 	i32_max_f:  [8]f32,
+	f255:       [8]f32,
+	byte_mask:  [8]u32,
 	two52_d:    [4]u64,
 }
 
@@ -128,6 +149,8 @@ init_jit :: proc "contextless" () {
 	jit_tables.f2i_hi = 2147483648.0
 	jit_tables.f2u_hi = 4294967296.0
 	jit_tables.two52_d = 0x4330_0000_0000_0000
+	jit_tables.f255 = 255.0
+	jit_tables.byte_mask = 0xFF
 
 	max_id, _, _, _ := intrinsics.x86_cpuid(0, 0)
 	if max_id < 7 {
@@ -230,6 +253,16 @@ OFF_CTX_BUF_PTR :: i32(offset_of(Jit_Ctx, buf_ptr))
 OFF_CTX_BUF_LEN :: i32(offset_of(Jit_Ctx, buf_len))
 @(private)
 OFF_CTX_LANES :: i32(offset_of(Jit_Ctx, lanes))
+@(private)
+OFF_CTX_IMGS :: i32(offset_of(Jit_Ctx, imgs))
+@(private)
+OFF_IMG_PTR :: i32(offset_of(Jit_Img, ptr))
+@(private)
+OFF_IMG_WB :: i32(offset_of(Jit_Img, wb))
+@(private)
+OFF_IMG_HB :: i32(offset_of(Jit_Img, hb))
+@(private)
+OFF_IMG_STRIDE :: i32(offset_of(Jit_Img, stride))
 
 @(private)
 OFF_CHAN_PTR :: i32(offset_of(Chan_Img, ptr))
@@ -288,6 +321,10 @@ OFF_TAB_F2I_HI :: i32(offset_of(Jit_Tables, f2i_hi))
 OFF_TAB_F2U_HI :: i32(offset_of(Jit_Tables, f2u_hi))
 @(private)
 OFF_TAB_TWO52_D :: i32(offset_of(Jit_Tables, two52_d))
+@(private)
+OFF_TAB_F255 :: i32(offset_of(Jit_Tables, f255))
+@(private)
+OFF_TAB_BYTE :: i32(offset_of(Jit_Tables, byte_mask))
 
 @(private)
 emit_b :: #force_inline proc(buf: ^[dynamic]u8, b0: u8) {
@@ -461,6 +498,13 @@ vcmpps :: #force_inline proc(buf: ^[dynamic]u8, dst, a, b, pred: u8) {
 vcmpps_tab :: #force_inline proc(buf: ^[dynamic]u8, dst, a: u8, tab_off: i32, pred: u8) {
 	emit_vex_rm(buf, 1, 0, 1, 0, 0xC2, dst, a, GPR_R14, tab_off)
 	append(buf, pred)
+}
+
+// vpslld (ext 6), vpsrld (ext 2) or vpsrad (ext 4) dst, src, imm.
+@(private)
+vshift_imm :: #force_inline proc(buf: ^[dynamic]u8, ext, dst, src, imm: u8) {
+	emit_vex_rr(buf, 1, 1, 1, 0, 0x72, ext, dst, src)
+	append(buf, imm)
 }
 
 @(private)
@@ -1091,12 +1135,16 @@ copy_to_dst :: proc(e: ^Jit_Emitter, slot: i32, src: u8, pinned: u8 = 0, no_alia
 }
 
 @(private)
-is_helper_instr :: proc(in_: Instr) -> bool {
+is_helper_instr :: proc(p: ^Program, in_: Instr) -> bool {
 	#partial switch in_.op {
+	case .Image_Load:
+		return p.image_formats[in_.k] == .Rgba16f
 	case .Store_Dyn,
 	     .Faceforward, .Refract,
 	     .Determinant, .Inverse,
-	     .Texture_Size:
+	     .Texture_Size,
+	     .Store_Buf, .Image_Store, .Image_Size,
+	     .Load_Shared, .Store_Shared, .Atomic_Shared, .Atomic_Buf:
 		return true
 	case .Load_Dyn:
 		return int(in_.n) > 4
@@ -1105,7 +1153,7 @@ is_helper_instr :: proc(in_: Instr) -> bool {
 	case .F_Fn1:
 		#partial switch Builtin(in_.k) {
 		case .Radians, .Degrees, .Sqrt, .Inversesqrt,
-		     .Floor, .Ceil, .Fract, .Trunc, .Round_Even,
+		     .Floor, .Ceil, .Fract, .Trunc, .Round, .Round_Even,
 		     .Abs, .Sign, .Isnan, .Isinf:
 			return false
 		}
@@ -1155,6 +1203,33 @@ instr_read_write :: proc(in_: Instr) -> (writes: Slots, full_write: bool, reads:
 	case .Mask_Cond:
 		reads[0] = {in_.b, 1}
 		return {}, false, reads
+	case .Store_Buf:
+		reads[0] = {in_.a, 1}
+		reads[1] = {in_.b, n}
+		return {}, false, reads
+	case .Image_Load:
+		reads[0] = {in_.a, 2}
+		return {in_.dst, 4}, true, reads
+	case .Image_Store:
+		reads[0] = {in_.a, 2}
+		reads[1] = {in_.b, 4}
+		return {}, false, reads
+	case .Load_Shared:
+		if in_.k != 0 {
+			reads[0] = {in_.a, 1}
+		}
+		return {in_.dst, n}, true, reads
+	case .Store_Shared:
+		reads[0] = {in_.a, n}
+		if in_.k != 0 {
+			reads[1] = {in_.b, 1}
+		}
+		return {}, false, reads
+	case .Atomic_Shared, .Atomic_Buf:
+		reads[0] = {in_.a, 1}
+		reads[1] = {in_.b, 1}
+		reads[2] = {in_.c, 1}
+		return {in_.dst, 1}, true, reads
 	}
 	return {}, false, reads
 }
@@ -1247,8 +1322,6 @@ jit_help_fn1 :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_chec
 			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Exp2)}
 		case .Log2:
 			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Log2)}
-		case .Round:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Round)}
 		}
 	}
 }
@@ -1535,7 +1608,318 @@ jit_help_load_buf :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds
 	}
 }
 
+// Compute memory ops: the interpreter's lane kernels (vm_run.odin) over 8 lanes,
+// in ascending lane order.
+
+@(private)
+jit_help_store_buf :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
+	if exec == 0 || int(in_.k) >= len(ctx.opts.buffers) {
+		return
+	}
+	store_buf_lanes(ctx.slots, ctx.opts.buffers[in_.k], in_^, exec)
+}
+
+@(private)
+jit_help_image_load :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
+	image_load_lanes(ctx.slots, &ctx.opts.images[in_.k], in_^, exec)
+}
+
+@(private)
+jit_help_image_store :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
+	image_store_lanes(ctx.slots, &ctx.opts.images[in_.k], in_^, exec)
+}
+
+@(private)
+jit_help_image_size :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
+	w, h: i32
+	if int(in_.k) < len(ctx.opts.images) {
+		im := ctx.opts.images[in_.k]
+		w, h = i32(max(im.width, 0)), i32(max(im.height, 0))
+	}
+	ctx.slots[in_.dst] = u32(w)
+	ctx.slots[in_.dst + 1] = u32(h)
+}
+
+@(private)
+jit_help_load_shared :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
+	slots, sh := ctx.slots, ctx.shared
+	dst, c := in_.dst, in_.c
+	if in_.k == 0 {
+		for i in 0 ..< i32(in_.n) {
+			slots[dst + i] = sh[c + i]
+		}
+		return
+	}
+	off := &slots[in_.a]
+	for i in 0 ..< i32(in_.n) {
+		d := &slots[dst + i]
+		for l in 0 ..< JIT_LANES {
+			d[l] = sh[c + i + i32(off[l])]
+		}
+	}
+}
+
+@(private)
+jit_help_store_shared :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
+	store_shared_lanes(ctx.slots, ctx.shared, in_^, exec)
+}
+
+@(private)
+jit_help_atomic_shared :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
+	atomic_shared_lanes(ctx.slots, ctx.shared, in_^, exec)
+}
+
+@(private)
+jit_help_atomic_buf :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
+	words := ctx.opts.buffers[in_.d] if int(in_.d) < len(ctx.opts.buffers) else nil
+	atomic_buf_lanes(ctx.slots, words, in_^, exec)
+}
+
 // ---- IR -> AVX2 lowering ----------------------------------------------------------------
+
+// Whether nothing reads `slot` after this instruction writes it.
+@(private)
+dead_write :: #force_inline proc(e: ^Jit_Emitter, slot: i32) -> bool {
+	return write_lu(e, slot) <= e.pc && !need_mem_write(e, slot)
+}
+
+// Store_Dyn (its own basic block, so its operands are in memory): where every
+// lane has the same offset (a loop counter's index), masked blends into the
+// element's slots; otherwise jit_help_store_dyn.
+@(private)
+emit_store_dyn :: proc(e: ^Jit_Emitter, code: []Instr, pc: int) {
+	in_ := code[pc]
+	n := i32(in_.n)
+	if n > 4 {
+		emit_helper_call(&e.buf, jit_help_store_dyn, &code[pc])
+		return
+	}
+	yoff := read_slot(e, in_.b, 6)
+	emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x58, 4, 0, yoff)    // vpbroadcastd ymm4, xmm(yoff)
+	vop_d(&e.buf, 0x76, 4, 4, yoff)
+	emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x50, GPR_RDX, 0, 4) // vmovmskps edx, ymm4
+	emit_bytes(&e.buf, 0x81, 0xFA, 0xFF, 0x00, 0x00, 0x00)
+	emit_bytes(&e.buf, 0x0F, 0x85) // jne divergent
+	div_patch := len(e.buf)
+	emit_i32(&e.buf, 0)
+	emit_vex_rr(&e.buf, 1, 1, 0, 0, 0x7E, yoff, 0, GPR_RAX) // vmovd eax, xmm(yoff)
+	emit_bytes(&e.buf, 0x48, 0xC1, 0xE0, 0x05)              // shl rax, 5 (off * 32)
+	ym := ensure_exec_ymask(e)
+	for i in 0 ..< n {
+		ya := read_slot(e, in_.a + i, 1)
+		emit_vex_sib(&e.buf, 1, 0, 1, 0, 0x28, 2, 0, GPR_RBX, GPR_RAX, 0, (in_.dst + i) * 32) // vmovaps ymm2, [rbx + rax + slot]
+		vpblendvb(&e.buf, 2, 2, ya, ym)
+		emit_vex_sib(&e.buf, 1, 0, 1, 0, 0x29, 2, 0, GPR_RBX, GPR_RAX, 0, (in_.dst + i) * 32)
+	}
+	emit_b(&e.buf, 0xE9) // jmp done
+	done_patch := len(e.buf)
+	emit_i32(&e.buf, 0)
+	patch_i32(e.buf[:], div_patch, i32(len(e.buf) - (div_patch + 4)))
+	emit_helper_call(&e.buf, jit_help_store_dyn, &code[pc])
+	patch_i32(e.buf[:], done_patch, i32(len(e.buf) - (done_patch + 4)))
+}
+
+// Store_Buf (its own basic block, so its operands are in memory) of up to 4
+// words into one of the first 4 buffers: lane by lane in ascending order over
+// the running lanes, as store_buf_lanes does, words past the buffer dropped.
+// buffer_stores splits a std430 element (scalars, vectors and structs of them)
+// into scalars and vectors, so n is 1 to 4 and the stride at least 1 word.
+@(private)
+emit_store_buf :: proc(e: ^Jit_Emitter, in_: Instr) {
+	n := i32(in_.n)
+	k := i32(in_.k)
+	emit_bytes(&e.buf, 0x48, 0x8B) // mov rsi, [rbp + buf_ptr[k]]
+	emit_modrm_mem(&e.buf, GPR_RSI, GPR_RBP, OFF_CTX_BUF_PTR + k * 8)
+	emit_bytes(&e.buf, 0x48, 0x8B) // mov rcx, [rbp + buf_len[k]]
+	emit_modrm_mem(&e.buf, GPR_RCX, GPR_RBP, OFF_CTX_BUF_LEN + k * 8)
+	emit_bytes(&e.buf, 0x44, 0x89, 0xEA) // mov edx, r13d
+	emit_bytes(&e.buf, 0x85, 0xD2)       // test edx, edx
+	emit_bytes(&e.buf, 0x0F, 0x84)       // jz done
+	done_patch := len(e.buf)
+	emit_i32(&e.buf, 0)
+	loop_top := len(e.buf)
+	emit_bytes(&e.buf, 0x0F, 0xBC, 0xC2) // bsf eax, edx
+	emit_b(&e.buf, 0x8B)                 // mov edi, [rbx + rax*4 + a*32]
+	emit_modrm_sib(&e.buf, GPR_RDI, GPR_RBX, GPR_RAX, 2, in_.a * 32)
+	stride, word := u32(in_.c), u32(in_.d)
+	if stride != 1 {
+		emit_bytes(&e.buf, 0x69, 0xFF) // imul edi, edi, stride
+		emit_u32(&e.buf, stride)
+	}
+	if word != 0 {
+		emit_bytes(&e.buf, 0x81, 0xC7) // add edi, word
+		emit_u32(&e.buf, word)
+	}
+	for i in 0 ..< n {
+		if i == 0 {
+			emit_bytes(&e.buf, 0x41, 0x89, 0xF8) // mov r8d, edi
+		} else {
+			emit_bytes(&e.buf, 0x44, 0x8D, 0x47, u8(i)) // lea r8d, [rdi + i] (32-bit wrap)
+		}
+		emit_bytes(&e.buf, 0x49, 0x39, 0xC8) // cmp r8, rcx
+		emit_b(&e.buf, 0x73)                 // jae skip
+		skip_patch := len(e.buf)
+		emit_b(&e.buf, 0)
+		emit_bytes(&e.buf, 0x44, 0x8B) // mov r9d, [rbx + rax*4 + (b + i)*32]
+		emit_modrm_sib(&e.buf, 9, GPR_RBX, GPR_RAX, 2, (in_.b + i) * 32)
+		emit_bytes(&e.buf, 0x46, 0x89, 0x0C, 0x86) // mov [rsi + r8*4], r9d
+		e.buf[skip_patch] = u8(len(e.buf) - (skip_patch + 1))
+	}
+	emit_bytes(&e.buf, 0x44, 0x8D, 0x52, 0xFF) // lea r10d, [rdx - 1]
+	emit_bytes(&e.buf, 0x44, 0x21, 0xD2)       // and edx, r10d
+	emit_bytes(&e.buf, 0x0F, 0x85)             // jnz loop_top
+	emit_i32(&e.buf, i32(loop_top - (len(e.buf) + 4)))
+	patch_i32(e.buf[:], done_patch, i32(len(e.buf) - (done_patch + 4)))
+}
+
+// Image_Load of a 4- or 16-byte texel format (rgba8, r32f, r32ui, r32i,
+// rgba32f) with AVX2 gathers, as image_load_fmt does it: running lanes in
+// bounds read their texel, the others 0.
+@(private)
+emit_image_load :: proc(e: ^Jit_Emitter, in_: Instr, fmt: Image_Format) {
+	dst := in_.dst
+	emit_image_addr(e, in_, fmt)
+	if fmt == .Rgba32f {
+		for i in i32(0) ..< 4 {
+			if dead_write(e, dst + i) {
+				continue
+			}
+			yd := prep_dst(e, dst + i, 3)
+			vmovaps_rr(&e.buf, 6, 2)
+			vzero(&e.buf, yd)
+			emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x90, yd, 6, GPR_RSI, 4, 0, i * 4) // vpgatherdd yd, [rsi + ymm4 + 4i], ymm6
+			commit_dst(e, dst + i, yd)
+		}
+		return
+	}
+	vmovaps_rr(&e.buf, 6, 2)
+	vzero(&e.buf, 0)
+	emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x90, 0, 6, GPR_RSI, 4, 0, 0) // vpgatherdd ymm0, [rsi + ymm4], ymm6
+	if fmt == .Rgba8 {
+		// f32(byte) / 255 rounds exactly as UNORM8_TO_F32 (test_jit_image_load_rgba8_lut).
+		for i in i32(0) ..< 4 {
+			if dead_write(e, dst + i) {
+				continue
+			}
+			yd := prep_dst(e, dst + i, 3)
+			src := u8(0)
+			if i > 0 {
+				vshift_imm(&e.buf, 2, yd, 0, u8(8 * i))
+				src = yd
+			}
+			if i < 3 {
+				vop_d_tab(&e.buf, 0xDB, yd, src, OFF_TAB_BYTE)
+			}
+			emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x5B, yd, 0, yd) // vcvtdq2ps
+			vop_ps_tab(&e.buf, 0x5E, yd, yd, OFF_TAB_F255)
+			commit_dst(e, dst + i, yd)
+		}
+		return
+	}
+	// Single-channel formats: (texel, 0, 0, 1) in bounds.
+	if !dead_write(e, dst) {
+		copy_to_dst(e, dst, 0)
+	}
+	for i in i32(1) ..< 3 {
+		if dead_write(e, dst + i) {
+			continue
+		}
+		yd := prep_dst(e, dst + i, 3)
+		vzero(&e.buf, yd)
+		commit_dst(e, dst + i, yd)
+	}
+	if !dead_write(e, dst + 3) {
+		yd := prep_dst(e, dst + 3, 3)
+		vop_d_tab(&e.buf, 0xDB, yd, 2, OFF_TAB_ONE_F if fmt == .R32f else OFF_TAB_ONE_U)
+		commit_dst(e, dst + 3, yd)
+	}
+}
+
+// Image_Store (its own basic block, so its operands are in memory) of a 4- or
+// 16-byte texel format: offsets and rgba8 texels computed 8 lanes at once,
+// then stored lane by lane in ascending order over the running lanes in
+// bounds, as image_store_fmt does it.
+@(private)
+emit_image_store :: proc(e: ^Jit_Emitter, in_: Instr, fmt: Image_Format) {
+	b := in_.b
+	emit_image_addr(e, in_, fmt)
+	emit_bytes(&e.buf, 0x48, 0x83, 0xEC, 64)           // sub rsp, 64
+	emit_vex_rm(&e.buf, 1, 2, 1, 0, 0x7F, 4, 0, GPR_RSP, 0) // vmovdqu [rsp], ymm4
+	if fmt == .Rgba8 {
+		// round(min(max(v, 0), 1) * 255) per channel (NaN to 0), packed.
+		vzero(&e.buf, 5)
+		for i in i32(0) ..< 4 {
+			y := read_slot(e, b + i, 1)
+			vop_ps(&e.buf, 0x5F, 1, y, 5)                    // max(v, 0): NaN gives the second operand, 0
+			vop_ps_tab(&e.buf, 0x5D, 1, 1, OFF_TAB_ONE_F)
+			vop_ps_tab(&e.buf, 0x59, 1, 1, OFF_TAB_F255)
+			vroundps(&e.buf, 3, 1, 0x0B)                     // t = trunc(x), x >= 0
+			vop_ps(&e.buf, 0x5C, 1, 1, 3)                    // x - t
+			vcmpps_tab(&e.buf, 1, 1, OFF_TAB_HALF_F, 0x1D)   // >= 0.5
+			vop_ps_tab(&e.buf, 0x54, 1, 1, OFF_TAB_ONE_F)
+			vop_ps(&e.buf, 0x58, 3, 3, 1)                    // t + 1 where rounding up
+			emit_vex_rr(&e.buf, 1, 2, 1, 0, 0x5B, 3, 0, 3)   // vcvttps2dq
+			if i == 0 {
+				vmovaps_rr(&e.buf, 0, 3)
+			} else {
+				vshift_imm(&e.buf, 6, 3, 3, u8(8 * i))
+				vop_d(&e.buf, 0xEB, 0, 0, 3)
+			}
+		}
+		emit_vex_rm(&e.buf, 1, 2, 1, 0, 0x7F, 0, 0, GPR_RSP, 32) // vmovdqu [rsp + 32], ymm0
+	}
+	emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x50, GPR_RDX, 0, 2) // vmovmskps edx, ymm2
+	emit_bytes(&e.buf, 0x85, 0xD2)                       // test edx, edx
+	emit_bytes(&e.buf, 0x0F, 0x84)                       // jz done
+	done_patch := len(e.buf)
+	emit_i32(&e.buf, 0)
+	loop_top := len(e.buf)
+	emit_bytes(&e.buf, 0x0F, 0xBC, 0xC2) // bsf eax, edx
+	emit_b(&e.buf, 0x8B)                 // mov ecx, [rsp + rax*4]
+	emit_modrm_sib(&e.buf, GPR_RCX, GPR_RSP, GPR_RAX, 2, 0)
+	words := 4 if fmt == .Rgba32f else 1
+	for i in 0 ..< words {
+		emit_bytes(&e.buf, 0x44, 0x8B) // mov r9d, [rsp + 32 + rax*4] or [rbx + rax*4 + (b + i)*32]
+		if fmt == .Rgba8 {
+			emit_modrm_sib(&e.buf, 9, GPR_RSP, GPR_RAX, 2, 32)
+		} else {
+			emit_modrm_sib(&e.buf, 9, GPR_RBX, GPR_RAX, 2, (b + i32(i)) * 32)
+		}
+		emit_bytes(&e.buf, 0x44, 0x89) // mov [rsi + rcx + 4i], r9d
+		emit_modrm_sib(&e.buf, 9, GPR_RSI, GPR_RCX, 0, i32(i) * 4)
+	}
+	emit_bytes(&e.buf, 0x44, 0x8D, 0x52, 0xFF) // lea r10d, [rdx - 1]
+	emit_bytes(&e.buf, 0x44, 0x21, 0xD2)       // and edx, r10d
+	emit_bytes(&e.buf, 0x0F, 0x85)             // jnz loop_top
+	emit_i32(&e.buf, i32(loop_top - (len(e.buf) + 4)))
+	patch_i32(e.buf[:], done_patch, i32(len(e.buf) - (done_patch + 4)))
+	emit_bytes(&e.buf, 0x48, 0x83, 0xC4, 64) // add rsp, 64
+}
+
+// rsi = image k's data, ymm2 = the running lanes whose (a, a + 1) is in
+// bounds, ymm4 = their texels' byte offsets (y * stride + x * texel bytes).
+@(private)
+emit_image_addr :: proc(e: ^Jit_Emitter, in_: Instr, fmt: Image_Format) {
+	a := in_.a
+	disp := OFF_CTX_IMGS + i32(in_.k) * size_of(Jit_Img)
+	yx := read_slot(e, a, 0)
+	yy := read_slot(e, a + 1, 1, pin_bit(yx))
+	ym := ensure_exec_ymask(e)
+	emit_bytes(&e.buf, 0x48, 0x8B) // mov rsi, [rbp + img.ptr]
+	emit_modrm_mem(&e.buf, GPR_RSI, GPR_RBP, disp + OFF_IMG_PTR)
+	vop_d_tab(&e.buf, 0xEF, 2, yx, OFF_TAB_SIGN) // x ^ 2^31
+	vpbroadcastd_mem(&e.buf, 3, GPR_RBP, disp + OFF_IMG_WB)
+	vop_d(&e.buf, 0x66, 2, 3, 2)                 // u32(x) < width
+	vop_d_tab(&e.buf, 0xEF, 4, yy, OFF_TAB_SIGN)
+	vpbroadcastd_mem(&e.buf, 3, GPR_RBP, disp + OFF_IMG_HB)
+	vop_d(&e.buf, 0x66, 4, 3, 4)                 // u32(y) < height
+	vop_d(&e.buf, 0xDB, 2, 2, 4)
+	vop_d(&e.buf, 0xDB, 2, 2, ym)                // ymm2 = in bounds and running
+	vpbroadcastd_mem(&e.buf, 3, GPR_RBP, disp + OFF_IMG_STRIDE)
+	vop38_d(&e.buf, 0x40, 4, yy, 3)              // y * stride
+	vshift_imm(&e.buf, 6, 5, yx, 4 if fmt == .Rgba32f else 2)
+	vop_d(&e.buf, 0xFE, 4, 4, 5)                 // ymm4 = texel byte offset
+}
 
 @(private)
 Jump_Patch :: struct {
@@ -1850,7 +2234,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			bb_start[pc + 1] = true
 		} else if in_.op == .Mask_Kill {
 			bb_start[pc + 1] = true
-		} else if is_helper_instr(in_) {
+		} else if is_helper_instr(p, in_) {
 			bb_start[pc] = true
 			bb_start[pc + 1] = true
 		}
@@ -2212,7 +2596,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			}
 
 		case .Store_Dyn:
-			emit_helper_call(&e.buf, jit_help_store_dyn, &code[pc])
+			emit_store_dyn(e, code, pc)
 
 		case .F_Add, .F_Sub, .F_Mul, .F_Div:
 			op_byte: u8 = 0x58
@@ -2684,6 +3068,22 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					ya := read_slot(e, a + i, 1)
 					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
 					vroundps(&e.buf, yd, ya, mode)
+					commit_dst(e, dst + i, yd)
+				}
+			case .Round:
+				// Half away from zero, as math.round: t = trunc(x), and where
+				// |x - t| >= 0.5 (exact), t + copysign(1, x); NaN and inf keep t.
+				for i in 0 ..< n {
+					ya := read_slot(e, a + i, 1)
+					vroundps(&e.buf, 2, ya, 0x0B)
+					vop_ps(&e.buf, 0x5C, 3, ya, 2)                   // x - t
+					vop_ps_tab(&e.buf, 0x54, 3, 3, OFF_TAB_ABS)
+					vcmpps_tab(&e.buf, 3, 3, OFF_TAB_HALF_F, 0x1D)   // |x - t| >= 0.5 (GE_OQ)
+					vop_ps_tab(&e.buf, 0x54, 4, ya, OFF_TAB_SIGN)
+					vop_ps_tab(&e.buf, 0x56, 4, 4, OFF_TAB_ONE_F)    // copysign(1, x)
+					vop_ps(&e.buf, 0x58, 4, 2, 4)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vblendvps(&e.buf, yd, 2, 4, 3)
 					commit_dst(e, dst + i, yd)
 				}
 			case .Fract:
@@ -3181,6 +3581,13 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				}
 			}
 			fn := jit_help_texel_fetch if in_.op == .Texel_Fetch else jit_help_texture
+			if p.stage == .Compute {
+				// No quads: the callback runs for the running lanes only, as in
+				// the interpreter (the helpers call it for ctx.lanes, which
+				// nothing else reads after the prologue in compute).
+				emit_bytes(&e.buf, 0x44, 0x88) // mov byte [rbp + lanes], r13b
+				emit_modrm_mem(&e.buf, GPR_R13, GPR_RBP, OFF_CTX_LANES)
+			}
 			if n_save == 0 {
 				emit_helper_call(&e.buf, fn, &code[pc])
 			} else if n_save <= 2 {
@@ -3453,7 +3860,37 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			append(&e.patches, Jump_Patch{len(e.buf), a})
 			emit_i32(&e.buf, 0)
 
-		case .Store_Buf, .Image_Load, .Image_Store, .Image_Size, .Load_Shared, .Store_Shared, .Atomic_Shared, .Atomic_Buf, .Barrier:
+		case .Store_Buf:
+			if in_.k >= 4 {
+				emit_helper_call(&e.buf, jit_help_store_buf, &code[pc])
+			} else {
+				emit_store_buf(e, in_)
+			}
+		case .Image_Load:
+			if p.image_formats[in_.k] == .Rgba16f {
+				emit_helper_call(&e.buf, jit_help_image_load, &code[pc])
+			} else {
+				emit_image_load(e, in_, p.image_formats[in_.k])
+			}
+		case .Image_Store:
+			if p.image_formats[in_.k] == .Rgba16f {
+				emit_helper_call(&e.buf, jit_help_image_store, &code[pc])
+			} else {
+				emit_image_store(e, in_, p.image_formats[in_.k])
+			}
+		case .Image_Size:
+			emit_helper_call(&e.buf, jit_help_image_size, &code[pc])
+		case .Load_Shared:
+			emit_helper_call(&e.buf, jit_help_load_shared, &code[pc])
+		case .Store_Shared:
+			emit_helper_call(&e.buf, jit_help_store_shared, &code[pc])
+		case .Atomic_Shared:
+			emit_helper_call(&e.buf, jit_help_atomic_shared, &code[pc])
+		case .Atomic_Buf:
+			emit_helper_call(&e.buf, jit_help_atomic_buf, &code[pc])
+		case .Barrier:
+			// Only compiled when one batch is the whole workgroup (jit_compute_eligible),
+			// where every lane reaches it together: nothing to wait for.
 		}
 	}
 
@@ -3643,9 +4080,35 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 	}
 }
 
+// Whether a compute program runs in the JIT. Its 8-lane batches run each
+// workgroup batch by batch, where the interpreter runs 64-lane chunks
+// instruction by instruction, so only results that do not depend on the order
+// between invocations of a workgroup are the same: a workgroup of at most 8
+// invocations is one batch, in the interpreter's order, so barriers are no-ops
+// and atomics apply in the same order; larger ones run here only without
+// barrier() (which needs every batch to reach it before any passes) and
+// without atomics (whose returned values and non-commutative results follow
+// the order lanes apply them).
+@(private)
+jit_compute_eligible :: proc(p: ^Program) -> bool {
+	ls := [3]u32{max(p.local_size[0], 1), max(p.local_size[1], 1), max(p.local_size[2], 1)}
+	if ls.x * ls.y * ls.z <= JIT_LANES {
+		return true
+	}
+	if p.has_barrier {
+		return false
+	}
+	for in_ in p.code {
+		if in_.op == .Atomic_Shared || in_.op == .Atomic_Buf {
+			return false
+		}
+	}
+	return true
+}
+
 @(private)
 jit_compile :: proc(p: ^Program) {
-	if !jit_avx2_ready || len(p.code) == 0 || p.stage == .Compute {
+	if !jit_avx2_ready || len(p.code) == 0 || (p.stage == .Compute && !jit_compute_eligible(p)) {
 		return
 	}
 	heap := runtime.default_allocator()
@@ -3725,7 +4188,7 @@ jit_compile :: proc(p: ^Program) {
 			if in_.k + 1 > meta.num_chans {
 				meta.num_chans = in_.k + 1
 			}
-		case .Load_Buf:
+		case .Load_Buf, .Store_Buf:
 			if in_.k < 4 && in_.k + 1 > meta.num_buf_binds {
 				meta.num_buf_binds = in_.k + 1
 			}
@@ -4463,6 +4926,114 @@ jit_run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, tar
 			}
 		} else {
 			jit_write_fragment_slow(meta, slots, quads, targets, shaded, sample_masks, first, 1, alive)
+		}
+	}
+}
+
+// Runs workgroups [start, end) of a compute dispatch (run_compute validated the
+// options and the range): each workgroup's invocations in 8-lane batches of
+// consecutive gl_LocalInvocationIndex, the last batch partial.
+@(private, enable_target_feature = "avx2")
+jit_run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, start, end: int, scratch: ^Scratch, opts: Run_Options) #no_bounds_check {
+	opts_local := opts
+	ctx := jit_begin(p, scratch, uniforms, &opts_local)
+	slots := ctx.slots
+	masks := ctx.masks
+	body_fn := Jit_Fn(p.jit_body)
+	shared: []u32
+	if p.shared_words > 0 {
+		if len(scratch.shared) < p.shared_words {
+			resize(&scratch.shared, p.shared_words)
+		}
+		shared = scratch.shared[:p.shared_words]
+		ctx.shared = raw_data(shared)
+	}
+	for im, i in opts.images[:len(p.image_formats)] {
+		tb := image_texel_bytes(im.format)
+		ctx.imgs[i] = {
+			ptr    = raw_data(im.data),
+			wb     = u32(max(im.width, 0)) ~ 0x8000_0000,
+			hb     = u32(max(im.height, 0)) ~ 0x8000_0000,
+			stride = u32(im.stride if im.stride != 0 else im.width * tb),
+		}
+	}
+	ls := [3]u32{max(p.local_size[0], 1), max(p.local_size[1], 1), max(p.local_size[2], 1)}
+	local_total := int(ls.x * ls.y * ls.z)
+	n_batches := (local_total + JIT_LANES - 1) / JIT_LANES
+
+	// Each batch's gl_LocalInvocationID (x, y, z) and gl_LocalInvocationIndex,
+	// once per run; lanes past the workgroup read 0 as in the interpreter.
+	local: [1024 / JIT_LANES][4]Jit_Slot = ---
+	{
+		i := 0
+		for lz in 0 ..< ls.z {
+			for ly in 0 ..< ls.y {
+				for lx in 0 ..< ls.x {
+					local[i / JIT_LANES][0][i % JIT_LANES] = lx
+					local[i / JIT_LANES][1][i % JIT_LANES] = ly
+					local[i / JIT_LANES][2][i % JIT_LANES] = lz
+					i += 1
+				}
+			}
+		}
+		for j in 0 ..< n_batches * JIT_LANES {
+			if j >= local_total {
+				for k in 0 ..< 3 {
+					local[j / JIT_LANES][k][j % JIT_LANES] = 0
+				}
+			}
+			local[j / JIT_LANES][3][j % JIT_LANES] = u32(j)
+		}
+	}
+	lid_slot, lidx_slot, gid_slot, wg_slot := i32(-1), i32(-1), i32(-1), i32(-1)
+	for v in p.inputs {
+		#partial switch v.kind {
+		case .Num_Work_Groups:
+			for k in 0 ..< 3 {
+				slots[v.slot + i32(k)] = u32(groups[k])
+			}
+		case .Local_Invocation_ID:
+			lid_slot = v.slot
+		case .Local_Invocation_Index:
+			lidx_slot = v.slot
+		case .Global_Invocation_ID:
+			gid_slot = v.slot
+		case .Work_Group_ID:
+			wg_slot = v.slot
+		}
+	}
+	gx_n := groups.x
+	gxy_n := groups.x * groups.y
+	for g in start ..< end {
+		if len(shared) > 0 {
+			intrinsics.mem_zero(raw_data(shared), len(shared) * size_of(u32))
+		}
+		wg := [3]u32{u32(g % gx_n), u32((g / gx_n) % groups.y), u32(g / gxy_n)}
+		if wg_slot >= 0 {
+			for k in 0 ..< i32(3) {
+				slots[wg_slot + k] = wg[k]
+			}
+		}
+		base_gid := [3]Simd_U8{Simd_U8(wg[0] * ls.x), Simd_U8(wg[1] * ls.y), Simd_U8(wg[2] * ls.z)}
+		for b in 0 ..< n_batches {
+			lb := &local[b]
+			if lid_slot >= 0 {
+				for k in 0 ..< i32(3) {
+					slots[lid_slot + k] = lb[k]
+				}
+			}
+			if lidx_slot >= 0 {
+				slots[lidx_slot] = lb[3]
+			}
+			if gid_slot >= 0 {
+				for k in 0 ..< i32(3) {
+					(^Simd_U8)(&slots[gid_slot + k])^ = intrinsics.unaligned_load((^Simd_U8)(&lb[k])) + base_gid[k]
+				}
+			}
+			lanes := min(local_total - b * JIT_LANES, JIT_LANES)
+			ctx.lanes = u8((u32(1) << uint(lanes)) - 1)
+			masks[MASK_DISCARD] = 0
+			body_fn(&ctx)
 		}
 	}
 }
