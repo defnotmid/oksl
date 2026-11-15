@@ -222,6 +222,8 @@ Program :: struct {
 	shared_words:   int,
 	has_barrier:    bool,
 	image_formats:  []Image_Format,
+	// Packed slot ranges indexed by Load_Dyn or Store_Dyn (`pack_slots`).
+	dyn_slots:      []Slots,
 	// Optional native machine code compiled from `code` (`vm_jit.odin`).
 	jit_mem:  []byte,
 	jit_init: rawptr,
@@ -2529,6 +2531,36 @@ pack_slots :: proc(p: ^Program, blocks: []Slots) {
 			}
 			new_base[bi] = next_pinned + i32(placed)
 		}
+	}
+
+	dyn_bis := make([dynamic]i32, 0, 8, heap)
+	defer delete(dyn_bis)
+	for in_ in p.code {
+		bi := i32(-1)
+		if in_.op == .Load_Dyn {
+			bi = block_of[in_.a]
+		} else if in_.op == .Store_Dyn {
+			bi = block_of[in_.dst]
+		}
+		if bi >= 0 && (last[bi] == -2 || last[bi] >= 0) {
+			seen := false
+			for prev in dyn_bis {
+				if prev == bi {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				append(&dyn_bis, bi)
+			}
+		}
+	}
+	if len(dyn_bis) > 0 {
+		dyn_slots := make([]Slots, len(dyn_bis))
+		for bi, i in dyn_bis {
+			dyn_slots[i] = {new_base[bi], blocks[bi].n}
+		}
+		p.dyn_slots = dyn_slots
 	}
 
 	remap := block_of

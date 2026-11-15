@@ -497,13 +497,22 @@ vpbroadcastd_mem :: #force_inline proc(buf: ^[dynamic]u8, dst, base: u8, disp: i
 	emit_vex_rm(buf, 2, 1, 1, 0, 0x58, dst, 0, base, disp)
 }
 
-// Gathers 1, 2 or 4 float components from `[rsi + yidx*4]` under `ymask` into
-// `ymm0..3`, filling missing components with `(0, 0, 0, 1)` on masked-in lanes.
+// Gathers the live components (`comp_mask` bits 0..3) from 1-, 2-, or 4-component
+// `[rsi + yidx*4]` under `ymask` into `ymm0..3`, filling missing image channels
+// with `(0, 0, 0, 1)` on masked-in lanes.
 @(private)
-emit_chan_gather_rgba :: proc(buf: ^[dynamic]u8, chan_base: u8, chan_disp: i32, yidx, ymask: u8) {
-	vmovaps_rr(buf, 7, ymask)
-	vzero(buf, 0)
-	emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 0, 7, GPR_RSI, yidx, 2, 0)
+emit_chan_gather_rgba :: proc(buf: ^[dynamic]u8, chan_base: u8, chan_disp: i32, yidx, ymask, comp_mask: u8) {
+	if comp_mask == 0 {
+		return
+	}
+	if (comp_mask & 1) != 0 {
+		vmovaps_rr(buf, 7, ymask)
+		vzero(buf, 0)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 0, 7, GPR_RSI, yidx, 2, 0)
+	}
+	if (comp_mask & 0xE) == 0 {
+		return
+	}
 
 	emit_bytes(buf, 0x0F, 0xB6) // movzx ecx, byte [chan_base + chan_disp + OFF_CHAN_COMPS]
 	emit_modrm_mem(buf, GPR_RCX, chan_base, chan_disp + OFF_CHAN_COMPS)
@@ -512,34 +521,56 @@ emit_chan_gather_rgba :: proc(buf: ^[dynamic]u8, chan_base: u8, chan_disp: i32, 
 	comp1_patch := len(buf^)
 	emit_b(buf, 0)
 
-	vmovaps_rr(buf, 7, ymask)
-	vzero(buf, 1)
-	emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 1, 7, GPR_RSI, yidx, 2, 4)
-	emit_b(buf, 0x74) // je comp2
+	if (comp_mask & 2) != 0 {
+		vmovaps_rr(buf, 7, ymask)
+		vzero(buf, 1)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 1, 7, GPR_RSI, yidx, 2, 4)
+	}
+	if (comp_mask & 0xC) == 0 {
+		emit_b(buf, 0xEB) // jmp done
+		end_rg := len(buf^)
+		emit_b(buf, 0)
+		buf[comp1_patch] = u8(len(buf^) - (comp1_patch + 1))
+		vzero(buf, 1)
+		buf[end_rg] = u8(len(buf^) - (end_rg + 1))
+		return
+	}
+
+	emit_b(buf, 0x74) // je comp2 (ZF preserved from cmp ecx, 2)
 	comp2_patch := len(buf^)
 	emit_b(buf, 0)
 
-	vmovaps_rr(buf, 7, ymask)
-	vzero(buf, 2)
-	emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 2, 7, GPR_RSI, yidx, 2, 8)
-	vmovaps_rr(buf, 7, ymask)
-	vzero(buf, 3)
-	emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 3, 7, GPR_RSI, yidx, 2, 12)
+	if (comp_mask & 4) != 0 {
+		vmovaps_rr(buf, 7, ymask)
+		vzero(buf, 2)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 2, 7, GPR_RSI, yidx, 2, 8)
+	}
+	if (comp_mask & 8) != 0 {
+		vmovaps_rr(buf, 7, ymask)
+		vzero(buf, 3)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, 3, 7, GPR_RSI, yidx, 2, 12)
+	}
 	emit_b(buf, 0xEB) // jmp done
 	end_patch := len(buf^)
 	emit_b(buf, 0)
 
 	buf[comp1_patch] = u8(len(buf^) - (comp1_patch + 1))
-	vzero(buf, 1)
+	if (comp_mask & 2) != 0 {
+		vzero(buf, 1)
+	}
 	buf[comp2_patch] = u8(len(buf^) - (comp2_patch + 1))
-	vzero(buf, 2)
-	vop_ps_tab(buf, 0x54, 3, ymask, OFF_TAB_ONE_F)
+	if (comp_mask & 4) != 0 {
+		vzero(buf, 2)
+	}
+	if (comp_mask & 8) != 0 {
+		vop_ps_tab(buf, 0x54, 3, ymask, OFF_TAB_ONE_F)
+	}
 	buf[end_patch] = u8(len(buf^) - (end_patch + 1))
 }
 
 // Internal AVX2 subroutine for bilinear bound-channel taps:
-//   in:  ymm0 = u, ymm1 = v, rsi = im.ptr, rdi = ^Chan_Img
-//   out: ymm0..3 = RGBA; preserves rbp, rbx, r12..r14 and ymm8..15.
+//   in:  ymm0 = u, ymm1 = v, rsi = im.ptr, rdi = ^Chan_Img, dl = comp_mask (bits 0..3)
+//   out: ymm0..3 = live RGBA components; preserves rbp, rbx, r12..r14 and ymm8..15.
 @(private)
 emit_bilinear_sub :: proc(buf: ^[dynamic]u8) {
 	emit_bytes(buf, 0x48, 0x81, 0xEC) // sub rsp, 192
@@ -600,7 +631,14 @@ emit_bilinear_sub :: proc(buf: ^[dynamic]u8) {
 	emit_modrm_mem(buf, GPR_RCX, GPR_RDI, OFF_CHAN_COMPS)
 
 	comp1_patch, comp2_patch := 0, 0
+	done_patches: [3]int
+	n_done := 0
 	for c in 0 ..< i32(4) {
+		emit_bytes(buf, 0xF6, 0xC2, u8(1 << uint(c))) // test dl, (1 << c)
+		emit_bytes(buf, 0x0F, 0x84)                   // jz skip_c
+		skip_patch := len(buf^)
+		emit_i32(buf, 0)
+
 		yd := u8(c)
 		// c00 -> yd, c10 -> ymm4, top -> yd
 		emit_vex_rm(buf, 1, 0, 1, 0, 0x10, 6, 0, GPR_RSP, 0)
@@ -639,19 +677,33 @@ emit_bilinear_sub :: proc(buf: ^[dynamic]u8) {
 		vop_ps(buf, 0x59, 4, 4, 6)
 		vop_ps(buf, 0x58, yd, yd, 4)
 
+		patch_i32(buf[:], skip_patch, i32(len(buf^) - (skip_patch + 4)))
 		if c == 0 {
+			emit_bytes(buf, 0xF6, 0xC2, 0x0E) // test dl, 0x0E
+			emit_bytes(buf, 0x0F, 0x84)       // jz done
+			done_patches[n_done] = len(buf^)
+			n_done += 1
+			emit_i32(buf, 0)
+
 			emit_bytes(buf, 0x83, 0xF9, 0x02) // cmp ecx, 2
 			emit_bytes(buf, 0x0F, 0x82)       // jb comp1
 			comp1_patch = len(buf^)
 			emit_i32(buf, 0)
 		} else if c == 1 {
-			emit_bytes(buf, 0x0F, 0x84) // je comp2 (flags preserved from cmp ecx, 2)
+			emit_bytes(buf, 0xF6, 0xC2, 0x0C) // test dl, 0x0C
+			emit_bytes(buf, 0x0F, 0x84)       // jz done
+			done_patches[n_done] = len(buf^)
+			n_done += 1
+			emit_i32(buf, 0)
+
+			emit_bytes(buf, 0x83, 0xF9, 0x02) // cmp ecx, 2
+			emit_bytes(buf, 0x0F, 0x84)       // je comp2
 			comp2_patch = len(buf^)
 			emit_i32(buf, 0)
 		}
 	}
 	emit_b(buf, 0xEB) // jmp done
-	done_patch := len(buf^)
+	done_short := len(buf^)
 	emit_b(buf, 0)
 
 	patch_i32(buf[:], comp1_patch, i32(len(buf^) - (comp1_patch + 4)))
@@ -660,20 +712,13 @@ emit_bilinear_sub :: proc(buf: ^[dynamic]u8) {
 	vzero(buf, 2)
 	emit_vex_rm(buf, 1, 0, 1, 0, 0x28, 3, 0, GPR_R14, OFF_TAB_ONE_F)
 
-	buf[done_patch] = u8(len(buf^) - (done_patch + 1))
+	buf[done_short] = u8(len(buf^) - (done_short + 1))
+	for dp in done_patches[:n_done] {
+		patch_i32(buf[:], dp, i32(len(buf^) - (dp + 4)))
+	}
 	emit_bytes(buf, 0x48, 0x81, 0xC4) // add rsp, 192
 	emit_u32(buf, 192)
 	emit_b(buf, 0xC3) // ret
-}
-
-@(private)
-emit_load_mask_eax :: proc(buf: ^[dynamic]u8, m: i32) {
-	if m == MASK_EXEC {
-		emit_bytes(buf, 0x44, 0x89, 0xE8) // mov eax, r13d
-	} else {
-		emit_bytes(buf, 0x41, 0x0F, 0xB6) // movzx eax, byte [r12 + m]
-		emit_modrm_mem(buf, GPR_RAX, GPR_R12, m)
-	}
 }
 
 @(private)
@@ -698,13 +743,97 @@ emit_helper_call :: proc(buf: ^[dynamic]u8, fn: Jit_Help_Fn, in_ptr: ^Instr) {
 	emit_bytes(buf, 0xFF, 0xD0)       // call rax
 }
 
+// Internal SysV-bridging subroutine for cold unbound texture callbacks when
+// 3+ `ymm8..15` registers hold live basic-block values:
+//   in:  rbp = ^Jit_Ctx, rsi = ^Instr, r13d = exec, rax = Jit_Help_Fn
+//   out: preserves rbp, rbx, r12..r14 and ymm8..15.
+@(private)
+emit_helper_ymm_sub :: proc(buf: ^[dynamic]u8) {
+	// Entry rsp % 16 == 8 (after `call`); 264 + 8 = 272 == 0 (mod 16) before `call rax`.
+	emit_bytes(buf, 0x48, 0x81, 0xEC) // sub rsp, 264
+	emit_u32(buf, 264)
+	for i in 0 ..< 8 {
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x11, u8(8 + i), 0, GPR_RSP, i32(i * 32))
+	}
+	emit_bytes(buf, 0xC5, 0xF8, 0x77) // vzeroupper
+	emit_bytes(buf, 0x48, 0x89, 0xEF) // mov rdi, rbp
+	emit_bytes(buf, 0x44, 0x89, 0xEA) // mov edx, r13d
+	emit_bytes(buf, 0xFF, 0xD0)       // call rax
+	for i in 0 ..< 8 {
+		emit_vex_rm(buf, 1, 0, 1, 0, 0x10, u8(8 + i), 0, GPR_RSP, i32(i * 32))
+	}
+	emit_bytes(buf, 0x48, 0x81, 0xC4) // add rsp, 264
+	emit_u32(buf, 264)
+	emit_b(buf, 0xC3) // ret
+}
+
+// Internal AVX2 subroutine for cold uniform Load_Buf edge cases (n in 2..4,
+// straddling buf_len or wrapping u32(max)):
+//   in:  rax = u64(u32(w0)), rcx = buf_len, rsi = buf_ptr, edx = n (2..4)
+//   out: ymm0..ymm(n-1) = broadcast or zeroed components; preserves rbp, rbx, r12..r14 and ymm8..15.
+@(private)
+emit_unif_oob_sub :: proc(buf: ^[dynamic]u8) {
+	for i in 0 ..< i32(4) {
+		if i >= 2 {
+			emit_bytes(buf, 0x83, 0xFA, u8(i)) // cmp edx, i
+			emit_bytes(buf, 0x77, 0x01, 0xC3)  // ja +1; ret
+		}
+		if i > 0 {
+			emit_bytes(buf, 0x83, 0xC0, 0x01) // add eax, 1 (32-bit wrap + zero-extend rax)
+		}
+		ui := u8(i)
+		emit_bytes(buf, 0x48, 0x39, 0xC8) // cmp rax, rcx
+		emit_b(buf, 0x73)                 // jae oob
+		oob_p := len(buf^)
+		emit_b(buf, 0)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x18, ui, 0, GPR_RSI, GPR_RAX, 2, 0) // vbroadcastss ymm(i), [rsi + rax*4]
+		emit_b(buf, 0xEB) // jmp next_i
+		next_p := len(buf^)
+		emit_b(buf, 0)
+		buf[oob_p] = u8(len(buf^) - (oob_p + 1))
+		vzero(buf, ui)
+		buf[next_p] = u8(len(buf^) - (next_p + 1))
+	}
+	emit_b(buf, 0xC3) // ret
+}
+
+// Internal AVX2 subroutine for cold divergent Load_Buf gathers on > 2^31-word buffers:
+//   in:  rcx = buf_len (> 2^31), rdx = 0x8000_0000, rsi = buf_ptr, ymm4 = w0, eax = n (1..4)
+//   out: ymm0..ymm(n-1) = gathered components; preserves rbp, rbx, r12..r14 and ymm8..15.
+@(private)
+emit_big_buf_sub :: proc(buf: ^[dynamic]u8) {
+	emit_bytes(buf, 0x48, 0x29, 0xD1) // sub rcx, rdx -> rem in 1..2^31
+	emit_bytes(buf, 0x48, 0x8D)       // lea rdi, [rsi + rdx*4] -> rsi + 8 GiB
+	emit_modrm_sib(buf, GPR_RDI, GPR_RSI, GPR_RDX, 2, 0)
+	emit_vex_rr(buf, 1, 1, 0, 0, 0x6E, 5, 0, GPR_RCX)
+	emit_vex_rr(buf, 2, 1, 1, 0, 0x58, 5, 0, 5)
+	for i in 0 ..< i32(4) {
+		if i > 0 {
+			emit_bytes(buf, 0x83, 0xF8, u8(i)) // cmp eax, i
+			emit_bytes(buf, 0x77, 0x01, 0xC3)  // ja +1; ret
+			vop_d_tab(buf, 0xFE, 4, 4, OFF_TAB_ONE_U)
+		}
+		ui := u8(i)
+		vzero(buf, ui)
+		vop_d_tab(buf, 0xDB, 6, 4, OFF_TAB_ABS)  // ymm6 = w & 0x7fffffff (non-negative)
+		vop_d_tab(buf, 0xEF, 7, 4, OFF_TAB_ALL1) // MSB=1 where w < 2^31
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, ui, 7, GPR_RSI, 6, 2, 0)
+		vop38_d(buf, 0x3B, 7, 6, 5)              // vpminud(w_lo, rem)
+		vop_d(buf, 0x76, 7, 7, 5)                // ~0 where w_lo >= rem
+		vop_d(buf, 0xDF, 7, 7, 4)                // vpandn: MSB=1 where w >= 2^31 && w_lo < rem
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, ui, 7, GPR_RDI, 6, 2, 0)
+	}
+	emit_b(buf, 0xC3) // ret
+}
+
 // ---- basic-block slot register cache (ymm8..ymm15) --------------------------------------
 
 @(private)
 Cache_Slot :: struct {
-	slot:  i32,
-	dirty: bool,
-	stamp: u32,
+	slot:     i32,
+	last_use: i32,
+	dirty:    bool,
+	stamp:    u32,
 }
 
 @(private)
@@ -718,31 +847,125 @@ Instr_RW :: struct {
 Bound_Tex_Stub :: struct {
 	bound_patch: int,
 	ret_off:     int,
+	stub_off:    int,
+	stub_end:    int,
 	pc:          i32,
+	comp_mask:   u8,
+}
+
+@(private)
+Load_Buf_Stub :: struct {
+	unif_patch: int,
+	big_patch:  int,
+	ret_off:    int,
+	stub_off:   int,
+	stub_end:   int,
+	pc:         i32,
+	yd:         [4]u8,
 }
 
 @(private)
 Jit_Emitter :: struct {
-	buf:          [dynamic]u8,
-	cross_bb:     []bool,
-	last_use:     []i32,
-	def_bb:       []i32,
-	bb_start:     []bool,
-	pc_off:       []int,
-	rw:           []Instr_RW,
-	patches:        [dynamic]Jump_Patch,
-	epilogues:      [dynamic]int,
-	bilinear_calls: [dynamic]int,
-	bound_tex:      [dynamic]Bound_Tex_Stub,
-	cache:          [8]Cache_Slot,
-	stamp:        u32,
-	pc:           i32,
+	buf:              [dynamic]u8,
+	mem_mask:         []u16,
+	tex_mask:         []u8,
+	pc_to_bb:         []i32,
+	last_use:         []i32,
+	def_off:          []i32,
+	def_lu:           [dynamic]i32,
+	bb_start:         []bool,
+	mask_written:     []bool,
+	mask_eq_gen:      []u32,
+	pc_off:           []int,
+	rw:               []Instr_RW,
+	patches:          [dynamic]Jump_Patch,
+	epilogues:        [dynamic]int,
+	bilinear_calls:   [dynamic]int,
+	helper_ymm_calls: [dynamic]int,
+	unif_oob_calls:   [dynamic]int,
+	big_buf_calls:    [dynamic]int,
+	bound_tex:        [dynamic]Bound_Tex_Stub,
+	load_bufs:        [dynamic]Load_Buf_Stub,
+	epilogue_off:     int,
+	bilinear_off:     int,
+	helper_ymm_off:   int,
+	unif_oob_off:     int,
+	big_buf_off:      int,
+	cache:            [8]Cache_Slot,
+	stamp:            u32,
+	exec_gen:         u32,
+	pc:               i32,
+	cur_dst_base:     i32,
+	cur_def_off:      i32,
+	cur_mem_mask:     u16,
+	fused_mc_pc:      i32,
+	fused_mc_inv:     bool,
+	exec_ymask_valid: bool,
 }
 
 @(private)
 cache_reset :: proc(e: ^Jit_Emitter) {
 	for &c in e.cache {
-		c = {slot = -1, dirty = false, stamp = 0}
+		c = {slot = -1, last_use = -1, dirty = false, stamp = 0}
+	}
+	e.exec_gen += 1
+	e.fused_mc_pc = -1
+	e.fused_mc_inv = false
+	e.exec_ymask_valid = false
+}
+
+@(private)
+is_mask_eq_exec :: #force_inline proc(e: ^Jit_Emitter, m: i32) -> bool {
+	return m == MASK_EXEC || e.mask_eq_gen[m] == e.exec_gen
+}
+
+@(private)
+invalidate_mask_write :: #force_inline proc(e: ^Jit_Emitter, dst: i32) {
+	if dst == MASK_EXEC {
+		e.exec_gen += 1
+		e.exec_ymask_valid = false
+	} else if dst > 0 {
+		e.mask_eq_gen[dst] = 0
+	}
+}
+
+@(private)
+ensure_exec_ymask :: #force_inline proc(e: ^Jit_Emitter) -> u8 {
+	if !e.exec_ymask_valid {
+		emit_exec_ymask(&e.buf, 7)
+		e.exec_ymask_valid = true
+	}
+	return 7
+}
+
+@(private)
+emit_load_mask_eax :: proc(e: ^Jit_Emitter, m: i32) {
+	if is_mask_eq_exec(e, m) {
+		emit_bytes(&e.buf, 0x44, 0x89, 0xE8) // mov eax, r13d
+	} else {
+		emit_bytes(&e.buf, 0x41, 0x0F, 0xB6) // movzx eax, byte [r12 + m]
+		emit_modrm_mem(&e.buf, GPR_RAX, GPR_R12, m)
+	}
+}
+
+@(private)
+emit_copy_mask :: proc(e: ^Jit_Emitter, dst, a: i32) {
+	if dst == a || (dst == MASK_EXEC && is_mask_eq_exec(e, a)) {
+		return
+	}
+	if is_mask_eq_exec(e, a) {
+		emit_bytes(&e.buf, 0x45, 0x88) // mov byte [r12 + dst], r13b
+		emit_modrm_mem(&e.buf, GPR_R13, GPR_R12, dst)
+		e.mask_eq_gen[dst] = e.exec_gen
+	} else if dst == MASK_EXEC {
+		emit_bytes(&e.buf, 0x45, 0x0F, 0xB6) // movzx r13d, byte [r12 + a]
+		emit_modrm_mem(&e.buf, GPR_R13, GPR_R12, a)
+		invalidate_mask_write(e, MASK_EXEC)
+		e.mask_eq_gen[a] = e.exec_gen
+	} else {
+		emit_load_mask_eax(e, a)
+		emit_store_mask_al(&e.buf, dst)
+		e.mask_eq_gen[dst] = 0
 	}
 }
 
@@ -752,14 +975,19 @@ pin_bit :: #force_inline proc(ymm: u8) -> u8 {
 }
 
 @(private)
+write_lu :: #force_inline proc(e: ^Jit_Emitter, slot: i32) -> i32 {
+	return e.def_lu[e.cur_def_off + (slot - e.cur_dst_base)]
+}
+
+@(private)
 alloc_cache_idx :: proc(e: ^Jit_Emitter, pinned: u8) -> int {
 	// Prefer empty or already-dead entries first (zero spill cost).
 	for c, i in e.cache {
 		if (pinned & (u8(1) << uint(i))) != 0 {
 			continue
 		}
-		if c.slot < 0 || e.last_use[c.slot] < e.pc {
-			e.cache[i] = {slot = -1, dirty = false, stamp = 0}
+		if c.slot < 0 || c.last_use < e.pc {
+			e.cache[i] = {slot = -1, last_use = -1, dirty = false, stamp = 0}
 			return i
 		}
 	}
@@ -777,7 +1005,7 @@ alloc_cache_idx :: proc(e: ^Jit_Emitter, pinned: u8) -> int {
 	if e.cache[best].dirty {
 		vmovaps_store(&e.buf, e.cache[best].slot, u8(8 + best))
 	}
-	e.cache[best] = {slot = -1, dirty = false, stamp = 0}
+	e.cache[best] = {slot = -1, last_use = -1, dirty = false, stamp = 0}
 	return best
 }
 
@@ -790,51 +1018,76 @@ read_slot :: proc(e: ^Jit_Emitter, slot: i32, scratch: u8, pinned: u8 = 0) -> u8
 			return u8(8 + i)
 		}
 	}
-	if e.last_use[slot] > e.pc {
+	rlu := e.last_use[slot]
+	if rlu > e.pc {
 		idx := alloc_cache_idx(e, pinned)
 		r := u8(8 + idx)
 		vmovaps_load(&e.buf, r, slot)
 		e.stamp += 1
-		e.cache[idx] = {slot = slot, dirty = false, stamp = e.stamp}
+		e.cache[idx] = {slot = slot, last_use = rlu, dirty = false, stamp = e.stamp}
 		return r
 	}
 	vmovaps_load(&e.buf, scratch, slot)
 	return scratch
 }
 
+// Selects the destination YMM register for `slot` (`ymm8..15` when read again
+// in this block, else `scratch` in `ymm0..7`).
+// - `pinned`: `ymm8..15` bits read by this step (never evicted).
+// - `no_alias`: `ymm8..15` bits read after `yd` is written (never reused as `yd`).
 @(private)
-write_slot :: proc(e: ^Jit_Emitter, slot: i32, src: u8, pinned: u8 = 0) {
+prep_dst :: proc(e: ^Jit_Emitter, slot: i32, scratch: u8 = 0, pinned: u8 = 0, no_alias: u8 = 0) -> u8 {
+	wlu := write_lu(e, slot)
 	for &c, i in e.cache {
 		if c.slot == slot {
-			r := u8(8 + i)
-			vmovaps_rr(&e.buf, r, src)
-			e.stamp += 1
-			c.stamp = e.stamp
-			if e.cross_bb[slot] {
-				vmovaps_store(&e.buf, slot, r)
-				c.dirty = false
-			} else {
-				c.dirty = true
+			bit := u8(1) << uint(i)
+			if (no_alias & bit) != 0 || wlu <= e.pc {
+				c = {slot = -1, last_use = -1, dirty = false, stamp = 0}
+				break
 			}
-			return
+			c.last_use = wlu
+			return u8(8 + i)
 		}
 	}
-	if e.last_use[slot] > e.pc {
-		idx := alloc_cache_idx(e, pinned)
-		r := u8(8 + idx)
-		vmovaps_rr(&e.buf, r, src)
+	if wlu > e.pc {
+		idx := alloc_cache_idx(e, pinned | no_alias)
+		e.cache[idx].slot = slot
+		e.cache[idx].last_use = wlu
+		return u8(8 + idx)
+	}
+	return scratch
+}
+
+@(private)
+need_mem_write :: #force_inline proc(e: ^Jit_Emitter, slot: i32) -> bool {
+	idx := uint(slot - e.cur_dst_base)
+	if idx >= 16 {
+		return true
+	}
+	return (e.cur_mem_mask & (u16(1) << idx)) != 0
+}
+
+@(private)
+commit_dst :: proc(e: ^Jit_Emitter, slot: i32, yd: u8) {
+	need_mem := need_mem_write(e, slot)
+	wlu := write_lu(e, slot)
+	if yd >= 8 && wlu > e.pc {
+		idx := yd - 8
 		e.stamp += 1
-		if e.cross_bb[slot] {
-			vmovaps_store(&e.buf, slot, r)
-			e.cache[idx] = {slot = slot, dirty = false, stamp = e.stamp}
-		} else {
-			e.cache[idx] = {slot = slot, dirty = true, stamp = e.stamp}
-		}
-		return
+		e.cache[idx] = {slot = slot, last_use = wlu, dirty = !need_mem, stamp = e.stamp}
 	}
-	if e.cross_bb[slot] {
-		vmovaps_store(&e.buf, slot, src)
+	if need_mem {
+		vmovaps_store(&e.buf, slot, yd)
 	}
+}
+
+@(private)
+copy_to_dst :: proc(e: ^Jit_Emitter, slot: i32, src: u8, pinned: u8 = 0, no_alias: u8 = 0) {
+	yd := prep_dst(e, slot, src, pinned, no_alias)
+	if yd != src {
+		vmovaps_rr(&e.buf, yd, src)
+	}
+	commit_dst(e, slot, yd)
 }
 
 @(private)
@@ -843,7 +1096,7 @@ is_helper_instr :: proc(in_: Instr) -> bool {
 	case .Store_Dyn,
 	     .Faceforward, .Refract,
 	     .Determinant, .Inverse,
-	     .Texture, .Texture_Bias, .Texel_Fetch, .Texture_Size:
+	     .Texture_Size:
 		return true
 	case .Load_Dyn:
 		return int(in_.n) > 4
@@ -882,9 +1135,16 @@ instr_read_write :: proc(in_: Instr) -> (writes: Slots, full_write: bool, reads:
 	case .Deriv_X, .Deriv_Y, .Fwidth:
 		reads[0] = {in_.a, n}
 		return {in_.dst, n}, true, reads
+	case .Load_Buf:
+		reads[0] = {in_.a, 1}
+		return {in_.dst, n}, true, reads
 	case .Load_Dyn:
 		reads[0] = {in_.b, 1}
 		return {in_.dst, n}, true, reads
+	case .Store_Dyn:
+		reads[0] = {in_.a, n}
+		reads[1] = {in_.b, 1}
+		return {}, false, reads
 	case .Store:
 		reads[0] = {in_.a, n}
 		reads[1] = {in_.dst, n}
@@ -1284,25 +1544,309 @@ Jump_Patch :: struct {
 }
 
 @(private)
+can_fuse_cmp_mask_cond :: #force_inline proc(e: ^Jit_Emitter, code: []Instr, pc: int, is_init: bool) -> (pc_mc: int, ok: bool) {
+	if is_init || code[pc].n != 1 {
+		return -1, false
+	}
+	cond := code[pc].dst
+	if (e.mem_mask[pc] & 1) != 0 {
+		return -1, false
+	}
+	n_code := len(code)
+	bb_start := e.bb_start[:n_code + 1]
+	pc_mc = -1
+	if pc + 1 < n_code && !bb_start[pc + 1] {
+		if code[pc + 1].op == .Mask_Cond {
+			pc_mc = pc + 1
+		} else if code[pc + 1].op == .Mask_Copy && pc + 2 < n_code && !bb_start[pc + 2] && code[pc + 2].op == .Mask_Cond {
+			pc_mc = pc + 2
+		}
+	}
+	if pc_mc < 0 || code[pc_mc].b != cond || write_lu(e, cond) != i32(pc_mc) {
+		return -1, false
+	}
+	return pc_mc, true
+}
+
+@(private)
+finish_fused_cmp :: #force_inline proc(e: ^Jit_Emitter, cond: i32, pc_mc: int, inv: bool) {
+	for &cs in e.cache {
+		if cs.slot == cond {
+			cs = {slot = -1, last_use = -1, dirty = false, stamp = 0}
+		}
+	}
+	emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x50, GPR_RCX, 0, 0) // vmovmskps ecx, ymm0
+	e.fused_mc_pc = i32(pc_mc)
+	e.fused_mc_inv = inv
+}
+
+@(private)
+bset_set :: #force_inline proc(bits: []u64, slot: i32) {
+	u := uint(slot)
+	bits[u >> 6] |= u64(1) << (u & 63)
+}
+
+@(private)
+bset_clear :: #force_inline proc(bits: []u64, slot: i32) {
+	u := uint(slot)
+	bits[u >> 6] &~= u64(1) << (u & 63)
+}
+
+@(private)
+bset_test :: #force_inline proc(bits: []u64, slot: i32) -> bool {
+	u := uint(slot)
+	return (bits[u >> 6] & (u64(1) << (u & 63))) != 0
+}
+
+// Backward CFG liveness over basic blocks: marks `e.mem_mask[pc]` bit `k` iff
+// `writes.start + k` is live out of `pc`'s block without a subsequent full_write
+// in the same block (or is in `p.dyn_slots` / `is_init`).
+@(private)
+jit_compute_liveness :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) {
+	n_code := len(code)
+	if n_code == 0 {
+		return
+	}
+	mem_mask := e.mem_mask[:n_code]
+	tex_mask := e.tex_mask[:n_code]
+	if is_init {
+		for &mm in mem_mask {
+			mm = 0xFFFF
+		}
+		for &tm in tex_mask {
+			tm = 0xF
+		}
+		return
+	}
+
+	bb_start := e.bb_start[:n_code + 1]
+	rw := e.rw[:n_code]
+	pc_to_bb := e.pc_to_bb[:n_code + 1]
+	n_bb := 0
+	for pc in 0 ..< n_code {
+		if bb_start[pc] {
+			n_bb += 1
+		}
+		pc_to_bb[pc] = i32(n_bb - 1)
+	}
+	exit_bb := i32(n_bb)
+	pc_to_bb[n_code] = exit_bb
+
+	heap := runtime.default_allocator()
+	bb_meta := make([][4]i32, n_bb, heap)
+	defer delete(bb_meta, heap)
+
+	bi := 0
+	for pc := 0; pc < n_code; {
+		end := pc + 1
+		for end < n_code && !bb_start[end] {
+			end += 1
+		}
+		last := code[end - 1]
+		s0 := i32(bi + 1)
+		s1 := i32(-1)
+		#partial switch last.op {
+		case .Jump:
+			s0 = pc_to_bb[last.a] if last.a >= 0 && int(last.a) <= n_code else exit_bb
+		case .Jump_If_None:
+			s1 = pc_to_bb[last.a] if last.a >= 0 && int(last.a) <= n_code else exit_bb
+		case .Mask_Kill:
+			if last.dst == MASK_DISCARD {
+				s1 = exit_bb
+			}
+		}
+		bb_meta[bi] = {i32(pc), i32(end), s0, s1}
+		bi += 1
+		pc = end
+	}
+
+	n_words := (max(p.num_slots, 1) + 63) / 64
+	total_words := (3 * n_bb + 4) * n_words
+	words_buf := make([]u64, total_words, heap)
+	defer delete(words_buf, heap)
+
+	live_in := words_buf[:(n_bb + 1) * n_words]
+	off1 := (n_bb + 1) * n_words
+	bb_use := words_buf[off1 : off1 + n_bb * n_words]
+	off2 := off1 + n_bb * n_words
+	bb_def := words_buf[off2 : off2 + n_bb * n_words]
+	off3 := off2 + n_bb * n_words
+	always_mem := words_buf[off3 : off3 + n_words]
+	cur := words_buf[off3 + n_words : off3 + 2 * n_words]
+	live := words_buf[off3 + 2 * n_words : off3 + 3 * n_words]
+
+	for ds in p.dyn_slots {
+		for s in ds.start ..< ds.start + ds.n {
+			bset_set(always_mem, s)
+		}
+	}
+	exit_in := live_in[n_bb * n_words : (n_bb + 1) * n_words]
+	for v in p.outputs {
+		for k in 0 ..< v.n {
+			bset_set(exit_in, v.slot + k)
+		}
+	}
+
+	for b in 0 ..< n_bb {
+		u := bb_use[b * n_words : (b + 1) * n_words]
+		d := bb_def[b * n_words : (b + 1) * n_words]
+		first, end := int(bb_meta[b][0]), int(bb_meta[b][1])
+		for pc := end - 1; pc >= first; pc -= 1 {
+			info := rw[pc]
+			if info.full_write {
+				for s in info.writes.start ..< info.writes.start + info.writes.n {
+					bset_clear(u, s)
+					bset_set(d, s)
+				}
+			}
+			for r in info.reads {
+				for s in r.start ..< r.start + r.n {
+					bset_set(u, s)
+					bset_clear(d, s)
+				}
+			}
+		}
+		copy(live_in[b * n_words : (b + 1) * n_words], u)
+	}
+
+	for {
+		changed := false
+		for b := n_bb - 1; b >= 0; b -= 1 {
+			s0, s1 := int(bb_meta[b][2]), int(bb_meta[b][3])
+			base := b * n_words
+			s0_base := s0 * n_words
+			if s1 >= 0 {
+				s1_base := s1 * n_words
+				for w in 0 ..< n_words {
+					lo := live_in[s0_base + w] | live_in[s1_base + w]
+					li := (lo & ~bb_def[base + w]) | bb_use[base + w]
+					if li != live_in[base + w] {
+						live_in[base + w] = li
+						changed = true
+					}
+				}
+			} else {
+				for w in 0 ..< n_words {
+					lo := live_in[s0_base + w]
+					li := (lo & ~bb_def[base + w]) | bb_use[base + w]
+					if li != live_in[base + w] {
+						live_in[base + w] = li
+						changed = true
+					}
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+
+	for b in 0 ..< n_bb {
+		s0, s1 := int(bb_meta[b][2]), int(bb_meta[b][3])
+		s0_base := s0 * n_words
+		for w in 0 ..< n_words {
+			lo := live_in[s0_base + w]
+			if s1 >= 0 {
+				lo |= live_in[s1 * n_words + w]
+			}
+			v := lo | always_mem[w]
+			cur[w] = v
+			live[w] = v
+		}
+		first, end := int(bb_meta[b][0]), int(bb_meta[b][1])
+		for pc := end - 1; pc >= first; pc -= 1 {
+			info := rw[pc]
+			op := code[pc].op
+			if op == .Texture || op == .Texture_Bias || op == .Texel_Fetch {
+				tm: u8 = 0
+				for k in 0 ..< 4 {
+					if bset_test(live, info.writes.start + i32(k)) {
+						tm |= u8(1) << uint(k)
+					}
+				}
+				tex_mask[pc] = tm
+			}
+			wn := int(info.writes.n)
+			mask: u16 = 0
+			if wn > 0 {
+				lim := min(wn, 16)
+				ws := info.writes.start
+				for k in 0 ..< lim {
+					if bset_test(cur, ws + i32(k)) {
+						mask |= u16(1) << uint(k)
+					}
+				}
+				if info.full_write {
+					for k in 0 ..< wn {
+						s := ws + i32(k)
+						if !bset_test(always_mem, s) {
+							bset_clear(cur, s)
+							bset_clear(live, s)
+						}
+					}
+				}
+			}
+			for r in info.reads {
+				for s in r.start ..< r.start + r.n {
+					bset_set(live, s)
+				}
+			}
+			mem_mask[pc] = mask
+		}
+	}
+}
+
+@(private)
 jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) {
 	n_code := len(code)
 	bb_start := e.bb_start[:n_code + 1]
 	for &b in bb_start {
 		b = false
 	}
+	for in_ in code {
+		if (in_.op == .Jump || in_.op == .Jump_If_None) && in_.a >= 0 && int(in_.a) <= n_code {
+			bb_start[in_.a] = true
+		}
+	}
+
+	// From pc = 0 to the first jump target or the first write to MASK_EXEC,
+	// MASK_EXEC is provably the entry mask (`ctx.lanes`), so Store and Store_Zero
+	// run unmasked: lanes outside the entry mask never execute, derivatives are
+	// unaffected because fragment quads are whole (`0x0F`, `0xF0`, or `0xFF`),
+	// and runner output write-back masks by alive entry lanes.
+	entry_exec_end := 0
+	if !is_init {
+		for pc in 0 ..< n_code {
+			if bb_start[pc] {
+				break
+			}
+			in_ := code[pc]
+			if in_.op == .Jump || in_.op == .Mask_Kill {
+				break
+			}
+			if (in_.op == .Mask_Cond || in_.op == .Mask_Restore || in_.op == .Mask_Or || in_.op == .Mask_Clear) && in_.dst == MASK_EXEC {
+				break
+			}
+			if in_.op == .Mask_Copy && in_.dst == MASK_EXEC && in_.a != MASK_EXEC {
+				break
+			}
+			entry_exec_end = pc + 1
+		}
+	}
+
 	bb_start[0] = true
-	has_dyn := false
 	rw := e.rw[:n_code]
 	for in_, pc in code {
 		w, fw, r := instr_read_write(in_)
-		rw[pc] = {w, fw, r}
-		if in_.op == .Load_Dyn || in_.op == .Store_Dyn {
-			has_dyn = true
-		}
-		if in_.op == .Jump || in_.op == .Jump_If_None {
-			if in_.a >= 0 && int(in_.a) <= n_code {
-				bb_start[in_.a] = true
+		if pc < entry_exec_end {
+			if in_.op == .Store {
+				w, fw, r = {in_.dst, i32(in_.n)}, true, {{in_.a, i32(in_.n)}, {}, {}, {}}
+			} else if in_.op == .Store_Zero {
+				w, fw, r = {in_.dst, i32(in_.n)}, true, {}
 			}
+		}
+		rw[pc] = {w, fw, r}
+		if in_.op == .Jump || in_.op == .Jump_If_None {
 			bb_start[pc + 1] = true
 		} else if in_.op == .Mask_Kill {
 			bb_start[pc + 1] = true
@@ -1313,48 +1857,47 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 	}
 	bb_start[n_code] = true
 
-	for &cb in e.cross_bb {
-		cb = is_init || has_dyn
-	}
-	if !is_init && !has_dyn {
-		for v in p.outputs {
-			for k in 0 ..< v.n {
-				e.cross_bb[v.slot + k] = true
-			}
-		}
-		for &d in e.def_bb {
-			d = 0
-		}
-		bb_id := i32(0)
-		for _, pc in code {
-			if bb_start[pc] {
-				bb_id += 1
-			}
-			info := rw[pc]
-			for r in info.reads {
-				for s in r.start ..< r.start + r.n {
-					if e.def_bb[s] != bb_id {
-						e.cross_bb[s] = true
-					}
-				}
-			}
-			if info.full_write {
-				for s in info.writes.start ..< info.writes.start + info.writes.n {
-					e.def_bb[s] = bb_id
-				}
-			}
-		}
-	}
+	jit_compute_liveness(e, p, code, is_init)
 
 	for &lu in e.last_use {
 		lu = -1
+	}
+
+	for &mw in e.mask_written {
+		mw = false
+	}
+	for &mg in e.mask_eq_gen {
+		mg = 0
+	}
+	e.exec_gen = 0
+	e.mask_written[MASK_EXEC] = true
+	for in_ in code {
+		#partial switch in_.op {
+		case .Mask_Kill, .Mask_Or, .Mask_Cond:
+			if in_.dst >= 0 {
+				e.mask_written[in_.dst] = true
+			}
+		case .Mask_Copy, .Mask_Restore:
+			if in_.dst >= 0 && in_.dst != in_.a {
+				e.mask_written[in_.dst] = true
+			}
+		}
 	}
 
 	pc_off := e.pc_off[:n_code + 1]
 	clear(&e.patches)
 	clear(&e.epilogues)
 	clear(&e.bilinear_calls)
+	clear(&e.helper_ymm_calls)
+	clear(&e.unif_oob_calls)
+	clear(&e.big_buf_calls)
 	clear(&e.bound_tex)
+	clear(&e.load_bufs)
+	e.epilogue_off = 0
+	e.bilinear_off = 0
+	e.helper_ymm_off = 0
+	e.unif_oob_off = 0
+	e.big_buf_off = 0
 
 	// Prologue: 5 callee-saved GPRs (40 B + 8 B ret addr = 48 B -> 16-byte aligned rsp).
 	emit_bytes(&e.buf, 0x55, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56)
@@ -1378,17 +1921,52 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			for end < n_code && !bb_start[end] {
 				end += 1
 			}
+			clear(&e.def_lu)
 			for q in pc ..< end {
+				e.def_off[q] = i32(len(e.def_lu))
+				wn := int(rw[q].writes.n)
+				if wn > 0 {
+					resize(&e.def_lu, len(e.def_lu) + wn)
+				}
 				for r in rw[q].reads {
 					for s in r.start ..< r.start + r.n {
-						e.last_use[s] = i32(q)
+						e.last_use[s] = -1
 					}
 				}
+				for s in rw[q].writes.start ..< rw[q].writes.start + rw[q].writes.n {
+					e.last_use[s] = -1
+				}
+			}
+			for q := end - 1; q >= pc; q -= 1 {
+				info := rw[q]
+				doff := e.def_off[q]
+				for k in i32(0) ..< info.writes.n {
+					e.def_lu[doff + k] = e.last_use[info.writes.start + k]
+					if info.full_write {
+						e.last_use[info.writes.start + k] = -1
+					}
+				}
+				for r in info.reads {
+					for s in r.start ..< r.start + r.n {
+						if e.last_use[s] < 0 {
+							e.last_use[s] = i32(q)
+						}
+					}
+				}
+			}
+		} else {
+			prev := rw[pc - 1]
+			doff := e.def_off[pc - 1]
+			for k in i32(0) ..< prev.writes.n {
+				e.last_use[prev.writes.start + k] = e.def_lu[doff + k]
 			}
 		}
 
 		e.pc = i32(pc)
 		in_ := code[pc]
+		e.cur_dst_base = in_.dst
+		e.cur_def_off = e.def_off[pc]
+		e.cur_mem_mask = e.mem_mask[pc]
 		n := i32(in_.n)
 		dst, a, b, c := in_.dst, in_.a, in_.b, in_.c
 
@@ -1398,49 +1976,210 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 		case .Mov:
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 0)
-				write_slot(e, dst + i, ya, pin_bit(ya))
+				copy_to_dst(e, dst + i, ya, pin_bit(ya))
 			}
 
 		case .Splat:
 			ya := read_slot(e, a, 0)
 			pa := pin_bit(ya)
 			for i in 0 ..< n {
-				write_slot(e, dst + i, ya, pa)
+				copy_to_dst(e, dst + i, ya, pa, pa if i + 1 < n else 0)
 			}
 
 		case .Gather:
 			srcs := [4]i32{a, b, c, in_.d}
 			for i in 0 ..< n {
-				ys := read_slot(e, srcs[i], u8(i))
-				vmovaps_rr(&e.buf, u8(i), ys)
-			}
-			for i in 0 ..< n {
-				write_slot(e, dst + i, u8(i))
+				ys := read_slot(e, srcs[i], 0)
+				copy_to_dst(e, dst + i, ys, pin_bit(ys))
 			}
 
 		case .Store:
-			emit_exec_ymask(&e.buf, 0)
+			if pc < entry_exec_end {
+				for i in 0 ..< n {
+					ya := read_slot(e, a + i, 0)
+					copy_to_dst(e, dst + i, ya, pin_bit(ya))
+				}
+				break
+			}
+			if !is_init && n <= 4 && (a + n <= dst || dst + n <= a) {
+				ya: [4]u8
+				old_reg: [4]u8
+				yd: [4]u8
+				pins: u8 = 0
+				for i in 0 ..< n {
+					ya[i] = read_slot(e, a + i, u8(2 + i), pins)
+					pins |= pin_bit(ya[i])
+				}
+				old_pins: u8 = 0
+				for i in 0 ..< n {
+					old_reg[i] = 255
+					for c, ci in e.cache {
+						if c.slot == dst + i {
+							old_reg[i] = u8(8 + ci)
+							old_pins |= u8(1) << uint(ci)
+							break
+						}
+					}
+				}
+				for i in 0 ..< n {
+					yd[i] = prep_dst(e, dst + i, 0, pins | old_pins)
+					if yd[i] >= 8 {
+						pins |= pin_bit(yd[i])
+						e.stamp += 1
+						e.cache[yd[i] - 8] = {slot = dst + i, last_use = write_lu(e, dst + i), dirty = !need_mem_write(e, dst + i), stamp = e.stamp}
+					}
+				}
+				was_valid := e.exec_ymask_valid
+				emit_bytes(&e.buf, 0x41, 0x81, 0xFD, 0xFF, 0x00, 0x00, 0x00) // cmp r13d, 0xFF
+				emit_b(&e.buf, 0x75) // jne masked
+				masked_patch := len(e.buf)
+				emit_b(&e.buf, 0)
+				for i in 0 ..< n {
+					if yd[i] >= 8 {
+						if yd[i] != ya[i] {
+							vmovaps_rr(&e.buf, yd[i], ya[i])
+						}
+						if need_mem_write(e, dst + i) {
+							vmovaps_store(&e.buf, dst + i, yd[i])
+						}
+					} else if need_mem_write(e, dst + i) {
+						vmovaps_store(&e.buf, dst + i, ya[i])
+					}
+				}
+				emit_b(&e.buf, 0xEB) // jmp done
+				done_patch := len(e.buf)
+				emit_b(&e.buf, 0)
+				e.buf[masked_patch] = u8(len(e.buf) - (masked_patch + 1))
+				ym := ensure_exec_ymask(e)
+				for i in 0 ..< n {
+					if yd[i] == 0 && !need_mem_write(e, dst + i) {
+						continue
+					}
+					yold := old_reg[i]
+					if yold == 255 {
+						vmovaps_load(&e.buf, 1, dst + i)
+						yold = 1
+					}
+					vpblendvb(&e.buf, yd[i], yold, ya[i], ym)
+					if need_mem_write(e, dst + i) {
+						vmovaps_store(&e.buf, dst + i, yd[i])
+					}
+				}
+				e.buf[done_patch] = u8(len(e.buf) - (done_patch + 1))
+				e.exec_ymask_valid = was_valid
+				break
+			}
+			ym := ensure_exec_ymask(e)
 			for i in 0 ..< n {
-				yd := read_slot(e, dst + i, 1)
-				ya := read_slot(e, a + i, 2, pin_bit(yd))
-				vpblendvb(&e.buf, 3, yd, ya, 0)
-				write_slot(e, dst + i, 3)
+				yold := read_slot(e, dst + i, 1)
+				ya := read_slot(e, a + i, 2, pin_bit(yold))
+				yd := prep_dst(e, dst + i, 0, pin_bit(yold) | pin_bit(ya))
+				vpblendvb(&e.buf, yd, yold, ya, ym)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Store_Zero:
-			emit_exec_ymask(&e.buf, 0)
+			if pc < entry_exec_end {
+				z0_ready := false
+				for i in 0 ..< n {
+					yd := prep_dst(e, dst + i, 0)
+					if yd != 0 || !z0_ready {
+						vzero(&e.buf, yd)
+						if yd == 0 {
+							z0_ready = true
+						}
+					}
+					commit_dst(e, dst + i, yd)
+				}
+				break
+			}
+			if !is_init && n <= 4 {
+				old_reg: [4]u8
+				yd: [4]u8
+				old_pins: u8 = 0
+				for i in 0 ..< n {
+					old_reg[i] = 255
+					for c, ci in e.cache {
+						if c.slot == dst + i {
+							old_reg[i] = u8(8 + ci)
+							old_pins |= u8(1) << uint(ci)
+							break
+						}
+					}
+				}
+				pins := old_pins
+				for i in 0 ..< n {
+					yd[i] = prep_dst(e, dst + i, 0, pins)
+					if yd[i] >= 8 {
+						pins |= pin_bit(yd[i])
+						e.stamp += 1
+						e.cache[yd[i] - 8] = {slot = dst + i, last_use = write_lu(e, dst + i), dirty = !need_mem_write(e, dst + i), stamp = e.stamp}
+					}
+				}
+				was_valid := e.exec_ymask_valid
+				emit_bytes(&e.buf, 0x41, 0x81, 0xFD, 0xFF, 0x00, 0x00, 0x00) // cmp r13d, 0xFF
+				emit_b(&e.buf, 0x75) // jne masked
+				masked_patch := len(e.buf)
+				emit_b(&e.buf, 0)
+				z0_ready := false
+				for i in 0 ..< n {
+					if yd[i] >= 8 {
+						vzero(&e.buf, yd[i])
+						if need_mem_write(e, dst + i) {
+							vmovaps_store(&e.buf, dst + i, yd[i])
+						}
+					} else if need_mem_write(e, dst + i) {
+						if !z0_ready {
+							vzero(&e.buf, 0)
+							z0_ready = true
+						}
+						vmovaps_store(&e.buf, dst + i, 0)
+					}
+				}
+				emit_b(&e.buf, 0xEB) // jmp done
+				done_patch := len(e.buf)
+				emit_b(&e.buf, 0)
+				e.buf[masked_patch] = u8(len(e.buf) - (masked_patch + 1))
+				ym := ensure_exec_ymask(e)
+				for i in 0 ..< n {
+					if yd[i] == 0 && !need_mem_write(e, dst + i) {
+						continue
+					}
+					yold := old_reg[i]
+					if yold == 255 {
+						vmovaps_load(&e.buf, 1, dst + i)
+						yold = 1
+					}
+					vop_d(&e.buf, 0xDF, yd[i], ym, yold)
+					if need_mem_write(e, dst + i) {
+						vmovaps_store(&e.buf, dst + i, yd[i])
+					}
+				}
+				e.buf[done_patch] = u8(len(e.buf) - (done_patch + 1))
+				e.exec_ymask_valid = was_valid
+				break
+			}
+			ym := ensure_exec_ymask(e)
 			for i in 0 ..< n {
-				yd := read_slot(e, dst + i, 1)
-				vop_d(&e.buf, 0xDF, 2, 0, yd) // vpandn ymm2, ymm0, yd
-				write_slot(e, dst + i, 2)
+				yold := read_slot(e, dst + i, 1)
+				yd := prep_dst(e, dst + i, 0, pin_bit(yold))
+				vop_d(&e.buf, 0xDF, yd, ym, yold) // vpandn yd, ymm7, yold
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Load_Dyn:
+			e.exec_ymask_valid = false
 			if n > 4 {
 				emit_helper_call(&e.buf, jit_help_load_dyn, &code[pc])
 				break
 			}
 			yoff := read_slot(e, b, 6)
+			pins := pin_bit(yoff)
+			yd: [4]u8
+			for i in 0 ..< n {
+				yd[i] = prep_dst(e, dst + i, u8(i), pins)
+				pins |= pin_bit(yd[i])
+			}
 			emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x58, 4, 0, yoff)
 			vop_d(&e.buf, 0x76, 4, 4, yoff)
 			emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x50, GPR_RDX, 0, 4)
@@ -1452,7 +2191,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			emit_vex_rr(&e.buf, 1, 1, 0, 0, 0x7E, yoff, 0, GPR_RAX) // vmovd eax, xmm(yoff)
 			emit_bytes(&e.buf, 0x48, 0xC1, 0xE0, 0x05)              // shl rax, 5 (off * 32)
 			for i in 0 ..< n {
-				emit_vex_sib(&e.buf, 1, 0, 1, 0, 0x28, u8(i), 0, GPR_RBX, GPR_RAX, 0, (a + i) * 32)
+				emit_vex_sib(&e.buf, 1, 0, 1, 0, 0x28, yd[i], 0, GPR_RBX, GPR_RAX, 0, (a + i) * 32)
 			}
 			emit_b(&e.buf, 0xE9) // jmp done
 			done_dyn := len(e.buf)
@@ -1463,13 +2202,13 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			vop_d_tab(&e.buf, 0xFE, 5, 5, OFF_TAB_IOTA)                              // off*8 + lane
 			for i in 0 ..< n {
 				emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x28, 7, 0, GPR_R14, OFF_TAB_ALL1)
-				vzero(&e.buf, u8(i))
-				emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x90, u8(i), 7, GPR_RBX, 5, 2, (a + i) * 32)
+				vzero(&e.buf, yd[i])
+				emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x90, yd[i], 7, GPR_RBX, 5, 2, (a + i) * 32)
 			}
 
 			patch_i32(e.buf[:], done_dyn, i32(len(e.buf) - (done_dyn + 4)))
 			for i in 0 ..< n {
-				write_slot(e, dst + i, u8(i))
+				commit_dst(e, dst + i, yd[i])
 			}
 
 		case .Store_Dyn:
@@ -1483,36 +2222,55 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			case .F_Div: op_byte = 0x5E
 			}
 			sa, sb := 1 - i32(in_.k & 1), 1 - i32(in_.k >> 1)
+			hoist_a := sa == 0 && (a < dst || a >= dst + n)
+			hoist_b := sb == 0 && (b < dst || b >= dst + n)
+			ya_s: u8 = 0
+			yb_s: u8 = 0
+			if hoist_a {
+				ya_s = read_slot(e, a, 6)
+			}
+			if hoist_b {
+				yb_s = read_slot(e, b, 5, pin_bit(ya_s))
+			}
 			for i in 0 ..< n {
-				ya := read_slot(e, a + i * sa, 1)
-				yb := read_slot(e, b + i * sb, 2, pin_bit(ya))
-				vop_ps(&e.buf, op_byte, 0, ya, yb)
-				write_slot(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+				ya := ya_s if hoist_a else read_slot(e, a + i * sa, 1, pin_bit(yb_s))
+				yb := yb_s if hoist_b else read_slot(e, b + i * sb, 2, pin_bit(ya))
+				keep := u8(0)
+				if i + 1 < n {
+					if hoist_a {keep |= pin_bit(ya)}
+					if hoist_b {keep |= pin_bit(yb)}
+				}
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb), keep)
+				vop_ps(&e.buf, op_byte, yd, ya, yb)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .F_Neg:
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
-				vop_ps_tab(&e.buf, 0x57, 0, ya, OFF_TAB_SIGN) // vxorps
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_ps_tab(&e.buf, 0x57, yd, ya, OFF_TAB_SIGN) // vxorps
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .I_Add, .I_Sub, .I_Mul, .Bit_And, .Bit_Or, .Bit_Xor:
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
 				yb := read_slot(e, b + i, 2, pin_bit(ya))
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
 				#partial switch in_.op {
-				case .I_Add:   vop_d(&e.buf, 0xFE, 0, ya, yb)
-				case .I_Sub:   vop_d(&e.buf, 0xFA, 0, ya, yb)
-				case .I_Mul:   vop38_d(&e.buf, 0x40, 0, ya, yb)
-				case .Bit_And: vop_d(&e.buf, 0xDB, 0, ya, yb)
-				case .Bit_Or:  vop_d(&e.buf, 0xEB, 0, ya, yb)
-				case .Bit_Xor: vop_d(&e.buf, 0xEF, 0, ya, yb)
+				case .I_Add:   vop_d(&e.buf, 0xFE, yd, ya, yb)
+				case .I_Sub:   vop_d(&e.buf, 0xFA, yd, ya, yb)
+				case .I_Mul:   vop38_d(&e.buf, 0x40, yd, ya, yb)
+				case .Bit_And: vop_d(&e.buf, 0xDB, yd, ya, yb)
+				case .Bit_Or:  vop_d(&e.buf, 0xEB, yd, ya, yb)
+				case .Bit_Xor: vop_d(&e.buf, 0xEF, yd, ya, yb)
 				}
-				write_slot(e, dst + i, 0)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .I_Div, .U_Div, .I_Rem, .U_Rem:
+			e.exec_ymask_valid = false
 			is_u := in_.op == .U_Div || in_.op == .U_Rem
 			is_rem := in_.op == .I_Rem || in_.op == .U_Rem
 			cvt_pd :: #force_inline proc(buf: ^[dynamic]u8, y_dst, x_src: u8, unsigned: bool) {
@@ -1553,23 +2311,26 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				}
 				vzero(&e.buf, 4)
 				vop_d(&e.buf, 0x76, 4, yb, 4)                           // vpcmpeqd ymm4, yb, 0
-				vop_d(&e.buf, 0xDF, 0, 4, 0)                            // vpandn ymm0, ymm4, ymm0
-				write_slot(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+				vop_d(&e.buf, 0xDF, yd, 4, 0)                           // vpandn yd, ymm4, ymm0
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .I_Neg:
 			vzero(&e.buf, 2)
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
-				vop_d(&e.buf, 0xFA, 0, 2, ya)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_d(&e.buf, 0xFA, yd, 2, ya)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Bit_Not:
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
-				vop_d_tab(&e.buf, 0xEF, 0, ya, OFF_TAB_ALL1)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_d_tab(&e.buf, 0xEF, yd, ya, OFF_TAB_ALL1)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Shl, .Shr_I, .Shr_U:
@@ -1583,8 +2344,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				ya := read_slot(e, a + i, 1)
 				yb := read_slot(e, b + i, 2, pin_bit(ya))
 				vop_d_tab(&e.buf, 0xDB, 3, yb, OFF_TAB_MASK31)
-				vop38_d(&e.buf, op_byte, 0, ya, 3)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+				vop38_d(&e.buf, op_byte, yd, ya, 3)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .F_Lt, .F_Le, .F_Gt, .F_Ge, .F_Eq, .F_Ne:
@@ -1597,42 +2359,79 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			case .F_Eq: pred = 0x00
 			case .F_Ne: pred = 0x04 // NEQ_UQ: true when unordered (NaN)
 			}
+			if pc_mc, fused := can_fuse_cmp_mask_cond(e, code, pc, is_init); fused {
+				ya := read_slot(e, a, 1)
+				yb := read_slot(e, b, 2, pin_bit(ya))
+				vcmpps(&e.buf, 0, ya, yb, pred)
+				finish_fused_cmp(e, dst, pc_mc, false)
+				break
+			}
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
 				yb := read_slot(e, b + i, 2, pin_bit(ya))
-				vcmpps(&e.buf, 0, ya, yb, pred)
-				vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+				vcmpps(&e.buf, yd, ya, yb, pred)
+				vop_d_tab(&e.buf, 0xDB, yd, yd, OFF_TAB_ONE_U)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .I_Lt, .I_Le, .I_Gt, .I_Ge, .I_Eq, .I_Ne:
+			if pc_mc, fused := can_fuse_cmp_mask_cond(e, code, pc, is_init); fused {
+				ya := read_slot(e, a, 1)
+				yb := read_slot(e, b, 2, pin_bit(ya))
+				inv := false
+				#partial switch in_.op {
+				case .I_Gt: vop_d(&e.buf, 0x66, 0, ya, yb)
+				case .I_Lt: vop_d(&e.buf, 0x66, 0, yb, ya)
+				case .I_Le: vop_d(&e.buf, 0x66, 0, ya, yb); inv = true
+				case .I_Ge: vop_d(&e.buf, 0x66, 0, yb, ya); inv = true
+				case .I_Eq: vop_d(&e.buf, 0x76, 0, ya, yb)
+				case .I_Ne: vop_d(&e.buf, 0x76, 0, ya, yb); inv = true
+				}
+				finish_fused_cmp(e, dst, pc_mc, inv)
+				break
+			}
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
 				yb := read_slot(e, b + i, 2, pin_bit(ya))
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
 				#partial switch in_.op {
 				case .I_Gt:
-					vop_d(&e.buf, 0x66, 0, ya, yb)
-					vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
+					vop_d(&e.buf, 0x66, yd, ya, yb)
+					vop_d_tab(&e.buf, 0xDB, yd, yd, OFF_TAB_ONE_U)
 				case .I_Lt:
-					vop_d(&e.buf, 0x66, 0, yb, ya)
-					vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
+					vop_d(&e.buf, 0x66, yd, yb, ya)
+					vop_d_tab(&e.buf, 0xDB, yd, yd, OFF_TAB_ONE_U)
 				case .I_Le:
-					vop_d(&e.buf, 0x66, 0, ya, yb)
-					vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
+					vop_d(&e.buf, 0x66, yd, ya, yb)
+					vop_d_tab(&e.buf, 0xDF, yd, yd, OFF_TAB_ONE_U)
 				case .I_Ge:
-					vop_d(&e.buf, 0x66, 0, yb, ya)
-					vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
+					vop_d(&e.buf, 0x66, yd, yb, ya)
+					vop_d_tab(&e.buf, 0xDF, yd, yd, OFF_TAB_ONE_U)
 				case .I_Eq:
-					vop_d(&e.buf, 0x76, 0, ya, yb)
-					vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
+					vop_d(&e.buf, 0x76, yd, ya, yb)
+					vop_d_tab(&e.buf, 0xDB, yd, yd, OFF_TAB_ONE_U)
 				case .I_Ne:
-					vop_d(&e.buf, 0x76, 0, ya, yb)
-					vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
+					vop_d(&e.buf, 0x76, yd, ya, yb)
+					vop_d_tab(&e.buf, 0xDF, yd, yd, OFF_TAB_ONE_U)
 				}
-				write_slot(e, dst + i, 0)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .U_Lt, .U_Le, .U_Gt, .U_Ge:
+			if pc_mc, fused := can_fuse_cmp_mask_cond(e, code, pc, is_init); fused {
+				ya := read_slot(e, a, 1)
+				yb := read_slot(e, b, 2, pin_bit(ya))
+				inv := false
+				#partial switch in_.op {
+				case .U_Le: vop38_d(&e.buf, 0x3B, 0, ya, yb); vop_d(&e.buf, 0x76, 0, 0, ya)
+				case .U_Ge: vop38_d(&e.buf, 0x3F, 0, ya, yb); vop_d(&e.buf, 0x76, 0, 0, ya)
+				case .U_Gt: vop38_d(&e.buf, 0x3B, 0, ya, yb); vop_d(&e.buf, 0x76, 0, 0, ya); inv = true
+				case .U_Lt: vop38_d(&e.buf, 0x3F, 0, ya, yb); vop_d(&e.buf, 0x76, 0, 0, ya); inv = true
+				}
+				finish_fused_cmp(e, dst, pc_mc, inv)
+				break
+			}
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
 				yb := read_slot(e, b + i, 2, pin_bit(ya))
@@ -1640,21 +2439,28 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				case .U_Le:
 					vop38_d(&e.buf, 0x3B, 0, ya, yb) // vpminud
 					vop_d(&e.buf, 0x76, 0, 0, ya)
-					vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vop_d_tab(&e.buf, 0xDB, yd, 0, OFF_TAB_ONE_U)
+					commit_dst(e, dst + i, yd)
 				case .U_Ge:
 					vop38_d(&e.buf, 0x3F, 0, ya, yb) // vpmaxud
 					vop_d(&e.buf, 0x76, 0, 0, ya)
-					vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vop_d_tab(&e.buf, 0xDB, yd, 0, OFF_TAB_ONE_U)
+					commit_dst(e, dst + i, yd)
 				case .U_Gt:
 					vop38_d(&e.buf, 0x3B, 0, ya, yb)
 					vop_d(&e.buf, 0x76, 0, 0, ya)
-					vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vop_d_tab(&e.buf, 0xDF, yd, 0, OFF_TAB_ONE_U)
+					commit_dst(e, dst + i, yd)
 				case .U_Lt:
 					vop38_d(&e.buf, 0x3F, 0, ya, yb)
 					vop_d(&e.buf, 0x76, 0, 0, ya)
-					vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vop_d_tab(&e.buf, 0xDF, yd, 0, OFF_TAB_ONE_U)
+					commit_dst(e, dst + i, yd)
 				}
-				write_slot(e, dst + i, 0)
 			}
 
 		case .B_And:
@@ -1665,8 +2471,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				vop_d(&e.buf, 0x76, 4, ya, 3)
 				vop_d(&e.buf, 0x76, 5, yb, 3)
 				vop_d(&e.buf, 0xEB, 0, 4, 5)
-				vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+				vop_d_tab(&e.buf, 0xDF, yd, 0, OFF_TAB_ONE_U)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .B_Or:
@@ -1676,24 +2483,27 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				yb := read_slot(e, b + i, 2, pin_bit(ya))
 				vop_d(&e.buf, 0xEB, 0, ya, yb)
 				vop_d(&e.buf, 0x76, 0, 0, 3)
-				vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+				vop_d_tab(&e.buf, 0xDF, yd, 0, OFF_TAB_ONE_U)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .B_Not:
 			vzero(&e.buf, 2)
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
-				vop_d(&e.buf, 0x76, 0, ya, 2)
-				vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_d(&e.buf, 0x76, yd, ya, 2)
+				vop_d_tab(&e.buf, 0xDB, yd, yd, OFF_TAB_ONE_U)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .I_To_F:
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
-				emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x5B, 0, 0, ya) // vcvtdq2ps
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x5B, yd, 0, ya) // vcvtdq2ps
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .U_To_F:
@@ -1705,8 +2515,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				vop_d(&e.buf, 0xEB, 3, 3, 4)                    // (u >> 1) | (u & 1)
 				emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x5B, 3, 0, 3)  // vcvtdq2ps
 				vop_ps(&e.buf, 0x58, 3, 3, 3)                   // * 2.0
-				vblendvps(&e.buf, 0, 2, 3, ya)                  // sign(u) ? hi : lo
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vblendvps(&e.buf, yd, 2, 3, ya)                 // sign(u) ? hi : lo
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .F_To_I:
@@ -1716,8 +2527,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				vcmpps_tab(&e.buf, 3, ya, OFF_TAB_F2I_HI, 0x1D)      // ya >= 2^31
 				vop_d(&e.buf, 0xEF, 2, 2, 3)                         // 0x80000000 -> 0x7fffffff
 				vcmpps(&e.buf, 3, ya, ya, 0x07)                      // ORD_Q (!isnan)
-				vop_d(&e.buf, 0xDB, 0, 2, 3)                         // NaN -> 0
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_d(&e.buf, 0xDB, yd, 2, 3)                        // NaN -> 0
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .F_To_U:
@@ -1732,35 +2544,39 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				vcmpps_tab(&e.buf, 6, 2, OFF_TAB_F2I_HI, 0x1D)       // pos >= 2^31
 				vpblendvb(&e.buf, 0, 3, 4, 6)
 				vcmpps_tab(&e.buf, 6, 2, OFF_TAB_F2U_HI, 0x1D)       // pos >= 2^32
-				vop_d(&e.buf, 0xEB, 0, 0, 6)                         // clamp to 0xffffffff
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_d(&e.buf, 0xEB, yd, 0, 6)                        // clamp to 0xffffffff
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .B_To_F:
 			vzero(&e.buf, 2)
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
-				vop_d(&e.buf, 0x76, 0, ya, 2)
-				vop_ps_tab(&e.buf, 0x55, 0, 0, OFF_TAB_ONE_F) // vandnps
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_d(&e.buf, 0x76, yd, ya, 2)
+				vop_ps_tab(&e.buf, 0x55, yd, yd, OFF_TAB_ONE_F) // vandnps
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .F_To_B:
 			vzero(&e.buf, 2)
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
-				vcmpps(&e.buf, 0, ya, 2, 0x04) // NEQ_UQ: !(x == 0.0)
-				vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vcmpps(&e.buf, yd, ya, 2, 0x04) // NEQ_UQ: !(x == 0.0)
+				vop_d_tab(&e.buf, 0xDB, yd, yd, OFF_TAB_ONE_U)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .I_To_B:
 			vzero(&e.buf, 2)
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
-				vop_d(&e.buf, 0x76, 0, ya, 2)
-				vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_d(&e.buf, 0x76, yd, ya, 2)
+				vop_d_tab(&e.buf, 0xDF, yd, yd, OFF_TAB_ONE_U)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Select:
@@ -1771,8 +2587,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
 					yb := read_slot(e, b + i, 2, pin_bit(ya))
-					vpblendvb(&e.buf, 0, ya, yb, 3)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vpblendvb(&e.buf, yd, ya, yb, 3)
+					commit_dst(e, dst + i, yd)
 				}
 			} else {
 				for i in 0 ..< n {
@@ -1780,34 +2597,55 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					vop_d(&e.buf, 0x76, 3, yc, 4)
 					ya := read_slot(e, a + i, 1)
 					yb := read_slot(e, b + i, 2, pin_bit(ya))
-					vpblendvb(&e.buf, 0, ya, yb, 3)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vpblendvb(&e.buf, yd, ya, yb, 3)
+					commit_dst(e, dst + i, yd)
 				}
 			}
 
 		case .All:
 			vzero(&e.buf, 2)
 			ya0 := read_slot(e, a, 1)
-			vop_d(&e.buf, 0x76, 0, ya0, 2)
-			vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
-			for i in 1 ..< n {
-				yai := read_slot(e, a + i, 1)
-				vop_d(&e.buf, 0x76, 3, yai, 2)
-				vop_d(&e.buf, 0xDF, 0, 3, 0)
+			if n == 1 {
+				yd := prep_dst(e, dst, 0, pin_bit(ya0))
+				vop_d(&e.buf, 0x76, yd, ya0, 2)
+				vop_d_tab(&e.buf, 0xDF, yd, yd, OFF_TAB_ONE_U)
+				commit_dst(e, dst, yd)
+			} else {
+				vop_d(&e.buf, 0x76, 0, ya0, 2)
+				vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
+				for i in 1 ..< n - 1 {
+					yai := read_slot(e, a + i, 1)
+					vop_d(&e.buf, 0x76, 3, yai, 2)
+					vop_d(&e.buf, 0xDF, 0, 3, 0)
+				}
+				yal := read_slot(e, a + n - 1, 1)
+				vop_d(&e.buf, 0x76, 3, yal, 2)
+				yd := prep_dst(e, dst, 0, pin_bit(yal))
+				vop_d(&e.buf, 0xDF, yd, 3, 0)
+				commit_dst(e, dst, yd)
 			}
-			write_slot(e, dst, 0)
 
 		case .Any:
 			vzero(&e.buf, 2)
 			ya0 := read_slot(e, a, 0)
-			vmovaps_rr(&e.buf, 0, ya0)
-			for i in 1 ..< n {
-				yai := read_slot(e, a + i, 1)
-				vop_d(&e.buf, 0xEB, 0, 0, yai)
+			if n == 1 {
+				yd := prep_dst(e, dst, 0, pin_bit(ya0))
+				vop_d(&e.buf, 0x76, yd, ya0, 2)
+				vop_d_tab(&e.buf, 0xDF, yd, yd, OFF_TAB_ONE_U)
+				commit_dst(e, dst, yd)
+			} else {
+				ya1 := read_slot(e, a + 1, 1, pin_bit(ya0))
+				vop_d(&e.buf, 0xEB, 0, ya0, ya1)
+				for i in 2 ..< n {
+					yai := read_slot(e, a + i, 1)
+					vop_d(&e.buf, 0xEB, 0, 0, yai)
+				}
+				vop_d(&e.buf, 0x76, 0, 0, 2)
+				yd := prep_dst(e, dst, 0)
+				vop_d_tab(&e.buf, 0xDF, yd, 0, OFF_TAB_ONE_U)
+				commit_dst(e, dst, yd)
 			}
-			vop_d(&e.buf, 0x76, 0, 0, 2)
-			vop_d_tab(&e.buf, 0xDF, 0, 0, OFF_TAB_ONE_U)
-			write_slot(e, dst, 0)
 
 		case .F_Fn1:
 			bi := Builtin(in_.k)
@@ -1815,22 +2653,25 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			case .Abs:
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					vop_ps_tab(&e.buf, 0x54, 0, ya, OFF_TAB_ABS)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vop_ps_tab(&e.buf, 0x54, yd, ya, OFF_TAB_ABS)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Sqrt:
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x51, 0, 0, ya)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x51, yd, 0, ya)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Inversesqrt:
 				emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x28, 2, 0, GPR_R14, OFF_TAB_ONE_F)
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x51, 0, 0, ya)
-					vop_ps(&e.buf, 0x5E, 0, 2, 0)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x51, yd, 0, ya)
+					vop_ps(&e.buf, 0x5E, yd, 2, yd)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Floor, .Ceil, .Trunc, .Round_Even:
 				mode: u8 = 0x08
@@ -1841,27 +2682,31 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				}
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					vroundps(&e.buf, 0, ya, mode)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vroundps(&e.buf, yd, ya, mode)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Fract:
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
 					vroundps(&e.buf, 2, ya, 0x09)
-					vop_ps(&e.buf, 0x5C, 0, ya, 2)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vop_ps(&e.buf, 0x5C, yd, ya, 2)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Radians:
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					vop_ps_tab(&e.buf, 0x59, 0, ya, OFF_TAB_DEG2RAD)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vop_ps_tab(&e.buf, 0x59, yd, ya, OFF_TAB_DEG2RAD)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Degrees:
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					vop_ps_tab(&e.buf, 0x59, 0, ya, OFF_TAB_RAD2DEG)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vop_ps_tab(&e.buf, 0x59, yd, ya, OFF_TAB_RAD2DEG)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Sign:
 				vzero(&e.buf, 2)
@@ -1871,23 +2716,26 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					vcmpps(&e.buf, 4, ya, 2, 0x11) // ya < 0
 					vop_ps_tab(&e.buf, 0x54, 3, 3, OFF_TAB_ONE_F)
 					vop_ps_tab(&e.buf, 0x54, 4, 4, OFF_TAB_NEG1_F)
-					vop_ps(&e.buf, 0x56, 0, 3, 4)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vop_ps(&e.buf, 0x56, yd, 3, 4)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Isnan:
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					vcmpps(&e.buf, 0, ya, ya, 0x03) // UNORD_Q
-					vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vcmpps(&e.buf, yd, ya, ya, 0x03) // UNORD_Q
+					vop_d_tab(&e.buf, 0xDB, yd, yd, OFF_TAB_ONE_U)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Isinf:
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					vop_ps_tab(&e.buf, 0x54, 0, ya, OFF_TAB_ABS)
-					vop_d_tab(&e.buf, 0x76, 0, 0, OFF_TAB_INF)
-					vop_d_tab(&e.buf, 0xDB, 0, 0, OFF_TAB_ONE_U)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vop_ps_tab(&e.buf, 0x54, yd, ya, OFF_TAB_ABS)
+					vop_d_tab(&e.buf, 0x76, yd, yd, OFF_TAB_INF)
+					vop_d_tab(&e.buf, 0xDB, yd, yd, OFF_TAB_ONE_U)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Sin:
 				emit_helper_call(&e.buf, jit_help_sin, &code[pc])
@@ -1905,25 +2753,28 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
 					yb := read_slot(e, b + i, 2, pin_bit(ya))
-					vop_ps(&e.buf, 0x5D, 0, yb, ya)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vop_ps(&e.buf, 0x5D, yd, yb, ya)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Max:
 				// (y > x) ? y : x -> vvvv = y, rm = x.
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
 					yb := read_slot(e, b + i, 2, pin_bit(ya))
-					vop_ps(&e.buf, 0x5F, 0, yb, ya)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vop_ps(&e.buf, 0x5F, yd, yb, ya)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Step:
 				// (y < x) ? 0.0 : 1.0
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
 					yb := read_slot(e, b + i, 2, pin_bit(ya))
-					vcmpps(&e.buf, 0, yb, ya, 0x11)
-					vop_ps_tab(&e.buf, 0x55, 0, 0, OFF_TAB_ONE_F)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vcmpps(&e.buf, yd, yb, ya, 0x11)
+					vop_ps_tab(&e.buf, 0x55, yd, yd, OFF_TAB_ONE_F)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Mod:
 				for i in 0 ..< n {
@@ -1932,8 +2783,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					vop_ps(&e.buf, 0x5E, 3, ya, yb)
 					vroundps(&e.buf, 3, 3, 0x09)
 					vop_ps(&e.buf, 0x59, 3, yb, 3)
-					vop_ps(&e.buf, 0x5C, 0, ya, 3)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+					vop_ps(&e.buf, 0x5C, yd, ya, 3)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Atan2:
 				emit_helper_call(&e.buf, jit_help_atan2, &code[pc])
@@ -1956,8 +2808,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					vblendvps(&e.buf, 0, 4, yx, 5)
 					vop_ps(&e.buf, 0x5D, 4, 0, yhi)
 					vcmpps(&e.buf, 5, yhi, yhi, 0x03)
-					vblendvps(&e.buf, 0, 4, 0, 5)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(yx) | pin_bit(ylo) | pin_bit(yhi))
+					vblendvps(&e.buf, yd, 4, 0, 5)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Mix:
 				// x * (1 - z) + y * z
@@ -1969,8 +2822,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					vop_ps(&e.buf, 0x5C, 4, 5, yz)
 					vop_ps(&e.buf, 0x59, 4, yx, 4)
 					vop_ps(&e.buf, 0x59, 6, yy, yz)
-					vop_ps(&e.buf, 0x58, 0, 4, 6)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(yx) | pin_bit(yy) | pin_bit(yz))
+					vop_ps(&e.buf, 0x58, yd, 4, 6)
+					commit_dst(e, dst + i, yd)
 				}
 			case .Smoothstep:
 				vzero(&e.buf, 5)
@@ -1987,8 +2841,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					vop_ps_tab(&e.buf, 0x59, 4, 0, OFF_TAB_TWO_F) // 2 * t
 					vop_ps(&e.buf, 0x5C, 4, 6, 4)                 // 3 - 2 * t
 					vop_ps(&e.buf, 0x59, 0, 0, 0)                 // t * t
-					vop_ps(&e.buf, 0x59, 0, 0, 4)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(yx) | pin_bit(yy) | pin_bit(yz))
+					vop_ps(&e.buf, 0x59, yd, 0, 4)
+					commit_dst(e, dst + i, yd)
 				}
 			}
 
@@ -1996,8 +2851,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			if Builtin(in_.k) == .Abs {
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x1E, 0, 0, ya) // vpabsd
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x1E, yd, 0, ya) // vpabsd
+					commit_dst(e, dst + i, yd)
 				}
 			} else {
 				vzero(&e.buf, 2)
@@ -2005,8 +2861,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					ya := read_slot(e, a + i, 1)
 					vop_d(&e.buf, 0x66, 3, ya, 2) // pos = (x > 0) ? -1 : 0
 					vop_d(&e.buf, 0x66, 4, 2, ya) // neg = (0 > x) ? -1 : 0
-					vop_d(&e.buf, 0xFA, 0, 4, 3) // neg - pos = sign(x)
-					write_slot(e, dst + i, 0)
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vop_d(&e.buf, 0xFA, yd, 4, 3) // neg - pos = sign(x)
+					commit_dst(e, dst + i, yd)
 				}
 			}
 
@@ -2020,8 +2877,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			for i in 0 ..< n {
 				ya := read_slot(e, a + i, 1)
 				yb := read_slot(e, b + i, 2, pin_bit(ya))
-				vop38_d(&e.buf, op_byte, 0, ya, yb)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya) | pin_bit(yb))
+				vop38_d(&e.buf, op_byte, yd, ya, yb)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .I_Fn3, .U_Fn3:
@@ -2032,21 +2890,33 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				ylo := read_slot(e, b + i, 2, pin_bit(yx))
 				yhi := read_slot(e, c + i, 3, pin_bit(yx) | pin_bit(ylo))
 				vop38_d(&e.buf, max_op, 0, yx, ylo)
-				vop38_d(&e.buf, min_op, 0, 0, yhi)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(yx) | pin_bit(ylo) | pin_bit(yhi))
+				vop38_d(&e.buf, min_op, yd, 0, yhi)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Dot:
 			ya0 := read_slot(e, a, 1)
 			yb0 := read_slot(e, b, 2, pin_bit(ya0))
-			vop_ps(&e.buf, 0x59, 0, ya0, yb0)
-			for i in 1 ..< n {
-				yai := read_slot(e, a + i, 1)
-				ybi := read_slot(e, b + i, 2, pin_bit(yai))
-				vop_ps(&e.buf, 0x59, 3, yai, ybi)
-				vop_ps(&e.buf, 0x58, 0, 0, 3)
+			if n == 1 {
+				yd := prep_dst(e, dst, 0, pin_bit(ya0) | pin_bit(yb0))
+				vop_ps(&e.buf, 0x59, yd, ya0, yb0)
+				commit_dst(e, dst, yd)
+			} else {
+				vop_ps(&e.buf, 0x59, 0, ya0, yb0)
+				for i in 1 ..< n - 1 {
+					yai := read_slot(e, a + i, 1)
+					ybi := read_slot(e, b + i, 2, pin_bit(yai))
+					vop_ps(&e.buf, 0x59, 3, yai, ybi)
+					vop_ps(&e.buf, 0x58, 0, 0, 3)
+				}
+				yal := read_slot(e, a + n - 1, 1)
+				ybl := read_slot(e, b + n - 1, 2, pin_bit(yal))
+				vop_ps(&e.buf, 0x59, 3, yal, ybl)
+				yd := prep_dst(e, dst, 0, pin_bit(yal) | pin_bit(ybl))
+				vop_ps(&e.buf, 0x58, yd, 0, 3)
+				commit_dst(e, dst, yd)
 			}
-			write_slot(e, dst, 0)
 
 		case .Length:
 			ya0 := read_slot(e, a, 1)
@@ -2056,8 +2926,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				vop_ps(&e.buf, 0x59, 2, yai, yai)
 				vop_ps(&e.buf, 0x58, 0, 0, 2)
 			}
-			emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x51, 0, 0, 0)
-			write_slot(e, dst, 0)
+			yd := prep_dst(e, dst, 0)
+			emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x51, yd, 0, 0)
+			commit_dst(e, dst, yd)
 
 		case .Distance:
 			ya0 := read_slot(e, a, 1)
@@ -2071,55 +2942,54 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				vop_ps(&e.buf, 0x59, 3, 3, 3)
 				vop_ps(&e.buf, 0x58, 0, 0, 3)
 			}
-			emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x51, 0, 0, 0)
-			write_slot(e, dst, 0)
+			yd := prep_dst(e, dst, 0)
+			emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x51, yd, 0, 0)
+			commit_dst(e, dst, yd)
 
 		case .Normalize:
-			for i in 0 ..< n {
-				yai := read_slot(e, a + i, u8(i))
-				vmovaps_rr(&e.buf, u8(i), yai)
-			}
-			vop_ps(&e.buf, 0x59, 4, 0, 0)
+			ya0 := read_slot(e, a, 0)
+			vop_ps(&e.buf, 0x59, 4, ya0, ya0)
 			for i in 1 ..< n {
-				vop_ps(&e.buf, 0x59, 5, u8(i), u8(i))
+				yai := read_slot(e, a + i, 0)
+				vop_ps(&e.buf, 0x59, 5, yai, yai)
 				vop_ps(&e.buf, 0x58, 4, 4, 5)
 			}
 			emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x51, 4, 0, 4)
 			emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x28, 5, 0, GPR_R14, OFF_TAB_ONE_F)
 			vop_ps(&e.buf, 0x5E, 4, 5, 4)
 			for i in 0 ..< n {
-				vop_ps(&e.buf, 0x59, u8(i), u8(i), 4)
-				write_slot(e, dst + i, u8(i))
+				yai := read_slot(e, a + i, 1)
+				yd := prep_dst(e, dst + i, 0, pin_bit(yai))
+				vop_ps(&e.buf, 0x59, yd, yai, 4)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Cross:
-			x0 := read_slot(e, a, 0)
-			vmovaps_rr(&e.buf, 0, x0)
-			x1 := read_slot(e, a + 1, 1)
-			vmovaps_rr(&e.buf, 1, x1)
-			x2 := read_slot(e, a + 2, 2)
-			vmovaps_rr(&e.buf, 2, x2)
-			y0 := read_slot(e, b, 3)
-			vmovaps_rr(&e.buf, 3, y0)
-			y1 := read_slot(e, b + 1, 4)
-			vmovaps_rr(&e.buf, 4, y1)
-			y2 := read_slot(e, b + 2, 5)
-			vmovaps_rr(&e.buf, 5, y2)
+			e.exec_ymask_valid = false
+			x0 := read_slot(e, a, 0);     if x0 != 0 {vmovaps_rr(&e.buf, 0, x0)}
+			x1 := read_slot(e, a + 1, 1); if x1 != 1 {vmovaps_rr(&e.buf, 1, x1)}
+			x2 := read_slot(e, a + 2, 2); if x2 != 2 {vmovaps_rr(&e.buf, 2, x2)}
+			y0 := read_slot(e, b, 3);     if y0 != 3 {vmovaps_rr(&e.buf, 3, y0)}
+			y1 := read_slot(e, b + 1, 4); if y1 != 4 {vmovaps_rr(&e.buf, 4, y1)}
+			y2 := read_slot(e, b + 2, 5); if y2 != 5 {vmovaps_rr(&e.buf, 5, y2)}
 
 			vop_ps(&e.buf, 0x59, 6, 1, 5)
 			vop_ps(&e.buf, 0x59, 7, 4, 2)
-			vop_ps(&e.buf, 0x5C, 6, 6, 7)
-			write_slot(e, dst, 6)
+			yd0 := prep_dst(e, dst, 6)
+			vop_ps(&e.buf, 0x5C, yd0, 6, 7)
+			commit_dst(e, dst, yd0)
 
 			vop_ps(&e.buf, 0x59, 6, 2, 3)
 			vop_ps(&e.buf, 0x59, 7, 5, 0)
-			vop_ps(&e.buf, 0x5C, 6, 6, 7)
-			write_slot(e, dst + 1, 6)
+			yd1 := prep_dst(e, dst + 1, 6)
+			vop_ps(&e.buf, 0x5C, yd1, 6, 7)
+			commit_dst(e, dst + 1, yd1)
 
 			vop_ps(&e.buf, 0x59, 6, 0, 4)
 			vop_ps(&e.buf, 0x59, 7, 3, 1)
-			vop_ps(&e.buf, 0x5C, 6, 6, 7)
-			write_slot(e, dst + 2, 6)
+			yd2 := prep_dst(e, dst + 2, 6)
+			vop_ps(&e.buf, 0x5C, yd2, 6, 7)
+			commit_dst(e, dst + 2, yd2)
 
 		case .Reflect:
 			ya0 := read_slot(e, a, 1)
@@ -2136,8 +3006,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				yai := read_slot(e, a + i, 1)
 				ybi := read_slot(e, b + i, 2, pin_bit(yai))
 				vop_ps(&e.buf, 0x59, 5, 4, ybi)
-				vop_ps(&e.buf, 0x5C, 0, yai, 5)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(yai) | pin_bit(ybi))
+				vop_ps(&e.buf, 0x5C, yd, yai, 5)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Faceforward, .Refract:
@@ -2147,16 +3018,29 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			rows, inner, cols := n, i32(in_.k), in_.d
 			for col in 0 ..< cols {
 				for row in 0 ..< rows {
+					out_s := dst + col * rows + row
 					ya0 := read_slot(e, a + row, 1)
 					yb0 := read_slot(e, b + col * inner, 2, pin_bit(ya0))
-					vop_ps(&e.buf, 0x59, 0, ya0, yb0)
-					for k in 1 ..< inner {
-						yak := read_slot(e, a + k * rows + row, 1)
-						ybk := read_slot(e, b + col * inner + k, 2, pin_bit(yak))
-						vop_ps(&e.buf, 0x59, 3, yak, ybk)
-						vop_ps(&e.buf, 0x58, 0, 0, 3)
+					if inner == 1 {
+						yd := prep_dst(e, out_s, 0, pin_bit(ya0) | pin_bit(yb0))
+						vop_ps(&e.buf, 0x59, yd, ya0, yb0)
+						commit_dst(e, out_s, yd)
+					} else {
+						vop_ps(&e.buf, 0x59, 0, ya0, yb0)
+						for k in 1 ..< inner - 1 {
+							yak := read_slot(e, a + k * rows + row, 1)
+							ybk := read_slot(e, b + col * inner + k, 2, pin_bit(yak))
+							vop_ps(&e.buf, 0x59, 3, yak, ybk)
+							vop_ps(&e.buf, 0x58, 0, 0, 3)
+						}
+						kl := inner - 1
+						yal := read_slot(e, a + kl * rows + row, 1)
+						ybl := read_slot(e, b + col * inner + kl, 2, pin_bit(yal))
+						vop_ps(&e.buf, 0x59, 3, yal, ybl)
+						yd := prep_dst(e, out_s, 0, pin_bit(yal) | pin_bit(ybl))
+						vop_ps(&e.buf, 0x58, yd, 0, 3)
+						commit_dst(e, out_s, yd)
 					}
-					write_slot(e, dst + col * rows + row, 0)
 				}
 			}
 
@@ -2165,14 +3049,26 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			for col in 0 ..< cols {
 				ya0 := read_slot(e, a, 1)
 				yb0 := read_slot(e, b + col * rows, 2, pin_bit(ya0))
-				vop_ps(&e.buf, 0x59, 0, ya0, yb0)
-				for row in 1 ..< rows {
-					yar := read_slot(e, a + row, 1)
-					ybr := read_slot(e, b + col * rows + row, 2, pin_bit(yar))
-					vop_ps(&e.buf, 0x59, 3, yar, ybr)
-					vop_ps(&e.buf, 0x58, 0, 0, 3)
+				if rows == 1 {
+					yd := prep_dst(e, dst + col, 0, pin_bit(ya0) | pin_bit(yb0))
+					vop_ps(&e.buf, 0x59, yd, ya0, yb0)
+					commit_dst(e, dst + col, yd)
+				} else {
+					vop_ps(&e.buf, 0x59, 0, ya0, yb0)
+					for row in 1 ..< rows - 1 {
+						yar := read_slot(e, a + row, 1)
+						ybr := read_slot(e, b + col * rows + row, 2, pin_bit(yar))
+						vop_ps(&e.buf, 0x59, 3, yar, ybr)
+						vop_ps(&e.buf, 0x58, 0, 0, 3)
+					}
+					rl := rows - 1
+					yal := read_slot(e, a + rl, 1)
+					ybl := read_slot(e, b + col * rows + rl, 2, pin_bit(yal))
+					vop_ps(&e.buf, 0x59, 3, yal, ybl)
+					yd := prep_dst(e, dst + col, 0, pin_bit(yal) | pin_bit(ybl))
+					vop_ps(&e.buf, 0x58, yd, 0, 3)
+					commit_dst(e, dst + col, yd)
 				}
-				write_slot(e, dst + col, 0)
 			}
 
 		case .Transpose:
@@ -2180,7 +3076,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			for col in 0 ..< cols {
 				for row in 0 ..< rows {
 					ya := read_slot(e, a + col * rows + row, 0)
-					write_slot(e, dst + row * cols + col, ya, pin_bit(ya))
+					copy_to_dst(e, dst + row * cols + col, ya, pin_bit(ya))
 				}
 			}
 
@@ -2191,8 +3087,10 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				pb := pin_bit(ybc)
 				for row in 0 ..< rows {
 					yar := read_slot(e, a + row, 1, pb)
-					vop_ps(&e.buf, 0x59, 0, yar, ybc)
-					write_slot(e, dst + col * rows + row, 0, pb)
+					keep := pb if row + 1 < rows else 0
+					yd := prep_dst(e, dst + col * rows + row, 0, pb | pin_bit(yar), keep)
+					vop_ps(&e.buf, 0x59, yd, yar, ybc)
+					commit_dst(e, dst + col * rows + row, yd)
 				}
 			}
 
@@ -2204,8 +3102,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				ya := read_slot(e, a + i, 1)
 				emit_vex_rr(&e.buf, 1, 2, 1, 0, 0x16, 2, 0, ya) // vmovshdup
 				emit_vex_rr(&e.buf, 1, 2, 1, 0, 0x12, 3, 0, ya) // vmovsldup
-				vop_ps(&e.buf, 0x5C, 0, 2, 3)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_ps(&e.buf, 0x5C, yd, 2, 3)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Deriv_Y:
@@ -2213,8 +3112,9 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				ya := read_slot(e, a + i, 1)
 				emit_vex_rr(&e.buf, 1, 0, 1, 0, 0xC6, 2, ya, ya); emit_b(&e.buf, 0xEE)
 				emit_vex_rr(&e.buf, 1, 0, 1, 0, 0xC6, 3, ya, ya); emit_b(&e.buf, 0x44)
-				vop_ps(&e.buf, 0x5C, 0, 2, 3)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_ps(&e.buf, 0x5C, yd, 2, 3)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Fwidth:
@@ -2228,11 +3128,24 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				emit_vex_rr(&e.buf, 1, 0, 1, 0, 0xC6, 4, ya, ya); emit_b(&e.buf, 0x44)
 				vop_ps(&e.buf, 0x5C, 3, 3, 4)
 				vop_ps_tab(&e.buf, 0x54, 3, 3, OFF_TAB_ABS)
-				vop_ps(&e.buf, 0x58, 0, 2, 3)
-				write_slot(e, dst + i, 0)
+				yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+				vop_ps(&e.buf, 0x58, yd, 2, 3)
+				commit_dst(e, dst + i, yd)
 			}
 
 		case .Texture, .Texture_Bias, .Texel_Fetch:
+			e.exec_ymask_valid = false
+			comp_mask := e.tex_mask[pc]
+			if comp_mask != 0 {
+				ya0 := read_slot(e, a, 0)
+				ya1 := read_slot(e, a + 1, 1, pin_bit(ya0))
+				if ya0 != 0 {
+					vmovaps_rr(&e.buf, 0, ya0)
+				}
+				if ya1 != 1 {
+					vmovaps_rr(&e.buf, 1, ya1)
+				}
+			}
 			chan_disp := (i32(in_.k) - SAMPLER_COUNT) * size_of(Chan_Img)
 			emit_bytes(&e.buf, 0x48, 0x8B) // mov rsi, [rbx + chan_disp + OFF_CHAN_PTR]
 			emit_modrm_mem(&e.buf, GPR_RSI, GPR_RBX, chan_disp + OFF_CHAN_PTR)
@@ -2240,23 +3153,84 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			emit_bytes(&e.buf, 0x0F, 0x85)       // jnz bound_tex
 			bound_patch := len(e.buf)
 			emit_i32(&e.buf, 0)
-			emit_helper_call(&e.buf, jit_help_texel_fetch if in_.op == .Texel_Fetch else jit_help_texture, &code[pc])
-			append(&e.bound_tex, Bound_Tex_Stub {
-				bound_patch = bound_patch,
-				ret_off     = len(e.buf),
-				pc          = i32(pc),
-			})
+
+			// Unbound callback path: flush any dirty cached input slots to [rbx]
+			// and save/restore only the ymm8..15 registers still live after `pc`.
+			for cs, idx in e.cache {
+				if cs.slot < 0 || !cs.dirty {
+					continue
+				}
+				for r in rw[pc].reads {
+					if cs.slot >= r.start && cs.slot < r.start + r.n {
+						vmovaps_store(&e.buf, cs.slot, u8(8 + idx))
+						break
+					}
+				}
+			}
+			save_regs: [8]u8
+			n_save := 0
+			for &cs, idx in e.cache {
+				if cs.slot < 0 {
+					continue
+				}
+				if (cs.slot >= dst && cs.slot < dst + 4) || cs.last_use <= e.pc {
+					cs = {slot = -1, last_use = -1, dirty = false, stamp = 0}
+				} else {
+					save_regs[n_save] = u8(8 + idx)
+					n_save += 1
+				}
+			}
+			fn := jit_help_texel_fetch if in_.op == .Texel_Fetch else jit_help_texture
+			if n_save == 0 {
+				emit_helper_call(&e.buf, fn, &code[pc])
+			} else if n_save <= 2 {
+				frame := u8(n_save * 32)
+				emit_bytes(&e.buf, 0x48, 0x83, 0xEC, frame)
+				for i in 0 ..< n_save {
+					emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x11, save_regs[i], 0, GPR_RSP, i32(i * 32))
+				}
+				emit_helper_call(&e.buf, fn, &code[pc])
+				for i in 0 ..< n_save {
+					emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x10, save_regs[i], 0, GPR_RSP, i32(i * 32))
+				}
+				emit_bytes(&e.buf, 0x48, 0x83, 0xC4, frame)
+			} else {
+				emit_bytes(&e.buf, 0x48, 0xBE) // movabs rsi, &code[pc]
+				emit_u64(&e.buf, u64(uintptr(&code[pc])))
+				emit_bytes(&e.buf, 0x48, 0xB8) // movabs rax, fn
+				emit_u64(&e.buf, u64(uintptr(rawptr(fn))))
+				emit_b(&e.buf, 0xE8) // call helper_ymm_sub
+				append(&e.helper_ymm_calls, len(e.buf))
+				emit_i32(&e.buf, 0)
+			}
+			if comp_mask == 0 {
+				patch_i32(e.buf[:], bound_patch, i32(len(e.buf) - (bound_patch + 4)))
+			} else {
+				append(&e.bound_tex, Bound_Tex_Stub {
+					bound_patch = bound_patch,
+					ret_off     = len(e.buf),
+					pc          = i32(pc),
+					comp_mask   = comp_mask,
+				})
+			}
 
 		case .Texture_Size:
 			emit_helper_call(&e.buf, jit_help_texture_size, &code[pc])
 
 		case .Load_Buf:
+			e.exec_ymask_valid = false
 			k_buf := i32(in_.k)
 			if k_buf >= 4 {
 				emit_helper_call(&e.buf, jit_help_load_buf, &code[pc])
 				break
 			}
 			yidx := read_slot(e, a, 6)
+			pins := pin_bit(yidx)
+			yd: [4]u8
+			for i in 0 ..< n {
+				yd[i] = prep_dst(e, dst + i, u8(i), pins)
+				pins |= pin_bit(yd[i])
+			}
 			emit_bytes(&e.buf, 0x48, 0x8B) // mov rcx, [rbp + OFF_CTX_BUF_LEN + k*8]
 			emit_modrm_mem(&e.buf, GPR_RCX, GPR_RBP, OFF_CTX_BUF_LEN + k_buf * 8)
 			emit_bytes(&e.buf, 0x48, 0x8B) // mov rsi, [rbp + OFF_CTX_BUF_PTR + k*8]
@@ -2271,7 +3245,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			div_patch := len(e.buf)
 			emit_i32(&e.buf, 0)
 
-			// Uniform fast path: 64-bit unsigned bounds-checked vbroadcastss into ymm0..ymm(n-1).
+			// Uniform fast path: 64-bit unsigned bounds-checked vbroadcastss into yd[0..n-1].
 			emit_vex_rr(&e.buf, 1, 1, 0, 0, 0x7E, yidx, 0, GPR_RAX) // vmovd eax, xmm(yidx)
 			stride := u32(in_.b)
 			off := u32(in_.c)
@@ -2285,27 +3259,26 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				emit_b(&e.buf, 0x05) // add eax, off
 				emit_u32(&e.buf, off)
 			}
-			for i in 0 ..< n {
-				if i > 0 {
-					emit_bytes(&e.buf, 0x83, 0xC0, 0x01) // add eax, 1 (32-bit wrap + zero-extend rax)
-				}
+			// ctx.buf_len is clamped at 2^32, so in 64 bits `rax + (n - 1) < rcx` holds iff
+			// `eax + u32(n - 1)` does not wrap 32 bits and all `n` words lie within `buf_len`.
+			if n == 1 {
 				emit_bytes(&e.buf, 0x48, 0x39, 0xC8) // cmp rax, rcx
-				emit_b(&e.buf, 0x73)                 // jae oob
-				oob_patch := len(e.buf)
-				emit_b(&e.buf, 0)
-				emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x18, u8(i), 0, GPR_RSI, GPR_RAX, 2, 0) // vbroadcastss ymm(i), [rsi + rax*4]
-				emit_b(&e.buf, 0xEB) // jmp next_i
-				next_patch := len(e.buf)
-				emit_b(&e.buf, 0)
-				e.buf[oob_patch] = u8(len(e.buf) - (oob_patch + 1))
-				vzero(&e.buf, u8(i))
-				e.buf[next_patch] = u8(len(e.buf) - (next_patch + 1))
+			} else {
+				emit_bytes(&e.buf, 0x48, 0x8D) // lea rdx, [rax + (n - 1)]
+				emit_modrm_mem(&e.buf, GPR_RDX, GPR_RAX, n - 1)
+				emit_bytes(&e.buf, 0x48, 0x39, 0xCA) // cmp rdx, rcx
+			}
+			emit_bytes(&e.buf, 0x0F, 0x83) // jae unif_oob_stub
+			unif_patch := len(e.buf)
+			emit_i32(&e.buf, 0)
+			for i in 0 ..< n {
+				emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x18, yd[i], 0, GPR_RSI, GPR_RAX, 2, i * 4) // vbroadcastss yd[i], [rsi + rax*4 + i*4]
 			}
 			emit_b(&e.buf, 0xE9) // jmp done
 			done_patch := len(e.buf)
 			emit_i32(&e.buf, 0)
 
-			// Divergent path: hardware AVX2 vpgatherdd.
+			// Divergent path: hardware AVX2 vpgatherdd (< 2^31 words inline; > 2^31 words out of line).
 			patch_i32(e.buf[:], div_patch, i32(len(e.buf) - (div_patch + 4)))
 			if stride == 0 {
 				vzero(&e.buf, 4)
@@ -2325,11 +3298,11 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x58, 5, 0, 5)
 				vop_d(&e.buf, 0xFE, 4, 4, 5)
 			}
-			// vpgatherdd sign-extends 32-bit indices; if eff_len > 2^31, split low/high 8 GiB halves.
+			// vpgatherdd sign-extends 32-bit indices; if eff_len > 2^31, jump to out-of-line split gather.
 			emit_b(&e.buf, 0xBA) // mov edx, 0x80000000 (zero-extended into rdx)
 			emit_u32(&e.buf, 0x8000_0000)
 			emit_bytes(&e.buf, 0x48, 0x39, 0xD1) // cmp rcx, rdx
-			emit_bytes(&e.buf, 0x0F, 0x87)       // ja big_buf
+			emit_bytes(&e.buf, 0x0F, 0x87)       // ja big_buf_stub
 			big_patch := len(e.buf)
 			emit_i32(&e.buf, 0)
 
@@ -2343,79 +3316,102 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				vop_d(&e.buf, 0x76, 7, 7, 5)                // ~0 where w >= len
 				vop_d_tab(&e.buf, 0xEF, 7, 7, OFF_TAB_ALL1) // ~0 where w < len (so bit 31 of w is 0)
 				vop_d(&e.buf, 0xDB, 6, 4, 7)                // non-negative safe index
-				vzero(&e.buf, u8(i))
-				emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x90, u8(i), 7, GPR_RSI, 6, 2, 0) // vpgatherdd ymm(i), [rsi + ymm6*4], ymm7
-			}
-			emit_b(&e.buf, 0xE9) // jmp done2
-			done2_patch := len(e.buf)
-			emit_i32(&e.buf, 0)
-
-			// Large buffer (> 2^31 words): gather w < 2^31 from rsi and w >= 2^31 from rsi + 8 GiB.
-			patch_i32(e.buf[:], big_patch, i32(len(e.buf) - (big_patch + 4)))
-			emit_bytes(&e.buf, 0x48, 0x29, 0xD1) // sub rcx, rdx -> rem in 1..2^31
-			emit_bytes(&e.buf, 0x48, 0x8D)       // lea rdi, [rsi + rdx*4] -> rsi + 8 GiB
-			emit_modrm_sib(&e.buf, GPR_RDI, GPR_RSI, GPR_RDX, 2, 0)
-			emit_vex_rr(&e.buf, 1, 1, 0, 0, 0x6E, 5, 0, GPR_RCX)
-			emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x58, 5, 0, 5)
-			for i in 0 ..< n {
-				if i > 0 {
-					vop_d_tab(&e.buf, 0xFE, 4, 4, OFF_TAB_ONE_U)
-				}
-				vzero(&e.buf, u8(i))
-				vop_d_tab(&e.buf, 0xDB, 6, 4, OFF_TAB_ABS)  // ymm6 = w & 0x7fffffff (non-negative)
-				vop_d_tab(&e.buf, 0xEF, 7, 4, OFF_TAB_ALL1) // MSB=1 where w < 2^31
-				emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x90, u8(i), 7, GPR_RSI, 6, 2, 0)
-				vop38_d(&e.buf, 0x3B, 7, 6, 5)              // vpminud(w_lo, rem)
-				vop_d(&e.buf, 0x76, 7, 7, 5)                // ~0 where w_lo >= rem
-				vop_d(&e.buf, 0xDF, 7, 7, 4)                // vpandn: MSB=1 where w >= 2^31 && w_lo < rem
-				emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x90, u8(i), 7, GPR_RDI, 6, 2, 0)
+				vzero(&e.buf, yd[i])
+				emit_vex_sib(&e.buf, 2, 1, 1, 0, 0x90, yd[i], 7, GPR_RSI, 6, 2, 0) // vpgatherdd yd[i], [rsi + ymm6*4], ymm7
 			}
 
-			patch_i32(e.buf[:], done_patch, i32(len(e.buf) - (done_patch + 4)))
-			patch_i32(e.buf[:], done2_patch, i32(len(e.buf) - (done2_patch + 4)))
+			ret_off := len(e.buf)
+			patch_i32(e.buf[:], done_patch, i32(ret_off - (done_patch + 4)))
+			append(&e.load_bufs, Load_Buf_Stub {
+				unif_patch = unif_patch,
+				big_patch  = big_patch,
+				ret_off    = ret_off,
+				pc         = i32(pc),
+				yd         = yd,
+			})
 			for i in 0 ..< n {
-				write_slot(e, dst + i, u8(i))
+				commit_dst(e, dst + i, yd[i])
 			}
 
 		case .Mask_Copy:
-			if dst != a {
-				emit_load_mask_eax(&e.buf, a)
-				emit_store_mask_al(&e.buf, dst)
-			}
+			emit_copy_mask(e, dst, a)
 
 		case .Mask_Cond:
-			yb := read_slot(e, b, 1)
-			vzero(&e.buf, 0)
-			vop_d(&e.buf, 0x76, 0, yb, 0)                         // ~0 where b == 0
-			emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x50, GPR_RCX, 0, 0)  // vmovmskps ecx, ymm0
-			if in_.k == 0 {
-				emit_bytes(&e.buf, 0x81, 0xF1, 0xFF, 0x00, 0x00, 0x00) // xor ecx, 0xFF
-			}
-			emit_load_mask_eax(&e.buf, a)
-			emit_bytes(&e.buf, 0x21, 0xC8) // and eax, ecx
-			emit_store_mask_al(&e.buf, dst)
-
-		case .Mask_Restore:
-			emit_bytes(&e.buf, 0x41, 0x0F, 0xB6) // movzx ecx, byte [r12 + MASK_DISCARD]
-			emit_modrm_mem(&e.buf, GPR_RCX, GPR_R12, MASK_DISCARD)
-			kills := [3]i32{b, c, in_.d}
-			for km in kills {
-				if km >= 0 {
-					emit_load_mask_eax(&e.buf, km)
-					emit_bytes(&e.buf, 0x09, 0xC1) // or ecx, eax
+			if e.fused_mc_pc == i32(pc) {
+				e.fused_mc_pc = -1
+				if (in_.k == 1) != e.fused_mc_inv {
+					emit_bytes(&e.buf, 0xF7, 0xD1) // not ecx
+				}
+			} else {
+				yb := read_slot(e, b, 1)
+				vzero(&e.buf, 0)
+				vop_d(&e.buf, 0x76, 0, yb, 0)                         // ~0 where b == 0
+				emit_vex_rr(&e.buf, 1, 0, 1, 0, 0x50, GPR_RCX, 0, 0)  // vmovmskps ecx, ymm0
+				if in_.k == 0 {
+					emit_bytes(&e.buf, 0x81, 0xF1, 0xFF, 0x00, 0x00, 0x00) // xor ecx, 0xFF
 				}
 			}
-			emit_bytes(&e.buf, 0xF7, 0xD1) // not ecx
-			emit_load_mask_eax(&e.buf, a)
-			emit_bytes(&e.buf, 0x21, 0xC8) // and eax, ecx
-			emit_store_mask_al(&e.buf, dst)
+			if dst == MASK_EXEC && is_mask_eq_exec(e, a) {
+				emit_bytes(&e.buf, 0x41, 0x21, 0xCD) // and r13d, ecx
+			} else {
+				emit_load_mask_eax(e, a)
+				emit_bytes(&e.buf, 0x21, 0xC8) // and eax, ecx
+				emit_store_mask_al(&e.buf, dst)
+			}
+			invalidate_mask_write(e, dst)
+
+		case .Mask_Restore:
+			cands := [4]i32{MASK_DISCARD, b, c, in_.d}
+			kills: [4]i32
+			n_kills := 0
+			for km in cands {
+				if km < 0 || !e.mask_written[km] {
+					continue
+				}
+				dup := false
+				for prev in kills[:n_kills] {
+					if prev == km {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					kills[n_kills] = km
+					n_kills += 1
+				}
+			}
+			if n_kills == 0 {
+				emit_copy_mask(e, dst, a)
+			} else {
+				k0 := kills[0]
+				if is_mask_eq_exec(e, k0) {
+					emit_bytes(&e.buf, 0x44, 0x89, 0xE9) // mov ecx, r13d
+				} else {
+					emit_bytes(&e.buf, 0x41, 0x0F, 0xB6) // movzx ecx, byte [r12 + k0]
+					emit_modrm_mem(&e.buf, GPR_RCX, GPR_R12, k0)
+				}
+				for km in kills[1:n_kills] {
+					emit_load_mask_eax(e, km)
+					emit_bytes(&e.buf, 0x09, 0xC1) // or ecx, eax
+				}
+				emit_bytes(&e.buf, 0xF7, 0xD1) // not ecx
+				if dst == MASK_EXEC && is_mask_eq_exec(e, a) {
+					emit_bytes(&e.buf, 0x41, 0x21, 0xCD) // and r13d, ecx
+				} else {
+					emit_load_mask_eax(e, a)
+					emit_bytes(&e.buf, 0x21, 0xC8) // and eax, ecx
+					emit_store_mask_al(&e.buf, dst)
+				}
+				invalidate_mask_write(e, dst)
+			}
 
 		case .Mask_Or:
-			emit_load_mask_eax(&e.buf, b)
+			emit_load_mask_eax(e, b)
 			emit_bytes(&e.buf, 0x89, 0xC1) // mov ecx, eax
-			emit_load_mask_eax(&e.buf, a)
+			emit_load_mask_eax(e, a)
 			emit_bytes(&e.buf, 0x09, 0xC8) // or eax, ecx
 			emit_store_mask_al(&e.buf, dst)
+			invalidate_mask_write(e, dst)
 
 		case .Mask_Clear:
 			if dst == MASK_EXEC {
@@ -2425,14 +3421,17 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				emit_modrm_mem(&e.buf, 0, GPR_R12, dst)
 				emit_b(&e.buf, 0)
 			}
+			invalidate_mask_write(e, dst)
 
 		case .Mask_Kill:
 			if dst != MASK_EXEC {
-				emit_load_mask_eax(&e.buf, dst)
+				emit_load_mask_eax(e, dst)
 				emit_bytes(&e.buf, 0x44, 0x09, 0xE8) // or eax, r13d
 				emit_store_mask_al(&e.buf, dst)
 			}
 			emit_bytes(&e.buf, 0x45, 0x31, 0xED) // xor r13d, r13d
+			invalidate_mask_write(e, dst)
+			invalidate_mask_write(e, MASK_EXEC)
 			if dst == MASK_DISCARD && !is_init {
 				emit_bytes(&e.buf, 0xF7, 0xD0) // not eax
 				emit_bytes(&e.buf, 0x0F, 0xB6) // movzx ecx, byte [rbp + OFF_CTX_LANES]
@@ -2460,6 +3459,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 
 	pc_off[n_code] = len(e.buf)
 	epilogue_off := len(e.buf)
+	e.epilogue_off = epilogue_off
 
 	// Epilogue: vzeroupper, restore callee-saved GPRs.
 	emit_bytes(&e.buf, 0xC5, 0xF8, 0x77) // vzeroupper
@@ -2473,12 +3473,11 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 		rel := i32(epilogue_off - (ep + 4))
 		patch_i32(e.buf[:], ep, rel)
 	}
-	for stub in e.bound_tex {
+	for &stub in e.bound_tex {
+		stub.stub_off = len(e.buf)
 		patch_i32(e.buf[:], stub.bound_patch, i32(len(e.buf) - (stub.bound_patch + 4)))
 		in_ := code[stub.pc]
 		chan_disp := (i32(in_.k) - SAMPLER_COUNT) * size_of(Chan_Img)
-		vmovaps_load(&e.buf, 0, in_.a)
-		vmovaps_load(&e.buf, 1, in_.a + 1)
 		if in_.op == .Texel_Fetch {
 			if (in_.d & 1) != 0 {
 				vpbroadcastd_mem(&e.buf, 6, GPR_RBX, chan_disp + OFF_CHAN_MAX_Y)
@@ -2499,7 +3498,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			emit_vex_rr(&e.buf, 1, 1, 0, 0, 0x6E, 6, 0, GPR_RCX)
 			emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x58, 6, 0, 6)
 			vop38_d(&e.buf, 0x47, 4, 4, 6)
-			emit_chan_gather_rgba(&e.buf, GPR_RBX, chan_disp, 4, 5)
+			emit_chan_gather_rgba(&e.buf, GPR_RBX, chan_disp, 4, 5, stub.comp_mask)
 		} else {
 			emit_b(&e.buf, 0x80) // cmp byte [rbx + chan_disp + OFF_CHAN_FILTER], 0
 			emit_modrm_mem(&e.buf, 7, GPR_RBX, chan_disp + OFF_CHAN_FILTER)
@@ -2535,7 +3534,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			emit_vex_rr(&e.buf, 2, 1, 1, 0, 0x58, 6, 0, 6)
 			vop38_d(&e.buf, 0x47, 4, 4, 6)
 			emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x28, 5, 0, GPR_R14, OFF_TAB_ALL1)
-			emit_chan_gather_rgba(&e.buf, GPR_RBX, chan_disp, 4, 5)
+			emit_chan_gather_rgba(&e.buf, GPR_RBX, chan_disp, 4, 5, stub.comp_mask)
 			emit_b(&e.buf, 0xE9) // jmp bound_done
 			done_near := len(e.buf)
 			emit_i32(&e.buf, 0)
@@ -2544,25 +3543,102 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			patch_i32(e.buf[:], lin_patch, i32(len(e.buf) - (lin_patch + 4)))
 			emit_bytes(&e.buf, 0x48, 0x8D) // lea rdi, [rbx + chan_disp]
 			emit_modrm_mem(&e.buf, GPR_RDI, GPR_RBX, chan_disp)
-			emit_b(&e.buf, 0xE8) // call bilinear_sub
+			emit_b(&e.buf, 0xBA)           // mov edx, u32(stub.comp_mask)
+			emit_u32(&e.buf, u32(stub.comp_mask))
+			emit_b(&e.buf, 0xE8)           // call bilinear_sub
 			append(&e.bilinear_calls, len(e.buf))
 			emit_i32(&e.buf, 0)
 
 			patch_i32(e.buf[:], done_near, i32(len(e.buf) - (done_near + 4)))
 		}
 		for i in 0 ..< i32(4) {
-			vmovaps_store(&e.buf, in_.dst + i, u8(i))
+			if (stub.comp_mask & (u8(1) << uint(i))) != 0 {
+				vmovaps_store(&e.buf, in_.dst + i, u8(i))
+			}
 		}
 		emit_b(&e.buf, 0xE9) // jmp ret_off
 		ret_patch := len(e.buf)
 		emit_i32(&e.buf, 0)
 		patch_i32(e.buf[:], ret_patch, i32(stub.ret_off - (ret_patch + 4)))
+		stub.stub_end = len(e.buf)
+	}
+	for &stub in e.load_bufs {
+		stub.stub_off = len(e.buf)
+		patch_i32(e.buf[:], stub.unif_patch, i32(len(e.buf) - (stub.unif_patch + 4)))
+		in_ := code[stub.pc]
+		n := i32(in_.n)
+		if n == 1 {
+			vzero(&e.buf, stub.yd[0])
+			emit_b(&e.buf, 0xE9) // jmp ret_off
+			p := len(e.buf)
+			emit_i32(&e.buf, 0)
+			patch_i32(e.buf[:], p, i32(stub.ret_off - (p + 4)))
+
+			patch_i32(e.buf[:], stub.big_patch, i32(len(e.buf) - (stub.big_patch + 4)))
+			emit_b(&e.buf, 0xB8) // mov eax, 1
+			emit_u32(&e.buf, 1)
+			emit_b(&e.buf, 0xE8) // call big_buf_sub
+			append(&e.big_buf_calls, len(e.buf))
+			emit_i32(&e.buf, 0)
+			vmovaps_rr(&e.buf, stub.yd[0], 0)
+		} else {
+			emit_b(&e.buf, 0xBA) // mov edx, u32(n)
+			emit_u32(&e.buf, u32(n))
+			emit_b(&e.buf, 0xE8) // call unif_oob_sub
+			append(&e.unif_oob_calls, len(e.buf))
+			emit_i32(&e.buf, 0)
+			emit_b(&e.buf, 0xEB) // jmp copy_out
+			copy_jmp := len(e.buf)
+			emit_b(&e.buf, 0)
+
+			patch_i32(e.buf[:], stub.big_patch, i32(len(e.buf) - (stub.big_patch + 4)))
+			emit_b(&e.buf, 0xB8) // mov eax, u32(n)
+			emit_u32(&e.buf, u32(n))
+			emit_b(&e.buf, 0xE8) // call big_buf_sub
+			append(&e.big_buf_calls, len(e.buf))
+			emit_i32(&e.buf, 0)
+
+			e.buf[copy_jmp] = u8(len(e.buf) - (copy_jmp + 1))
+			for i in 0 ..< n {
+				vmovaps_rr(&e.buf, stub.yd[i], u8(i))
+			}
+		}
+		emit_b(&e.buf, 0xE9) // jmp ret_off
+		ret_p := len(e.buf)
+		emit_i32(&e.buf, 0)
+		patch_i32(e.buf[:], ret_p, i32(stub.ret_off - (ret_p + 4)))
+		stub.stub_end = len(e.buf)
 	}
 	if len(e.bilinear_calls) > 0 {
 		bilinear_off := len(e.buf)
+		e.bilinear_off = bilinear_off
 		emit_bilinear_sub(&e.buf)
 		for cp in e.bilinear_calls {
 			patch_i32(e.buf[:], cp, i32(bilinear_off - (cp + 4)))
+		}
+	}
+	if len(e.helper_ymm_calls) > 0 {
+		helper_ymm_off := len(e.buf)
+		e.helper_ymm_off = helper_ymm_off
+		emit_helper_ymm_sub(&e.buf)
+		for cp in e.helper_ymm_calls {
+			patch_i32(e.buf[:], cp, i32(helper_ymm_off - (cp + 4)))
+		}
+	}
+	if len(e.unif_oob_calls) > 0 {
+		unif_oob_off := len(e.buf)
+		e.unif_oob_off = unif_oob_off
+		emit_unif_oob_sub(&e.buf)
+		for cp in e.unif_oob_calls {
+			patch_i32(e.buf[:], cp, i32(unif_oob_off - (cp + 4)))
+		}
+	}
+	if len(e.big_buf_calls) > 0 {
+		big_buf_off := len(e.buf)
+		e.big_buf_off = big_buf_off
+		emit_big_buf_sub(&e.buf)
+		for cp in e.big_buf_calls {
+			patch_i32(e.buf[:], cp, i32(big_buf_off - (cp + 4)))
 		}
 	}
 }
@@ -2576,33 +3652,53 @@ jit_compile :: proc(p: ^Program) {
 	num_slots := max(p.num_slots, 1)
 	max_code := max(p.init_len, len(p.code) - p.init_len)
 	e := Jit_Emitter {
-		buf       = make([dynamic]u8, 0, max(len(p.code) * 24, 256), heap),
-		cross_bb  = make([]bool, num_slots, heap),
-		last_use  = make([]i32, num_slots, heap),
-		def_bb    = make([]i32, num_slots, heap),
-		bb_start  = make([]bool, max_code + 1, heap),
-		pc_off    = make([]int, max_code + 1, heap),
-		rw        = make([]Instr_RW, max_code, heap),
-		patches        = make([dynamic]Jump_Patch, 0, 64, heap),
-		epilogues      = make([dynamic]int, 0, 8, heap),
-		bilinear_calls = make([dynamic]int, 0, 8, heap),
-		bound_tex      = make([dynamic]Bound_Tex_Stub, 0, 8, heap),
+		buf              = make([dynamic]u8, 0, max(len(p.code) * 24, 256), heap),
+		mem_mask         = make([]u16, max_code, heap),
+		tex_mask         = make([]u8, max_code, heap),
+		pc_to_bb         = make([]i32, max_code + 1, heap),
+		last_use         = make([]i32, num_slots, heap),
+		def_off          = make([]i32, max_code, heap),
+		def_lu           = make([dynamic]i32, 0, 256, heap),
+		bb_start         = make([]bool, max_code + 1, heap),
+		mask_written     = make([]bool, max(p.num_masks, 2), heap),
+		mask_eq_gen      = make([]u32, max(p.num_masks, 2), heap),
+		pc_off           = make([]int, max_code + 1, heap),
+		rw               = make([]Instr_RW, max_code, heap),
+		patches          = make([dynamic]Jump_Patch, 0, 64, heap),
+		epilogues        = make([dynamic]int, 0, 8, heap),
+		bilinear_calls   = make([dynamic]int, 0, 8, heap),
+		helper_ymm_calls = make([dynamic]int, 0, 8, heap),
+		unif_oob_calls   = make([dynamic]int, 0, 8, heap),
+		big_buf_calls    = make([dynamic]int, 0, 8, heap),
+		bound_tex        = make([dynamic]Bound_Tex_Stub, 0, 8, heap),
+		load_bufs        = make([dynamic]Load_Buf_Stub, 0, 8, heap),
 	}
 	defer delete(e.buf)
-	defer delete(e.cross_bb, heap)
+	defer delete(e.mem_mask, heap)
+	defer delete(e.tex_mask, heap)
+	defer delete(e.pc_to_bb, heap)
 	defer delete(e.last_use, heap)
-	defer delete(e.def_bb, heap)
+	defer delete(e.def_off, heap)
+	defer delete(e.def_lu)
 	defer delete(e.bb_start, heap)
+	defer delete(e.mask_written, heap)
+	defer delete(e.mask_eq_gen, heap)
 	defer delete(e.pc_off, heap)
 	defer delete(e.rw, heap)
 	defer delete(e.patches)
 	defer delete(e.epilogues)
 	defer delete(e.bilinear_calls)
+	defer delete(e.helper_ymm_calls)
+	defer delete(e.unif_oob_calls)
+	defer delete(e.big_buf_calls)
 	defer delete(e.bound_tex)
+	defer delete(e.load_bufs)
 
 	has_init := p.init_len > 0
+	init_bytes := 0
 	if has_init {
 		jit_emit_fn(&e, p, p.code[:p.init_len], true)
+		init_bytes = len(e.buf)
 		for (len(e.buf) & 31) != 0 {
 			append(&e.buf, 0xCC)
 		}
@@ -2620,6 +3716,7 @@ jit_compile :: proc(p: ^Program) {
 		virtual.release(raw_data(mem_slice), uint(len(mem_slice)))
 		return
 	}
+	jit_dump_program(p, &e, mem_slice, init_bytes, body_off, total)
 
 	meta := new(Jit_Meta, heap)
 	for in_ in p.code {

@@ -2,6 +2,8 @@ package oksl
 
 import "core:fmt"
 import "core:math"
+import "core:mem"
+import "core:mem/virtual"
 import "core:os"
 import "core:slice"
 import "core:strings"
@@ -8030,6 +8032,2117 @@ void main() {
 						row_got := bj[ry * rc.w:(ry + 1) * rc.w]
 						row_ref := full_j[(rc.y + ry) * LW + rc.x:][:rc.w]
 						testing.expect(t, slice.equal(slice.reinterpret([]u32, row_got), slice.reinterpret([]u32, row_ref)))
+					}
+				}
+			}
+		}
+	}
+}
+
+@(test)
+test_jit_dyn_slots_only :: proc(t: ^testing.T) {
+	// Dynamic array indexing next to cached single-BB temporaries (both uniform
+	// and lane-divergent indices, static write -> Load_Dyn in one BB, Store_Dyn ->
+	// static/dynamic reads, and swizzled vec3 array reads).
+	make_src :: proc(dynamic_idx: bool) -> string {
+		idx_expr := "idx" if dynamic_idx else "1"
+		return fmt.tprintf(`#version 310 es
+precision highp float;
+uniform int uBase;
+out vec4 o;
+void main() {{
+    int px = int(gl_FragCoord.x);
+    int py = int(gl_FragCoord.y);
+    int idx = clamp((px + py + uBase) %% 3, 0, 2);
+    int idx2 = clamp((px * 2 + uBase) %% 4, 0, 3);
+
+    vec4 v = vec4(float(px) * 0.1 + 1.0, float(py) * 0.2 + 0.5, 0.75, 1.25);
+    vec3 a[3];
+    a[0] = v.xyz + vec3(1.0, 2.0, 3.0);
+    a[1] = v.yzx * vec3(1.5, 0.5, 2.5);
+    a[2] = v.zxy - vec3(0.25, 0.75, 1.25);
+
+    // 24 vec4 ops (96 scalar writes) in the same BB as Load_Dyn: must stay in YMM cache,
+    // while array a (9 slots) MUST flush to memory before Load_Dyn reads [rbx + (a+off)*32].
+    vec4 t0 = v * 1.1 + 0.05;
+    vec4 t1 = t0 * 0.9 + v;
+    vec4 t2 = t1 * 1.05 - t0 * 0.25;
+    vec4 t3 = t2 + t1 * 0.5;
+    vec4 t4 = t3 * 0.8 + t0;
+    vec4 t5 = t4 - t2 * 0.3;
+    vec4 t6 = t5 * 1.2 + t3 * 0.1;
+    vec4 t7 = t6 + t4 * 0.4;
+    vec4 t8 = t7 * 0.75 + t5;
+    vec4 t9 = t8 - t6 * 0.2 + t1;
+    vec4 t10 = t9 * 1.15 + t7 * 0.3;
+    vec4 t11 = t10 + t8 * 0.6 - t2 * 0.1;
+    vec4 t12 = t11 * 0.95 + t9 * 0.2;
+    vec4 t13 = t12 - t10 * 0.15 + t3 * 0.25;
+    vec4 t14 = t13 * 1.05 + t11 * 0.35;
+    vec4 t15 = t14 + t12 * 0.45 - t4 * 0.05;
+
+    vec2 picked = a[%s].zy;
+
+    float b[4];
+    b[0] = 10.0;
+    b[1] = 20.0;
+    b[2] = 30.0;
+    b[3] = 40.0;
+    if (%s > 0) {{
+        b[idx2] = t15.x + picked.x;
+    }}
+    float s = b[0] + b[2] + b[%s];
+    o = t15 + vec4(picked, s, t0.w + t8.z);
+}}`, idx_expr, "uBase + px" if dynamic_idx else "uBase", "idx2" if dynamic_idx else "1")
+	}
+
+	m_dyn, e1, ok1 := compile(make_src(true), {profile = .Glsl, stage = .Fragment})
+	defer destroy(m_dyn)
+	testing.expectf(t, ok1, "dyn compile failed:\n%s", format_errors(e1, context.temp_allocator))
+	m_sta, e2, ok2 := compile(make_src(false), {profile = .Glsl, stage = .Fragment})
+	defer destroy(m_sta)
+	testing.expectf(t, ok2, "sta compile failed:\n%s", format_errors(e2, context.temp_allocator))
+	if !ok1 || !ok2 {
+		return
+	}
+
+	// Only `a` (9 slots) and `b` (4 slots) are dynamically indexed.
+	dyn_total := i32(0)
+	for ds in m_dyn.program.dyn_slots {
+		dyn_total += ds.n
+	}
+	testing.expect_value(t, dyn_total, i32(13))
+
+	when JIT_ENABLED {
+		if jit_avx2_ready {
+			// Reverting Item 1 marks all slots cross_bb and emits >600 B of extra [rbx] stores on t0..t15.
+			testing.expectf(
+				t,
+				len(m_dyn.program.jit_mem) < len(m_sta.program.jit_mem) + 450,
+				"expected cached temporaries alongside dynamic arrays: dyn=%d B vs static=%d B",
+				len(m_dyn.program.jit_mem),
+				len(m_sta.program.jit_mem),
+			)
+		}
+	}
+
+	p_int := m_dyn.program
+	p_int.jit_body, p_int.jit_init = nil, nil
+	scratch := temp_scratch()
+	ublk := make([]u8, max(m_dyn.block_size, 16), context.temp_allocator)
+	for base_val in ([3]f32{0, 1, 2}) {
+		set_uniform(m_dyn, ublk, "uBase", {base_val})
+		oj: [32][4]f32
+		oi: [32][4]f32
+		run_f32(&m_dyn.program, ublk, 8, 4, oj[:], scratch)
+		run_f32(&p_int, ublk, 8, 4, oi[:], scratch)
+		testing.expect(t, slice.equal(slice.reinterpret([]u32, oj[:]), slice.reinterpret([]u32, oi[:])))
+	}
+}
+
+@(private = "file")
+jit_vec4_bits_eq :: proc(a, b: [4]f32) -> bool {
+	for c in 0 ..< 4 {
+		if !(math.is_nan(a[c]) && math.is_nan(b[c])) && transmute(u32)a[c] != transmute(u32)b[c] {
+			return false
+		}
+	}
+	return true
+}
+
+@(test)
+test_jit_dst_reg_direct :: proc(t: ^testing.T) {
+	// 1. Synthetic Program exercising dst == src aliasing (in-place Splat, scalar F_Mul k=1,
+	//    in-place Gather reversal, Cross, Normalize, Select), dead dst, and cross_bb dst.
+	consts := [8][2]u32 {
+		{0, transmute(u32)f32(2.0)},
+		{1, transmute(u32)f32(-3.0)},
+		{2, transmute(u32)f32(5.0)},
+		{3, transmute(u32)f32(0.5)},
+		{8, transmute(u32)f32(1.25)},
+		{9, transmute(u32)f32(2.5)},
+		{10, transmute(u32)f32(-1.5)},
+		{11, transmute(u32)f32(4.0)},
+	}
+	outputs := [1]Program_Var{{kind = .Stage_Out, location = 0, slot = 12, n = 4, base = .Float}}
+	code := [13]Instr {
+		{op = .Mov, n = 1, dst = 4, a = 0},                       // slot 4 = 2.0 (cached)
+		{op = .Splat, n = 4, dst = 4, a = 4},                     // in-place splat: slots 4..7 = (2,2,2,2)
+		{op = .F_Add, n = 4, dst = 4, a = 4, b = 0},              // in-place vec add: (4, -1, 7, 2.5)
+		{op = .F_Mul, n = 4, k = 1, dst = 4, a = 4, b = 8},       // scalar a aliases dst+0: 4.0 * (1.25, 2.5, -1.5, 4.0) = (5, 10, -6, 16)
+		{op = .Gather, n = 4, dst = 4, a = 7, b = 6, c = 5, d = 4}, // in-place reverse swizzle: (16, -6, 10, 5)
+		{op = .Cross, n = 3, dst = 4, a = 4, b = 8},              // in-place cross with (1.25, 2.5, -1.5)
+		{op = .Normalize, n = 3, dst = 4, a = 4},                 // in-place normalize slots 4..6
+		{op = .F_Add, n = 1, dst = 7, a = 7, b = 3},              // dead intra-BB write if overwritten next
+		{op = .F_Mul, n = 1, dst = 7, a = 4, b = 2},              // overwrites dead slot 7, read below
+		{op = .F_Lt, n = 1, dst = 16, a = 5, b = 0},              // bool in slot 16
+		{op = .Select, n = 4, k = 1, dst = 4, a = 4, b = 8, c = 16}, // in-place scalar select
+		{op = .F_Add, n = 4, dst = 12, a = 4, b = 8},             // cross_bb output dst dead after pc
+		{op = .F_Sub, n = 1, dst = 17, a = 0, b = 1},             // dead non-cross_bb dst (unread)
+	}
+	p := Program {
+		code      = code[:],
+		consts    = consts[:],
+		outputs   = outputs[:],
+		num_slots = 18,
+		num_masks = 2,
+		stage     = .Fragment,
+	}
+	jit_compile(&p)
+	defer jit_destroy(&p)
+
+	oj1: [1][4]f32
+	oi1: [1][4]f32
+	run_f32(&p, nil, 1, 1, oj1[:], temp_scratch())
+	run_f32_interp(&p, nil, 1, 1, oi1[:], temp_scratch(), {})
+	testing.expectf(
+		t,
+		jit_vec4_bits_eq(oj1[0], oi1[0]),
+		"bit mismatch: jit=%v (0x%08x) interp=%v (0x%08x)",
+		oj1[0], transmute([4]u32)oj1[0],
+		oi1[0], transmute([4]u32)oi1[0],
+	)
+
+	// 2. Relative two-program comparison: 32 alternating vec4 F_Add/F_Mul ops in cached
+	//    BB-local slots 4..7 and 8..11 write directly into ymm8..15 (5 B per component,
+	//    identical length to reg-to-reg Mov) without bouncing through scratch ymm0.
+	outputs0 := [1]Program_Var{{kind = .Stage_Out, location = 0, slot = 0, n = 4, base = .Float}}
+	consts2 := [8][2]u32 {
+		{8, transmute(u32)f32(1.25)},
+		{9, transmute(u32)f32(2.5)},
+		{10, transmute(u32)f32(-1.5)},
+		{11, transmute(u32)f32(4.0)},
+		{12, transmute(u32)f32(2.0)},
+		{13, transmute(u32)f32(-3.0)},
+		{14, transmute(u32)f32(5.0)},
+		{15, transmute(u32)f32(0.5)},
+	}
+	chain_alu: [35]Instr
+	chain_mov: [35]Instr
+	chain_alu[0] = {op = .Mov, n = 4, dst = 4, a = 12}
+	chain_alu[1] = {op = .Mov, n = 4, dst = 8, a = 8}
+	chain_mov[0] = {op = .Mov, n = 4, dst = 4, a = 12}
+	chain_mov[1] = {op = .Mov, n = 4, dst = 8, a = 8}
+	for i in 0 ..< 32 {
+		if (i & 1) == 0 {
+			chain_alu[2 + i] = {op = .F_Add, n = 4, dst = 4, a = 4, b = 8}
+			chain_mov[2 + i] = {op = .Mov, n = 4, dst = 4, a = 8}
+		} else {
+			chain_alu[2 + i] = {op = .F_Mul, n = 4, dst = 8, a = 8, b = 4}
+			chain_mov[2 + i] = {op = .Mov, n = 4, dst = 8, a = 4}
+		}
+	}
+	chain_alu[34] = {op = .F_Add, n = 4, dst = 0, a = 4, b = 8}
+	chain_mov[34] = {op = .F_Add, n = 4, dst = 0, a = 4, b = 8}
+
+	p_cached := Program {
+		code      = chain_alu[:],
+		consts    = consts2[:],
+		outputs   = outputs0[:],
+		num_slots = 16,
+		num_masks = 2,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_cached)
+	defer jit_destroy(&p_cached)
+
+	p_mov := Program {
+		code      = chain_mov[:],
+		consts    = consts2[:],
+		outputs   = outputs0[:],
+		num_slots = 16,
+		num_masks = 2,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_mov)
+	defer jit_destroy(&p_mov)
+
+	when JIT_ENABLED {
+		if jit_avx2_ready {
+			// Direct-dst vaddps/vmulps (5 B) matches reg-to-reg vmovaps (5 B);
+			// bouncing through ymm0 adds 128 vmovaps copies (+512 B).
+			testing.expectf(
+				t,
+				len(p_cached.jit_mem) * 6 < len(p_mov.jit_mem) * 7,
+				"expected direct-dst cached ALU chain to omit ymm0 bounces: alu=%d B vs mov=%d B",
+				len(p_cached.jit_mem),
+				len(p_mov.jit_mem),
+			)
+		}
+	}
+	oj2, oi2: [1][4]f32
+	run_f32(&p_cached, nil, 1, 1, oj2[:], temp_scratch())
+	run_f32_interp(&p_cached, nil, 1, 1, oi2[:], temp_scratch(), {})
+	testing.expect(t, jit_vec4_bits_eq(oj2[0], oi2[0]))
+
+	oj3, oi3: [1][4]f32
+	run_f32(&p_mov, nil, 1, 1, oj3[:], temp_scratch())
+	run_f32_interp(&p_mov, nil, 1, 1, oi3[:], temp_scratch(), {})
+	testing.expect(t, jit_vec4_bits_eq(oj3[0], oi3[0]))
+}
+
+@(test)
+test_jit_mask_restore_dead_kills :: proc(t: ^testing.T) {
+	// 1. Relative two-program comparison: 20 Mask_Restore ops whose kill masks (2..4) have
+	//    no writers prune to 0-byte no-ops vs the same sequence when 2..4 are written.
+	consts := [1][2]u32{{0, transmute(u32)f32(1.0)}}
+	outputs := [1]Program_Var{{kind = .Stage_Out, location = 0, slot = 1, n = 4, base = .Float}}
+	code_zero: [25]Instr
+	code_zero[0] = {op = .Mask_Copy, dst = 5, a = MASK_EXEC}
+	code_zero[1] = {op = .Mask_Clear, dst = 2}
+	code_zero[2] = {op = .Mask_Clear, dst = 3}
+	code_zero[3] = {op = .Mask_Clear, dst = 4}
+	for i in 0 ..< 20 {
+		code_zero[4 + i] = {op = .Mask_Restore, dst = 5, a = 5, b = 2, c = 3, d = 4}
+	}
+	code_zero[24] = {op = .Splat, n = 4, dst = 1, a = 0}
+
+	code_live: [28]Instr
+	for i in 0 ..< 25 {
+		code_live[i] = code_zero[i]
+	}
+	code_live[25] = {op = .Mask_Copy, dst = 2, a = 5}
+	code_live[26] = {op = .Mask_Copy, dst = 3, a = 5}
+	code_live[27] = {op = .Mask_Copy, dst = 4, a = 5}
+
+	p_zero := Program {
+		code      = code_zero[:],
+		consts    = consts[:],
+		outputs   = outputs[:],
+		num_slots = 5,
+		num_masks = 6,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_zero)
+	defer jit_destroy(&p_zero)
+
+	p_live := Program {
+		code      = code_live[:],
+		consts    = consts[:],
+		outputs   = outputs[:],
+		num_slots = 5,
+		num_masks = 6,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_live)
+	defer jit_destroy(&p_live)
+
+	when JIT_ENABLED {
+		if jit_avx2_ready {
+			testing.expectf(
+				t,
+				len(p_zero.jit_mem) * 2 < len(p_live.jit_mem),
+				"expected dead-kill Mask_Restore pruning: dead=%d B vs live=%d B",
+				len(p_zero.jit_mem),
+				len(p_live.jit_mem),
+			)
+		}
+	}
+
+	// 2. Adversarial static-proof violation:
+	//    - break and continue appear AFTER an inner if/else inside a loop (reaching the earlier
+	//      Mask_Restore on the next iteration via the loop back-edge);
+	//    - early return in an inlined helper precedes a subsequent if/else;
+	//    - divergent discard precedes a subsequent if/else.
+	src := `#version 310 es
+precision highp float;
+out vec4 o;
+
+float helper_early(float x) {
+	float v = 1.0;
+	if (x > 5.0) {
+		return 42.0;
+	}
+	if (x > 2.5) {
+		v += 10.0;
+	} else {
+		v += 3.0;
+	}
+	return v;
+}
+
+void main() {
+	float x = floor(gl_FragCoord.x);
+	float y = floor(gl_FragCoord.y);
+	float acc = helper_early(x);
+
+	for (int i = 0; i < 6; i++) {
+		// Earlier Mask_Restore in loop body: reached on iteration i+1 after break/continue below!
+		if (x > float(i)) {
+			acc += float(i + 1) * 2.0;
+		} else {
+			acc += 0.5;
+		}
+		if (i == 1 && int(x) == 2) {
+			continue;
+		}
+		acc += 100.0;
+		if (i == 2 && int(x) == 4) {
+			break;
+		}
+		acc += 10.0;
+	}
+
+	if (int(y) == 1 && int(x) == 6) {
+		discard;
+	}
+	if (y > 1.5) {
+		acc += 7.0;
+	} else {
+		acc -= 3.0;
+	}
+	o = vec4(acc, x, y, 1.0);
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator))
+	if !ok {
+		return
+	}
+	p_int := m.program
+	p_int.jit_body, p_int.jit_init = nil, nil
+
+	W, H :: 8, 4
+	oj: [W * H][4]f32
+	oi: [W * H][4]f32
+	for px in 0 ..< W * H {
+		oj[px] = {-99, -99, -99, -99}
+		oi[px] = {-99, -99, -99, -99}
+	}
+	run_f32(&m.program, nil, W, H, oj[:], temp_scratch())
+	run_f32(&p_int, nil, W, H, oi[:], temp_scratch())
+	for px in 0 ..< W * H {
+		testing.expectf(t, oj[px] == oi[px], "px %d: jit=%v interp=%v", px, oj[px], oi[px])
+	}
+}
+
+@(test)
+test_jit_cmp_mask_cond_fusion :: proc(t: ^testing.T) {
+	// 1. Fails if reverted: 16 comparisons fused into Mask_Cond (one per comparison VM_Op,
+	//    testing both pc+1 and pc+2 with Mask_Copy, and both k=0 and k=1) vs unfused when
+	//    the bool slot is also read later.
+	cmp_ops := [16]VM_Op {
+		.F_Lt, .F_Le, .F_Gt, .F_Ge, .F_Eq, .F_Ne,
+		.I_Lt, .I_Le, .I_Gt, .I_Ge, .I_Eq, .I_Ne,
+		.U_Lt, .U_Le, .U_Gt, .U_Ge,
+	}
+	consts := [4][2]u32 {
+		{0, transmute(u32)f32(-2.0)}, // also 0xC0000000 (> 2^31 as u32, < 0 as i32)
+		{1, transmute(u32)f32(3.0)},
+		{2, 0x7FC0_0000},             // quiet NaN
+		{3, transmute(u32)f32(1.0)},
+	}
+	outputs := [1]Program_Var{{kind = .Stage_Out, location = 0, slot = 4, n = 4, base = .Float}}
+
+	code_fused: [dynamic]Instr
+	defer delete(code_fused)
+	code_unfused: [dynamic]Instr
+	defer delete(code_unfused)
+
+	append(&code_fused, Instr{op = .Splat, n = 4, dst = 4, a = 3})
+	append(&code_unfused, Instr{op = .Splat, n = 4, dst = 4, a = 3})
+	// Cache slot 8 first, then overwrite slot 8 in-place on op 0 to test cached-cond invalidation.
+	append(&code_fused, Instr{op = .Mov, n = 1, dst = 8, a = 0})
+	append(&code_unfused, Instr{op = .Mov, n = 1, dst = 8, a = 0})
+
+	for op, idx in cmp_ops {
+		sa := i32(8) if idx == 0 else (i32(2) if idx == 5 else i32(0))
+		sb := i32(1)
+		cond_s := i32(8 + idx)
+		k_mc := u8(idx & 1)
+		append(&code_fused, Instr{op = op, n = 1, dst = cond_s, a = sa, b = sb})
+		append(&code_unfused, Instr{op = op, n = 1, dst = cond_s, a = sa, b = sb})
+		if (idx & 1) == 0 {
+			append(&code_fused, Instr{op = .Mask_Copy, dst = 2, a = MASK_EXEC})
+			append(&code_unfused, Instr{op = .Mask_Copy, dst = 2, a = MASK_EXEC})
+		}
+		src_m := i32(2) if (idx & 1) == 0 else i32(MASK_EXEC)
+		append(&code_fused, Instr{op = .Mask_Cond, k = k_mc, dst = 3, a = src_m, b = cond_s})
+		append(&code_unfused, Instr{op = .Mask_Cond, k = k_mc, dst = 3, a = src_m, b = cond_s})
+		// Keep cond_s alive after Mask_Cond in code_unfused so fusion is illegal there.
+		append(&code_unfused, Instr{op = .Bit_Or, n = 1, dst = 25, a = cond_s, b = cond_s})
+	}
+	append(&code_unfused, Instr{op = .I_To_F, n = 1, dst = 26, a = 25})
+
+	p_fused := Program {
+		code      = code_fused[:],
+		consts    = consts[:],
+		outputs   = outputs[:],
+		num_slots = 28,
+		num_masks = 4,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_fused)
+	defer jit_destroy(&p_fused)
+
+	p_unfused := Program {
+		code      = code_unfused[:],
+		consts    = consts[:],
+		outputs   = outputs[:],
+		num_slots = 28,
+		num_masks = 4,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_unfused)
+	defer jit_destroy(&p_unfused)
+
+	when JIT_ENABLED {
+		if jit_avx2_ready {
+			// 16 extra Bit_Or + 1 I_To_F in p_unfused add ~85 B, while unfusing 16 cmp+Mask_Cond pairs adds ~350 B (>430 B diff).
+			// Reverting Item 3b collapses the difference to ~85 B.
+			testing.expectf(
+				t,
+				len(p_fused.jit_mem) + 260 < len(p_unfused.jit_mem),
+				"expected fused cmp+Mask_Cond to shrink code: fused=%d B vs unfused=%d B",
+				len(p_fused.jit_mem),
+				len(p_unfused.jit_mem),
+			)
+		}
+	}
+
+	// 2. End-to-end GLSL test covering fused comparisons (float/NaN, signed int, unsigned >= 2^31)
+	//    AND adversarial cases where the comparison bool is reused in the same BB or across BBs.
+	src := `#version 310 es
+precision highp float;
+uniform float uZero;
+out vec4 o;
+
+void main() {
+	float x = floor(gl_FragCoord.x) - 3.5;
+	float y = floor(gl_FragCoord.y) - 1.5;
+	int ix = int(floor(gl_FragCoord.x)) - 4;
+	int iy = int(floor(gl_FragCoord.y)) - 2;
+	uint ux = uint(int(floor(gl_FragCoord.x))) * 0x30000000u;
+	uint uy = 0x80000000u;
+	float nan_v = uZero / uZero;
+
+	float acc = 0.0;
+	// Fused float, NaN, signed int, unsigned int, and loop conditions:
+	if (x < y)  { acc += 1.0; }
+	if (x <= y) { acc += 2.0; }
+	if (x > y)  { acc += 4.0; }
+	if (x >= y) { acc += 8.0; }
+	if (x == -0.5) { acc += 16.0; }
+	if (nan_v != 1.0) { acc += 32.0; }
+	if (nan_v < 1.0)  { acc += 1000.0; }
+	if (ix < iy)  { acc += 64.0; }
+	if (ix <= iy) { acc += 128.0; }
+	if (ix > iy)  { acc += 256.0; }
+	if (ix >= iy) { acc += 512.0; }
+	if (ix == -1) { acc += 1024.0; }
+	if (ix != -2) { acc += 2048.0; }
+	if (ux < uy)  { acc += 0.25; }
+	if (ux <= uy) { acc += 0.5; }
+	if (ux > uy)  { acc += 0.125; }
+	if (ux >= uy) { acc += 0.0625; }
+
+	for (int k = 0; k < 4; k++) {
+		if (k <= ix + 4) {
+			acc += 3.0;
+		}
+	}
+
+	// Adversarial 1: bool used by Mask_Cond AND converted to float after the branch (cross-BB).
+	bool b_cross = (x < 0.0);
+	if (b_cross) {
+		acc += 5.0;
+	}
+	acc += float(b_cross) * 11.0;
+
+	// Adversarial 2: bool used by two separate Mask_Conds across BBs.
+	bool b_twice = (ux >= uy);
+	if (b_twice) {
+		acc += 7.0;
+	}
+	if (b_twice) {
+		acc += 13.0;
+	}
+
+	// Adversarial 3: bool read in the same BB before Mask_Cond via Select.
+	bool b_same = (ix != 0);
+	float sel = b_same ? 17.0 : 19.0;
+	if (b_same) {
+		acc += sel;
+	}
+
+	o = vec4(acc, sel, float(b_cross), float(b_twice));
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator))
+	if !ok {
+		return
+	}
+	p_int := m.program
+	p_int.jit_body, p_int.jit_init = nil, nil
+	ublk := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	set_uniform(m, ublk, "uZero", {0.0})
+
+	W, H :: 8, 4
+	oj: [W * H][4]f32
+	oi: [W * H][4]f32
+	run_f32(&m.program, ublk, W, H, oj[:], temp_scratch())
+	run_f32(&p_int, ublk, W, H, oi[:], temp_scratch())
+	for px in 0 ..< W * H {
+		testing.expectf(t, oj[px] == oi[px], "px %d: jit=%v interp=%v", px, oj[px], oi[px])
+	}
+}
+
+@(test)
+test_jit_mask_eq_exec :: proc(t: ^testing.T) {
+	// 1. Relative two-program comparison: within a single BB, copying/testing a mask known
+	//    equal to MASK_EXEC (r13d) avoids memory reloads vs copying from an unrelated mask.
+	consts := [3][2]u32 {
+		{0, 1},
+		{1, 0},
+		{2, transmute(u32)f32(3.0)},
+	}
+	outputs := [1]Program_Var{{kind = .Stage_Out, location = 0, slot = 4, n = 4, base = .Float}}
+	code_opt: [dynamic]Instr
+	defer delete(code_opt)
+	code_noopt: [dynamic]Instr
+	defer delete(code_noopt)
+
+	append(&code_opt, Instr{op = .Mask_Copy, dst = 4, a = MASK_EXEC})
+	append(&code_opt, Instr{op = .Jump, a = 2})
+	append(&code_noopt, Instr{op = .Mask_Copy, dst = 4, a = MASK_EXEC})
+	append(&code_noopt, Instr{op = .Jump, a = 2}) // BB boundary clears mask_eq_gen[4]
+	for _ in 0 ..< 20 {
+		append(&code_opt, Instr{op = .Mask_Copy, dst = 2, a = MASK_EXEC})
+		append(&code_opt, Instr{op = .Mask_Copy, dst = MASK_EXEC, a = 2}) // 0-byte no-op when m2 == r13d
+		append(&code_opt, Instr{op = .Mask_Cond, dst = 3, a = 2, b = 0})
+		append(&code_opt, Instr{op = .Mask_Copy, dst = MASK_EXEC, a = 2}) // 0-byte no-op when m2 == r13d
+
+		append(&code_noopt, Instr{op = .Mask_Copy, dst = 2, a = 4})       // m2 loaded from m4 != r13d
+		append(&code_noopt, Instr{op = .Mask_Copy, dst = MASK_EXEC, a = 2})
+		append(&code_noopt, Instr{op = .Mask_Cond, dst = 3, a = 2, b = 0})
+		append(&code_noopt, Instr{op = .Mask_Copy, dst = MASK_EXEC, a = 2})
+	}
+	append(&code_opt, Instr{op = .Splat, n = 4, dst = 4, a = 2})
+	append(&code_noopt, Instr{op = .Splat, n = 4, dst = 4, a = 2})
+
+	p_opt := Program {
+		code      = code_opt[:],
+		consts    = consts[:],
+		outputs   = outputs[:],
+		num_slots = 8,
+		num_masks = 5,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_opt)
+	defer jit_destroy(&p_opt)
+
+	p_noopt := Program {
+		code      = code_noopt[:],
+		consts    = consts[:],
+		outputs   = outputs[:],
+		num_slots = 8,
+		num_masks = 5,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_noopt)
+	defer jit_destroy(&p_noopt)
+
+	when JIT_ENABLED {
+		if jit_avx2_ready {
+			testing.expectf(
+				t,
+				len(p_opt.jit_mem) * 6 < len(p_noopt.jit_mem) * 5,
+				"expected r13d mask reuse to shrink emission: opt=%d B vs noopt=%d B",
+				len(p_opt.jit_mem),
+				len(p_noopt.jit_mem),
+			)
+		}
+	}
+
+	// 2. Adversarial intra-BB invalidation:
+	//    a) Mask_Cond(MASK_EXEC, ...) narrows r13d -> saved m2 no longer equals r13d;
+	//    b) Mask_Clear(3) clears m3 -> m3 no longer equals r13d;
+	//    c) Mask_Or(dst = 2, ...) widens m2 after m2 == r13d -> MUST invalidate m2 == r13d;
+	//    d) emit_copy_mask's else branch (Mask_Copy(dst = 3, a = 2) when m2 != r13d, even
+	//       if m3 previously equalled r13d) MUST set mask_eq_gen[3] = 0, never exec_gen.
+	adv_consts := [5][2]u32 {
+		{0, 0},
+		{1, transmute(u32)f32(7.0)},
+		{2, transmute(u32)f32(99.0)},
+		{3, transmute(u32)f32(42.0)},
+		{4, transmute(u32)f32(77.0)},
+	}
+	outputs2 := [2]Program_Var {
+		{kind = .Stage_Out, location = 0, slot = 4, n = 4, base = .Float},
+		{kind = .Stage_Out, location = 1, slot = 16, n = 4, base = .Float},
+	}
+	adv_code_full := [?]Instr {
+		{op = .Splat, n = 4, dst = 8, a = 2},                     // slots 8..11 = 99.0
+		{op = .Splat, n = 4, dst = 12, a = 3},                    // slots 12..15 = 42.0
+		{op = .Splat, n = 4, dst = 20, a = 4},                    // slots 20..23 = 77.0
+		{op = .Splat, n = 4, dst = 4, a = 1},                     // o0 = 7.0
+		{op = .Splat, n = 4, dst = 16, a = 1},                    // o1 = 7.0
+		// (a) & (b): Mask_Cond narrowing MASK_EXEC + Mask_Clear invalidating dst
+		{op = .Mask_Copy, dst = 2, a = MASK_EXEC},                // m2 = 0xFF (equals r13d)
+		{op = .Mask_Cond, dst = MASK_EXEC, a = 2, b = 0},         // r13d = 0 (invalidates m2 == r13d)
+		{op = .Store_Zero, n = 4, dst = 4},                       // masked out (r13d == 0)
+		{op = .Mask_Copy, dst = MASK_EXEC, a = 2},                // MUST reload m2 (= 0xFF) into r13d
+		{op = .Store, n = 4, dst = 4, a = 8},                     // o0 = 99.0
+		{op = .Mask_Copy, dst = 3, a = MASK_EXEC},                // m3 = 0xFF (equals r13d)
+		{op = .Mask_Clear, dst = 3},                              // m3 = 0 (invalidates m3 == r13d)
+		{op = .Mask_Copy, dst = MASK_EXEC, a = 3},                // MUST reload m3 (= 0) into r13d
+		{op = .Store_Zero, n = 4, dst = 4},                       // MUST be masked out (r13d == 0)
+		// (c): Mask_Or MUST invalidate dst when dst previously equalled r13d!
+		//      Right here r13d == 0 and m2 == 0xFF.
+		{op = .Mask_Copy, dst = 5, a = MASK_EXEC},                // m5 = 0 (equals r13d == 0)
+		{op = .Mask_Or, dst = 5, a = 5, b = 2},                   // m5 = 0 | 0xFF = 0xFF (MUST clear mask_eq_gen[5]!)
+		{op = .Mask_Copy, dst = MASK_EXEC, a = 5},                // MUST reload m5 (= 0xFF) into r13d!
+		{op = .Store, n = 4, dst = 4, a = 12},                    // o0 = 42.0 (stays 99.0 if Mask_Or kept mask_eq_gen[5])
+		// (d): emit_copy_mask else-branch MUST set mask_eq_gen[dst] = 0 (NOT exec_gen)!
+		{op = .Mask_Copy, dst = 2, a = MASK_EXEC},                // m2 = 0xFF
+		{op = .Mask_Cond, dst = MASK_EXEC, a = 2, b = 0},         // r13d = 0, so m2 (0xFF) != r13d (0)
+		{op = .Mask_Copy, dst = 3, a = MASK_EXEC},                // m3 = 0 (pre-equals r13d == 0)
+		{op = .Mask_Copy, dst = 3, a = 2},                        // else-branch: m3 = m2 (0xFF); MUST set mask_eq_gen[3] = 0!
+		{op = .Mask_Copy, dst = MASK_EXEC, a = 3},                // MUST reload m3 (= 0xFF) into r13d!
+		{op = .Store, n = 4, dst = 16, a = 20},                   // o1 = 77.0 (stays 7.0 if else-branch claimed m3 == r13d)
+	}
+	p_adv := Program {
+		code      = adv_code_full[:],
+		consts    = adv_consts[:],
+		outputs   = outputs2[:],
+		num_slots = 24,
+		num_masks = 6,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_adv)
+	defer jit_destroy(&p_adv)
+
+	tj0, tj1, ti0, ti1: [1][4]f32
+	tjs := [2][][4]f32{tj0[:], tj1[:]}
+	tis := [2][][4]f32{ti0[:], ti1[:]}
+	run_targets(&p_adv, nil, 1, 1, tjs[:], temp_scratch())
+	p_adv_int := p_adv
+	p_adv_int.jit_body, p_adv_int.jit_init = nil, nil
+	run_targets(&p_adv_int, nil, 1, 1, tis[:], temp_scratch())
+	testing.expect_value(t, tj0[0], [4]f32{42, 42, 42, 42})
+	testing.expect_value(t, tj1[0], [4]f32{77, 77, 77, 77})
+	testing.expect(t, jit_vec4_bits_eq(tj0[0], ti0[0]))
+	testing.expect(t, jit_vec4_bits_eq(tj1[0], ti1[0]))
+
+	// 3. End-to-end GLSL nested if/else, short-circuit && / ||, and switch.
+	src := `#version 310 es
+precision highp float;
+out vec4 o;
+void main() {
+	int x = int(floor(gl_FragCoord.x));
+	int y = int(floor(gl_FragCoord.y));
+	float v = 1.0;
+	if ((x > 1 && y < 3) || x == 6) {
+		if (x < 4) {
+			v += 10.0;
+		} else {
+			v += 20.0;
+		}
+	} else {
+		v += 5.0;
+	}
+	switch (x & 3) {
+	case 0: v += 100.0; break;
+	case 1: v += 200.0;
+	case 2: v += 300.0; break;
+	default: v += 400.0; break;
+	}
+	o = vec4(v, float(x), float(y), 1.0);
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator))
+	if !ok {
+		return
+	}
+	p_int := m.program
+	p_int.jit_body, p_int.jit_init = nil, nil
+	oj: [32][4]f32
+	oi: [32][4]f32
+	run_f32(&m.program, nil, 8, 4, oj[:], temp_scratch())
+	run_f32(&p_int, nil, 8, 4, oi[:], temp_scratch())
+	for px in 0 ..< 32 {
+		testing.expectf(t, jit_vec4_bits_eq(oj[px], oi[px]), "px %d: jit=%v interp=%v", px, oj[px], oi[px])
+	}
+}
+
+@(test)
+test_jit_store_exec_ymask_cache :: proc(t: ^testing.T) {
+	// 1. Fails if reverted: after a narrowing Mask_Cond (so MASK_EXEC is not entry mask),
+	//    24 Store / Store_Zero ops interleaved with F_Mul(k=2) in one BB share a single
+	//    expanded exec YMM mask instead of emitting 24 vpmovsxbd loads (+138 B).
+	consts := [3][2]u32 {
+		{0, 1},
+		{1, transmute(u32)f32(1.5)},
+		{2, transmute(u32)f32(2.0)},
+	}
+	outputs := [1]Program_Var{{kind = .Stage_Out, location = 0, slot = 4, n = 4, base = .Float}}
+	code_cached: [dynamic]Instr
+	defer delete(code_cached)
+	code_reexp: [dynamic]Instr
+	defer delete(code_reexp)
+
+	append(&code_cached, Instr{op = .Splat, n = 4, dst = 4, a = 1})
+	append(&code_cached, Instr{op = .Mask_Cond, dst = MASK_EXEC, a = MASK_EXEC, b = 0})
+	append(&code_reexp, Instr{op = .Splat, n = 4, dst = 4, a = 1})
+	append(&code_reexp, Instr{op = .Mask_Cond, dst = MASK_EXEC, a = MASK_EXEC, b = 0})
+
+	for i in 0 ..< 24 {
+		append(&code_cached, Instr{op = .F_Mul, n = 4, k = 2, dst = 8, a = 4, b = 2})
+		append(&code_reexp, Instr{op = .F_Mul, n = 4, k = 2, dst = 8, a = 4, b = 2})
+		// In code_reexp, touch MASK_EXEC with Mask_Or(0, 0, 0) (7 B) to force re-expansion (+6 B).
+		append(&code_reexp, Instr{op = .Mask_Or, dst = MASK_EXEC, a = MASK_EXEC, b = MASK_EXEC})
+		if (i & 3) == 3 {
+			append(&code_cached, Instr{op = .Store_Zero, n = 1, dst = 7})
+			append(&code_reexp, Instr{op = .Store_Zero, n = 1, dst = 7})
+		} else {
+			append(&code_cached, Instr{op = .Store, n = 4, dst = 4, a = 8})
+			append(&code_reexp, Instr{op = .Store, n = 4, dst = 4, a = 8})
+		}
+	}
+
+	p_cached := Program {
+		code      = code_cached[:],
+		consts    = consts[:],
+		outputs   = outputs[:],
+		num_slots = 12,
+		num_masks = 2,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_cached)
+	defer jit_destroy(&p_cached)
+
+	p_reexp := Program {
+		code      = code_reexp[:],
+		consts    = consts[:],
+		outputs   = outputs[:],
+		num_slots = 12,
+		num_masks = 2,
+		stage     = .Fragment,
+	}
+	jit_compile(&p_reexp)
+	defer jit_destroy(&p_reexp)
+
+	when JIT_ENABLED {
+		if jit_avx2_ready {
+			// 24 Mask_Or(0,0,0) alone is 24 * 10 = 240 B; with 23 saved vpmovsxbd (23 * 6 = 138 B),
+			// p_reexp - p_cached is ~378 B. Reverting Item 4a shrinks the gap to 240 B (< 290 B).
+			testing.expectf(
+				t,
+				len(p_cached.jit_mem) + 300 < len(p_reexp.jit_mem),
+				"expected cached exec ymask across BB stores: cached=%d B vs reexp=%d B",
+				len(p_cached.jit_mem),
+				len(p_reexp.jit_mem),
+			)
+		}
+	}
+
+	// 2. Adversarial clobber & MASK_EXEC update test under divergent lanes:
+	//    Interleave Store / Store_Zero inside a divergent branch with Cross, integer division,
+	//    Load_Buf, dynamic array Load_Dyn, scalar-RHS F_Mul(k=2), and nested narrowing branches.
+	src := `#version 310 es
+precision highp float;
+layout(std430, binding = 0) readonly buffer Buf { float data[]; } buf;
+out vec4 o;
+void main() {
+	int ix = int(floor(gl_FragCoord.x));
+	int iy = int(floor(gl_FragCoord.y));
+	vec4 acc = vec4(1.0, 2.0, 3.0, 4.0);
+	float arr[3];
+	arr[0] = 0.5;
+	arr[1] = 1.5;
+	arr[2] = 2.5;
+	if ((ix + iy) % 2 == 0) {
+		acc += vec4(10.0);
+		vec3 cr = cross(acc.xyz, vec3(float(ix), float(iy), 1.5));
+		acc.xyz += cr * 0.25;                   // Store after Cross (clobbers ymm7) + F_Mul(k=2)
+		int q = (ix * 7 + 3) / max(iy + 1, 1);  // I_Div (clobbers ymm7)
+		acc.w += float(q);                      // Store after I_Div
+		float bv = buf.data[uint(ix & 3)];      // Load_Buf (clobbers ymm7)
+		acc.x += bv;                            // Store after Load_Buf
+		float dv = arr[clamp(ix % 3, 0, 2)];    // Load_Dyn (clobbers ymm7)
+		acc.y += dv;                            // Store after Load_Dyn
+		if (ix > 3) {
+			acc.z = 0.0;                        // Narrowed MASK_EXEC in nested branch
+		}
+		acc.w += 5.0;                           // Restored MASK_EXEC
+	}
+	o = acc;
+}
+`
+	m2, errs2, ok2 := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m2)
+	testing.expectf(t, ok2, "compile failed:\n%s", format_errors(errs2, context.temp_allocator))
+	if !ok2 {
+		return
+	}
+	p_int2 := m2.program
+	p_int2.jit_body, p_int2.jit_init = nil, nil
+	bwords := [4]u32 {
+		transmute(u32)f32(11.0),
+		transmute(u32)f32(22.0),
+		transmute(u32)f32(33.0),
+		transmute(u32)f32(44.0),
+	}
+	bview := [1][]u32{bwords[:]}
+	opts := Run_Options{buffers = bview[:]}
+	oj2: [32][4]f32
+	oi2: [32][4]f32
+	run_f32(&m2.program, nil, 8, 4, oj2[:], temp_scratch(), opts)
+	run_f32(&p_int2, nil, 8, 4, oi2[:], temp_scratch(), opts)
+	for px in 0 ..< 32 {
+		testing.expectf(t, jit_vec4_bits_eq(oj2[px], oi2[px]), "px %d: jit=%v interp=%v", px, oj2[px], oi2[px])
+	}
+
+	// 3. Texture / Texture_Bias / Texel_Fetch MUST invalidate exec_ymask_valid:
+	//    Inside a divergent branch, Store(n=9) populates ymm7 (exec_ymask_valid = true);
+	//    bound texture gather stubs zero ymm7 and unbound callbacks clobber ymm7;
+	//    a subsequent Store(n=9) in the same BB MUST re-expand ymm7.
+	{
+		src_tex := `#version 310 es
+precision highp float;
+uniform sampler2D s0;
+uniform sampler2D s1;
+uniform sampler2D s2;
+out vec4 o;
+void main() {
+	int ix = int(floor(gl_FragCoord.x));
+	int iy = int(floor(gl_FragCoord.y));
+	vec2 uv = (gl_FragCoord.xy + vec2(0.25)) * 0.25;
+	mat3 m0 = mat3(9.0);
+	mat3 m1 = mat3(8.0);
+	mat3 m2 = mat3(7.0);
+	if (((ix + iy) & 1) == 0) {
+		m0 = mat3(2.0);
+		vec4 t0 = texture(s0, uv);
+		m0 = mat3(t0.x + 1.0);
+		vec4 t1 = textureLod(s1, uv, 0.0);
+		m1 = mat3(t1.y + 2.0);
+		vec4 t2 = texelFetch(s2, ivec2(ix & 3, iy & 3), 0);
+		m2 = mat3(t2.z + 3.0);
+	}
+	o = vec4(m0[0][0], m1[1][1], m2[2][2], m0[2][2] + m1[0][0] + m2[0][0]);
+}
+`
+		mt, et, okt := compile(src_tex, {profile = .Glsl, stage = .Fragment})
+		defer destroy(mt)
+		testing.expectf(t, okt, "src_tex compile failed:\n%s", format_errors(et, context.temp_allocator))
+		if !okt {
+			return
+		}
+		tex_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+			// Actively overwrite SIMD registers (including ymm7) with all-zeros / non-mask values.
+			z := #simd[8]f32{0, 0, 0, 0, 0, 0, 0, 0}
+			arr := transmute([8]f32)z
+			b := f32(channel + 1) + arr[0]
+			return {uv.x + b, uv.y + b, lod + b * 0.5, 1.0}
+		}
+		tdata: [16 * 4]f32
+		for i in 0 ..< 16 {
+			tdata[i * 4 + 0] = f32(i + 1) * 0.5
+			tdata[i * 4 + 1] = f32(i + 2) * 0.25
+			tdata[i * 4 + 2] = f32(i + 3) * 0.75
+			tdata[i * 4 + 3] = 1.0
+		}
+		sizes := [3][3]i32{{4, 4, 1}, {4, 4, 1}, {4, 4, 1}}
+		imgs_bound := [3]Channel_Image {
+			{data = tdata[:], width = 4, height = 4, components = 4, filter = .Linear},
+			{data = tdata[:], width = 4, height = 4, components = 4, filter = .Nearest},
+			{data = tdata[:], width = 4, height = 4, components = 4, filter = .Nearest},
+		}
+		for opts_t, ti in ([2]Run_Options {
+			{sampler = tex_cb, channel_sizes = sizes[:], channel_images = imgs_bound[:]},
+			{sampler = tex_cb, channel_sizes = sizes[:]},
+		}) {
+			ojt, oit: [32][4]f32
+			run_f32(&mt.program, nil, 8, 4, ojt[:], temp_scratch(), opts_t)
+			run_f32_interp(&mt.program, nil, 8, 4, oit[:], temp_scratch(), opts_t)
+			for px in 0 ..< 32 {
+				testing.expectf(t, jit_vec4_bits_eq(ojt[px], oit[px]), "tex case %d px %d: jit=%v interp=%v", ti, px, ojt[px], oit[px])
+			}
+		}
+	}
+
+	// 4. cache_reset MUST clear exec_ymask_valid across basic-block boundaries and helper splits:
+	//    (a) 3-BB CFG where BB 0 narrows r13d, zeroes ymm7 via Cross, and jumps over BB 1
+	//        (whose Store(n=8) sets exec_ymask_valid = true) directly to BB 2's Store(n=8);
+	//    (b) GLSL divergent branch with helper `atan(y, x)` splitting the BB between two mat3 stores.
+	{
+		consts_bb := [5][2]u32 {
+			{4, transmute(u32)f32(4.0)},
+			{5, transmute(u32)f32(0.0)},
+			{6, transmute(u32)f32(9.0)},
+			{7, transmute(u32)f32(11.0)},
+			{24, transmute(u32)f32(33.0)},
+		}
+		inputs_bb := [1]Program_Var{{kind = .Frag_Coord, slot = 0, n = 4, base = .Float}}
+		outputs_bb := [2]Program_Var {
+			{kind = .Stage_Out, location = 0, slot = 8, n = 4, base = .Float},
+			{kind = .Stage_Out, location = 1, slot = 12, n = 4, base = .Float},
+		}
+		code_bb := [?]Instr {
+			// BB 0: init dst 8..15 = 9.0, src_a 16..23 = 11.0, src_b 25..32 = 33.0, zero 33..35 = 0.0
+			{op = .Splat, n = 8, dst = 8, a = 6},
+			{op = .Splat, n = 8, dst = 16, a = 7},
+			{op = .Splat, n = 8, dst = 25, a = 24},
+			{op = .Splat, n = 3, dst = 33, a = 5},
+			{op = .F_Lt, n = 1, dst = 36, a = 0, b = 4},              // Frag_Coord.x < 4.0 (lanes 0..3)
+			{op = .Mask_Cond, dst = MASK_EXEC, a = MASK_EXEC, b = 36},
+			{op = .Cross, n = 3, dst = 37, a = 33, b = 33},           // zeroes ymm7!
+			{op = .Jump, a = 9},                                      // jump to BB 2 (pc 9)
+			// BB 1 (pc 8): sets exec_ymask_valid = true at end of BB 1!
+			{op = .Store, n = 8, dst = 8, a = 16},
+			// BB 2 (pc 9): jump target -> cache_reset MUST clear exec_ymask_valid!
+			{op = .Store, n = 8, dst = 8, a = 25},
+		}
+		p_bb := Program {
+			stage     = .Fragment,
+			num_slots = 40,
+			num_masks = 2,
+			consts    = consts_bb[:],
+			inputs    = inputs_bb[:],
+			outputs   = outputs_bb[:],
+			code      = code_bb[:],
+		}
+		jit_compile(&p_bb)
+		defer jit_destroy(&p_bb)
+		p_bb_int := p_bb
+		p_bb_int.jit_body, p_bb_int.jit_init = nil, nil
+		bj0, bj1, bi0, bi1: [8][4]f32
+		tjb := [2][][4]f32{bj0[:], bj1[:]}
+		tib := [2][][4]f32{bi0[:], bi1[:]}
+		run_targets(&p_bb, nil, 8, 1, tjb[:], temp_scratch())
+		run_targets(&p_bb_int, nil, 8, 1, tib[:], temp_scratch())
+		for px in 0 ..< 8 {
+			testing.expectf(t, jit_vec4_bits_eq(bj0[px], bi0[px]), "bb-reset t0 px %d: jit=%v interp=%v", px, bj0[px], bi0[px])
+			testing.expectf(t, jit_vec4_bits_eq(bj1[px], bi1[px]), "bb-reset t1 px %d: jit=%v interp=%v", px, bj1[px], bi1[px])
+		}
+
+		src_hlp := `#version 310 es
+precision highp float;
+out vec4 o;
+void main() {
+	int ix = int(floor(gl_FragCoord.x));
+	mat3 m = mat3(9.0);
+	if ((ix & 1) == 0) {
+		m = mat3(2.0);
+		float a = atan(float(ix) + 1.0, 2.0);
+		m = mat3(a + 3.0);
+	}
+	o = vec4(m[0][0], m[1][1], m[2][2], 1.0);
+}
+`
+		mh, eh, okh := compile(src_hlp, {profile = .Glsl, stage = .Fragment})
+		defer destroy(mh)
+		testing.expectf(t, okh, "src_hlp compile failed:\n%s", format_errors(eh, context.temp_allocator))
+		if okh {
+			ojh, oih: [32][4]f32
+			run_f32(&mh.program, nil, 8, 4, ojh[:], temp_scratch())
+			run_f32_interp(&mh.program, nil, 8, 4, oih[:], temp_scratch(), {})
+			for px in 0 ..< 32 {
+				testing.expectf(t, jit_vec4_bits_eq(ojh[px], oih[px]), "hlp-reset px %d: jit=%v interp=%v", px, ojh[px], oih[px])
+			}
+		}
+	}
+}
+
+@(test)
+test_jit_entry_unmasked_stores :: proc(t: ^testing.T) {
+	// 1. Static codegen check: entry Store_Zero / Store before any jump target or
+	//    MASK_EXEC write omit masked blends (vpandn / vpblendvb + old-value loads).
+	{
+		inputs := [2]Program_Var {
+			{kind = .Stage_In, location = 0, slot = 0, n = 4, base = .Float},
+			{kind = .Stage_In, location = 1, slot = 12, n = 1, base = .Float},
+		}
+		outputs := [2]Program_Var {
+			{kind = .Stage_Out, location = 0, slot = 4, n = 4, base = .Float},
+			{kind = .Stage_Out, location = 1, slot = 8, n = 4, base = .Float},
+		}
+		code_entry := [2]Instr {
+			{op = .Store_Zero, n = 4, dst = 4},
+			{op = .Store, n = 4, dst = 8, a = 0},
+		}
+		code_narrow := [3]Instr {
+			{op = .Mask_Cond, k = 0, dst = MASK_EXEC, a = MASK_EXEC, b = 12},
+			{op = .Store_Zero, n = 4, dst = 4},
+			{op = .Store, n = 4, dst = 8, a = 0},
+		}
+		p_entry := Program {
+			stage     = .Fragment,
+			num_slots = 16,
+			num_masks = 2,
+			inputs    = inputs[:],
+			outputs   = outputs[:],
+			code      = code_entry[:],
+		}
+		jit_compile(&p_entry)
+		defer jit_destroy(&p_entry)
+
+		p_narrow := Program {
+			stage     = .Fragment,
+			num_slots = 16,
+			num_masks = 2,
+			inputs    = inputs[:],
+			outputs   = outputs[:],
+			code      = code_narrow[:],
+		}
+		jit_compile(&p_narrow)
+		defer jit_destroy(&p_narrow)
+
+		when JIT_ENABLED {
+			if jit_avx2_ready {
+				// Mask_Cond itself is <= 24 B; the 8 masked stores (4 vpandn + 4 vpblendvb + 8 old loads + ensure_exec_ymask)
+				// add > 70 B on top of that. Fails if 4b is reverted!
+				testing.expectf(
+					t,
+					len(p_entry.jit_mem) + 60 < len(p_narrow.jit_mem),
+					"expected unmasked entry stores to be >60 B smaller: entry=%d B vs narrowed=%d B",
+					len(p_entry.jit_mem),
+					len(p_narrow.jit_mem),
+				)
+			}
+		}
+	}
+
+	// 2. Adversarial proof-failure case A: pc == 0 is a backward jump target!
+	//    Textually there is no write to MASK_EXEC before pc 0, yet iteration 2 enters pc 0
+	//    with narrowed MASK_EXEC, so Store and Store_Zero at pc 0..1 MUST remain masked.
+	{
+		code := [?]Instr {
+			// pc 0: backward loop header! Must NOT use unmasked Store/Store_Zero!
+			{op = .Store, n = 1, dst = 2, a = 1},
+			{op = .Store_Zero, n = 1, dst = 3},
+			// pc 2: increment iter counter (slot 1 += slot 4 (1.0))
+			{op = .F_Add, n = 1, dst = 1, a = 1, b = 4},
+			// pc 3..4: keep only lanes where slot 1 < slot 0 (per-lane trip limit)
+			{op = .F_Lt, n = 1, dst = 5, a = 1, b = 0},
+			{op = .Mask_Cond, k = 0, dst = MASK_EXEC, a = MASK_EXEC, b = 5},
+			// Restore slot 3 to slot 1 on still-active lanes so dropped lanes keep 0.0 from iter 1
+			// while if pc 0..1 were unmasked on iter 2, slot 2/3 on dropped lanes would be clobbered!
+			{op = .Store, n = 1, dst = 3, a = 1},
+			{op = .Jump_If_None, dst = MASK_EXEC, a = 8},
+			{op = .Jump, a = 0},
+		}
+		consts := [?][2]u32{
+			{1, transmute(u32)f32(0.0)},
+			{4, transmute(u32)f32(1.0)},
+		}
+		inputs := [?]Program_Var{{kind = .Frag_Coord, slot = 0, n = 4, base = .Float}}
+		outputs := [?]Program_Var{{kind = .Stage_Out, location = 0, slot = 2, n = 2, base = .Float}}
+		p := Program {
+			stage     = .Fragment,
+			num_slots = 8,
+			num_masks = 2,
+			consts    = consts[:],
+			inputs    = inputs[:],
+			outputs   = outputs[:],
+			code      = code[:],
+		}
+		jit_compile(&p)
+		defer jit_destroy(&p)
+		p_int := p
+		p_int.jit_body, p_int.jit_init = nil, nil
+		oj, oi: [16][4]f32
+		run_f32(&p, nil, 4, 4, oj[:], temp_scratch())
+		run_f32(&p_int, nil, 4, 4, oi[:], temp_scratch())
+		for px in 0 ..< 16 {
+			testing.expectf(t, oj[px] == oi[px], "pc0-loop px %d: jit=%v interp=%v", px, oj[px], oi[px])
+		}
+	}
+
+	// 3. Adversarial proof-failure case B + partial-lane entry batches (quads=3 with helpers,
+	//    dFdx/dFdy, 2 targets, plus 5x3 run_f32): entry Store_Zero/Store followed by narrowing branch.
+	{
+		src := `#version 310 es
+precision highp float;
+in float v;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+void main() {
+	vec4 a = vec4(0.0);                       // entry Store_Zero
+	vec4 b = vec4(v, v * 2.0, 3.0, 1.0);      // entry Store
+	float dx = dFdx(b.x);
+	float dy = dFdy(b.y);
+	if (gl_FragCoord.x > 2.0) {               // narrows MASK_EXEC: subsequent stores MUST be masked
+		a = vec4(10.0, 20.0, dx, dy);
+		b.zw = vec2(0.0);                     // Store_Zero / Store under narrowed MASK_EXEC
+	}
+	o0 = a + vec4(dx, dy, 0.0, 1.0);
+	o1 = b;
+}
+`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		if !ok {
+			return
+		}
+		p_int := m.program
+		p_int.jit_body, p_int.jit_init = nil, nil
+
+		origin := [3][2]i32{{0, 0}, {2, 0}, {4, 2}}
+		helpers := [3]Quad_Lanes{{2}, {}, {1, 3}}
+		vx: [12]f32
+		for i in 0 ..< 12 {
+			vx[i] = f32(i) * 0.75 + 1.0
+		}
+		SENT := [4]f32{-777.0, -888.0, -999.0, -111.0}
+		bj, bi: [2][12][4]f32
+		sh_j, sh_i: [3]Quad_Lanes
+		for p in 0 ..< 12 {
+			bj[0][p], bj[1][p] = SENT, SENT
+			bi[0][p], bi[1][p] = SENT, SENT
+		}
+		tj := [2][][4]f32{bj[0][:], bj[1][:]}
+		ti := [2][][4]f32{bi[0][:], bi[1][:]}
+		quads := Fragment_Quads{count = 3, origin = origin[:], helpers = helpers[:], varyings = vx[:]}
+		run_fragment(&m.program, nil, quads, tj[:], sh_j[:], temp_scratch())
+		run_fragment(&p_int, nil, quads, ti[:], sh_i[:], temp_scratch())
+		testing.expect(t, slice.equal(sh_j[:], sh_i[:]))
+		for p in 0 ..< 12 {
+			testing.expectf(t, bj[0][p] == bi[0][p], "t0 px %d: jit=%v interp=%v", p, bj[0][p], bi[0][p])
+			testing.expectf(t, bj[1][p] == bi[1][p], "t1 px %d: jit=%v interp=%v", p, bj[1][p], bi[1][p])
+		}
+	}
+}
+
+@(test)
+test_jit_store_runtime_all_lanes :: proc(t: ^testing.T) {
+	// 1. All-lanes (r13d == 0xFF) vs partial-lanes (0x0F odd quad / divergent) Store & Store_Zero.
+	src := `#version 310 es
+precision highp float;
+uniform int u_mode;
+out vec4 o;
+void main() {
+	vec4 acc = vec4(1.0, 2.0, 3.0, 4.0);
+	int ix = int(floor(gl_FragCoord.x));
+	int iy = int(floor(gl_FragCoord.y));
+	bool take = (u_mode == 0) ? (ix >= 0) : (((ix + iy) & 1) == 0);
+	if (take) {
+		acc = vec4(0.0); // non-entry Store_Zero
+		for (int k = 0; k < 4; k++) {
+			acc += vec4(float(k + 1), float(ix), float(iy), 0.5); // non-entry Store (cached)
+			if (k == 2 && ix > 4) {
+				acc.zw = vec2(0.0); // nested narrowed Store_Zero
+				acc.xy += vec2(7.0, 9.0);
+			}
+		}
+	}
+	o = acc;
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator))
+	if !ok {
+		return
+	}
+	when JIT_ENABLED {
+		if jit_avx2_ready {
+			// Verify non-entry Store / Store_Zero emitted the r13d == 0xFF fast-path check (41 81 FD FF 00 00 00).
+			sig := [7]u8{0x41, 0x81, 0xFD, 0xFF, 0x00, 0x00, 0x00}
+			hits := 0
+			mem_code := m.program.jit_mem
+			for i := 0; i + len(sig) <= len(mem_code); i += 1 {
+				if slice.equal(mem_code[i:i + len(sig)], sig[:]) {
+					hits += 1
+				}
+			}
+			testing.expectf(t, hits >= 3, "expected >=3 runtime r13d==0xFF store checks, found %d", hits)
+		}
+	}
+	p_int := m.program
+	p_int.jit_body, p_int.jit_init = nil, nil
+	for mode in ([2]i32{0, 1}) {
+		blk := [4]u8{}
+		(^i32)(&blk[0])^ = mode
+		oj, oi: [30][4]f32
+		run_f32(&m.program, blk[:], 10, 3, oj[:], temp_scratch())
+		run_f32(&p_int, blk[:], 10, 3, oi[:], temp_scratch())
+		for px in 0 ..< 30 {
+			testing.expectf(t, jit_vec4_bits_eq(oj[px], oi[px]), "mode=%d px=%d: jit=%v interp=%v", mode, px, oj[px], oi[px])
+		}
+	}
+
+	// 2. Regression tests for the r13d == 0xFF fast-path leaving exec_ymask_valid stale:
+	//    (a) Exact mat3 repro at 16x4 with u = 2 (I_Div clobbers ymm7 -> Store(n=1) takes
+	//        r13d==0xFF fast path -> Store(n=9) mat3 MUST still expand ymm7);
+	//    (b) 2-vec4 struct assignment (n = 8) after I_Div + Store(n=1);
+	//    (c) Store_Zero(n > 4) after Cross + Store_Zero(n <= 4) on the r13d==0xFF fast path
+	//        (tested both in GLSL and via explicit IR Store_Zero(n=1) -> Store_Zero(n=8)).
+	{
+		src_mat3 := `#version 310 es
+precision highp float;
+uniform int u;
+out vec4 o;
+void main() {
+	mat3 m = mat3(5.0);
+	float x = 0.0;
+	int ix = int(gl_FragCoord.x);
+	if (ix >= 0) {
+		int q = ix / (u + 3);
+		x = float(q);
+		m = mat3(float(q) + 1.0);
+	}
+	o = vec4(x, m[0][0], m[1][1], m[2][2]);
+}
+`
+		mm, em, okm := compile(src_mat3, {profile = .Glsl, stage = .Fragment})
+		defer destroy(mm)
+		testing.expectf(t, okm, "src_mat3 compile failed:\n%s", format_errors(em, context.temp_allocator))
+		if okm {
+			blk: [4]u8
+			(^i32)(&blk[0])^ = 2
+			oj, oi: [64][4]f32
+			run_f32(&mm.program, blk[:], 16, 4, oj[:], temp_scratch())
+			run_f32_interp(&mm.program, blk[:], 16, 4, oi[:], temp_scratch(), {})
+			testing.expect_value(t, oj[0], [4]f32{0, 1, 1, 1})
+			for px in 0 ..< 64 {
+				testing.expectf(t, jit_vec4_bits_eq(oj[px], oi[px]), "mat3 repro px %d: jit=%v interp=%v", px, oj[px], oi[px])
+			}
+		}
+
+		src_struct := `#version 310 es
+precision highp float;
+struct Pair {
+	vec4 a;
+	vec4 b;
+};
+uniform int u;
+out vec4 o;
+void main() {
+	Pair p = Pair(vec4(5.0), vec4(6.0));
+	Pair pz = Pair(vec4(7.0), vec4(8.0));
+	float x = 0.0;
+	float z = 9.0;
+	int ix = int(gl_FragCoord.x);
+	if (ix >= 0) {
+		int q = ix / (u + 3);
+		x = float(q);
+		p = Pair(vec4(float(q) + 1.0), vec4(float(q) + 2.0));
+	}
+	if (ix >= 0) {
+		int q2 = ix / (u + 3);
+		z = 0.0;
+		pz = Pair(vec4(0.0), vec4(float(q2) * 0.0));
+	}
+	o = vec4(x + z, p.a.x + pz.a.x, p.b.y + pz.b.y, p.b.w + pz.b.w);
+}
+`
+		ms, es, oks := compile(src_struct, {profile = .Glsl, stage = .Fragment})
+		defer destroy(ms)
+		testing.expectf(t, oks, "src_struct compile failed:\n%s", format_errors(es, context.temp_allocator))
+		if oks {
+			blk: [4]u8
+			(^i32)(&blk[0])^ = 2
+			oj, oi: [64][4]f32
+			run_f32(&ms.program, blk[:], 16, 4, oj[:], temp_scratch())
+			run_f32_interp(&ms.program, blk[:], 16, 4, oi[:], temp_scratch(), {})
+			for px in 0 ..< 64 {
+				testing.expectf(t, jit_vec4_bits_eq(oj[px], oi[px]), "struct repro px %d: jit=%v interp=%v", px, oj[px], oi[px])
+			}
+		}
+
+		// Explicit IR Store_Zero(n=1) -> Store_Zero(n=8) after Cross zeroes ymm7:
+		consts_sz := [3][2]u32 {
+			{0, 1},
+			{1, transmute(u32)f32(0.0)},
+			{2, transmute(u32)f32(7.0)},
+		}
+		outputs_sz := [2]Program_Var {
+			{kind = .Stage_Out, location = 0, slot = 8, n = 4, base = .Float},
+			{kind = .Stage_Out, location = 1, slot = 12, n = 4, base = .Float},
+		}
+		code_sz := [?]Instr {
+			{op = .Splat, n = 1, dst = 4, a = 2},                      // slot 4 = 7.0
+			{op = .Splat, n = 8, dst = 8, a = 2},                      // slots 8..15 = 7.0
+			{op = .Splat, n = 3, dst = 16, a = 1},                     // slots 16..18 = 0.0
+			{op = .Mask_Cond, dst = MASK_EXEC, a = MASK_EXEC, b = 0},  // ends entry_exec_end; r13d = 0xFF
+			{op = .Cross, n = 3, dst = 19, a = 16, b = 16},            // zeroes ymm7; exec_ymask_valid = false
+			{op = .Store_Zero, n = 1, dst = 4},                        // fast path (r13d == 0xFF) MUST NOT leave exec_ymask_valid = true!
+			{op = .Store_Zero, n = 8, dst = 8},                        // n > 4 MUST expand ymm7 and zero 8..15!
+			{op = .F_Add, n = 1, dst = 8, a = 8, b = 4},
+		}
+		p_sz := Program {
+			stage     = .Fragment,
+			num_slots = 24,
+			num_masks = 2,
+			consts    = consts_sz[:],
+			outputs   = outputs_sz[:],
+			code      = code_sz[:],
+		}
+		jit_compile(&p_sz)
+		defer jit_destroy(&p_sz)
+		p_sz_int := p_sz
+		p_sz_int.jit_body, p_sz_int.jit_init = nil, nil
+		zj0, zj1, zi0, zi1: [16][4]f32
+		for &px in zj0 {px = {-1, -1, -1, -1}}
+		for &px in zj1 {px = {-1, -1, -1, -1}}
+		tjz := [2][][4]f32{zj0[:], zj1[:]}
+		tiz := [2][][4]f32{zi0[:], zi1[:]}
+		run_targets(&p_sz, nil, 16, 1, tjz[:], temp_scratch())
+		run_targets(&p_sz_int, nil, 16, 1, tiz[:], temp_scratch())
+		for px in 0 ..< 16 {
+			testing.expect_value(t, zj0[px], [4]f32{0, 0, 0, 0})
+			testing.expect_value(t, zj1[px], [4]f32{0, 0, 0, 0})
+			testing.expect(t, jit_vec4_bits_eq(zj0[px], zi0[px]))
+			testing.expect(t, jit_vec4_bits_eq(zj1[px], zi1[px]))
+		}
+	}
+}
+
+@(test)
+test_jit_liveness_cross_bb :: proc(t: ^testing.T) {
+	// 1. Fails if reverted: packed-slot reuse across two basic blocks (slots 4..11 dead at BB 0 exit,
+	//    reused in BB 1). Coarse per-slot cross_bb marks 4..11 cross-BB and emits 16 extra [rbx] stores
+	//    (+96..128 B), whereas CFG liveness keeps both blocks register-only.
+	{
+		inputs := [1]Program_Var{{kind = .Stage_In, location = 0, slot = 0, n = 4, base = .Float}}
+		outputs := [1]Program_Var{{kind = .Stage_Out, location = 0, slot = 20, n = 4, base = .Float}}
+		make_reuse_prog :: proc(tb1: i32, inp: []Program_Var, outp: []Program_Var) -> (Program, [dynamic]Instr) {
+			c: [dynamic]Instr
+			append(&c, Instr{op = .F_Add, n = 4, dst = 4, a = 0, b = 0})
+			append(&c, Instr{op = .F_Mul, n = 4, dst = 8, a = 4, b = 0})
+			append(&c, Instr{op = .F_Sub, n = 4, dst = 20, a = 8, b = 4})
+			append(&c, Instr{op = .Jump, a = 4})
+			append(&c, Instr{op = .F_Mul, n = 4, dst = tb1, a = 0, b = 0})
+			append(&c, Instr{op = .F_Add, n = 4, dst = tb1 + 4, a = tb1, b = 0})
+			append(&c, Instr{op = .F_Add, n = 4, dst = 20, a = 20, b = tb1 + 4})
+			return Program {
+				stage     = .Fragment,
+				num_slots = 24,
+				num_masks = 2,
+				inputs    = inp,
+				outputs   = outp,
+				code      = c[:],
+			}, c
+		}
+		p_reused, c1 := make_reuse_prog(4, inputs[:], outputs[:])
+		defer {
+			delete(c1)
+			jit_destroy(&p_reused)
+		}
+		p_distinct, c2 := make_reuse_prog(12, inputs[:], outputs[:])
+		defer {
+			delete(c2)
+			jit_destroy(&p_distinct)
+		}
+		jit_compile(&p_reused)
+		jit_compile(&p_distinct)
+		when JIT_ENABLED {
+			if jit_avx2_ready {
+				testing.expectf(
+					t,
+					len(p_reused.jit_mem) <= len(p_distinct.jit_mem) + 16,
+					"expected packed-slot reuse across BBs to omit dead [rbx] stores: reused=%d B vs distinct=%d B",
+					len(p_reused.jit_mem),
+					len(p_distinct.jit_mem),
+				)
+			}
+		}
+	}
+
+	// 2. Adversarial proof-negative cases where values ARE live across BB boundaries:
+	//    - value live across an if/else diamond join;
+	//    - loop-carried value live across a loop back-edge;
+	//    - dynamic array (dyn_slots) next to BB-local temporaries;
+	//    - whole >16-component writes (`float[20]` and 20-slot `Big` struct -> Store with n=20,
+	//      exercising `idx >= 16` in `need_mem_write`) live out of an `if` block and read after it;
+	//    - partial-lane discard after writing stage output.
+	{
+		src := `#version 310 es
+precision highp float;
+struct Big {
+	mat4 m;
+	vec4 tail;
+};
+out vec4 o;
+void main() {
+	int ix = int(floor(gl_FragCoord.x));
+	int iy = int(floor(gl_FragCoord.y));
+	vec4 pre_diamond = vec4(float(ix) * 0.5, float(iy) * 0.25, 1.5, 2.5);
+	float arr[3];
+	arr[0] = pre_diamond.x + 1.0;
+	arr[1] = pre_diamond.y + 2.0;
+	arr[2] = 3.5;
+
+	float fa20[20] = float[20](
+		1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+		11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0
+	);
+	Big bg = Big(mat4(1.0), vec4(4.0, 5.0, 6.0, 7.0));
+	if (((ix + iy) & 1) == 0) {
+		fa20 = float[20](
+			101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0, 110.0,
+			111.0, 112.0, 113.0, 114.0, 115.0, 116.0, 117.0, 118.0, 119.0, 120.0
+		);
+		bg = Big(mat4(2.0), vec4(9.0, 8.0, 7.0, 6.0));
+	}
+	vec4 hi20 = vec4(fa20[16], fa20[17], fa20[18], fa20[19]) * 0.01;
+
+	// Loop-carried state across back-edge + dynamic array indexing inside loop.
+	vec4 carry = bg.m[3] * 0.1 + bg.tail + hi20;
+	for (int k = 0; k < 4; k++) {
+		vec4 tmp = vec4(float(k), arr[clamp((ix + k) % 3, 0, 2)], carry.z * 0.5, 1.0);
+		if (k == 2 && ix == 1 && iy == 1) {
+			o = vec4(-1.0);
+			discard;
+		}
+		carry = carry * 0.75 + tmp;
+	}
+	o = carry + pre_diamond;
+}
+`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		if !ok {
+			return
+		}
+		has_wide_store := false
+		for ins in m.program.code {
+			if ins.op == .Store && ins.n >= 20 {
+				has_wide_store = true
+				break
+			}
+		}
+		testing.expect(t, has_wide_store, "expected whole-aggregate Store with n >= 20")
+
+		p_int := m.program
+		p_int.jit_body, p_int.jit_init = nil, nil
+		oj, oi: [36][4]f32
+		for &px in oj {px = {-99, -99, -99, -99}}
+		for &px in oi {px = {-99, -99, -99, -99}}
+		run_f32(&m.program, nil, 6, 6, oj[:], temp_scratch())
+		run_f32(&p_int, nil, 6, 6, oi[:], temp_scratch())
+		for px in 0 ..< 36 {
+			testing.expectf(t, jit_vec4_bits_eq(oj[px], oi[px]), "px %d: jit=%v interp=%v", px, oj[px], oi[px])
+		}
+	}
+}
+
+@(test)
+test_jit_texture_same_bb :: proc(t: ^testing.T) {
+	// 1. Relative two-program comparison: 6 dirty accumulators (10..15) + coords (8..9)
+	//    stay in ymm8..15 across 6 Texel_Fetch ops in one BB vs the identical sequence with
+	//    BB-splitting fallthrough Jumps after each Texel_Fetch (which spill & reload [rbx]).
+	{
+		consts := [1][2]u32{{6, 0}}
+		outputs := [1]Program_Var{{slot = 20, n = 4}}
+		code_same := make([dynamic]Instr, 0, 56, context.temp_allocator)
+		code_split := make([dynamic]Instr, 0, 64, context.temp_allocator)
+		for k in i32(0) ..< 8 {
+			append(&code_same, Instr{op = .I_Add, n = 1, dst = 8 + k, a = k, b = 6})
+			append(&code_split, Instr{op = .I_Add, n = 1, dst = 8 + k, a = k, b = 6})
+		}
+		for _ in i32(0) ..< 6 {
+			append(&code_same, Instr{op = .Texel_Fetch, n = 2, k = 0, dst = 16, a = 8, b = 6})
+			append(&code_same, Instr{op = .F_Add, n = 4, dst = 12, a = 12, b = 16})
+			append(&code_same, Instr{op = .F_Add, n = 2, dst = 10, a = 10, b = 12})
+
+			append(&code_split, Instr{op = .Jump, a = i32(len(code_split) + 1)})
+			append(&code_split, Instr{op = .Texel_Fetch, n = 2, k = 0, dst = 16, a = 8, b = 6})
+			append(&code_split, Instr{op = .Jump, a = i32(len(code_split) + 1)})
+			append(&code_split, Instr{op = .F_Add, n = 4, dst = 12, a = 12, b = 16})
+			append(&code_split, Instr{op = .F_Add, n = 2, dst = 10, a = 10, b = 12})
+		}
+		append(&code_same, Instr{op = .F_Add, n = 2, dst = 12, a = 12, b = 10})
+		append(&code_same, Instr{op = .Mov, n = 4, dst = 20, a = 12})
+		append(&code_split, Instr{op = .F_Add, n = 2, dst = 12, a = 12, b = 10})
+		append(&code_split, Instr{op = .Mov, n = 4, dst = 20, a = 12})
+
+		p_same := Program {
+			code      = code_same[:],
+			consts    = consts[:],
+			outputs   = outputs[:],
+			num_slots = 24,
+			num_masks = 2,
+			stage     = .Fragment,
+		}
+		jit_compile(&p_same)
+		defer jit_destroy(&p_same)
+
+		p_split := Program {
+			code      = code_split[:],
+			consts    = consts[:],
+			outputs   = outputs[:],
+			num_slots = 24,
+			num_masks = 2,
+			stage     = .Fragment,
+		}
+		jit_compile(&p_split)
+		defer jit_destroy(&p_split)
+
+		when JIT_ENABLED {
+			if jit_avx2_ready {
+				testing.expectf(
+					t,
+					len(p_same.jit_mem) * 8 < len(p_split.jit_mem) * 7,
+					"expected single-BB texture caching to shrink emission: same_bb=%d B vs split_bb=%d B",
+					len(p_same.jit_mem),
+					len(p_split.jit_mem),
+				)
+			}
+		}
+	}
+
+	// 2. Adversarial mixed bound + unbound callback execution in one basic block:
+	//    - all 8 ymm8..15 occupied by BB-local dirty values across texture(), textureLod()
+	//      on sampler2DArray, and texelFetch();
+	//    - computed dirty coords, bias, lod, and array layer read by unbound callbacks;
+	//    - sampler callback actively clobbers YMM registers via #simd[8]f32 arithmetic.
+	{
+		src := `#version 310 es
+precision highp float;
+uniform sampler2D s0;
+uniform sampler2D s1;
+uniform highp sampler2DArray s2;
+out vec4 o;
+void main() {
+	float x = gl_FragCoord.x;
+	float y = gl_FragCoord.y;
+	float k0 = x * 0.25 + 1.0;
+	float k1 = y * 0.50 + 2.0;
+	float k2 = (x + y) * 0.125 + 3.0;
+	float k3 = (x - y) * 0.375 + 4.0;
+	float k4 = x * y * 0.0625 + 5.0;
+	float k5 = x * 0.75 - y * 0.25 + 6.0;
+	float k6 = y * 0.75 - x * 0.125 + 7.0;
+	float k7 = (x * 2.0 + y) * 0.1 + 8.0;
+
+	vec2 uv = vec2(fract(k0 * 0.31), fract(k1 * 0.47));
+	float bias = k2 * 0.1;
+	vec4 t0 = texture(s0, uv, bias);
+
+	float layer = floor(mod(x + y, 3.0));
+	float lod = k3 * 0.25;
+	vec4 t2 = textureLod(s2, vec3(uv.yx, layer), lod);
+
+	ivec2 ip = ivec2(int(x) & 3, int(y) & 3);
+	int ilod = int(x) & 1;
+	vec4 t1 = texelFetch(s1, ip, ilod);
+
+	float keep = k0 + k1 * 1.1 + k2 * 1.2 + k3 * 1.3 + k4 * 1.4 + k5 * 1.5 + k6 * 1.6 + k7 * 1.7;
+	o = t0 * 0.5 + t1 * 0.75 + t2 * 0.25 + vec4(keep, k4 - k5, k6 - k7, 1.0);
+}
+`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "adv compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		if !ok {
+			return
+		}
+
+		clobber_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+			// Clobber wide SIMD registers inside the callback to verify ymm8..15 save/restore.
+			v0 := #simd[8]f32{uv.x, uv.y, lod, f32(layer), f32(channel), 1.25, 2.5, 3.75}
+			v1 := v0 * #simd[8]f32{3, 5, 7, 11, 13, 17, 19, 23} + #simd[8]f32{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8}
+			v2 := v1 * v0 - v1
+			arr := transmute([8]f32)v2
+			base := f32(channel + 1) + arr[0] * 0.01 + lod * 0.5 + f32(layer) * 2.0
+			return {base + uv.x, base + uv.y * 2.0, base - lod * 0.25, 1.0}
+		}
+
+		img0_data: [16 * 4]f32
+		img1_data: [16 * 4]f32
+		for i in 0 ..< 16 {
+			img0_data[i * 4 + 0] = f32(i) * 0.25
+			img0_data[i * 4 + 1] = f32(16 - i) * 0.125
+			img0_data[i * 4 + 2] = f32(i % 5) * 0.5
+			img0_data[i * 4 + 3] = 1.0
+			img1_data[i * 4 + 0] = f32(i) * 1.5 + 3.0
+			img1_data[i * 4 + 1] = f32(i) * 0.5 + 1.0
+			img1_data[i * 4 + 2] = f32(i & 3) * 2.0
+			img1_data[i * 4 + 3] = 0.75
+		}
+		sizes := [3][3]i32{{4, 4, 1}, {4, 4, 1}, {4, 4, 3}}
+		imgs_both := [2]Channel_Image {
+			{data = img0_data[:], width = 4, height = 4, components = 4, filter = .Linear},
+			{data = img1_data[:], width = 4, height = 4, components = 4, filter = .Nearest},
+		}
+		imgs_only0 := [2]Channel_Image {
+			{data = img0_data[:], width = 4, height = 4, components = 4, filter = .Nearest},
+			{},
+		}
+		imgs_only1 := [2]Channel_Image {
+			{},
+			{data = img1_data[:], width = 4, height = 4, components = 4, filter = .Nearest},
+		}
+
+		for opts, case_idx in ([4]Run_Options {
+			{sampler = clobber_cb, channel_sizes = sizes[:]},
+			{sampler = clobber_cb, channel_sizes = sizes[:], channel_images = imgs_both[:]},
+			{sampler = clobber_cb, channel_sizes = sizes[:], channel_images = imgs_only0[:]},
+			{sampler = clobber_cb, channel_sizes = sizes[:], channel_images = imgs_only1[:]},
+		}) {
+			oj, oi: [32][4]f32
+			run_f32(&m.program, nil, 8, 4, oj[:], temp_scratch(), opts)
+			run_f32_interp(&m.program, nil, 8, 4, oi[:], temp_scratch(), opts)
+			for px in 0 ..< 32 {
+				for c in 0 ..< 4 {
+					diff := abs(oj[px][c] - oi[px][c])
+					testing.expectf(
+						t,
+						diff <= 1e-5,
+						"case %d px %d comp %d: jit=%v interp=%v",
+						case_idx, px, c, oj[px], oi[px],
+					)
+				}
+			}
+		}
+	}
+}
+
+@(test)
+test_jit_texture_dead_components :: proc(t: ^testing.T) {
+	// 1. Fails if reverted: reading only .r from 2 texelFetch + 2 texture ops must emit
+	//    substantially smaller bound-channel stubs than reading all .rgba (> 280 B smaller).
+	{
+		src_r := `#version 310 es
+precision highp float;
+uniform sampler2D s0;
+uniform sampler2D s1;
+uniform sampler2D s2;
+out vec4 o;
+void main() {
+	ivec2 ip = ivec2(int(gl_FragCoord.x), int(gl_FragCoord.y));
+	vec2 uv = gl_FragCoord.xy * 0.125;
+	float r0 = texelFetch(s0, ip, 0).r;
+	float r1 = texelFetch(s0, ip + ivec2(1, 0), 0).r;
+	float r2 = texture(s1, uv).r;
+	float r3 = texture(s1, uv + vec2(0.25)).r;
+	vec4 unused_tap = texture(s2, uv);
+	o = vec4(r0 + r1 + r2 + r3, 0.0, 0.0, 1.0);
+}
+`
+		src_rgba := `#version 310 es
+precision highp float;
+uniform sampler2D s0;
+uniform sampler2D s1;
+uniform sampler2D s2;
+out vec4 o;
+void main() {
+	ivec2 ip = ivec2(int(gl_FragCoord.x), int(gl_FragCoord.y));
+	vec2 uv = gl_FragCoord.xy * 0.125;
+	vec4 a0 = texelFetch(s0, ip, 0);
+	vec4 a1 = texelFetch(s0, ip + ivec2(1, 0), 0);
+	vec4 a2 = texture(s1, uv);
+	vec4 a3 = texture(s1, uv + vec2(0.25));
+	vec4 a4 = texture(s2, uv);
+	o = a0 + a1 + a2 + a3 + a4;
+}
+`
+		mr, er, ok_r := compile(src_r, {profile = .Glsl, stage = .Fragment})
+		defer destroy(mr)
+		m4, e4, ok_4 := compile(src_rgba, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m4)
+		testing.expectf(t, ok_r, "src_r compile failed:\n%s", format_errors(er, context.temp_allocator))
+		testing.expectf(t, ok_4, "src_rgba compile failed:\n%s", format_errors(e4, context.temp_allocator))
+		if !ok_r || !ok_4 {
+			return
+		}
+		when JIT_ENABLED {
+			if jit_avx2_ready {
+				testing.expectf(
+					t,
+					len(mr.program.jit_mem) + 350 < len(m4.program.jit_mem),
+					"expected dead-component trimming to save >350 B: .r=%d B vs .rgba=%d B",
+					len(mr.program.jit_mem),
+					len(m4.program.jit_mem),
+				)
+			}
+		}
+	}
+
+	// 2. Adversarial component masks (.r, .g, .rg, .b, .a, .rgb, .rgba, unused 0x0)
+	//    across 1-, 2-, and 4-component Nearest and Linear bound images + unbound
+	//    counting callback (including OOB texelFetch lanes).
+	{
+		src := `#version 310 es
+precision highp float;
+uniform sampler2D s0;
+uniform sampler2D s1;
+uniform sampler2D s2;
+uniform sampler2D s3;
+uniform sampler2D s4;
+uniform sampler2D s5;
+uniform sampler2D s6;
+uniform sampler2D s7;
+out vec4 o;
+void main() {
+	int ix = int(gl_FragCoord.x) - 1; // lane 0 is -1 (OOB for texelFetch)
+	int iy = int(gl_FragCoord.y);
+	ivec2 ip = ivec2(ix, iy);
+	vec2 uv = (gl_FragCoord.xy + vec2(0.37, 0.61)) * 0.25;
+
+	float c_r  = texelFetch(s0, ip, 0).r;
+	float c_g  = texelFetch(s1, ip, 0).g;
+	vec2  c_rg = texture(s2, uv).rg;
+	float c_b  = texture(s3, uv).b;
+	float c_a  = texture(s4, uv).a;
+	vec3  c_3  = texelFetch(s5, ip, 0).rgb;
+	vec4  c_4  = texture(s6, uv);
+	vec4  dead0 = texture(s7, uv);
+	vec4  dead1 = texelFetch(s7, ip, 0);
+
+	o = vec4(
+		c_r + c_rg.x + c_3.x + c_4.x,
+		c_g + c_rg.y + c_3.y + c_4.y,
+		c_b + c_3.z + c_4.z,
+		c_a + c_4.w
+	);
+}
+`
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator))
+		if !ok {
+			return
+		}
+
+		count_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+			cnt := (^int)(user)
+			cnt^ += 1
+			b := f32(channel + 1) * 0.5
+			return {b + uv.x, b + uv.y, b * 0.25 + lod, 0.875}
+		}
+
+		tex1: [16 * 1]f32
+		tex2: [16 * 2]f32
+		tex4: [16 * 4]f32
+		for i in 0 ..< 16 {
+			tex1[i] = f32(i + 1) * 0.25
+			tex2[i * 2 + 0] = f32(i + 1) * 0.5
+			tex2[i * 2 + 1] = f32(16 - i) * 0.125
+			tex4[i * 4 + 0] = f32(i) * 0.2 + 0.1
+			tex4[i * 4 + 1] = f32(i % 5) * 0.3 + 0.2
+			tex4[i * 4 + 2] = f32(i & 3) * 0.4 + 0.3
+			tex4[i * 4 + 3] = f32(i % 3) * 0.25 + 0.25
+		}
+		sizes: [8][3]i32
+		for &sz in sizes {
+			sz = {4, 4, 1}
+		}
+
+		for comps in ([3]int{1, 2, 4}) {
+			data := tex1[:] if comps == 1 else (tex2[:] if comps == 2 else tex4[:])
+			for filt in ([2]Channel_Filter{.Nearest, .Linear}) {
+				for mode in 0 ..< 3 {
+					imgs: [8]Channel_Image
+					for ch in 0 ..< 8 {
+						bind := mode == 0 || (mode == 1 && (ch & 1) == 0) || (mode == 2 && ch != 7)
+						if bind {
+							imgs[ch] = {data = data, width = 4, height = 4, components = comps, filter = filt}
+						}
+					}
+					cnt_j, cnt_i := 0, 0
+					oj, oi: [24][4]f32
+					opts_j := Run_Options {
+						sampler        = count_cb,
+						user           = &cnt_j,
+						channel_sizes  = sizes[:],
+						channel_images = imgs[:],
+					}
+					opts_i := opts_j
+					opts_i.user = &cnt_i
+					run_f32(&m.program, nil, 6, 4, oj[:], temp_scratch(), opts_j)
+					run_f32_interp(&m.program, nil, 6, 4, oi[:], temp_scratch(), opts_i)
+					testing.expectf(
+						t,
+						cnt_j == cnt_i,
+						"comps=%d filt=%v mode=%d: callback count jit=%d interp=%d",
+						comps, filt, mode, cnt_j, cnt_i,
+					)
+					for px in 0 ..< 24 {
+						for c in 0 ..< 4 {
+							diff := abs(oj[px][c] - oi[px][c])
+							testing.expectf(
+								t,
+								diff <= 1e-5,
+								"comps=%d filt=%v mode=%d px=%d c=%d: jit=%v interp=%v",
+								comps, filt, mode, px, c, oj[px], oi[px],
+							)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+@(test)
+test_jit_load_buf_bounds_and_cold :: proc(t: ^testing.T) {
+	// 1. Relative two-program comparison: 8 vec4 buffer loads (Load_Buf n=4, stride=1,
+	//    loading 32 words) share one uniform bounds check and one cold OOB/big-buf stub per
+	//    op, emitting smaller code than 20 scalar Load_Buf(n=1, stride=1) loads (20 words).
+	{
+		fills_sz := [1]Uniform_Fill{{slot = 0, offset = 0, base = .Uint}}
+		outputs_sz := [1]Program_Var{{kind = .Stage_Out, location = 0, slot = 4, n = 4, base = .Float}}
+		code_v4 := make([dynamic]Instr, 0, 20, context.temp_allocator)
+		code_f1 := make([dynamic]Instr, 0, 44, context.temp_allocator)
+		for i in i32(0) ..< 8 {
+			dst4 := i32(4) if i == 0 else i32(8)
+			append(&code_v4, Instr{op = .Load_Buf, n = 4, k = 0, dst = dst4, a = 0, b = 1, c = i * 4})
+			if i > 0 {
+				append(&code_v4, Instr{op = .F_Add, n = 4, dst = 4, a = 4, b = 8})
+			}
+		}
+		for i in i32(0) ..< 20 {
+			dst1 := i32(4) if i == 0 else i32(8)
+			append(&code_f1, Instr{op = .Load_Buf, n = 1, k = 0, dst = dst1, a = 0, b = 1, c = i})
+			if i > 0 {
+				append(&code_f1, Instr{op = .F_Add, n = 1, dst = 4, a = 4, b = 8})
+			}
+		}
+		append(&code_f1, Instr{op = .Splat, n = 4, dst = 4, a = 4})
+
+		p_v4 := Program {
+			code        = code_v4[:],
+			fills       = fills_sz[:],
+			outputs     = outputs_sz[:],
+			num_slots   = 16,
+			num_masks   = 2,
+			num_buffers = 1,
+			stage       = .Fragment,
+		}
+		jit_compile(&p_v4)
+		defer jit_destroy(&p_v4)
+
+		p_f1 := Program {
+			code        = code_f1[:],
+			fills       = fills_sz[:],
+			outputs     = outputs_sz[:],
+			num_slots   = 16,
+			num_masks   = 2,
+			num_buffers = 1,
+			stage       = .Fragment,
+		}
+		jit_compile(&p_f1)
+		defer jit_destroy(&p_f1)
+
+		when JIT_ENABLED {
+			if jit_avx2_ready {
+				testing.expectf(
+					t,
+					len(p_v4.jit_mem) < len(p_f1.jit_mem),
+					"expected shared bounds check & cold stubs on Load_Buf(n=4): 8x_v4=%d B vs 20x_f1=%d B",
+					len(p_v4.jit_mem),
+					len(p_f1.jit_mem),
+				)
+			}
+		}
+	}
+
+	// 2. Adversarial uniform & divergent bounds (in-bounds, straddling buf_len, index == len,
+	//    all-OOB, and u32(max) 32-bit wraparound) for n = 1, 2, 4 (and 3), passing every buffer
+	//    as a sub-slice of a larger backing array whose words past the end hold non-zero sentinels
+	//    (catches off-by-one `lea [rax + (n - 2)]` and `ja` vs `jae` overreads!).
+	src := `#version 310 es
+precision highp float;
+layout(std430, binding = 0) readonly buffer B0 { float f[]; } b0;
+layout(std430, binding = 1) readonly buffer B1 { vec2  v2[]; } b1;
+layout(std430, binding = 2) readonly buffer B2 { vec4  v4[]; } b2;
+uniform uint uMode;
+uniform uint uIdx;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+void main() {
+	uint lane = uint(int(gl_FragCoord.y) * 4 + int(gl_FragCoord.x));
+	uint w = uIdx;
+	if (uMode == 1u) {
+		if      (lane == 0u) w = 0u;
+		else if (lane == 1u) w = uIdx;
+		else if (lane == 2u) w = uIdx + 1u;
+		else if (lane == 3u) w = uIdx + 2u;
+		else if (lane == 4u) w = uIdx + 3u;
+		else if (lane == 5u) w = 0x7fffffffu;
+		else if (lane == 6u) w = 0xfffffffeu;
+		else                 w = 0xffffffffu;
+	}
+	o0 = b2.v4[w];
+	o1 = vec4(b1.v2[w], b0.f[w], b0.f[w + 3u]);
+}
+`
+	// Direct stride=1, off=0 IR program emitting separate outputs for n = 4 (t0.xyzw),
+	// n = 2 (t1.xy), n = 1 (t1.z), and n = 3 (t1.w = comp 2), driven in both uniform
+	// (uMode == 0 -> all 8 lanes use uIdx) and divergent (uMode == 1 -> uIdx + lane_x) modes.
+	fills := [2]Uniform_Fill {
+		{slot = 0, offset = 0, base = .Uint}, // uIdx
+		{slot = 1, offset = 4, base = .Uint}, // uMode (0 = uniform, 1 = divergent)
+	}
+	inputs := [1]Program_Var{{kind = .Frag_Coord, slot = 2, n = 2, base = .Float}}
+	outputs := [2]Program_Var {
+		{kind = .Stage_Out, location = 0, slot = 16, n = 4, base = .Float},
+		{kind = .Stage_Out, location = 1, slot = 20, n = 4, base = .Float},
+	}
+	consts := [1][2]u32{{4, 0}}
+	code_ir := [?]Instr {
+		{op = .F_To_U, n = 1, dst = 5, a = 2},                        // lane_x 0..7
+		{op = .I_Mul, n = 1, dst = 5, a = 5, b = 1},                  // 0 when uMode==0, lane_x when uMode==1
+		{op = .I_Add, n = 1, dst = 6, a = 0, b = 5},                  // idx = uIdx (+ lane_x)
+		{op = .Load_Buf, n = 4, k = 0, dst = 16, a = 6, b = 1, c = 0}, // n = 4 -> t0.xyzw
+		{op = .Load_Buf, n = 2, k = 0, dst = 20, a = 6, b = 1, c = 0}, // n = 2 -> t1.xy
+		{op = .Load_Buf, n = 1, k = 0, dst = 22, a = 6, b = 1, c = 0}, // n = 1 -> t1.z
+		{op = .Load_Buf, n = 3, k = 0, dst = 8,  a = 6, b = 1, c = 0}, // n = 3 -> t1.w = slot 10
+		{op = .Mov, n = 1, dst = 23, a = 10},
+	}
+	p_ir := Program {
+		code        = code_ir[:],
+		fills       = fills[:],
+		inputs      = inputs[:],
+		outputs     = outputs[:],
+		consts      = consts[:],
+		num_slots   = 28,
+		num_masks   = 2,
+		num_buffers = 1,
+		stage       = .Fragment,
+	}
+	jit_compile(&p_ir)
+	defer jit_destroy(&p_ir)
+	p_ir_int := p_ir
+	p_ir_int.jit_body, p_ir_int.jit_init = nil, nil
+
+	m2, errs2, ok2 := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m2)
+	testing.expectf(t, ok2, "src compile failed:\n%s", format_errors(errs2, context.temp_allocator))
+	if !ok2 {
+		return
+	}
+	p_m2_int := m2.program
+	p_m2_int.jit_body, p_m2_int.jit_init = nil, nil
+
+	// Backing array with 32 words: sub-slices [:10] and [:12] leave non-zero float sentinels
+	// immediately past `len(buf)` so any 1-word overread returns 930.0+ instead of 0.0!
+	backing_words: [32]u32
+	for i in 0 ..< 12 {
+		backing_words[i] = transmute(u32)(f32(i + 1) * 1.25)
+	}
+	for i in 12 ..< len(backing_words) {
+		backing_words[i] = transmute(u32)f32(800 + i * 13)
+	}
+	// Overwrite indices 10..11 with sentinels when testing len == 10, then restore for len == 12.
+	test_indices := [?]u32 {
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 100,
+		0x7FFF_FFFE, 0x8000_0000, 0xFFFF_FFFC, 0xFFFF_FFFD, 0xFFFF_FFFE, 0xFFFF_FFFF,
+	}
+	for sub_len in ([2]int{10, 12}) {
+		for i in 0 ..< len(backing_words) {
+			if i < sub_len {
+				backing_words[i] = transmute(u32)(f32(i + 1) * 1.25)
+			} else {
+				backing_words[i] = transmute(u32)f32(900 + i * 17)
+			}
+		}
+		sub := backing_words[:sub_len]
+		for mode in u32(0) ..= 1 {
+			for u_idx in test_indices {
+				unif_ir: [8]u8
+				(^u32)(&unif_ir[0])^ = u_idx
+				(^u32)(&unif_ir[4])^ = mode
+				bufs1 := [1][]u32{sub}
+				tj0, tj1, ti0, ti1: [16][4]f32
+				tjs := [2][][4]f32{tj0[:], tj1[:]}
+				tis := [2][][4]f32{ti0[:], ti1[:]}
+				run_targets(&p_ir, unif_ir[:], 8, 2, tjs[:], temp_scratch(), {buffers = bufs1[:]})
+				run_targets(&p_ir_int, unif_ir[:], 8, 2, tis[:], temp_scratch(), {buffers = bufs1[:]})
+				for px in 0 ..< 16 {
+					testing.expectf(
+						t,
+						jit_vec4_bits_eq(tj0[px], ti0[px]),
+						"IR len=%d mode=%d uIdx=0x%x t0 px=%d: jit=%v interp=%v",
+						sub_len, mode, u_idx, px, tj0[px], ti0[px],
+					)
+					testing.expectf(
+						t,
+						jit_vec4_bits_eq(tj1[px], ti1[px]),
+						"IR len=%d mode=%d uIdx=0x%x t1 px=%d: jit=%v interp=%v",
+						sub_len, mode, u_idx, px, tj1[px], ti1[px],
+					)
+				}
+
+				unif: [16]u8
+				for u in m2.uniforms {
+					if u.name == "uMode" {
+						(^u32)(&unif[u.offset])^ = mode
+					} else if u.name == "uIdx" {
+						(^u32)(&unif[u.offset])^ = u_idx
+					}
+				}
+				bufs3 := [3][]u32{sub, sub, sub}
+				gj0, gj1, gi0, gi1: [8][4]f32
+				gjs := [2][][4]f32{gj0[:], gj1[:]}
+				gis := [2][][4]f32{gi0[:], gi1[:]}
+				run_targets(&m2.program, unif[:], 4, 2, gjs[:], temp_scratch(), {buffers = bufs3[:]})
+				run_targets(&p_m2_int, unif[:], 4, 2, gis[:], temp_scratch(), {buffers = bufs3[:]})
+				for px in 0 ..< 8 {
+					testing.expectf(
+						t,
+						jit_vec4_bits_eq(gj0[px], gi0[px]),
+						"GLSL len=%d mode=%d uIdx=0x%x t0 px=%d: jit=%v interp=%v",
+						sub_len, mode, u_idx, px, gj0[px], gi0[px],
+					)
+					testing.expectf(
+						t,
+						jit_vec4_bits_eq(gj1[px], gi1[px]),
+						"GLSL len=%d mode=%d uIdx=0x%x t1 px=%d: jit=%v interp=%v",
+						sub_len, mode, u_idx, px, gj1[px], gi1[px],
+					)
+				}
+			}
+		}
+	}
+
+	// Sparse > 2^31-word (> 8 GiB) buffer: commit page 0 and the page at 2^31 words,
+	// with non-zero sentinels placed immediately past BIG_WORDS on the committed high page.
+	BIG_WORDS :: (int(1) << 31) + 6
+	BIG_BYTES :: uint(BIG_WORDS + 16) * size_of(u32)
+	if reserved, rerr := virtual.reserve(BIG_BYTES); rerr == .None && len(reserved) >= int(BIG_BYTES) {
+		defer virtual.release(raw_data(reserved), len(reserved))
+		hi_byte_off := uint(1) << 33 // (1 << 31) * 4 bytes (page-aligned)
+		c0 := virtual.commit(raw_data(reserved), 4096)
+		c1 := virtual.commit(([^]byte)(raw_data(reserved))[hi_byte_off:], 4096)
+		if c0 == .None && c1 == .None {
+			big_backing := mem.slice_ptr((^u32)(raw_data(reserved)), BIG_WORDS + 10)
+			for i in 0 ..< 8 {
+				big_backing[i] = transmute(u32)(f32(i + 1) * 2.5)
+			}
+			for i in 0 ..< 6 {
+				big_backing[(int(1) << 31) + i] = transmute(u32)(f32(i + 10) * 0.5)
+			}
+			for i in 6 ..< 16 {
+				big_backing[(int(1) << 31) + i] = transmute(u32)f32(700 + i * 19)
+			}
+			big_slice := big_backing[:BIG_WORDS]
+			big_indices := [?]u32 {
+				0,
+				2,
+				0x8000_0000,
+				0x8000_0002, // all 4 in bounds above 2^31
+				0x8000_0003, // 3 in bounds + 1 OOB above 2^31 (straddling sentinel!)
+				0x8000_0004, // 2 in bounds + 2 OOB above 2^31
+				0x8000_0005, // 1 in bounds + 3 OOB above 2^31 (n=2 straddling sentinel!)
+				0x8000_0006, // index == len above 2^31 (n=1 sentinel!)
+				0xFFFF_FFFE, // wraps 0xFFFF_FFFE, 0xFFFF_FFFF (OOB), 0, 1 (in bounds at page 0!)
+			}
+			bufs_big := [1][]u32{big_slice}
+			for mode in u32(0) ..= 1 {
+				for u_idx in big_indices {
+					unif_ir: [8]u8
+					(^u32)(&unif_ir[0])^ = u_idx
+					(^u32)(&unif_ir[4])^ = mode
+					tj0, tj1, ti0, ti1: [16][4]f32
+					tjs := [2][][4]f32{tj0[:], tj1[:]}
+					tis := [2][][4]f32{ti0[:], ti1[:]}
+					run_targets(&p_ir, unif_ir[:], 8, 2, tjs[:], temp_scratch(), {buffers = bufs_big[:]})
+					run_targets(&p_ir_int, unif_ir[:], 8, 2, tis[:], temp_scratch(), {buffers = bufs_big[:]})
+					for px in 0 ..< 16 {
+						testing.expectf(t, jit_vec4_bits_eq(tj0[px], ti0[px]), "IR >2^31 mode=%d uIdx=0x%x t0 px=%d: jit=%v interp=%v", mode, u_idx, px, tj0[px], ti0[px])
+						testing.expectf(t, jit_vec4_bits_eq(tj1[px], ti1[px]), "IR >2^31 mode=%d uIdx=0x%x t1 px=%d: jit=%v interp=%v", mode, u_idx, px, tj1[px], ti1[px])
 					}
 				}
 			}
