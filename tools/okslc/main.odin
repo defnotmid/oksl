@@ -6,7 +6,8 @@
 //     odin run tools/okslc -- shader.sksl [more.sksl tunnel.glsl ...]
 //     odin run tools/okslc -- -o out_prefix shader.sksl
 //
-// `-o` writes out_prefix.spv and out_prefix.metal (one shader).
+// `-o` writes out_prefix.spv, out_prefix.metal and, for vertex and fragment
+// shaders, out_prefix.dxbc (one shader).
 package okslc
 
 import "core:fmt"
@@ -35,6 +36,8 @@ main :: proc() {
 		errors: []oksl.Error
 		ok: bool
 		options, _ := oksl.options_of_path(path)
+		// DXBC for every stage that has it.
+		options.dxbc = options.stage != .Compute
 		m, errors, ok = oksl.compile(string(data), options)
 		if !ok {
 			failed += 1
@@ -43,10 +46,13 @@ main :: proc() {
 				fmt.printfln("%s:%d:%d: %s", path, e.pos.line, e.pos.col, oksl.error_message(e, context.temp_allocator))
 			}
 		} else {
-			fmt.printfln("%s: ok, %d SPIR-V words, %d MSL bytes, block %d bytes, %d children", path, len(m.spirv), len(m.msl), m.block_size, m.num_samplers)
+			fmt.printfln("%s: ok, %d SPIR-V words, %d MSL bytes, %d DXBC bytes, block %d bytes, %d children", path, len(m.spirv), len(m.msl), len(m.dxbc), m.block_size, m.num_samplers)
 			if prefix != "" {
 				_ = os.write_entire_file(fmt.tprintf("%s.spv", prefix), ([^]u8)(raw_data(m.spirv))[:len(m.spirv) * 4])
 				_ = os.write_entire_file(fmt.tprintf("%s.metal", prefix), transmute([]u8)m.msl)
+				if len(m.dxbc) > 0 {
+					_ = os.write_entire_file(fmt.tprintf("%s.dxbc", prefix), m.dxbc)
+				}
 			}
 		}
 		oksl.destroy(m)

@@ -1,4 +1,4 @@
-// oksl compiles shaders to SPIR-V and MSL for SDL_GPU, and to a program the
+// oksl compiles shaders to SPIR-V, MSL and DXBC for SDL_GPU, and to a program the
 // CPU interpreter runs, with no external compiler. One front end (lexer,
 // preprocessor, parser, checker) takes three kinds of source: SkSL (Skia
 // runtime effects, `half4 main(float2 coord)`), Shadertoy's GLSL ES 3
@@ -29,6 +29,9 @@ Options :: struct {
 	no_spirv: bool,
 	no_msl:   bool,
 	no_cpu:   bool,
+	// Also emit DXBC (Module.dxbc) for Direct3D 12: vertex and fragment
+	// shaders; a compute shader with it set is an error (Dxbc_Compute).
+	dxbc:     bool,
 	// Vertex shaders: runs of main for other environments, each giving the
 	// vertex's position there (a motion blur's shutter opening). In
 	// compile_pipeline, the vertex stage's.
@@ -119,6 +122,9 @@ Module :: struct {
 	spirv:         []u32,
 	// Metal source; entry point MSL_ENTRY.
 	msl:           string,
+	// A DXBC container (Shader Model 5.1, vs_5_1 or ps_5_1) for Direct3D
+	// 12, when Options.dxbc asks for it; entry point DXBC_ENTRY.
+	dxbc:          []u8,
 	// The uniforms of the block's first environment.
 	uniforms:      []Uniform_Info,
 	// Size of the uniform block in bytes (a multiple of 16): (1 + taps)
@@ -171,6 +177,7 @@ Module :: struct {
 
 SPIRV_ENTRY :: "main"
 MSL_ENTRY :: "oksl_main"
+DXBC_ENTRY :: "main"
 
 // Compiles `source` as `options.profile` (SkSL by default). On failure
 // `errors` lists every problem found (with line:column) and the module is
@@ -196,6 +203,10 @@ module_front :: proc(source: string, options: Options, src, prelude_src: Source)
 	unit_init(u, options.profile, context.allocator, buffer_pass = options.unclamped, stage = options.stage, taps = options.taps)
 	if options.stage not_in PROFILE_RULES[options.profile].stages {
 		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Stage_Unsupported, a = PROFILE_NAMES[options.profile], b = STAGE_NAMES[options.stage]})
+		return u, nil, false
+	}
+	if options.dxbc && options.stage == .Compute {
+		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Dxbc_Compute})
 		return u, nil, false
 	}
 	if len(options.taps) > 0 && options.stage != .Vertex {
@@ -360,6 +371,9 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 	}
 	if !options.no_msl {
 		m.msl = emit_msl(u, c)
+	}
+	if options.dxbc {
+		m.dxbc = emit_dxbc(u, c)
 	}
 	if !options.no_cpu {
 		m.program = build_program(u, c)

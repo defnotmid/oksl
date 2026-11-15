@@ -219,6 +219,8 @@ Error_Code :: enum u8 {
 	Atomic_Target,
 	Unsupported_Atomic_Counter,
 	Unsupported_Image_Atomic,
+	// Options.dxbc on a compute shader (DXBC has vertex and fragment only).
+	Dxbc_Compute,
 }
 
 // A diagnostic at `pos` (the user's line and column: macro expansions keep
@@ -428,6 +430,7 @@ ERROR_TEXT := [Error_Code]string {
 	.Atomic_Target         = "{name} requires a shared variable or read-write buffer element",
 	.Unsupported_Atomic_Counter = "atomic_uint counters are not supported; use atomic operations on a storage buffer or shared variable",
 	.Unsupported_Image_Atomic   = "{name} is not in GLSL ES 3.10 core; use atomic operations on a storage buffer or shared variable",
+	.Dxbc_Compute               = "DXBC is emitted for vertex and fragment shaders, not compute shaders",
 }
 
 // The text of a diagnostic (without its position).

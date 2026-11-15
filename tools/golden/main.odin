@@ -11,7 +11,11 @@
 // interpreter code, and a hash of the CPU result with the value folded into
 // the output colour. Per shader in testdata/ and demo/media/ it writes the
 // .spv, the .metal, a float CPU render (.f32) and the reflection the host
-// sees (.reflect), or the diagnostics (.errors).
+// sees (.reflect), or the diagnostics (.errors), and for vertex and
+// fragment shaders the .dxbc (Options.dxbc; testdata/'s vertex shaders
+// have only it). corpus_dxbc.tsv has a hash of each valid case's DXBC,
+// and for the cases where GLSL leaves the result open and D3D12 on vkd3d
+// (RADV) differs from the CPU, the reason (DXBC_OPEN).
 //
 // `compare` reports, per kind of output, which cases and files differ;
 // it exits 1 when anything does.
@@ -74,6 +78,49 @@ CTORS := []string {
 COLUMNS :: [?]string{"result", "type", "spv", "msl", "vm", "cpu"}
 
 out: strings.Builder
+out_dxbc: strings.Builder
+
+// The corpus cases whose DXBC renders differ from the CPU on D3D12 (vkd3d
+// on RADV, tools/d3d12_parity's harness over the whole corpus) where GLSL
+// leaves the result open: pow(x, y) for x < 0, or x = 0 and y <= 0 (GLSL
+// ES 3.10 8.2: undefined), mod(x, y) where x / y is within the division's
+// precision of an integer (x - y * floor(x / y) is then 0 or y; D3D's div
+// is not exactly rounded) and division by zero (the driver may fold or
+// reassociate it without precise). 23 cases, all of them.
+DXBC_OPEN := [][2]string {
+	{"pow(f1, i1)", "pow, x < 0 or x = 0 with y <= 0"},
+	{"pow(f1, u1)", "pow, x < 0 or x = 0 with y <= 0"},
+	{"pow(f2, u2)", "pow, x < 0 or x = 0 with y <= 0"},
+	{"pow(f3, i3)", "pow, x < 0 or x = 0 with y <= 0"},
+	{"pow(i1, i1)", "pow, x < 0 or x = 0 with y <= 0"},
+	{"pow(i1, u1)", "pow, x < 0 or x = 0 with y <= 0"},
+	{"pow(i3, i3)", "pow, x < 0 or x = 0 with y <= 0"},
+	{"pow(u2, u2)", "pow, x < 0 or x = 0 with y <= 0"},
+	{"mod(f1, f1)", "mod, x / y within the division's precision of an integer"},
+	{"mod(f2, f2)", "mod, x / y within the division's precision of an integer"},
+	{"mod(f3, f3)", "mod, x / y within the division's precision of an integer"},
+	{"mod(f4, f4)", "mod, x / y within the division's precision of an integer"},
+	{"mod(i1, i1)", "mod, x / y within the division's precision of an integer"},
+	{"mod(i3, f3)", "mod, x / y within the division's precision of an integer"},
+	{"mod(i3, i3)", "mod, x / y within the division's precision of an integer"},
+	{"mod(u1, u1)", "mod, x / y within the division's precision of an integer"},
+	{"mod(u2, u2)", "mod, x / y within the division's precision of an integer"},
+	{"m2 / i1", "division by zero"},
+	{"m2 / m2", "division by zero"},
+	{"m23 / i1", "division by zero"},
+	{"m2 /= i1", "division by zero"},
+	{"m2 /= m2", "division by zero"},
+	{"m23 /= i1", "division by zero"},
+}
+
+dxbc_open :: proc(key: string) -> (string, bool) {
+	for o in DXBC_OPEN {
+		if o[0] == key {
+			return o[1], true
+		}
+	}
+	return "", false
+}
 
 main :: proc() {
 	args := os.args[1:]
@@ -93,9 +140,11 @@ main :: proc() {
 snapshot :: proc(dir: string) {
 	_ = os.make_directory(dir)
 	out = strings.builder_make()
+	out_dxbc = strings.builder_make()
 	files(dir)
 	corpus()
 	_ = os.write_entire_file(fmt.tprintf("%s/corpus.tsv", dir), out.buf[:])
+	_ = os.write_entire_file(fmt.tprintf("%s/corpus_dxbc.tsv", dir), out_dxbc.buf[:])
 	fmt.printfln("%s: %d cases", dir, strings.count(strings.to_string(out), "\n"))
 }
 
@@ -202,9 +251,14 @@ expr_case :: proc(key, expr: string, prefix := "") {
 	fmt.sbprint(&sb2, "half4 main(float2 p) {\n")
 	decls(&sb2)
 	fmt.sbprintf(&sb2, "\t%s\n\t%s r = %s;\n\treturn %s;\n}}\n", prefix, t, expr, fold(t))
-	m2, errs2, ok2 := oksl.compile(strings.to_string(sb2))
+	m2, errs2, ok2 := oksl.compile(strings.to_string(sb2), {dxbc = true})
 	if ok2 {
 		fmt.sbprintf(&out, "%s\tok\t%s\t%s\t%s\n", key, t, code_hashes(m2), cpu_hash(m2))
+		fmt.sbprintf(&out_dxbc, "%s\t%x", key, hash.fnv64a(m2.dxbc))
+		if reason, open := dxbc_open(key); open {
+			fmt.sbprintf(&out_dxbc, "\topen on D3D12: %s", reason)
+		}
+		fmt.sbprint(&out_dxbc, "\n")
 	} else {
 		fmt.sbprintf(&out, "%s\terror\tfolding %s failed: %s\n", key, t, one_line(errs2))
 	}
@@ -300,7 +354,7 @@ files :: proc(dir: string) {
 	for sub in ([]string{"testdata", "demo/media"}) {
 		fis, _ := os.read_all_directory_by_path(sub, context.allocator)
 		for fi in fis {
-			if o, known := oksl.options_of_path(fi.name); known && (o.stage == .Fragment || o.stage == .Compute) {
+			if _, known := oksl.options_of_path(fi.name); known {
 				append(&paths, fi.fullpath)
 			}
 		}
@@ -311,6 +365,7 @@ files :: proc(dir: string) {
 		errs: []oksl.Error
 		ok: bool
 		options, _ := oksl.options_of_path(path)
+		options.dxbc = options.stage != .Compute
 		m, errs, ok = oksl.compile(string(data), options)
 		base := fmt.tprintf("%s/%s", dir, filepath.base(path))
 		if !ok {
@@ -319,6 +374,11 @@ files :: proc(dir: string) {
 		}
 		if options.stage == .Compute {
 			snapshot_compute(base, m)
+			oksl.destroy(m)
+			continue
+		}
+		_ = os.write_entire_file(fmt.tprintf("%s.dxbc", base), m.dxbc)
+		if options.stage == .Vertex {
 			oksl.destroy(m)
 			continue
 		}

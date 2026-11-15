@@ -2,13 +2,15 @@
 // GLSL fragment shaders, by oksl.SOURCE_EXTENSIONS) with SDL_GPU (the
 // generated SPIR-V, or MSL on Metal, drawn through oksl.LAYER_VERTEX_GLSL,
 // whose uv a .frag reads at location 0) and with the CPU interpreter, and
-// compares the colour at location 0: sampler2Ds read a checker texture,
-// sampler2DArrays LAYERS copies of it with their colours rotated, and
-// every storage buffer the test words. It also checks a tap of the layer
-// vertex shader (Options.taps), its position drawn as colour, and a vertex
-// shader placing the quad's corners by gl_VertexID from a storage buffer,
-// against run_vertex's, and gl_SampleMask resolved from 4x MSAA against
-// run_fragment's masks.
+// compares the colour at location 0: sampler2DArrays read LAYERS copies
+// of a checker texture with their colours rotated, sampler2D channel n
+// layer n % LAYERS, and every storage buffer the test words. It also
+// checks a tap of the layer vertex shader (Options.taps), its position
+// drawn as colour, a vertex shader placing the quad's corners by
+// gl_VertexID from a storage buffer, against run_vertex's, gl_SampleMask
+// resolved from 4x MSAA against run_fragment's masks, and both windings
+// with perspective and flat integers. The CPU side (test data, sampler,
+// references, comparisons) is tools/parity's, shared with d3d12_parity.
 // Writes <name>_gpu.png, <name>_cpu.png and <name>_diff.png.
 //
 //     odin run tools/gpu_parity -- [out_dir] [testdata_dir]
@@ -22,163 +24,16 @@ import "core:slice"
 import "core:strings"
 import "core:thread"
 import oksl "../.."
+import parity "../parity"
 import sdl "vendor:sdl3"
-import stbi "vendor:stb/image"
 
-W :: 256
-H :: 144
-TIME :: 1.5
-TEX :: 64
-LAYERS :: 3
-
-// The storage buffers' words: floats in [0, 1], which shaders read as
-// floats or as bits.
-WORDS :: 4096
-test_words: [WORDS]u32
-
-make_words :: proc() {
-	for &w, i in test_words {
-		w = transmute(u32)(f32((i * 37 + 11) % 256) / 255)
-	}
-}
-
-// The channel texture: a colour checker and its mip chain, each level the
-// 2x2 box average of the one above, in 8 bits (so both sides see the same
-// values).
-LEVELS :: 7
-texture_pixels: [(TEX * TEX * 4 * 4 - 4) / 3]u8
-
-BOUND_R_W :: 16
-BOUND_R_H :: 8
-BOUND_RG_W :: 12
-BOUND_RG_H :: 10
-BOUND_RGBA_W :: 20
-BOUND_RGBA_H :: 14
-
-bound_r_texels: [BOUND_R_W * BOUND_R_H]f32
-bound_rg_texels: [BOUND_RG_W * BOUND_RG_H][2]f32
-bound_rgba_texels: [BOUND_RGBA_W * BOUND_RGBA_H][4]f32
-
-make_bound_textures :: proc() {
-	for y in 0 ..< BOUND_R_H {
-		for x in 0 ..< BOUND_R_W {
-			bound_r_texels[y * BOUND_R_W + x] = f32(((x * 5 + y * 3) % 25) - 8) * 0.125
-		}
-	}
-	for y in 0 ..< BOUND_RG_H {
-		for x in 0 ..< BOUND_RG_W {
-			bound_rg_texels[y * BOUND_RG_W + x] = {
-				f32(((x * 3 + y * 7 + 2) % 25) - 8) * 0.125,
-				f32(((x * 7 + y * 5 + 9) % 25) - 8) * 0.125,
-			}
-		}
-	}
-	for y in 0 ..< BOUND_RGBA_H {
-		for x in 0 ..< BOUND_RGBA_W {
-			bound_rgba_texels[y * BOUND_RGBA_W + x] = {
-				f32(((x * 3 + y * 5 + 1) % 25) - 8) * 0.125,
-				f32(((x * 5 + y * 7 + 4) % 25) - 8) * 0.125,
-				f32(((x * 7 + y * 3 + 11) % 25) - 8) * 0.125,
-				f32(((x * 2 + y * 3 + 5) % 17) - 2) * 0.125,
-			}
-		}
-	}
-}
-
-// Where level l starts in texture_pixels.
-level_offset :: proc(l: int) -> int {
-	o := 0
-	for i in 0 ..< l {
-		o += (TEX >> uint(i)) * (TEX >> uint(i)) * 4
-	}
-	return o
-}
-
-make_texture :: proc() {
-	for y in 0 ..< TEX {
-		for x in 0 ..< TEX {
-			i := (y * TEX + x) * 4
-			on := ((x / 8) + (y / 8)) % 2 == 0
-			texture_pixels[i + 0] = u8(x * 4)
-			texture_pixels[i + 1] = u8(y * 4)
-			texture_pixels[i + 2] = 230 if on else 50
-			texture_pixels[i + 3] = 255
-		}
-	}
-	for l in 1 ..< LEVELS {
-		src, dst := level_offset(l - 1), level_offset(l)
-		n := TEX >> uint(l)
-		for y in 0 ..< n {
-			for x in 0 ..< n {
-				for k in 0 ..< 4 {
-					sum := 2
-					for d in 0 ..< 4 {
-						sum += int(texture_pixels[src + ((2 * y + d / 2) * 2 * n + 2 * x + d % 2) * 4 + k])
-					}
-					texture_pixels[dst + (y * n + x) * 4 + k] = u8(sum / 4)
-				}
-			}
-		}
-	}
-}
-
-// Layer `layer` of the array texture: the checker with its colours
-// rotated `layer` places (layer 0 is the 2D texture).
-layer_pixel :: proc(i, layer: int) -> u8 {
-	k := i % 4
-	return texture_pixels[i - k + (k + layer) % 3] if k < 3 else texture_pixels[i]
-}
-
-texel :: proc(l, x, y, layer: int) -> [4]f32 {
-	n := TEX >> uint(l)
-	xx := ((x % n) + n) % n
-	yy := ((y % n) + n) % n
-	i := level_offset(l) + (yy * n + xx) * 4
-	return {f32(layer_pixel(i, layer)), f32(layer_pixel(i + 1, layer)), f32(layer_pixel(i + 2, layer)), f32(layer_pixel(i + 3, layer))} / 255
-}
-
-bilinear :: proc(l: int, uv: [2]f32, layer: int) -> [4]f32 {
-	n := f32(int(TEX) >> uint(l))
-	fx := uv.x * n - 0.5
-	fy := uv.y * n - 0.5
-	x0 := int(fx) if fx >= 0 else int(fx) - 1
-	y0 := int(fy) if fy >= 0 else int(fy) - 1
-	tx := fx - f32(x0)
-	ty := fy - f32(y0)
-	a, b := texel(l, x0, y0, layer), texel(l, x0 + 1, y0, layer)
-	c, d := texel(l, x0, y0 + 1, layer), texel(l, x0 + 1, y0 + 1, layer)
-	return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
-}
-
-// Trilinear and repeating, the level clamped to the chain and the layer to
-// the array: what the GPU sampler below does.
-cpu_sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
-	ly := clamp(layer, 0, LAYERS - 1)
-	if !(lod > 0) {
-		return bilinear(0, uv, ly)
-	}
-	level := min(lod, LEVELS - 1)
-	l0 := int(level)
-	l1 := min(l0 + 1, LEVELS - 1)
-	t := level - f32(l0)
-	return bilinear(l0, uv, ly) * (1 - t) + bilinear(l1, uv, ly) * t
-}
-
-uniform_block :: proc(m: ^oksl.Module) -> []u8 {
-	block := make([]u8, m.block_size)
-	ch := [3]f32{TEX, TEX, 1}
-	oksl.write_builtins(block, {resolution = {W, H, 1}, time = TIME, time_delta = 1.0 / 60, frame = 90, frame_rate = 60, channel_resolution = {ch, ch, ch, ch}})
-	oksl.set_uniform(m, block, "uSpeed", {0.5})
-	oksl.set_uniform(m, block, "uScale", {1.5})
-	oksl.set_uniform(m, block, "uTint", {1, 0.9, 0.8})
-	oksl.set_uniform(m, block, "uPalette", {1, 0.2, 0.2, 1}, 0)
-	oksl.set_uniform(m, block, "uPalette", {0.2, 1, 0.2, 1}, 1)
-	oksl.set_uniform(m, block, "uPalette", {0.2, 0.2, 1, 1}, 2)
-	oksl.set_uniform(m, block, "uRot", {0.8, 0.6, -0.6, 0.8})
-	oksl.set_uniform(m, block, "uMode", {1})
-	oksl.set_uniform(m, block, "uInvert", {0})
-	return block
-}
+W :: parity.W
+H :: parity.H
+TEX :: parity.TEX
+LAYERS :: parity.LAYERS
+LEVELS :: parity.LEVELS
+cpu_sampler :: parity.cpu_sampler
+write_png :: parity.write_png
 
 Gpu :: struct {
 	device:         ^sdl.GPUDevice,
@@ -186,7 +41,9 @@ Gpu :: struct {
 	vert:           ^sdl.GPUShader,
 	target:         ^sdl.GPUTexture,
 	target_f32:     ^sdl.GPUTexture,
-	tex:            ^sdl.GPUTexture,
+	// The checker's layers as 2D textures (sampler2D channel n reads tex[n
+	// % LAYERS]), and the array of them.
+	tex:            [LAYERS]^sdl.GPUTexture,
 	layers:         ^sdl.GPUTexture,
 	tex_r32f:       ^sdl.GPUTexture,
 	tex_rg32f:      ^sdl.GPUTexture,
@@ -203,9 +60,7 @@ main :: proc() {
 	out_dir := args[0] if len(args) > 0 else "parity_out"
 	data_dir := args[1] if len(args) > 1 else "testdata"
 	os.make_directory_all(out_dir)
-	make_texture()
-	make_bound_textures()
-	make_words()
+	parity.make_data()
 
 	g: Gpu
 	if !gpu_init(&g) {
@@ -241,110 +96,70 @@ main :: proc() {
 		options, _ := oksl.options_of_path(path)
 		m, errors, ok = oksl.compile(string(src), options)
 		if !ok {
-			fmt.printfln("%-16s compile error:\n%s", name, oksl.format_errors(errors, context.temp_allocator))
+			fmt.printfln("%-20s compile error:\n%s", name, oksl.format_errors(errors, context.temp_allocator))
 			failed += 1
 			continue
 		}
-		block := uniform_block(m)
+		block := parity.uniform_block(m)
 		if name == "bound_channels" {
 			detail, bc_ok := bound_channels_check(&g, m, block, out_dir, &scratch)
 			if !bc_ok {
 				failed += 1
 			}
-			fmt.printfln("%-16s %s  %s", name, detail, "ok" if bc_ok else "MISMATCH")
+			fmt.printfln("%-20s %s  %s", name, detail, "ok" if bc_ok else "MISMATCH")
 			oksl.destroy(m)
 			continue
 		}
 		gpu_px, gpu_ok := gpu_render(&g, m, block)
 		if !gpu_ok {
-			fmt.printfln("%-16s GPU render failed: %s", name, sdl.GetError())
+			fmt.printfln("%-20s GPU render failed: %s", name, sdl.GetError())
 			failed += 1
 			oksl.destroy(m)
 			continue
 		}
-		cpu_px := make([]u8, W * H * 4)
-		for i in 0 ..< W * H {
-			cpu_px[i * 4 + 3] = 255
-		}
-		sizes: [oksl.SAMPLER_COUNT][3]i32
-		for &s, ch in sizes {
-			s = {TEX, TEX, LAYERS if ch in m.channel_arrays else 1}
-		}
-		buffers := make([][]u32, len(m.storage_buffers), context.temp_allocator)
-		for &b in buffers {
-			b = test_words[:]
-		}
-		oksl.run(&m.program, block, W, H, cpu_px, W * 4, &scratch, {sampler = cpu_sampler, channel_sizes = sizes[:], buffers = buffers})
-
-		max_d, sum, over2, over8 := 0, 0, 0, 0
-		diff := make([]u8, W * H * 4)
-		for i := 0; i < len(cpu_px); i += 4 {
-			pd := 0
-			for k in 0 ..< 4 {
-				d := abs(int(cpu_px[i + k]) - int(gpu_px[i + k]))
-				pd = max(pd, d)
-				sum += d
-			}
-			max_d = max(max_d, pd)
-			if pd > 2 {over2 += 1}
-			if pd > 8 {over8 += 1}
-			v := u8(min(pd * 16, 255))
-			diff[i], diff[i + 1], diff[i + 2], diff[i + 3] = v, v, v, 255
-		}
-		mean := f64(sum) / f64(len(cpu_px))
-		// Within 3/255 everywhere, or differences confined to a few pixels
-		// where a threshold (step, comparisons) meets transcendental results
-		// that differ by ulps between the GPU and the CPU.
-		verdict := "ok"
-		if max_d > 3 {
-			verdict = "ok (threshold edges)" if over8 <= W * H / 100 && mean < 1 else "MISMATCH"
-		}
-		if verdict == "MISMATCH" {
+		if !parity.compare_rgba8(name, "gpu", out_dir, parity.fragment_reference(m, block, &scratch), gpu_px) {
 			failed += 1
 		}
-		fmt.printfln("%-16s max diff %d, mean %.4f, pixels >2: %d, >8: %d  %s", name, max_d, mean, over2, over8, verdict)
-		write_png(fmt.tprintf("%s/%s_gpu.png", out_dir, name), gpu_px)
-		write_png(fmt.tprintf("%s/%s_cpu.png", out_dir, name), cpu_px)
-		write_png(fmt.tprintf("%s/%s_diff.png", out_dir, name), diff)
+		delete(gpu_px)
 		oksl.destroy(m)
+		free_all(context.temp_allocator)
+	}
+	report :: proc(name: string, d: int, ok: bool, failed: ^int) {
+		good := ok && d <= 2
+		if !good {
+			failed^ += 1
+		}
+		fmt.printfln("%-20s max diff %d  %s", name, d, "ok" if good else "MISMATCH")
 	}
 	max_d, tap_ok := tap_check(&g)
-	if !tap_ok || max_d > 2 {
-		failed += 1
-	}
-	fmt.printfln("%-16s max diff %d  %s", "layer.vert tap", max_d, "ok" if tap_ok && max_d <= 2 else "MISMATCH")
+	report("layer.vert tap", max_d, tap_ok, &failed)
 	id_d, id_ok := vertex_id_check(&g)
-	if !id_ok || id_d > 2 {
-		failed += 1
-	}
-	fmt.printfln("%-16s max diff %d  %s", "gl_VertexID", id_d, "ok" if id_ok && id_d <= 2 else "MISMATCH")
+	report("gl_VertexID", id_d, id_ok, &failed)
 	mask_d, mask_ok := sample_mask_check(&g)
-	if !mask_ok || mask_d > 2 {
+	report("gl_SampleMask", mask_d, mask_ok, &failed)
+	face_detail, face_ok := facing_check(&g)
+	if !face_ok {
 		failed += 1
 	}
-	fmt.printfln("%-16s max diff %d  %s", "gl_SampleMask", mask_d, "ok" if mask_ok && mask_d <= 2 else "MISMATCH")
+	fmt.printfln("%-20s %s  %s", "facing", face_detail, "ok" if face_ok else "MISMATCH")
 	for path in comp_names {
 		name := filepath.base(path)
 		detail, comp_ok := compute_file_check(&g, path, &scratch)
 		if !comp_ok {
 			failed += 1
 		}
-		fmt.printfln("%-16s %s  %s", name, detail, "ok" if comp_ok else "MISMATCH")
+		fmt.printfln("%-20s %s  %s", name, detail, "ok" if comp_ok else "MISMATCH")
 	}
 	fmt_detail, fmt_ok := image_formats_check(&g, &scratch)
 	if !fmt_ok {
 		failed += 1
 	}
-	fmt.printfln("%-16s %s  %s", "image_formats", fmt_detail, "ok" if fmt_ok else "MISMATCH")
-	checks := len(names) + 3 + len(comp_names) + 1
+	fmt.printfln("%-20s %s  %s", "image_formats", fmt_detail, "ok" if fmt_ok else "MISMATCH")
+	checks := len(names) + 4 + len(comp_names) + 1
 	fmt.printfln("%d/%d shaders match (images in %s)", checks - failed, checks, out_dir)
 	if failed > 0 {
 		os.exit(1)
 	}
-}
-
-write_png :: proc(path: string, px: []u8) {
-	stbi.write_png(strings.clone_to_cstring(path, context.temp_allocator), W, H, 4, raw_data(px), W * 4)
 }
 
 gpu_init :: proc(g: ^Gpu) -> bool {
@@ -382,11 +197,13 @@ gpu_init :: proc(g: ^Gpu) -> bool {
 	g.vert = sdl.CreateGPUShader(g.device, vert)
 	g.target = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET}, width = W, height = H, layer_count_or_depth = 1, num_levels = 1})
 	g.target_f32 = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32G32B32A32_FLOAT, usage = {.COLOR_TARGET}, width = W, height = H, layer_count_or_depth = 1, num_levels = 1})
-	g.tex = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = TEX, height = TEX, layer_count_or_depth = 1, num_levels = LEVELS})
+	for &t in g.tex {
+		t = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = TEX, height = TEX, layer_count_or_depth = 1, num_levels = LEVELS})
+	}
 	g.layers = sdl.CreateGPUTexture(g.device, {type = .D2_ARRAY, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = TEX, height = TEX, layer_count_or_depth = LAYERS, num_levels = LEVELS})
-	g.tex_r32f = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32_FLOAT, usage = {.SAMPLER}, width = BOUND_R_W, height = BOUND_R_H, layer_count_or_depth = 1, num_levels = 1})
-	g.tex_rg32f = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32G32_FLOAT, usage = {.SAMPLER}, width = BOUND_RG_W, height = BOUND_RG_H, layer_count_or_depth = 1, num_levels = 1})
-	g.tex_rgba32f = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32G32B32A32_FLOAT, usage = {.SAMPLER}, width = BOUND_RGBA_W, height = BOUND_RGBA_H, layer_count_or_depth = 1, num_levels = 1})
+	g.tex_r32f = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32_FLOAT, usage = {.SAMPLER}, width = parity.BOUND_R_W, height = parity.BOUND_R_H, layer_count_or_depth = 1, num_levels = 1})
+	g.tex_rg32f = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32G32_FLOAT, usage = {.SAMPLER}, width = parity.BOUND_RG_W, height = parity.BOUND_RG_H, layer_count_or_depth = 1, num_levels = 1})
+	g.tex_rgba32f = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32G32B32A32_FLOAT, usage = {.SAMPLER}, width = parity.BOUND_RGBA_W, height = parity.BOUND_RGBA_H, layer_count_or_depth = 1, num_levels = 1})
 	g.sampler = sdl.CreateGPUSampler(g.device, {
 		min_filter = .LINEAR,
 		mag_filter = .LINEAR,
@@ -412,58 +229,55 @@ gpu_init :: proc(g: ^Gpu) -> bool {
 		address_mode_v = .CLAMP_TO_EDGE,
 		address_mode_w = .CLAMP_TO_EDGE,
 	})
-	Vertex :: struct {
-		pos, uv: [2]f32,
-	}
-	quad := [6]Vertex{{{0, 0}, {0, 0}}, {{W, 0}, {1, 0}}, {{W, H}, {1, 1}}, {{0, 0}, {0, 0}}, {{W, H}, {1, 1}}, {{0, H}, {0, 1}}}
+	quad := parity.QUAD
 	g.quad = sdl.CreateGPUBuffer(g.device, {usage = {.VERTEX}, size = size_of(quad)})
-	g.words = sdl.CreateGPUBuffer(g.device, {usage = {.GRAPHICS_STORAGE_READ}, size = size_of(test_words)})
-	if g.vert == nil || g.target == nil || g.target_f32 == nil || g.tex == nil || g.layers == nil ||
+	g.words = sdl.CreateGPUBuffer(g.device, {usage = {.GRAPHICS_STORAGE_READ}, size = size_of(parity.test_words)})
+	if g.vert == nil || g.target == nil || g.target_f32 == nil || g.tex[0] == nil || g.tex[1] == nil || g.tex[2] == nil || g.layers == nil ||
 	   g.tex_r32f == nil || g.tex_rg32f == nil || g.tex_rgba32f == nil ||
 	   g.sampler == nil || g.sampler_near == nil || g.sampler_linear == nil || g.quad == nil || g.words == nil {
 		return false
 	}
 
 	// Upload the quad, the words, the texture, the array's layers and the float textures.
-	pixels := len(texture_pixels)
+	pixels := len(parity.texture_pixels)
 	at_words := size_of(quad)
-	at_layers := at_words + size_of(test_words)
+	at_layers := at_words + size_of(parity.test_words)
 	at_r32 := at_layers + LAYERS * pixels
-	at_rg32 := at_r32 + size_of(bound_r_texels)
-	at_rgba32 := at_rg32 + size_of(bound_rg_texels)
-	total_upload := at_rgba32 + size_of(bound_rgba_texels)
+	at_rg32 := at_r32 + size_of(parity.bound_r_texels)
+	at_rgba32 := at_rg32 + size_of(parity.bound_rg_texels)
+	total_upload := at_rgba32 + size_of(parity.bound_rgba_texels)
 	transfer := sdl.CreateGPUTransferBuffer(g.device, {usage = .UPLOAD, size = u32(total_upload)})
 	defer sdl.ReleaseGPUTransferBuffer(g.device, transfer)
 	mapped := ([^]u8)(sdl.MapGPUTransferBuffer(g.device, transfer, false))
 	mem.copy(mapped, &quad, size_of(quad))
-	mem.copy(mapped[at_words:], &test_words, size_of(test_words))
+	mem.copy(mapped[at_words:], &parity.test_words, size_of(parity.test_words))
 	for layer in 0 ..< LAYERS {
 		for i in 0 ..< pixels {
-			mapped[at_layers + layer * pixels + i] = layer_pixel(i, layer)
+			mapped[at_layers + layer * pixels + i] = parity.layer_pixel(i, layer)
 		}
 	}
-	mem.copy(mapped[at_r32:], &bound_r_texels, size_of(bound_r_texels))
-	mem.copy(mapped[at_rg32:], &bound_rg_texels, size_of(bound_rg_texels))
-	mem.copy(mapped[at_rgba32:], &bound_rgba_texels, size_of(bound_rgba_texels))
+	mem.copy(mapped[at_r32:], &parity.bound_r_texels, size_of(parity.bound_r_texels))
+	mem.copy(mapped[at_rg32:], &parity.bound_rg_texels, size_of(parity.bound_rg_texels))
+	mem.copy(mapped[at_rgba32:], &parity.bound_rgba_texels, size_of(parity.bound_rgba_texels))
 	sdl.UnmapGPUTransferBuffer(g.device, transfer)
 	cmd := sdl.AcquireGPUCommandBuffer(g.device)
 	pass := sdl.BeginGPUCopyPass(cmd)
 	sdl.UploadToGPUBuffer(pass, {transfer_buffer = transfer}, {buffer = g.quad, size = size_of(quad)}, false)
-	sdl.UploadToGPUBuffer(pass, {transfer_buffer = transfer, offset = u32(at_words)}, {buffer = g.words, size = size_of(test_words)}, false)
+	sdl.UploadToGPUBuffer(pass, {transfer_buffer = transfer, offset = u32(at_words)}, {buffer = g.words, size = size_of(parity.test_words)}, false)
 	for l in 0 ..< LEVELS {
 		n := u32(TEX >> uint(l))
 		for layer in 0 ..< LAYERS {
-			// Layer 0 is the 2D texture's pixels.
-			src := sdl.GPUTextureTransferInfo{transfer_buffer = transfer, offset = u32(at_layers + layer * pixels + level_offset(l)), pixels_per_row = n, rows_per_layer = n}
+			src := sdl.GPUTextureTransferInfo{transfer_buffer = transfer, offset = u32(at_layers + layer * pixels + parity.level_offset(l)), pixels_per_row = n, rows_per_layer = n}
 			sdl.UploadToGPUTexture(pass, src, {texture = g.layers, mip_level = u32(l), layer = u32(layer), w = n, h = n, d = 1}, false)
-			if layer == 0 {
-				sdl.UploadToGPUTexture(pass, src, {texture = g.tex, mip_level = u32(l), w = n, h = n, d = 1}, false)
-			}
+			sdl.UploadToGPUTexture(pass, src, {texture = g.tex[layer], mip_level = u32(l), w = n, h = n, d = 1}, false)
 		}
 	}
-	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_r32), pixels_per_row = BOUND_R_W, rows_per_layer = BOUND_R_H}, {texture = g.tex_r32f, w = BOUND_R_W, h = BOUND_R_H, d = 1}, false)
-	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_rg32), pixels_per_row = BOUND_RG_W, rows_per_layer = BOUND_RG_H}, {texture = g.tex_rg32f, w = BOUND_RG_W, h = BOUND_RG_H, d = 1}, false)
-	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_rgba32), pixels_per_row = BOUND_RGBA_W, rows_per_layer = BOUND_RGBA_H}, {texture = g.tex_rgba32f, w = BOUND_RGBA_W, h = BOUND_RGBA_H, d = 1}, false)
+	BR_W, BR_H :: parity.BOUND_R_W, parity.BOUND_R_H
+	BRG_W, BRG_H :: parity.BOUND_RG_W, parity.BOUND_RG_H
+	BRGBA_W, BRGBA_H :: parity.BOUND_RGBA_W, parity.BOUND_RGBA_H
+	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_r32), pixels_per_row = BR_W, rows_per_layer = BR_H}, {texture = g.tex_r32f, w = BR_W, h = BR_H, d = 1}, false)
+	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_rg32), pixels_per_row = BRG_W, rows_per_layer = BRG_H}, {texture = g.tex_rg32f, w = BRG_W, h = BRG_H, d = 1}, false)
+	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_rgba32), pixels_per_row = BRGBA_W, rows_per_layer = BRGBA_H}, {texture = g.tex_rgba32f, w = BRGBA_W, h = BRGBA_H, d = 1}, false)
 	sdl.EndGPUCopyPass(pass)
 	fence := sdl.SubmitGPUCommandBufferAndAcquireFence(cmd)
 	_ = sdl.WaitForGPUFences(g.device, true, &fence, 1)
@@ -519,7 +333,7 @@ gpu_render :: proc(g: ^Gpu, m: ^oksl.Module, block: []u8) -> ([]u8, bool) {
 	if m.num_samplers > 0 {
 		samplers := make([]sdl.GPUTextureSamplerBinding, m.num_samplers, context.temp_allocator)
 		for &s, ch in samplers {
-			s = {texture = g.layers if ch in m.channel_arrays else g.tex, sampler = g.sampler}
+			s = {texture = g.layers if ch in m.channel_arrays else g.tex[ch % LAYERS], sampler = g.sampler}
 		}
 		sdl.BindGPUFragmentSamplers(pass, 0, raw_data(samplers), u32(len(samplers)))
 	}
@@ -626,57 +440,7 @@ bound_channels_check :: proc(g: ^Gpu, m: ^oksl.Module, block: []u8, out_dir: str
 	mapped := ([^][4]f32)(sdl.MapGPUTransferBuffer(g.device, transfer, false))
 	copy(gpu_f, mapped[:W * H])
 	sdl.UnmapGPUTransferBuffer(g.device, transfer)
-
-	cpu_f := make([][4]f32, W * H, context.temp_allocator)
-	cimgs := [6]oksl.Channel_Image {
-		oksl.channel_image(bound_r_texels[:], BOUND_R_W, BOUND_R_H, .Nearest),
-		oksl.channel_image(bound_rg_texels[:], BOUND_RG_W, BOUND_RG_H, .Nearest),
-		oksl.channel_image(bound_rgba_texels[:], BOUND_RGBA_W, BOUND_RGBA_H, .Nearest),
-		oksl.channel_image(bound_r_texels[:], BOUND_R_W, BOUND_R_H, .Linear),
-		oksl.channel_image(bound_rg_texels[:], BOUND_RG_W, BOUND_RG_H, .Linear),
-		oksl.channel_image(bound_rgba_texels[:], BOUND_RGBA_W, BOUND_RGBA_H, .Linear),
-	}
-	oksl.run_f32(&m.program, block, W, H, cpu_f, scratch, {channel_images = cimgs[:]})
-
-	near_err, lin_err: f32
-	mismatches := 0
-	gpu_png := make([]u8, W * H * 4, context.temp_allocator)
-	cpu_png := make([]u8, W * H * 4, context.temp_allocator)
-	diff_png := make([]u8, W * H * 4, context.temp_allocator)
-	for y in 0 ..< H {
-		for x in 0 ..< W {
-			idx := y * W + x
-			gp, cp_v := gpu_f[idx], cpu_f[idx]
-			pd: f32
-			for k in 0 ..< 4 {
-				d := abs(gp[k] - cp_v[k])
-				pd = max(pd, d)
-				if y < 72 {
-					near_err = max(near_err, d)
-					if !(gp[k] == cp_v[k]) {
-						mismatches += 1
-					}
-				} else {
-					lin_err = max(lin_err, d)
-					exact_fill := (x < 64 && k >= 1) || (x >= 64 && x < 128 && k >= 2)
-					tol: f32 = 0 if exact_fill else 0.02
-					if !(d <= tol) {
-						mismatches += 1
-					}
-				}
-				gpu_png[idx * 4 + k] = u8(clamp(gp[k] * 0.25 + 0.5, 0, 1) * 255 + 0.5)
-				cpu_png[idx * 4 + k] = u8(clamp(cp_v[k] * 0.25 + 0.5, 0, 1) * 255 + 0.5)
-			}
-			gpu_png[idx * 4 + 3] = 255
-			cpu_png[idx * 4 + 3] = 255
-			dv := u8(min(pd * 255 * 16, 255))
-			diff_png[idx * 4 + 0], diff_png[idx * 4 + 1], diff_png[idx * 4 + 2], diff_png[idx * 4 + 3] = dv, dv, dv, 255
-		}
-	}
-	write_png(fmt.tprintf("%s/bound_channels_gpu.png", out_dir), gpu_png)
-	write_png(fmt.tprintf("%s/bound_channels_cpu.png", out_dir), cpu_png)
-	write_png(fmt.tprintf("%s/bound_channels_diff.png", out_dir), diff_png)
-	return fmt.tprintf("nearest err %.6f, linear err %.6f, mismatches %d", near_err, lin_err, mismatches), mismatches == 0
+	return parity.bound_channels_compare(m, block, gpu_f, "gpu", out_dir, scratch)
 }
 
 // A module's shader with the resources it declares (no samplers).
@@ -699,20 +463,11 @@ make_shader :: proc(g: ^Gpu, m: ^oksl.Module, stage: sdl.GPUShaderStage) -> ^sdl
 	return sdl.CreateGPUShader(g.device, info)
 }
 
-TAP_PRELUDE :: "in vec2 openPosition;\nout vec4 openClip;\n"
-TAP_FRAGMENT :: "layout(location = 1) in vec4 openClip;\nout vec4 c;\nvoid main() { c = vec4(openClip.xy * 0.5 + 0.5, 0.0, 1.0); }"
-
-// The layer vertex shader with one tap, whose twin of position reads uv
-// and whose environment is a 1x1 target, so its position spans clip space:
-// the GPU draws it as colour, and run_vertex gives it at every pixel centre
-// (it is affine in the pixel, so interpolation agrees). The largest
-// difference in 8 bits.
+// The layer vertex shader with a tap, its position drawn as colour.
 tap_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
-	options := oksl.Options{profile = .Glsl, stage = .Vertex, prelude = TAP_PRELUDE}
-	options.taps = {{position = "openClip", attributes = {{"position", "openPosition"}}}}
-	vm, verrors, vok := oksl.compile(oksl.LAYER_VERTEX_GLSL, options)
+	vm, verrors, vok := oksl.compile(oksl.LAYER_VERTEX_GLSL, parity.tap_options(false))
 	defer oksl.destroy(vm)
-	fm, ferrors, fok := oksl.compile(TAP_FRAGMENT, {profile = .Glsl})
+	fm, ferrors, fok := oksl.compile(parity.TAP_FRAGMENT, {profile = .Glsl})
 	defer oksl.destroy(fm)
 	if !vok || !fok {
 		fmt.eprint(oksl.format_errors(verrors), oksl.format_errors(ferrors))
@@ -742,10 +497,7 @@ tap_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
 		return 0, false
 	}
 	defer sdl.ReleaseGPUGraphicsPipeline(g.device, pipeline)
-	block := make([]u8, vm.block_size)
-	defer delete(block)
-	oksl.set_uniform(vm, block, "size", {W, H, 0, 0})
-	oksl.set_uniform(vm, block[vm.block_stride:], "size", {1, 1, 0, 0})
+	block := parity.tap_block(vm)
 
 	cmd := sdl.AcquireGPUCommandBuffer(g.device)
 	target := sdl.GPUColorTargetInfo{texture = g.target, load_op = .CLEAR, store_op = .STORE, clear_color = {0, 0, 0, 1}}
@@ -758,79 +510,24 @@ tap_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
 	sdl.EndGPURenderPass(pass)
 	gpu_px := download(g, cmd)
 	defer delete(gpu_px)
-
-	// A vertex at every pixel centre.
-	centres := make([][2][2]f32, W * H)
-	defer delete(centres)
-	for y in 0 ..< H {
-		for x in 0 ..< W {
-			p := [2]f32{f32(x) + 0.5, f32(y) + 0.5}
-			centres[y * W + x] = {p, p / {W, H}}
-		}
-	}
-	cpu_attrs: [3]oksl.Attribute
-	for a in vm.stage_inputs {
-		cpu_attrs[a.location] = {&centres[0][1] if a.name != "position" else &centres[0][0], size_of([2][2]f32), .Float2}
-	}
-	positions := make([][4]f32, W * H)
-	defer delete(positions)
-	varyings := make([]f32, W * H * vm.varying_floats)
-	defer delete(varyings)
-	at := 0
-	for o in vm.stage_outputs {
-		if o.name == "openClip" {at = o.offset}
-	}
-	scratch: oksl.Scratch
-	defer oksl.scratch_destroy(&scratch)
-	oksl.run_vertex(&vm.program, block, cpu_attrs[:], W * H, positions, varyings, &scratch)
-	for i in 0 ..< W * H {
-		clip := varyings[i * vm.varying_floats + at:]
-		for k in 0 ..< 2 {
-			want := int(clamp(clip[k] * 0.5 + 0.5, 0, 1) * 255 + 0.5)
-			max_d = max(max_d, abs(want - int(gpu_px[i * 4 + k])))
-		}
-	}
-	return max_d, true
+	return parity.tap_compare(vm, block, gpu_px), true
 }
 
-VERTEX_ID_VS :: `#version 310 es
-struct Corner { vec4 position; vec4 color; };
-readonly buffer Corners { Corner corners[]; };
-uniform vec4 size;
-out vec4 vColor;
-void main() {
-    Corner c = corners[gl_VertexID];
-    vColor = c.color;
-    gl_Position = vec4(2.0 * c.position.x / size.x - 1.0, 1.0 - 2.0 * c.position.y / size.y, 0.0, 1.0);
-}`
-
-VERTEX_ID_FS :: "in vec4 vColor;\nout vec4 c;\nvoid main() { c = vColor; }"
-
 // A vertex shader with no attributes: gl_VertexID, counted from the draw's
-// first vertex (2), picks the quad's corners and their colours (affine in
-// the pixel) from a storage buffer. run_vertex gives the six from the same
-// first vertex; the GPU's colours against the CPU's interpolated at every
-// pixel centre, the largest difference in 8 bits.
+// first vertex (2), picks the quad's corners and their colours from a
+// storage buffer.
 vertex_id_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
-	vm, verrors, vok := oksl.compile(VERTEX_ID_VS, {profile = .Glsl, stage = .Vertex})
+	vm, verrors, vok := oksl.compile(parity.VERTEX_ID_VS, {profile = .Glsl, stage = .Vertex})
 	defer oksl.destroy(vm)
-	fm, ferrors, fok := oksl.compile(VERTEX_ID_FS, {profile = .Glsl})
+	fm, ferrors, fok := oksl.compile(parity.VERTEX_ID_FS, {profile = .Glsl})
 	defer oksl.destroy(fm)
 	if !vok || !fok {
 		fmt.eprint(oksl.format_errors(verrors), oksl.format_errors(ferrors))
 		return 0, false
 	}
 	FIRST :: 2
-	Corner :: struct {
-		position, color: [4]f32,
-	}
-	corners: [FIRST + 6]Corner
-	corners[0], corners[1] = {{1e6, 1e6, 0, 0}, {1, 0, 1, 1}}, {{-1e6, 0, 0, 0}, {0, 1, 1, 1}}
-	quad := [6][2]f32{{0, 0}, {W, 0}, {W, H}, {0, 0}, {W, H}, {0, H}}
-	for p, i in quad {
-		corners[FIRST + i] = {{p.x, p.y, 0, 1}, {p.x / W, p.y / H, 0.25, 1}}
-	}
-	words := slice.reinterpret([]u32, corners[:])
+	corners := parity.vertex_id_corners(FIRST)
+	size := u32(len(corners) * size_of(parity.Corner))
 
 	vert := make_shader(g, vm, .VERTEX)
 	frag := make_shader(g, fm, .FRAGMENT)
@@ -845,23 +542,21 @@ vertex_id_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
 		multisample_state = {sample_count = ._1},
 		target_info = {color_target_descriptions = &color, num_color_targets = 1},
 	})
-	buffer := sdl.CreateGPUBuffer(g.device, {usage = {.GRAPHICS_STORAGE_READ}, size = size_of(corners)})
+	buffer := sdl.CreateGPUBuffer(g.device, {usage = {.GRAPHICS_STORAGE_READ}, size = size})
 	if vert == nil || frag == nil || pipeline == nil || buffer == nil {
 		return 0, false
 	}
 	defer sdl.ReleaseGPUGraphicsPipeline(g.device, pipeline)
 	defer sdl.ReleaseGPUBuffer(g.device, buffer)
-	transfer := sdl.CreateGPUTransferBuffer(g.device, {usage = .UPLOAD, size = size_of(corners)})
+	transfer := sdl.CreateGPUTransferBuffer(g.device, {usage = .UPLOAD, size = size})
 	defer sdl.ReleaseGPUTransferBuffer(g.device, transfer)
-	mem.copy(sdl.MapGPUTransferBuffer(g.device, transfer, false), &corners, size_of(corners))
+	mem.copy(sdl.MapGPUTransferBuffer(g.device, transfer, false), raw_data(corners), int(size))
 	sdl.UnmapGPUTransferBuffer(g.device, transfer)
-	block := make([]u8, vm.block_size)
-	defer delete(block)
-	oksl.set_uniform(vm, block, "size", {W, H, 0, 0})
+	block := parity.vertex_id_block(vm)
 
 	cmd := sdl.AcquireGPUCommandBuffer(g.device)
 	copy_pass := sdl.BeginGPUCopyPass(cmd)
-	sdl.UploadToGPUBuffer(copy_pass, {transfer_buffer = transfer}, {buffer = buffer, size = size_of(corners)}, false)
+	sdl.UploadToGPUBuffer(copy_pass, {transfer_buffer = transfer}, {buffer = buffer, size = size}, false)
 	sdl.EndGPUCopyPass(copy_pass)
 	target := sdl.GPUColorTargetInfo{texture = g.target, load_op = .CLEAR, store_op = .STORE, clear_color = {0, 0, 0, 1}}
 	pass := sdl.BeginGPURenderPass(cmd, &target, 1, nil)
@@ -872,59 +567,12 @@ vertex_id_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
 	sdl.EndGPURenderPass(pass)
 	gpu_px := download(g, cmd)
 	defer delete(gpu_px)
-
-	positions: [6][4]f32
-	record := vm.varying_floats
-	varyings := make([]f32, 6 * record)
-	defer delete(varyings)
-	scratch: oksl.Scratch
-	defer oksl.scratch_destroy(&scratch)
-	oksl.run_vertex(&vm.program, block, nil, 6, positions[:], varyings, &scratch, {buffers = {words}, first_vertex = FIRST})
-	// The CPU's triangles in pixels, each pixel centre's colour by its
-	// barycentric coordinates.
-	px: [6][2]f32
-	for p, i in positions {
-		px[i] = {(p.x / p.w + 1) * 0.5 * W, (1 - p.y / p.w) * 0.5 * H}
-	}
-	for y in 0 ..< H {
-		for x in 0 ..< W {
-			c := [2]f32{f32(x) + 0.5, f32(y) + 0.5}
-			for tri in 0 ..< 2 {
-				a, b, d := px[tri * 3], px[tri * 3 + 1], px[tri * 3 + 2]
-				area := (b.x - a.x) * (d.y - a.y) - (d.x - a.x) * (b.y - a.y)
-				w1 := ((c.x - a.x) * (d.y - a.y) - (d.x - a.x) * (c.y - a.y)) / area
-				w2 := ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) / area
-				w0 := 1 - w1 - w2
-				if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
-					continue
-				}
-				for k in 0 ..< 4 {
-					v := w0 * varyings[(tri * 3) * record + k] + w1 * varyings[(tri * 3 + 1) * record + k] + w2 * varyings[(tri * 3 + 2) * record + k]
-					want := int(clamp(v, 0, 1) * 255 + 0.5)
-					max_d = max(max_d, abs(want - int(gpu_px[(y * W + x) * 4 + k])))
-				}
-				break
-			}
-		}
-	}
-	return max_d, true
+	return parity.vertex_id_compare(vm, block, corners, FIRST, gpu_px), true
 }
 
-SAMPLE_MASK_FS :: `#version 300 es
-precision highp float;
-out vec4 c;
-void main() {
-    ivec2 p = ivec2(gl_FragCoord.xy) / 8;
-    gl_SampleMask[0] = (p.x + 3 * p.y) & 15;
-    c = vec4(1.0, 0.5, 0.25, 1.0);
-}`
-
-// A fragment shader keeping some of a 4x MSAA pixel's samples, resolved
-// over black: each pixel is its colour times the kept samples / 4. The
-// GPU's against run_fragment's colours and masks over the target's quads,
-// the largest difference in 8 bits.
+// gl_SampleMask, 4x MSAA resolved over black.
 sample_mask_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
-	m, errors, cok := oksl.compile(SAMPLE_MASK_FS, {profile = .Glsl})
+	m, errors, cok := oksl.compile(parity.SAMPLE_MASK_FS, {profile = .Glsl})
 	defer oksl.destroy(m)
 	if !cok {
 		fmt.eprint(oksl.format_errors(errors))
@@ -965,38 +613,63 @@ sample_mask_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
 	sdl.EndGPURenderPass(pass)
 	gpu_px := download(g, cmd)
 	defer delete(gpu_px)
+	return parity.sample_mask_compare(m, gpu_px), true
+}
 
-	Q :: (W / 2) * (H / 2)
-	origin := make([][2]i32, Q)
-	defer delete(origin)
-	for q in 0 ..< Q {
-		origin[q] = {i32(q % (W / 2) * 2), i32(q / (W / 2) * 2)}
+// Both windings, perspective (w != 1, z != 0) and flat integers
+// (parity.FACING_VS / FACING_FS) on a float target, SDL_GPU's default
+// (counter-clockwise) front face.
+facing_check :: proc(g: ^Gpu) -> (string, bool) {
+	vm, verrors, vok := oksl.compile(parity.FACING_VS, {profile = .Glsl, stage = .Vertex})
+	defer oksl.destroy(vm)
+	fm, ferrors, fok := oksl.compile(parity.FACING_FS, {profile = .Glsl})
+	defer oksl.destroy(fm)
+	if !vok || !fok {
+		return fmt.tprint(oksl.format_errors(verrors), oksl.format_errors(ferrors)), false
 	}
-	out := make([][4]f32, Q * 4)
-	defer delete(out)
-	shaded := make([]oksl.Quad_Lanes, Q)
-	defer delete(shaded)
-	masks := make([]u32, Q * 4)
-	defer delete(masks)
-	scratch: oksl.Scratch
-	defer oksl.scratch_destroy(&scratch)
-	block := make([]u8, m.block_size)
-	defer delete(block)
-	targets := [1][][4]f32{out}
-	oksl.run_fragment(&m.program, block, {count = Q, origin = origin}, targets[:], shaded, &scratch, {}, masks)
-	for q in 0 ..< Q {
-		for i in 0 ..< 4 {
-			x, y := int(origin[q].x) + (i & 1), int(origin[q].y) + (i >> 1)
-			kept := f32(card(transmute(bit_set[0 ..< 32;u32])(masks[q * 4 + i] & 15))) / 4
-			for k in 0 ..< 4 {
-				// Each sample stores the colour in 8 bits; the resolve
-				// averages them.
-				want := int(f32(int(clamp(out[q * 4 + i][k], 0, 1) * 255 + 0.5)) * kept + 0.5)
-				max_d = max(max_d, abs(want - int(gpu_px[(y * W + x) * 4 + k])))
-			}
-		}
+	vert := make_shader(g, vm, .VERTEX)
+	frag := make_shader(g, fm, .FRAGMENT)
+	defer sdl.ReleaseGPUShader(g.device, vert)
+	defer sdl.ReleaseGPUShader(g.device, frag)
+	color := sdl.GPUColorTargetDescription{format = .R32G32B32A32_FLOAT}
+	pipeline := sdl.CreateGPUGraphicsPipeline(g.device, {
+		vertex_shader = vert,
+		fragment_shader = frag,
+		primitive_type = .TRIANGLELIST,
+		rasterizer_state = {fill_mode = .FILL, cull_mode = .NONE},
+		multisample_state = {sample_count = ._1},
+		target_info = {color_target_descriptions = &color, num_color_targets = 1},
+	})
+	if vert == nil || frag == nil || pipeline == nil {
+		return fmt.tprintf("pipeline failed: %s", sdl.GetError()), false
 	}
-	return max_d, true
+	defer sdl.ReleaseGPUGraphicsPipeline(g.device, pipeline)
+	cmd := sdl.AcquireGPUCommandBuffer(g.device)
+	target := sdl.GPUColorTargetInfo{texture = g.target_f32, load_op = .CLEAR, store_op = .STORE, clear_color = {0, 0, 0, 1}}
+	pass := sdl.BeginGPURenderPass(cmd, &target, 1, nil)
+	sdl.BindGPUGraphicsPipeline(pass, pipeline)
+	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+	sdl.EndGPURenderPass(pass)
+	return parity.facing_compare(vm, download_f32(g, cmd))
+}
+
+// Submits `cmd` with a copy of the float target and returns its pixels,
+// in the temp allocator.
+download_f32 :: proc(g: ^Gpu, cmd: ^sdl.GPUCommandBuffer) -> [][4]f32 {
+	nbytes :: W * H * size_of([4]f32)
+	transfer := sdl.CreateGPUTransferBuffer(g.device, {usage = .DOWNLOAD, size = nbytes})
+	defer sdl.ReleaseGPUTransferBuffer(g.device, transfer)
+	cp := sdl.BeginGPUCopyPass(cmd)
+	sdl.DownloadFromGPUTexture(cp, {texture = g.target_f32, w = W, h = H, d = 1}, {transfer_buffer = transfer, pixels_per_row = W, rows_per_layer = H})
+	sdl.EndGPUCopyPass(cp)
+	fence := sdl.SubmitGPUCommandBufferAndAcquireFence(cmd)
+	_ = sdl.WaitForGPUFences(g.device, true, &fence, 1)
+	sdl.ReleaseGPUFence(g.device, fence)
+	px := make([][4]f32, W * H, context.temp_allocator)
+	mapped := ([^][4]f32)(sdl.MapGPUTransferBuffer(g.device, transfer, false))
+	copy(px, mapped[:W * H])
+	sdl.UnmapGPUTransferBuffer(g.device, transfer)
+	return px
 }
 
 sdl_image_format :: proc(f: oksl.Image_Format) -> (sdl.GPUTextureFormat, int) {
@@ -1339,7 +1012,7 @@ compute_module_check :: proc(g: ^Gpu, m: ^oksl.Module, scratch: ^oksl.Scratch, r
 	if m.num_samplers > 0 {
 		samplers := make([]sdl.GPUTextureSamplerBinding, m.num_samplers, context.temp_allocator)
 		for &s, ch in samplers {
-			s = {texture = g.layers if ch in m.channel_arrays else g.tex, sampler = g.sampler}
+			s = {texture = g.layers if ch in m.channel_arrays else g.tex[ch % LAYERS], sampler = g.sampler}
 		}
 		sdl.BindGPUComputeSamplers(pass, 0, raw_data(samplers), u32(len(samplers)))
 	}
@@ -1379,7 +1052,8 @@ compute_module_check :: proc(g: ^Gpu, m: ^oksl.Module, scratch: ^oksl.Scratch, r
 	for &s, ch in sizes {
 		s = {TEX, TEX, LAYERS if ch in m.channel_arrays else 1}
 	}
-	opts := oksl.Run_Options{sampler = cpu_sampler, channel_sizes = sizes[:], buffers = cpu_bufs, images = cpu_imgs}
+	arrays := m.channel_arrays
+	opts := oksl.Run_Options{sampler = cpu_sampler, user = &arrays, channel_sizes = sizes[:], buffers = cpu_bufs, images = cpu_imgs}
 	// Split across three concurrent OS threads, each with its own Scratch.
 	total_groups := groups.x * groups.y * groups.z
 	third := total_groups / 3

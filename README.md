@@ -9,6 +9,7 @@ plain GLSL ES 3.0 / 3.1 vertex, fragment and compute shaders, into:
 
 - **SPIR-V** for Vulkan,
 - **MSL** for Metal,
+- **DXBC** (Shader Model 5.1) for Direct3D 12, vertex and fragment shaders,
 - a **CPU program** that renders or dispatches the same shader with no GPU at all.
 
 It's plain Odin with no external toolchain. Runtime shaders usually mean
@@ -52,8 +53,9 @@ if !ok {
 	fmt.eprint(oksl.format_errors(errors))   // "12:7: undeclared identifier \"foo\""
 	return
 }
-// GPU: SDL_CreateGPUShader with m.spirv (entry oksl.SPIRV_ENTRY) or m.msl
-// (entry oksl.MSL_ENTRY), num_samplers = m.num_samplers, num_uniform_buffers =
+// GPU: SDL_CreateGPUShader with m.spirv (entry oksl.SPIRV_ENTRY), m.msl
+// (entry oksl.MSL_ENTRY) or m.dxbc (format .DXBC, entry oksl.DXBC_ENTRY;
+// vertex and fragment shaders compiled with dxbc = true), num_samplers = m.num_samplers, num_uniform_buffers =
 // m.num_uniform_buffers, num_storage_buffers = len(m.storage_buffers);
 // Vertex shader: oksl.compile(oksl.LAYER_VERTEX_GLSL, {profile = .Glsl, stage = .Vertex}), once.
 // CPU:
@@ -503,6 +505,36 @@ four channels (the rows above); GLSL shaders have 16 (`SAMPLER_COUNT`).
   `[[buffer(0)]]` when present, then read-only storage buffers (`const
   device uint*`) followed by read-write / `writeonly` storage buffers
   (`device uint*`) starting at `[[buffer(num_uniform_buffers)]]`.
+- **DXBC** (`Module.dxbc`, SDL_GPU's `DXBC` format: a container with
+  ISGN, OSGN and an SM5.1 SHEX chunk, signed with the DXBC checksum; entry
+  `main`, profiles `vs_5_1` and `ps_5_1`; emitted only with
+  `Options.dxbc`, which is an error (`Dxbc_Compute`) on a compute shader
+  until compute is done): SDL_GPU's D3D12 registers. Vertex
+  shaders: channel n at `t[n]` and `s[n]` in space 0, storage buffer i at
+  `t[num_samplers + i]` (a `ByteAddressBuffer`), the uniform block at
+  `b0` in space 1. Fragment shaders: the same in space 2, the block in
+  space 3. A stage variable at location N is `TEXCOORD`N in register N
+  (SDL_GPU's vertex semantics), so a vertex shader's outputs and a
+  fragment shader's inputs agree by register whichever a stage reads;
+  `SV_Position` takes register 16 (after the 16 locations), as do a vertex
+  shader's `SV_VertexID` input, and `SV_IsFrontFace` 17; colour target N
+  is `SV_Target`N and `gl_SampleMask[0]` `SV_Coverage` (`oMask`).
+  `gl_FragCoord.w` is `1 / SV_Position.w` (D3D gives the clip w). D3D's
+  `SV_VertexID` leaves out the draw's first vertex (`StartVertexLocation`,
+  and `BaseVertexLocation` of an indexed draw), so on D3D12 `gl_VertexID`
+  is 0 at the draw's first vertex, where Vulkan and Metal (and
+  `Run_Options.first_vertex` on the CPU) count SDL's `first_vertex` in
+  (a host that batches draws passes its base in a uniform instead).
+  Every function is inlined (vkd3d takes no DXBC subroutines); every loop
+  has one shape (a first-pass flag runs a for's step and a do-while's
+  test at the top, so `continue` is a bare continue); `discard` ends the
+  invocation (`ret` after it, as SPIR-V's `OpKill`); integer division and
+  remainder follow the CPU's rules (`x / 0` and `x % 0` are 0); run-time
+  indexes are clamped as on the CPU, and a storage buffer read loads only
+  the words it reads, at element * stride + offset in 32-bit words (0 past
+  the buffer's end, as on the CPU). The emitter's tables live in the
+  temporary allocator; the container is the only allocation on the
+  module's.
 - **Layer vertex shader** (`LAYER_VERTEX_GLSL`, the source of
   `testdata/layer.vert`, which a host compiles once like any vertex
   shader: `compile(LAYER_VERTEX_GLSL, {profile = .Glsl, stage =
@@ -734,12 +766,13 @@ indexed by id, a frame stack for rescans, flat tokens out) -> `parser.odin`
 `inputs.odin` and `builtins.odin` tables, the Shadertoy entry adapter in
 `shadertoy.odin`, the stage entry and interface in `stage.odin`, both
 built with `nodes.odin`) ->
-`spirv.odin` / `spirv_emit.odin`, `msl.odin` and `vm.odin` / `vm_run.odin`
-/ `vm_jit.odin`.
+`spirv.odin` / `spirv_emit.odin`, `msl.odin`, `dxbc.odin` / `dxbc_emit.odin`
+and `vm.odin` / `vm_run.odin` / `vm_jit.odin`.
 `errors.odin` holds the error codes and their text. `switch` reaches each
 backend natively: SPIR-V as `OpSwitch` (fallthrough as the following
 labels' code, since structured SPIR-V only falls into the next operand),
-MSL as `switch`, the interpreter under masks.
+MSL as `switch`, DXBC as `switch` with each case's code from its label
+to the end (no case falls into another), the interpreter under masks.
 
 `program.odin` builds multipass programs on these pieces: one
 `Preprocessor` runs Common, marks its macro table and resets to the mark
@@ -754,10 +787,14 @@ and emitted like a single compile.
 odin test . -vet -strict-style                      # SkSL, GLSL/Shadertoy, the preprocessor, diagnostics,
                                                     # built-ins on the CPU, control flow and switch, discard,
                                                     # uniforms, children and channels, programs, corpus
-                                                    # (+ spirv-val when installed)
+                                                    # (+ spirv-val, and vkd3d for DXBC, when installed)
 odin test . -vet -strict-style -define:OKSL_JIT=false # force the portable interpreter on x86-64
 odin run tools/gpu_parity -- out_dir                # SDL_GPU vs CPU interpreter on testdata/ through the layer vertex shader, and a tap of it
-odin run tools/okslc -- a.sksl b.glsl ...           # compile (by extension: SOURCE_EXTENSIONS); -o prefix writes .spv / .metal
+odin run tools/d3d12_parity -- out_dir              # the same checks with the DXBC through Direct3D 12 on vkd3d (Linux)
+                                                    # or on WARP under the debug layer and GPU-based validation (Windows;
+                                                    # -hardware: the first hardware adapter), and the DXBC emitter's
+                                                    # own cases (tools/parity: the shared CPU side)
+odin run tools/okslc -- a.sksl b.glsl ...           # compile (by extension: SOURCE_EXTENSIONS); -o prefix writes .spv / .metal / .dxbc
 odin run tools/cpu_render -- shader.sksl out.png    # CPU render
 odin run tools/golden -- snapshot ref                # before a refactor: ~95k generated cases + every shader
 odin run tools/golden -- compare ref out             # after (snapshot out first): what changed, by kind
@@ -791,7 +828,13 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 - **MSL is compiled only on macOS:** Metal has no Linux compiler, so on
   Linux the emitter is checked textually; on macOS `tools/gpu_parity` runs
   the MSL through SDL_GPU's Metal driver against the CPU interpreter.
-- **No DXIL:** on Windows, run SDL_GPU's Vulkan driver.
+- **DXBC, not DXIL, and no compute yet:** Direct3D 12 takes the vertex
+  and fragment shaders as DXBC (SM5.1); for compute, run SDL_GPU's Vulkan
+  driver. The DXBC is checked with vkd3d (Wine's D3D12 over Vulkan:
+  `vkd3d-dxbc`, `vkd3d-compiler` and `tools/d3d12_parity`) and on
+  Windows' own runtime with WARP, its software device, under the debug
+  layer and GPU-based validation (`tools/d3d12_parity`), not yet on
+  vendor drivers.
 - **Not supported:** struct uniforms, arrays of arrays,
   `colorFilter` / `blender` children; in GLSL, cubemap and 3D samplers,
   arrays of samplers and Shadertoy's keyboard, sound and webcam inputs. Children

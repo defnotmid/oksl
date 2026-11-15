@@ -10150,3 +10150,918 @@ void main() {
 	}
 }
 
+
+// ---- DXBC ---------------------------------------------------------------------------
+
+// MD5 with RFC 1321's padding over md5_block, to check the compression
+// function the DXBC checksum shares.
+@(private = "file")
+md5_rfc :: proc(msg: []u8) -> (digest: [16]u8) {
+	state := [4]u32{0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476}
+	padded := make([dynamic]u8, context.temp_allocator)
+	append(&padded, ..msg)
+	append(&padded, 0x80)
+	for len(padded) % 64 != 56 {
+		append(&padded, 0)
+	}
+	bits := u64(len(msg)) * 8
+	for i in 0 ..< 8 {
+		append(&padded, u8(bits >> uint(8 * i)))
+	}
+	for b := 0; b < len(padded); b += 64 {
+		w: [16]u32
+		for i in 0 ..< 16 {
+			w[i] = u32(padded[b + 4 * i]) | u32(padded[b + 4 * i + 1]) << 8 | u32(padded[b + 4 * i + 2]) << 16 | u32(padded[b + 4 * i + 3]) << 24
+		}
+		md5_block(&state, w)
+	}
+	for v, i in state {
+		for k in 0 ..< 4 {
+			digest[4 * i + k] = u8(v >> uint(8 * k))
+		}
+	}
+	return
+}
+
+// The container checksum: MD5's compression on RFC 1321's vectors, and
+// containers of one chunk (both final-block shapes: fewer than 56 bytes
+// left, and 56 or more) against the checksums vkd3d-dxbc --emit gave the
+// same bytes.
+@(test)
+test_dxbc_checksum :: proc(t: ^testing.T) {
+	vectors := [?][2]string {
+		{"", "d41d8cd98f00b204e9800998ecf8427e"},
+		{"abc", "900150983cd24fb0d6963f7d28e17f72"},
+		{"message digest", "f96b697d7cb7938d525a2f31aaf161d0"},
+		{"12345678901234567890123456789012345678901234567890123456789012345678901234567890", "57edf4a22be3c955ac49da2e2107b67a"},
+	}
+	for v in vectors {
+		d := md5_rfc(transmute([]u8)v[0])
+		testing.expectf(t, d == hex_digest(v[1]), "md5(%q) = %02x", v[0], d)
+	}
+	Want :: struct {
+		len: int,
+		sum: [4]u32,
+	}
+	wants := [?]Want {
+		{0, {0x38f21f24, 0xeeb6071a, 0xe6974c5d, 0xc470fe8f}},
+		{32, {0x651ed640, 0xcfbd4905, 0x0f03016f, 0xaceff30d}},
+		{36, {0x65c6dcb6, 0x2b83c255, 0xe74da885, 0x916da9a6}},
+		{40, {0x20795276, 0x2122faaa, 0xcc4e2eab, 0x530ce50b}},
+		{100, {0xe11af0a1, 0xc1cbb5eb, 0xc81c8667, 0xf205a790}},
+		{1000, {0x33f58a16, 0x958dadde, 0xed2d25f7, 0x67cd03cc}},
+	}
+	for w in wants {
+		data := make([]u8, w.len, context.temp_allocator)
+		for &b, i in data {
+			b = u8(i * 7 + 3)
+		}
+		parts := [2][]u8{data[:w.len / 2], data[w.len / 2:]}
+		chunks := [1]Dx_Chunk{{{'T', 'E', 'S', 'T'}, parts[:]}}
+		blob := dxbc_container(chunks[:], context.temp_allocator)
+		testing.expect_value(t, len(blob), 44 + w.len)
+		sum := w.sum
+		got := slice.reinterpret([]u32, blob[4:20])
+		testing.expectf(t, slice.equal(got, sum[:]), "%d bytes: %x, want %x", w.len, got, sum)
+	}
+}
+
+@(private = "file")
+hex_digest :: proc(s: string) -> (out: [16]u8) {
+	for i in 0 ..< 16 {
+		hi, lo := s[2 * i], s[2 * i + 1]
+		nib :: proc(c: u8) -> u8 {return c - '0' if c <= '9' else c - 'a' + 10}
+		out[i] = nib(hi) << 4 | nib(lo)
+	}
+	return
+}
+
+// A DXBC container's chunks by tag.
+@(private = "file")
+dxbc_chunk :: proc(blob: []u8, tag: string) -> []u8 {
+	u32_at :: proc(b: []u8, at: int) -> int {return int(b[at]) | int(b[at + 1]) << 8 | int(b[at + 2]) << 16 | int(b[at + 3]) << 24}
+	for i in 0 ..< u32_at(blob, 28) {
+		at := u32_at(blob, 32 + 4 * i)
+		if string(blob[at:][:4]) == tag {
+			return blob[at + 8:][:u32_at(blob, at + 4)]
+		}
+	}
+	return nil
+}
+
+
+// A signature element as the test reads it back: the second mask byte is
+// an input's components read, an output's components never written.
+@(private = "file")
+Sig_Row :: struct {
+	name:                           string,
+	index, sysval, ctype, register: u32,
+	mask, rw:                       u8,
+}
+
+@(private = "file")
+dxbc_sig :: proc(chunk: []u8) -> []Sig_Row {
+	w := slice.reinterpret([]u32, chunk)
+	rows := make([]Sig_Row, w[0], context.temp_allocator)
+	for &r, i in rows {
+		e := w[2 + 6 * i:]
+		name := string(cstring(&chunk[e[0]]))
+		r = {name, e[1], e[2], e[3], e[4], u8(e[5]), u8(e[5] >> 8)}
+	}
+	return rows
+}
+
+// A decoded operand: file, indices, a relative register (or -1).
+@(private = "file")
+Operand :: struct {
+	file: u32,
+	idx:  [3]u32,
+	dims: int,
+	rel:  i64,
+	// An immediate's first word.
+	imm:  u32,
+	// The token's component count (0: none, 1: one, 2: four), selection
+	// mode (0: mask, 1: swizzle, 2: one component) and its mask, swizzle
+	// or component.
+	ncomp, mode, sel: u32,
+}
+
+// One instruction: opcode, controls and operands (from the operand
+// tokens to its end, for the ones the emitter writes without trailing
+// words).
+@(private = "file")
+Ins :: struct {
+	op, ctl: u32,
+	words:   []u32,
+}
+
+// Decodes a module's DXBC program and checks everything a blob must hold
+// without a driver: its operands against the declarations, its structure
+// (dxbc_check_structure) and its signatures against the module's stage
+// variables (dxbc_check_signatures).
+@(private = "file")
+dxbc_program :: proc(t: ^testing.T, m: ^Module, name: string, loc := #caller_location) -> (version: u32, ins: []Ins) {
+	blob := m.dxbc
+	if !testing.expectf(t, len(blob) > 32 && string(blob[:4]) == "DXBC", "%s: no DXBC", name, loc = loc) {
+		return
+	}
+	sum := dxbc_checksum(blob[20:])
+	testing.expectf(t, slice.equal(slice.reinterpret([]u32, blob[4:20]), sum[:]), "%s: checksum", name, loc = loc)
+	testing.expectf(t, int(slice.reinterpret([]u32, blob[20:32])[1]) == len(blob), "%s: container size", name, loc = loc)
+	shex := slice.reinterpret([]u32, dxbc_chunk(blob, "SHEX"))
+	testing.expect_value(t, int(shex[1]), len(shex), loc = loc)
+	out := make([dynamic]Ins, context.temp_allocator)
+	for i := 2; i < len(shex); {
+		n := int(shex[i] >> 24 & 0x7f)
+		if !testing.expect(t, n > 0 && i + n <= len(shex), loc = loc) {
+			break
+		}
+		append(&out, Ins{shex[i] & 0x7ff, shex[i] >> 11 & 0x1fff, shex[i + 1:i + n]})
+		i += n
+	}
+	dxbc_check_operands(t, name, out[:], loc)
+	dxbc_check_structure(t, name, out[:], loc)
+	dxbc_check_signatures(t, m, name, out[:], loc)
+	return shex[0], out[:]
+}
+
+// Decodes the operands of an instruction's words.
+@(private = "file")
+dxbc_operands :: proc(words: []u32) -> (ops: []Operand, ok: bool) {
+	out := make([dynamic]Operand, context.temp_allocator)
+	i := 0
+	for i < len(words) {
+		tok := words[i]
+		i += 1
+		if tok >> 31 != 0 {
+			i += 1
+		}
+		o := Operand{file = tok >> 12 & 0xff, dims = int(tok >> 20 & 3), rel = -1, ncomp = tok & 3, mode = tok >> 2 & 3, sel = tok >> 4 & 0xff}
+		for k in 0 ..< o.dims {
+			rep := tok >> (22 + 3 * uint(k)) & 7
+			if rep == 0 || rep == 3 {
+				o.idx[k] = words[i]
+				i += 1
+			}
+			if rep == 2 || rep == 3 {
+				// The relative register: a temp's component.
+				i += 1
+				o.rel = i64(words[i])
+				i += 1
+			}
+		}
+		if o.file == 4 {
+			o.imm = words[i] if i < len(words) else 0
+			i += 1 if tok & 3 == 1 else 4
+		}
+		append(&out, o)
+	}
+	return out[:], i == len(words)
+}
+
+// Checks every operand of the program's instructions against the
+// declarations: temps below dcl_temps, x# arrays declared and constant
+// indices inside them, inputs and outputs declared, constant buffer
+// elements inside the buffer, resource and sampler ids declared. Every
+// destination (the first operand, the first two of imul, udiv and sincos)
+// writes through a mask that is not empty (a null destination writes
+// nothing) and names only components its register has (an output's
+// declared ones).
+@(private = "file")
+dxbc_check_operands :: proc(t: ^testing.T, name: string, ins: []Ins, loc := #caller_location) {
+	temps: u32
+	x_sizes := make(map[u32]u32, context.temp_allocator)
+	inputs := make(map[u32]bool, context.temp_allocator)
+	outputs := make(map[u32]bool, context.temp_allocator)
+	output_masks := make(map[u32]u32, context.temp_allocator)
+	ids := make(map[[2]u32]bool, context.temp_allocator)
+	cb_size: u32
+	for in_ in ins {
+		switch Dx_Op(in_.op) {
+		case .Dcl_Temps:
+			temps = in_.words[0]
+		case .Dcl_Indexable_Temp:
+			x_sizes[in_.words[0]] = in_.words[1]
+		case .Dcl_Input, .Dcl_Input_Ps, .Dcl_Input_Sgv, .Dcl_Input_Ps_Sgv, .Dcl_Input_Ps_Siv:
+			inputs[in_.words[1]] = true
+		case .Dcl_Output, .Dcl_Output_Siv:
+			if in_.words[0] >> 12 & 0xff == 2 {
+				outputs[in_.words[1]] = true
+				output_masks[in_.words[1]] = in_.words[0] >> 4 & 0xf
+			}
+		case .Dcl_Constant_Buffer:
+			cb_size = in_.words[4]
+		case .Dcl_Global_Flags:
+		case .Dcl_Resource, .Dcl_Resource_Raw:
+			ids[{7, in_.words[1]}] = true
+		case .Dcl_Sampler:
+			ids[{6, in_.words[1]}] = true
+		case .Add, .And, .Break, .Breakc, .Case, .Continue, .Default, .Discard, .Div, .Dp2, .Dp3, .Dp4, .Else, .End_If,
+		     .End_Loop, .End_Switch, .Eq, .Exp, .Frc, .Ftoi, .Ftou, .Ge, .Iadd, .If, .Ieq, .Ige, .Ilt, .Imax, .Imin, .Imul,
+		     .Ine, .Ineg, .Ishl, .Ishr, .Itof, .Log, .Loop, .Lt, .Mad, .Min, .Max, .Mov, .Movc, .Mul, .Ne, .Not, .Or,
+		     .Resinfo, .Ret, .Round_Ne, .Round_Ni, .Round_Pi, .Round_Z, .Rsq, .Sample, .Sample_L, .Sample_D, .Sample_B,
+		     .Sqrt, .Switch, .Sincos, .Udiv, .Ult, .Uge, .Umax, .Umin, .Ushr, .Utof, .Xor, .Deriv_Rtx_Fine, .Deriv_Rty_Fine,
+		     .Rcp, .Ld_Raw:
+			ops, ok := dxbc_operands(in_.words)
+			testing.expectf(t, ok, "%s: op %x: operands overrun", name, in_.op, loc = loc)
+			dsts := 0
+			#partial switch Dx_Op(in_.op) {
+			case .Break, .Breakc, .Case, .Continue, .Default, .Discard, .Else, .End_If, .End_Loop, .End_Switch, .If, .Loop, .Ret, .Switch:
+			case .Imul, .Udiv, .Sincos:
+				dsts = 2
+			case:
+				dsts = 1
+			}
+			for o, k in ops[:min(dsts, len(ops))] {
+				switch o.file {
+				case 13, 15:
+				// null, oMask
+				case:
+					mask := o.sel & 0xf
+					testing.expectf(t, o.ncomp == 2 && o.mode == 0 && mask != 0, "%s: op %v destination %d writes mask %x", name, Dx_Op(in_.op), k, mask, loc = loc)
+					if o.file == 2 {
+						testing.expectf(t, mask & ~output_masks[o.idx[0]] == 0, "%s: op %v writes o%d.%x of %x", name, Dx_Op(in_.op), o.idx[0], mask, output_masks[o.idx[0]], loc = loc)
+					}
+					testing.expectf(t, o.file == 0 || o.file == 2 || o.file == 3, "%s: op %v writes file %d", name, Dx_Op(in_.op), o.file, loc = loc)
+				}
+			}
+			for o in ops {
+				switch o.file {
+				case 0:
+					testing.expectf(t, o.idx[0] < temps, "%s: r%d of %d", name, o.idx[0], temps, loc = loc)
+				case 1:
+					testing.expectf(t, inputs[o.idx[0]], "%s: v%d undeclared", name, o.idx[0], loc = loc)
+				case 2:
+					testing.expectf(t, outputs[o.idx[0]], "%s: o%d undeclared", name, o.idx[0], loc = loc)
+				case 3:
+					size, declared := x_sizes[o.idx[0]]
+					testing.expectf(t, declared && (o.rel >= 0 || o.idx[1] < size), "%s: x%d[%d] of %d", name, o.idx[0], o.idx[1], size, loc = loc)
+				case 6, 7:
+					testing.expectf(t, ids[{o.file, o.idx[0]}], "%s: %v id %d undeclared", name, o.file, o.idx[0], loc = loc)
+				case 8:
+					testing.expectf(t, o.rel >= 0 || o.idx[2] < cb_size, "%s: cb element %d of %d", name, o.idx[2], cb_size, loc = loc)
+				}
+				if o.rel >= 0 {
+					testing.expectf(t, u32(o.rel) < temps, "%s: relative r%d of %d", name, o.rel, temps, loc = loc)
+				}
+			}
+		case .Ld_Raw + Dx_Op(1) ..= max(Dx_Op):
+		}
+	}
+}
+
+// The program's structure, by Shader Model 4/5's rules and what drivers
+// assume: if / else / endif, loop / endloop and switch / endswitch nest;
+// a breakc's innermost loop or switch is a loop (in a switch it would
+// leave the switch, not the loop); break and continue sit in a construct
+// they can leave; every case or default whose code is not empty ends in
+// break or ret, and nothing precedes a switch's first label; every
+// discard is followed at once by ret (discard ends the invocation); the
+// program ends with ret.
+@(private = "file")
+dxbc_check_structure :: proc(t: ^testing.T, name: string, ins: []Ins, loc := #caller_location) {
+	Frame :: struct {
+		op:        Dx_Op,
+		// A switch: a label seen, and code since the last label.
+		labelled:  bool,
+		has_code:  bool,
+	}
+	stack := make([dynamic]Frame, context.temp_allocator)
+	breakable :: proc(stack: []Frame) -> (Dx_Op, bool) {
+		#reverse for f in stack {
+			if f.op == .Loop || f.op == .Switch {
+				return f.op, true
+			}
+		}
+		return .Mov, false
+	}
+	for in_, i in ins {
+		op := Dx_Op(in_.op)
+		if op >= .Dcl_Resource && op <= .Dcl_Global_Flags || op == .Dcl_Resource_Raw {
+			continue
+		}
+		if len(stack) > 0 && stack[len(stack) - 1].op == .Switch && op != .Case && op != .Default && op != .End_Switch {
+			top := &stack[len(stack) - 1]
+			testing.expectf(t, top.labelled, "%s: %v before a switch's first label (instruction %d)", name, op, i, loc = loc)
+			top.has_code = true
+		}
+		#partial switch op {
+		case .If, .Loop, .Switch:
+			append(&stack, Frame{op = op})
+		case .Else, .End_If:
+			ok := len(stack) > 0 && stack[len(stack) - 1].op == .If
+			testing.expectf(t, ok, "%s: %v outside an if (instruction %d)", name, op, i, loc = loc)
+			if ok && op == .End_If {
+				pop(&stack)
+			}
+		case .End_Loop:
+			ok := len(stack) > 0 && stack[len(stack) - 1].op == .Loop
+			testing.expectf(t, ok, "%s: endloop outside a loop (instruction %d)", name, i, loc = loc)
+			if ok {
+				pop(&stack)
+			}
+		case .Case, .Default, .End_Switch:
+			ok := len(stack) > 0 && stack[len(stack) - 1].op == .Switch
+			testing.expectf(t, ok, "%s: %v outside a switch (instruction %d)", name, op, i, loc = loc)
+			if !ok {
+				continue
+			}
+			top := &stack[len(stack) - 1]
+			if top.has_code {
+				prev := Dx_Op(ins[i - 1].op)
+				testing.expectf(t, prev == .Break || prev == .Ret, "%s: a case ends in %v, not break or ret (instruction %d)", name, prev, i, loc = loc)
+			}
+			top.labelled = true
+			top.has_code = false
+			if op == .End_Switch {
+				pop(&stack)
+			}
+		case .Breakc:
+			inner, ok := breakable(stack[:])
+			testing.expectf(t, ok && inner == .Loop, "%s: breakc whose innermost construct is %v (instruction %d)", name, inner if ok else Dx_Op.Ret, i, loc = loc)
+		case .Break:
+			_, ok := breakable(stack[:])
+			testing.expectf(t, ok, "%s: break outside a loop or switch (instruction %d)", name, i, loc = loc)
+		case .Continue:
+			in_loop := false
+			for f in stack {
+				in_loop ||= f.op == .Loop
+			}
+			testing.expectf(t, in_loop, "%s: continue outside a loop (instruction %d)", name, i, loc = loc)
+		case .Discard:
+			next_ret := i + 1 < len(ins) && Dx_Op(ins[i + 1].op) == .Ret
+			testing.expectf(t, next_ret, "%s: discard not followed by ret (instruction %d)", name, i, loc = loc)
+		}
+	}
+	testing.expectf(t, len(stack) == 0, "%s: %d constructs left open", name, len(stack), loc = loc)
+	testing.expectf(t, len(ins) > 0 && Dx_Op(ins[len(ins) - 1].op) == .Ret, "%s: the program does not end with ret", name, loc = loc)
+}
+
+// The signatures against the module's stage variables and system values,
+// derived here independently of the emitter: TEXCOORD<location> (vertex
+// inputs and outputs, fragment inputs) and SV_Target<location> in register
+// <location>, the component type of the variable's base (float 3, int 2,
+// uint 1) and its components; an input's read mask its components, an
+// output's never-written mask the others. Fragment inputs are
+// interpolated linearly unless flat or integer (constant).
+@(private = "file")
+dxbc_check_signatures :: proc(t: ^testing.T, m: ^Module, name: string, prog: []Ins, loc := #caller_location) {
+	ctype :: proc(b: Base) -> u32 {
+		#partial switch b {
+		case .Int:
+			return 2
+		case .Uint:
+			return 1
+		}
+		return 3
+	}
+	fragment := m.stage == .Fragment
+	ins := dxbc_sig(dxbc_chunk(m.dxbc, "ISGN"))
+	outs := dxbc_sig(dxbc_chunk(m.dxbc, "OSGN"))
+	varyings_in, varyings_out := 0, 0
+	for r in ins {
+		testing.expectf(t, r.rw == r.mask, "%s: input %s%d read mask %x of %x", name, r.name, r.index, r.rw, r.mask, loc = loc)
+		switch r.name {
+		case "TEXCOORD":
+			varyings_in += 1
+			found := false
+			for v in m.stage_inputs {
+				if u32(v.location) == r.index {
+					found = true
+					want := Sig_Row{"TEXCOORD", u32(v.location), 0, ctype(v.type.base), u32(v.location), u8(1 << uint(v.type.rows)) - 1, u8(1 << uint(v.type.rows)) - 1}
+					testing.expectf(t, r == want, "%s: input %v, want %v", name, r, want, loc = loc)
+					if fragment {
+						interp: u32 = 1 if v.flat || v.type.base != .Float else 2
+						for in_ in prog {
+							if Dx_Op(in_.op) == .Dcl_Input_Ps && in_.words[1] == r.register {
+								testing.expectf(t, in_.ctl & 0xf == interp, "%s: input %d interpolation %d, want %d", name, r.register, in_.ctl & 0xf, interp, loc = loc)
+							}
+						}
+					}
+				}
+			}
+			testing.expectf(t, found, "%s: input TEXCOORD%d is no stage input", name, r.index, loc = loc)
+		case "SV_Position":
+			testing.expectf(t, fragment && r == Sig_Row{"SV_Position", 0, 1, 3, 16, 0xf, 0xf}, "%s: %v", name, r, loc = loc)
+		case "SV_IsFrontFace":
+			testing.expectf(t, fragment && r == Sig_Row{"SV_IsFrontFace", 0, 9, 1, 17, 1, 1}, "%s: %v", name, r, loc = loc)
+		case "SV_VertexID":
+			testing.expectf(t, !fragment && r == Sig_Row{"SV_VertexID", 0, 6, 1, 16, 1, 1}, "%s: %v", name, r, loc = loc)
+		case:
+			testing.expectf(t, false, "%s: input %s", name, r.name, loc = loc)
+		}
+	}
+	for r in outs {
+		testing.expectf(t, r.rw == 0xf ~ r.mask, "%s: output %s%d never-written mask %x of %x", name, r.name, r.index, r.rw, r.mask, loc = loc)
+		switch r.name {
+		case "TEXCOORD", "SV_Target":
+			testing.expectf(t, (r.name == "SV_Target") == fragment, "%s: output %s", name, r.name, loc = loc)
+			varyings_out += 1
+			found := false
+			for v in m.stage_outputs {
+				if u32(v.location) == r.index {
+					found = true
+					mask := u8(1 << uint(v.type.rows)) - 1
+					want := Sig_Row{r.name, u32(v.location), 0, ctype(v.type.base), u32(v.location), mask, 0xf ~ mask}
+					testing.expectf(t, r == want, "%s: output %v, want %v", name, r, want, loc = loc)
+				}
+			}
+			testing.expectf(t, found, "%s: output %s%d is no stage output", name, r.name, r.index, loc = loc)
+		case "SV_Position":
+			testing.expectf(t, !fragment && r == Sig_Row{"SV_Position", 0, 1, 3, 16, 0xf, 0}, "%s: %v", name, r, loc = loc)
+		case "SV_Coverage":
+			testing.expectf(t, fragment && r == Sig_Row{"SV_Coverage", 0, 0, 1, 0xffffffff, 1, 0xe}, "%s: %v", name, r, loc = loc)
+		case:
+			testing.expectf(t, false, "%s: output %s", name, r.name, loc = loc)
+		}
+	}
+	testing.expectf(t, varyings_in == len(m.stage_inputs) && varyings_out == len(m.stage_outputs), "%s: %d and %d stage rows for %d inputs and %d outputs", name, varyings_in, varyings_out, len(m.stage_inputs), len(m.stage_outputs), loc = loc)
+}
+
+// Containers, signatures and SDL_GPU's D3D12 registers: a fragment shader
+// with flat and smooth inputs, three targets, gl_FragCoord,
+// gl_FrontFacing, a sampler2D, a sampler2DArray, a storage buffer and
+// uniforms; a vertex shader with attributes, gl_VertexID, a sampler and a
+// storage buffer.
+@(test)
+test_dxbc_interface :: proc(t: ^testing.T) {
+	fs := `#version 310 es
+precision highp float;
+in vec2 ramp;
+layout(location = 0) flat in ivec2 id;
+layout(location = 1) out vec4 second;
+layout(location = 0) out vec4 first;
+layout(location = 2) out uvec2 count;
+uniform float uGain;
+uniform sampler2D tex;
+uniform sampler2DArray layers;
+readonly buffer Words { uint words[]; };
+void main() {
+    vec4 c = texture(tex, ramp) + texture(layers, vec3(ramp, 1.0));
+    first = c * uGain + gl_FragCoord;
+    second = vec4(vec2(id), gl_FrontFacing ? 1.0 : 0.0, 1.0);
+    count = uvec2(words[id.x], gl_FragCoord.x);
+}`
+	m, errs, ok := compile_glsl(fs, {dxbc = true})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	blob := m.dxbc
+	ins := dxbc_sig(dxbc_chunk(blob, "ISGN"))
+	outs := dxbc_sig(dxbc_chunk(blob, "OSGN"))
+	// Locations are registers; SV_Position after them.
+	want_in := [?]Sig_Row{{"TEXCOORD", 0, 0, 2, 0, 3, 3}, {"TEXCOORD", 1, 0, 3, 1, 3, 3}, {"SV_Position", 0, 1, 3, 16, 15, 15}, {"SV_IsFrontFace", 0, 9, 1, 17, 1, 1}}
+	want_out := [?]Sig_Row{{"SV_Target", 0, 0, 3, 0, 15, 0}, {"SV_Target", 1, 0, 3, 1, 15, 0}, {"SV_Target", 2, 0, 1, 2, 3, 12}}
+	testing.expectf(t, slice.equal(ins, want_in[:]), "ISGN %v", ins)
+	testing.expectf(t, slice.equal(outs, want_out[:]), "OSGN %v", outs)
+	version, prog := dxbc_program(t, m, "fragment")
+	testing.expect_value(t, version, 0x51) // ps_5_1
+	// Pixel shader registers: t[n] and s[n] in space 2 (channel n, then
+	// the storage buffer), b0 in space 3.
+	spaces: [dynamic][3]u32
+	spaces.allocator = context.temp_allocator
+	rcp_w, flat_id := false, false
+	for in_ in prog {
+		#partial switch Dx_Op(in_.op) {
+		case .Dcl_Constant_Buffer:
+			append(&spaces, [3]u32{in_.op, in_.words[2], in_.words[5]})
+		case .Dcl_Sampler, .Dcl_Resource_Raw:
+			append(&spaces, [3]u32{in_.op, in_.words[2], in_.words[4]})
+		case .Dcl_Resource:
+			append(&spaces, [3]u32{in_.op | in_.ctl << 16, in_.words[2], in_.words[5]})
+		case .Rcp:
+			// gl_FragCoord.w is 1 / SV_Position.w.
+			rcp_w = in_.words[2] >> 12 & 0xff == 1 && in_.words[3] == 16 && in_.words[2] >> 4 & 3 == 3
+		case .Dcl_Input_Ps:
+			if in_.words[1] == 0 {
+				flat_id = in_.ctl == 1
+			}
+		}
+	}
+	sampler, resource, raw, cb := u32(Dx_Op.Dcl_Sampler), u32(Dx_Op.Dcl_Resource), u32(Dx_Op.Dcl_Resource_Raw), u32(Dx_Op.Dcl_Constant_Buffer)
+	want := [?][3]u32{{cb, 0, 3}, {sampler, 0, 2}, {sampler, 1, 2}, {resource | 3 << 16, 0, 2}, {resource | 8 << 16, 1, 2}, {raw, 2, 2}}
+	testing.expectf(t, slice.equal(spaces[:], want[:]), "%v", spaces)
+	testing.expect(t, rcp_w)
+	testing.expect(t, flat_id)
+
+	vs := `#version 310 es
+layout(location = 3) in vec4 position;
+layout(location = 0) in ivec2 cell;
+readonly buffer Offsets { vec4 offsets[]; };
+uniform sampler2D heights;
+uniform mat4 mvp;
+out vec2 uv;
+layout(location = 2) flat out int which;
+layout(location = 4) flat out uvec3 bits;
+void main() {
+    uv = vec2(cell) / 8.0;
+    which = gl_VertexID;
+    bits = uvec3(cell.xyx) * 3u;
+    gl_Position = mvp * (position + offsets[gl_VertexID] + textureLod(heights, uv, 0.0));
+}`
+	vm, verrs, vok := compile_glsl(vs, {stage = .Vertex, dxbc = true})
+	defer destroy(vm)
+	if !testing.expectf(t, vok, "%s", format_errors(verrs, context.temp_allocator)) {
+		return
+	}
+	vins := dxbc_sig(dxbc_chunk(vm.dxbc, "ISGN"))
+	vouts := dxbc_sig(dxbc_chunk(vm.dxbc, "OSGN"))
+	want_vin := [?]Sig_Row{{"TEXCOORD", 0, 0, 2, 0, 3, 3}, {"TEXCOORD", 3, 0, 3, 3, 15, 15}, {"SV_VertexID", 0, 6, 1, 16, 1, 1}}
+	want_vout := [?]Sig_Row{{"TEXCOORD", 0, 0, 3, 0, 3, 12}, {"TEXCOORD", 2, 0, 2, 2, 1, 14}, {"TEXCOORD", 4, 0, 1, 4, 7, 8}, {"SV_Position", 0, 1, 3, 16, 15, 0}}
+	testing.expectf(t, slice.equal(vins, want_vin[:]), "vertex ISGN %v", vins)
+	testing.expectf(t, slice.equal(vouts, want_vout[:]), "vertex OSGN %v", vouts)
+	vversion, vprog := dxbc_program(t, vm, "vertex")
+	testing.expect_value(t, vversion, 0x10051) // vs_5_1
+	clear(&spaces)
+	for in_ in vprog {
+		#partial switch Dx_Op(in_.op) {
+		case .Dcl_Constant_Buffer:
+			append(&spaces, [3]u32{in_.op, in_.words[2], in_.words[5]})
+		case .Dcl_Sampler, .Dcl_Resource_Raw:
+			append(&spaces, [3]u32{in_.op, in_.words[2], in_.words[4]})
+		case .Dcl_Resource:
+			append(&spaces, [3]u32{in_.op | in_.ctl << 16, in_.words[2], in_.words[5]})
+		}
+	}
+	// Vertex shader registers: t[n] and s[n] in space 0, b0 in space 1.
+	want_v := [?][3]u32{{cb, 0, 1}, {sampler, 0, 0}, {resource | 3 << 16, 0, 0}, {raw, 1, 0}}
+	testing.expectf(t, slice.equal(spaces[:], want_v[:]), "vertex %v", spaces)
+}
+
+// DXBC is opt-in: without Options.dxbc no stage has a blob (and the other
+// outputs are as they were); with it, vertex and fragment shaders have
+// one and a compute shader is an error (Dxbc_Compute).
+@(test)
+test_dxbc_opt_in :: proc(t: ^testing.T) {
+	Case :: struct {
+		src:   string,
+		stage: Stage,
+	}
+	cases := [?]Case {
+		{"#version 310 es\nprecision highp float;\nout vec4 c;\nvoid main() { c = vec4(gl_FragCoord.xy, 0.0, 1.0); }", .Fragment},
+		{"#version 310 es\nin vec4 p;\nvoid main() { gl_Position = p; }", .Vertex},
+		{"#version 310 es\nlayout(local_size_x = 8) in;\nbuffer B { uint w[]; };\nvoid main() { w[gl_GlobalInvocationID.x] = 1u; }", .Compute},
+	}
+	for cs in cases {
+		m, errs, ok := compile_glsl(cs.src, {stage = cs.stage})
+		testing.expectf(t, ok && m.dxbc == nil && len(m.spirv) > 0 && len(m.msl) > 0, "%v: %s", cs.stage, format_errors(errs, context.temp_allocator))
+		spirv := slice.clone(m.spirv, context.temp_allocator)
+		msl := strings.clone(m.msl, context.temp_allocator)
+		destroy(m)
+		dm, derrs, dok := compile_glsl(cs.src, {stage = cs.stage, dxbc = true})
+		if cs.stage == .Compute {
+			testing.expectf(t, !dok && len(derrs) == 1 && derrs[0].code == .Dxbc_Compute, "compute with dxbc: %v", derrs)
+		} else {
+			testing.expectf(t, dok && len(dm.dxbc) > 0, "%v: %s", cs.stage, format_errors(derrs, context.temp_allocator))
+			testing.expectf(t, slice.equal(dm.spirv, spirv) && dm.msl == msl, "%v: DXBC changed the other outputs", cs.stage)
+		}
+		destroy(dm)
+	}
+}
+
+// Compiles with DXBC and decodes the program.
+@(private = "file")
+dxbc_compile :: proc(t: ^testing.T, src: string, options: Options, loc := #caller_location) -> (m: ^Module, prog: []Ins, ok: bool) {
+	o := options
+	o.dxbc = true
+	errs: []Error
+	m, errs, ok = compile(src, o)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator), loc = loc) {
+		return
+	}
+	_, prog = dxbc_program(t, m, src, loc)
+	return
+}
+
+// The emitter's own lowering, by the instructions it leaves (every blob
+// also goes through dxbc_program's structural checks): each `seq` must
+// appear as consecutive instructions. A discard is followed by ret inside
+// and outside loops; every loop has one shape, so a continue is a bare
+// continue in a for (its step at the loop's top), a while and a do-while
+// (its test at the top too, behind the first-pass flag), and a switch case
+// that continues still ends with a break; integer division guards a zero
+// divisor; an early return from a loop in a function breaks through a
+// flag, from a switch in a switch through an if; run-time indexes are
+// clamped; textureSize is resinfo_uint; texelFetch converts a uint lod as
+// unsigned.
+@(test)
+test_dxbc_lowering :: proc(t: ^testing.T) {
+	Case :: struct {
+		src:     string,
+		seqs:    [][]Dx_Op,
+		profile: Profile,
+	}
+	cases := [?]Case {
+		{"void mainImage(out vec4 c, in vec2 f) { for (int i = 0; i < 9; i++) { if (f.x > float(i)) discard; } c = vec4(1.0); }", {{.Discard, .Ret, .End_If}}, .Shadertoy},
+		{"void mainImage(out vec4 c, in vec2 f) { if (f.x > 3.0) discard; c = vec4(1.0); }", {{.If, .Discard, .Ret, .End_If}}, .Shadertoy},
+		{"void mainImage(out vec4 c, in vec2 f) { int a = 0; for (int i = 0; i < 4; i++) { switch (int(f.x) % 3) { case 0: continue; default: a++; } } c = vec4(float(a)); }", {{.Loop, .If}, {.End_If, .Mov, .Ilt, .Breakc}, {.Case, .Continue, .Break, .Default}}, .Shadertoy},
+		{"void mainImage(out vec4 c, in vec2 f) { int a = 0, k = 0; do { k++; switch (int(f.x) % 3) { case 1: continue; } a++; } while (k < 4); c = vec4(float(a)); }", {{.Loop, .If, .Ilt, .Breakc, .End_If, .Mov}, {.Case, .Continue, .Break, .End_Switch}}, .Shadertoy},
+		{"void mainImage(out vec4 c, in vec2 f) { int a = 0; while (a < int(f.x)) { a++; if (a == 3) continue; a++; } c = vec4(float(a)); }", {{.Loop, .Ftoi, .Ilt, .Breakc}, {.If, .Continue, .End_If}}, .Shadertoy},
+		{"void mainImage(out vec4 c, in vec2 f) { int x = int(f.x) / int(f.y); c = vec4(float(x)); }", {{.Ieq, .Movc}}, .Shadertoy},
+		{"void mainImage(out vec4 c, in vec2 f) { uint x = uint(f.x) % uint(f.y); c = vec4(float(x)); }", {{.Udiv, .Ieq, .Movc}}, .Shadertoy},
+		{"int find(int n) { for (int i = 0; i < 8; i++) { for (int j = 0; j < 8; j++) { if (i * j == n) return i; } } return -1; }\nvoid mainImage(out vec4 c, in vec2 f) { c = vec4(float(find(int(f.x)))); }", {{.Mov, .Break, .End_If, .End_Loop, .Breakc, .End_Loop, .Breakc}}, .Shadertoy},
+		{"int pick(int a, int b) { switch (a) { case 0: switch (b) { case 1: return 7; } return 3; } return 5; }\nvoid mainImage(out vec4 c, in vec2 f) { c = vec4(float(pick(int(f.x), int(f.y)))); }", {{.End_Switch, .If, .Break, .End_If}}, .Shadertoy},
+		{"void mainImage(out vec4 c, in vec2 f) { float a[4] = float[4](1.0, 2.0, 3.0, 4.0); c = vec4(a[int(f.x)]); }", {{.Imax, .Imin, .Mov}}, .Shadertoy},
+		{"uniform sampler2D s;\nout vec4 c;\nvoid main() { c = vec4(vec2(textureSize(s, 1)), 0.0, 1.0); }", {{.Resinfo}}, .Glsl},
+		{"void mainImage(out vec4 c, in vec2 f) { c = texelFetch(iChannel0, ivec2(f), uint(f.x)); }", {{.Utof, .Sample_L}}, .Shadertoy},
+	}
+	for cs in cases {
+		m, prog, ok := dxbc_compile(t, cs.src, {profile = cs.profile})
+		defer destroy(m)
+		if !ok {
+			continue
+		}
+		for seq in cs.seqs {
+			found := false
+			for i in 0 ..= len(prog) - len(seq) {
+				run := true
+				for op, k in seq {
+					if Dx_Op(prog[i + k].op) != op {
+						run = false
+						break
+					}
+				}
+				if run {
+					if seq[0] == .Resinfo {
+						testing.expect_value(t, prog[i].ctl & 3, 2) // _uint
+					}
+					found = true
+					break
+				}
+			}
+			testing.expectf(t, found, "%s: %v not found", cs.src, seq)
+		}
+	}
+}
+
+// Run-time indexes are clamped to the last element, register or
+// component, as on the CPU: an index one past it would read past an
+// indexable temp (which drivers need not catch: RADV's selects return the
+// last element anyway) or the wrong component.
+@(test)
+test_dxbc_index_clamps :: proc(t: ^testing.T) {
+	src := "void mainImage(out vec4 c, in vec2 f) { int i = int(f.x); float a[5] = float[5](1.0, 2.0, 3.0, 4.0, 5.0); mat3 m = mat3(f.x); vec3 v = vec3(f, 1.0); vec2 w = f; a[i] = 0.5; v[i] = 2.0; c = vec4(a[i + 1], m[i].y, v[i + 2] + w[i], (w * 2.0)[i]); }"
+	m, prog, ok := dxbc_compile(t, src, {profile = .Shadertoy})
+	defer destroy(m)
+	if !ok {
+		return
+	}
+	// Every imax(i, 0) is followed by imin(i, last), one per index: a[i]
+	// twice (last 4), m[i] (2), v[i] twice (2), w[i] and (w * 2.0)[i] (1).
+	lasts := make([dynamic]u32, context.temp_allocator)
+	for in_, i in prog {
+		if Dx_Op(in_.op) != .Imin || i == 0 || Dx_Op(prog[i - 1].op) != .Imax {
+			continue
+		}
+		lo, _ := dxbc_operands(prog[i - 1].words)
+		hi, _ := dxbc_operands(in_.words)
+		testing.expectf(t, len(lo) == 3 && lo[2].file == 4 && lo[2].imm == 0, "lower clamp %v", lo)
+		if len(hi) == 3 && hi[2].file == 4 {
+			append(&lasts, hi[2].imm)
+		}
+	}
+	slice.sort(lasts[:])
+	want := []u32{1, 1, 2, 2, 2, 4, 4}
+	testing.expectf(t, slice.equal(lasts[:], want), "upper clamps %v, want %v", lasts, want)
+}
+
+// Storage buffer reads load only the words read, at word element * stride
+// + offset (in words, before the clamp), clamped to 0x3ffffffc and then
+// made a byte address: a field of a 6-vec4 struct is one ld_raw, a whole
+// struct one per field (a struct field's own fields at their offsets), a
+// component chosen at run time is clamped first.
+@(test)
+test_dxbc_buffer_reads :: proc(t: ^testing.T) {
+	Case :: struct {
+		src:     string,
+		ld_raws: int,
+		// Word offsets added before each clamp (0: none).
+		offsets: []u32,
+	}
+	decls :: "#version 310 es\nprecision highp float;\nstruct S { vec4 a; vec4 b; vec4 c; vec4 d; vec4 e; vec4 clip; };\nreadonly buffer B { S rows[]; };\nreadonly buffer W { uvec3 v[]; };\nstruct Inner { vec2 x; float y; };\nstruct Outer { vec4 a; Inner b; uint c; float d; };\nreadonly buffer N { Outer ns[]; };\nuniform int uI;\nout vec4 o;\n"
+	cases := [?]Case {
+		{decls + "void main() { o = rows[uI].clip; }", 1, {20}},
+		{decls + "void main() { o = vec4(rows[uI].b.zx, 0.0, 1.0); }", 1, {4}},
+		{decls + "void main() { S s = rows[uI]; o = s.a + s.clip; }", 6, {0, 4, 8, 12, 16, 20}},
+		{decls + "void main() { o = vec4(float(v[uI][uI + 1]), float(v[uI].y), 0.0, 1.0); }", 2, {0, 1}},
+		{decls + "void main() { Outer n = ns[uI]; o = vec4(n.b.x, n.b.y + float(n.c), n.a.x + n.d); }", 5, {0, 4, 6, 8, 9}},
+		{decls + "void main() { Inner b = ns[uI].b; o = vec4(b.x, b.y, ns[uI].b.y); }", 3, {4, 6, 6}},
+	}
+	for cs in cases {
+		m, prog, ok := dxbc_compile(t, cs.src, {profile = .Glsl})
+		defer destroy(m)
+		if !ok {
+			continue
+		}
+		n := 0
+		for in_, i in prog {
+			if Dx_Op(in_.op) != .Ld_Raw {
+				continue
+			}
+			// ... [iadd a, base, off] umin a, w, 0x3ffffffc; ishl a, a, 2; ld_raw
+			testing.expectf(t, i >= 2 && Dx_Op(prog[i - 2].op) == .Umin && Dx_Op(prog[i - 1].op) == .Ishl, "%s: ld_raw %d not after umin, ishl", cs.src, n)
+			if i >= 2 {
+				ops, _ := dxbc_operands(prog[i - 2].words)
+				testing.expectf(t, len(ops) == 3 && ops[2].file == 4 && ops[2].imm == 0x3ffffffc, "%s: clamp %v", cs.src, ops)
+				shl, _ := dxbc_operands(prog[i - 1].words)
+				testing.expectf(t, len(shl) == 3 && shl[2].file == 4 && shl[2].imm == 2, "%s: shift %v", cs.src, shl)
+			}
+			off: u32
+			if i >= 3 && Dx_Op(prog[i - 3].op) == .Iadd {
+				ops, _ := dxbc_operands(prog[i - 3].words)
+				if len(ops) == 3 && ops[2].file == 4 {
+					off = ops[2].imm
+				}
+			}
+			if n < len(cs.offsets) {
+				testing.expectf(t, off == cs.offsets[n], "%s: ld_raw %d at word offset %d, want %d", cs.src, n, off, cs.offsets[n])
+			}
+			n += 1
+		}
+		testing.expectf(t, n == cs.ld_raws, "%s: %d ld_raws, want %d", cs.src, n, cs.ld_raws)
+	}
+}
+
+// An allocator over the heap that fills every block it frees or moves
+// with 0xa5 first, so code that keeps a pointer into a dynamic array
+// across an append that grows it reads garbage instead of the old values.
+@(private = "file")
+poison_allocator_proc :: proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old_memory: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+	heap := os.heap_allocator()
+	#partial switch mode {
+	case .Free:
+		if old_memory != nil && old_size > 0 {
+			mem.set(old_memory, 0xa5, old_size)
+		}
+	case .Resize, .Resize_Non_Zeroed:
+		out, err := mem.alloc_bytes(size, alignment, heap, loc)
+		if err != nil || old_memory == nil {
+			return out, err
+		}
+		mem.copy(raw_data(out), old_memory, min(size, old_size))
+		mem.set(old_memory, 0xa5, old_size)
+		mem.free_with_size(old_memory, old_size, heap, loc)
+		return out, nil
+	case .Free_All:
+		// Its blocks are left to the process.
+		return nil, nil
+	}
+	return os.heap_allocator_proc(data, mode, size, alignment, old_memory, old_size, loc)
+}
+
+// The emitter's output does not depend on how its scratch is reused: a
+// chain of 12 functions each returning the next one's result (so the call
+// stack grows past its first capacity while a return is being emitted)
+// gives the same blob with a scratch allocator that poisons what it frees.
+@(test)
+test_dxbc_scratch_reuse :: proc(t: ^testing.T) {
+	sb := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(&sb, "float f12(float x) { if (x > 2.0) { return x * 0.5; } return x + 1.0; }\n")
+	for i := 11; i >= 1; i -= 1 {
+		fmt.sbprintf(&sb, "float f%d(float x) {{ if (x < -1.0) {{ return -x; }} return f%d(x * 1.5) + %d.0; }}\n", i, i + 1, i)
+	}
+	fmt.sbprint(&sb, "void mainImage(out vec4 c, in vec2 p) { c = vec4(f1(p.x), f1(p.y), 0.0, 1.0); }\n")
+	src := strings.to_string(sb)
+	m, errs, ok := compile(src, {profile = .Shadertoy, dxbc = true})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	want := slice.clone(m.dxbc, context.temp_allocator)
+	_, _ = dxbc_program(t, m, "call chain")
+	poisoned: []u8
+	{
+		context.temp_allocator = {procedure = poison_allocator_proc, data = nil}
+		pm, _, pok := compile(src, {profile = .Shadertoy, dxbc = true})
+		if pok {
+			poisoned = slice.clone(pm.dxbc, context.allocator)
+		}
+		destroy(pm)
+	}
+	defer delete(poisoned)
+	testing.expect(t, slice.equal(poisoned, want))
+}
+
+// The module's arena holds the DXBC container and nothing else of the
+// emitter's: its scratch is temporary.
+@(test)
+test_dxbc_arena :: proc(t: ^testing.T) {
+	src := #load("testdata/raymarch_sdf.glsl", string)
+	options, _ := options_of_path("raymarch_sdf.glsl")
+	a, _, aok := compile(src, options)
+	defer destroy(a)
+	options.dxbc = true
+	b, _, bok := compile(src, options)
+	defer destroy(b)
+	if !testing.expect(t, aok && bok) {
+		return
+	}
+	grown := int(b.arena.total_used) - int(a.arena.total_used)
+	// Alignment padding (here and in what follows it) aside.
+	testing.expectf(t, abs(grown - len(b.dxbc)) <= 64, "the arena grew %d bytes for a %d-byte container", grown, len(b.dxbc))
+}
+
+// vkd3d is a development tool: tests that use it skip without it.
+@(private = "file")
+have_vkd3d :: proc() -> bool {
+	_, _, _, err := os.process_exec({command = {"vkd3d-compiler", "--version"}}, context.temp_allocator)
+	_, _, _, err2 := os.process_exec({command = {"vkd3d-dxbc", "--version"}}, context.temp_allocator)
+	return err == nil && err2 == nil && have_spirv_val()
+}
+
+@(private = "file")
+dxbc_files: int
+
+// vkd3d-dxbc reads the container (checking its checksum), vkd3d-compiler
+// disassembles it and translates it to SPIR-V without a message, and
+// spirv-val accepts the SPIR-V.
+@(private = "file")
+expect_valid_dxbc :: proc(t: ^testing.T, name: string, blob: []u8, loc := #caller_location) {
+	dir := os.temp_directory(context.temp_allocator) or_else "/tmp"
+	base := fmt.tprintf("%s/oksl_test_%d_%d", dir, os.get_pid(), sync.atomic_add(&dxbc_files, 1))
+	in_path, spv := fmt.tprintf("%s.dxbc", base), fmt.tprintf("%s.spv", base)
+	_ = os.write_entire_file(in_path, blob)
+	defer os.remove(in_path)
+	defer os.remove(spv)
+	commands := [?][]string {
+		{"vkd3d-dxbc", "-t", in_path},
+		{"vkd3d-compiler", "-x", "dxbc-tpf", "-b", "d3d-asm", "-o", "/dev/null", in_path},
+		{"vkd3d-compiler", "-x", "dxbc-tpf", "-b", "spirv-binary", "-o", spv, in_path},
+		{"spirv-val", "--target-env", "vulkan1.0", spv},
+	}
+	for c, i in commands {
+		state, stdout, stderr, err := os.process_exec({command = c}, context.temp_allocator)
+		quiet := i == 0 || len(stderr) == 0
+		if !testing.expectf(t, err == nil && state.exit_code == 0 && quiet, "%s: %s: %s%s", name, c[0], stdout, stderr, loc = loc) {
+			return
+		}
+	}
+}
+
+// Every testdata vertex and fragment shader's DXBC through dxbc_program's
+// checks, and through vkd3d and spirv-val.
+@(test)
+test_dxbc_vkd3d :: proc(t: ^testing.T) {
+	check_vkd3d := have_vkd3d()
+	if !check_vkd3d {
+		fmt.println("vkd3d-compiler, vkd3d-dxbc or spirv-val not installed; checking the programs only")
+	}
+	for path in corpus() {
+		src, _ := os.read_entire_file(path, context.temp_allocator)
+		options, _ := options_of_path(path)
+		if options.stage == .Compute {
+			continue
+		}
+		options.dxbc = true
+		m, errs, ok := compile(string(src), options)
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%s: %s", path, format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		dxbc_program(t, m, path)
+		if check_vkd3d {
+			expect_valid_dxbc(t, path, m.dxbc)
+		}
+	}
+}
