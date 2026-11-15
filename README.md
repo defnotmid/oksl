@@ -532,7 +532,14 @@ layers), optional bound 2D float images (`channel_images`, below), the
 storage buffers' words (`buffers`, one `[]u32` per buffer in
 `Module.storage_buffers` order; a read past one gives 0 and a write past
 one is dropped), the compute storage images (`images`, one `Storage_Image`
-per image in `Module.storage_images` order), an optional sub-rectangle and
+per image in `Module.storage_images` order), an optional sub-rectangle
+(`x, y, w, h` in layer pixels; when `region_targets` is set on `run_f32` or
+`run_targets`, each non-nil target is tightly packed to that region and pixel
+`(px, py)` is written to `target[(py - y) * w + (px - x)]`, validated via
+`ensure` for `w > 0 && h > 0`, the region inside `0..width` × `0..height`,
+and `len >= w * h` on every non-nil target, while the shader still sees
+full-layer `gl_FragCoord`, `uv`, varyings and derivatives; `run` rejects
+`region_targets`) and
 the stage inputs by location
 (`Varying`: per component `a + dx * x + dy * y` at pixel centres, what one
 triangle's rasterization gives). An input without one is zero, except

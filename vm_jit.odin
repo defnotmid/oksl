@@ -2786,9 +2786,9 @@ JIT_LYF := Jit_Floats{0.5, 0.5, 1.5, 1.5, 0.5, 0.5, 1.5, 1.5}
 JIT_ROW_LANES := [2][4]int{{0, 1, 4, 5}, {2, 3, 6, 7}}
 
 @(private)
-jit_validate_run :: proc(p: ^Program, width, start_x, start_y, end_x, end_y: int, out: []u8, stride: int, targets: [][][4]f32) {
-	first_px := start_y * width + start_x
-	last_px := (end_y - 1) * width + (end_x - 1)
+jit_validate_run :: proc(p: ^Program, out_x, out_y, out_stride, start_x, start_y, end_x, end_y: int, out: []u8, stride: int, targets: [][][4]f32) {
+	first_px := (start_y - out_y) * out_stride + (start_x - out_x)
+	last_px := (end_y - 1 - out_y) * out_stride + (end_x - 1 - out_x)
 	for v in p.outputs {
 		if v.kind != .Stage_Out {
 			continue
@@ -2862,7 +2862,11 @@ jit_runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Ru
 	if start_x >= end_x || start_y >= end_y {
 		return
 	}
-	jit_validate_run(p, width, start_x, start_y, end_x, end_y, out, stride, targets)
+	out_x, out_y, out_stride := 0, 0, width
+	if opts.region_targets {
+		out_x, out_y, out_stride = start_x, start_y, w
+	}
+	jit_validate_run(p, out_x, out_y, out_stride, start_x, start_y, end_x, end_y, out, stride, targets)
 	opts_local := opts
 	ctx := jit_begin(p, scratch, uniforms, &opts_local)
 	slots := ctx.slots
@@ -2951,7 +2955,7 @@ jit_runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Ru
 					if target != nil {
 						tptr := ([^][4]f32)(raw_data(target))
 						for ry in 0 ..< 2 {
-							base_px := (by + ry) * width + bx
+							base_px := (by + ry - out_y) * out_stride + (bx - out_x)
 							lanes_r := JIT_ROW_LANES[ry]
 							for rx in 0 ..< 4 {
 								l := lanes_r[rx]
@@ -2982,7 +2986,7 @@ jit_runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Ru
 						c[k] = float_of(slots[v.slot + i32(k)][lane], v.base)
 					}
 					if target != nil {
-						target[y * width + x] = c
+						target[(y - out_y) * out_stride + (x - out_x)] = c
 					}
 					if bytes != nil {
 						o := y * stride + x * 4

@@ -21,8 +21,14 @@ Run_Options :: struct {
 	user:     rawptr,
 	// Region to shade in layer pixels, clipped to the layer; zero means
 	// the whole layer. Its pixels come out as a whole-layer run's do.
-	x, y:     int,
-	w, h:     int,
+	x, y:           int,
+	w, h:           int,
+	// When set on run_f32 or run_targets, each non-nil target is sized to
+	// the region (len >= w * h) rather than the whole layer, and pixel
+	// (px, py) is written to target[(py - y) * w + (px - x)]. Requires
+	// w > 0, h > 0 and the region inside 0..width x 0..height; the shader
+	// still sees full-layer coordinates, uv, varyings and derivatives.
+	region_targets: bool,
 	// The stage inputs by location. Absent ones are zero, except location
 	// 0, which is the layer's uv (what the layer vertex shader writes).
 	varyings: []Varying,
@@ -158,19 +164,22 @@ Varying :: struct {
 // Discarded pixels are left untouched. `scratch` is the caller's working
 // memory (one per thread running at once).
 run :: proc(p: ^Program, uniforms: []u8, width, height: int, out: []u8, stride: int, scratch: ^Scratch, opts := Run_Options{}) {
+	ensure(!opts.region_targets, "oksl: region_targets applies to float targets (run_f32 and run_targets), not run")
 	runner_run(p, uniforms, width, height, opts, out, stride, nil, scratch)
 }
 
 // Like `run`, writing unclamped float RGBA (`out` has width * height
-// entries, row-major).
+// entries, or opts.w * opts.h when opts.region_targets is set, row-major).
 run_f32 :: proc(p: ^Program, uniforms: []u8, width, height: int, out: [][4]f32, scratch: ^Scratch, opts := Run_Options{}) {
-	targets := [1][][4]f32{out}
+	empty: [1][4]f32
+	targets := [1][][4]f32{empty[:0] if opts.region_targets && out == nil else out}
 	runner_run(p, uniforms, width, height, opts, nil, 0, targets[:], scratch)
 }
 
 // Like `run_f32` for every output: `targets[n]` (width * height entries,
-// nil to skip) receives the output at location n, integer outputs
-// converted to float, missing components 0 (alpha 1).
+// or opts.w * opts.h when opts.region_targets is set; nil to skip) receives
+// the output at location n, integer outputs converted to float, missing
+// components 0 (alpha 1).
 run_targets :: proc(p: ^Program, uniforms: []u8, width, height: int, targets: [][][4]f32, scratch: ^Scratch, opts := Run_Options{}) {
 	runner_run(p, uniforms, width, height, opts, nil, 0, targets, scratch)
 }
@@ -287,9 +296,31 @@ BATCH_W :: 8
 BATCH_H :: LANES / BATCH_W
 
 @(private)
+validate_region_targets :: proc(width, height: int, opts: Run_Options, targets: [][][4]f32) {
+	ensure(opts.w > 0 && opts.h > 0, "oksl: region_targets requires opts.w > 0 and opts.h > 0")
+	ensure(
+		width > 0 && height > 0 &&
+		opts.x >= 0 && opts.y >= 0 &&
+		opts.x <= width && opts.w <= width - opts.x &&
+		opts.y <= height && opts.h <= height - opts.y,
+		"oksl: region_targets region lies outside the layer",
+	)
+	need, ovf := intrinsics.overflow_mul(opts.w, opts.h)
+	ensure(!ovf, "oksl: region_targets dimensions overflow")
+	for target in targets {
+		if target != nil {
+			ensure(len(target) >= need, "oksl: target is shorter than opts.w * opts.h")
+		}
+	}
+}
+
+@(private)
 runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) {
 	ensure(p.stage == .Fragment, "oksl: run requires a fragment program")
 	validate_channel_images(p, opts)
+	if opts.region_targets {
+		validate_region_targets(width, height, opts, targets)
+	}
 	if p.jit_body != nil {
 		jit_runner_run(p, uniforms, width, height, opts, out, stride, targets, scratch)
 		return
@@ -307,6 +338,10 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 	end_y := min(y0 + h, height)
 	if start_x >= end_x || start_y >= end_y {
 		return
+	}
+	out_x, out_y, out_stride := 0, 0, width
+	if opts.region_targets {
+		out_x, out_y, out_stride = start_x, start_y, w
 	}
 	r := runner_begin(p, scratch, uniforms, opts)
 	// Each lane's pixel in the batch.
@@ -378,7 +413,7 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 					r3 := &r.regs[v.slot + 3]
 					if target != nil {
 						for lane in 0 ..< LANES {
-							target[(by + ly[lane]) * width + bx + lx[lane]] = {fval(r0[lane]), fval(r1[lane]), fval(r2[lane]), fval(r3[lane])}
+							target[(by + ly[lane] - out_y) * out_stride + (bx + lx[lane] - out_x)] = {fval(r0[lane]), fval(r1[lane]), fval(r2[lane]), fval(r3[lane])}
 						}
 					}
 					if bytes != nil {
@@ -405,7 +440,7 @@ runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Op
 						c[k] = float_of(r.regs[v.slot + i32(k)][lane], v.base)
 					}
 					if target != nil {
-						target[y * width + x] = c
+						target[(y - out_y) * out_stride + (x - out_x)] = c
 					}
 					if bytes != nil {
 						o := y * stride + x * 4

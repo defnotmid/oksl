@@ -7669,6 +7669,371 @@ void main() {
 	testing.expect_value(t, find_edge(edges[:], t0_j, t1_j, 0xFFFF_FFFF, 0x8000_0000), [4]u32{0, 0xFFFF_FFFF, 1, 0x7FFF_FFFF})
 }
 
+@(test)
+test_run_targets_region_sized :: proc(t: ^testing.T) {
+	src := `#version 310 es
+precision highp float;
+layout(location = 0) in vec2 vUV;
+layout(location = 1) in vec3 vVar;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec2 o2;
+void main() {
+    int ix = int(gl_FragCoord.x);
+    int iy = int(gl_FragCoord.y);
+    if ((ix >= 16 && ix < 24 && ((ix + iy) & 3) == 1) || (ix == 2 && iy == 3)) {
+        discard;
+    }
+    float curve = vUV.x * vUV.x * 13.0 + vUV.y * gl_FragCoord.x * 0.25 + vVar.x * vVar.y;
+    float dx = dFdx(curve);
+    float dy = dFdy(curve);
+    float fw = fwidth(vUV.x * gl_FragCoord.y * 0.125 + vVar.z);
+    o0 = vec4(gl_FragCoord.xy * 0.0625, dx, dy);
+    o1 = vec4(vUV, fw, vVar.x + vVar.y + gl_FragCoord.w);
+    o2 = vec2(dx - dy + vVar.z, gl_FragCoord.x + gl_FragCoord.y * 0.5);
+}`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	testing.expectf(t, ok, "region_targets shader compile failed:\n%s", format_errors(errs, context.temp_allocator))
+	if !ok {
+		return
+	}
+	p_int := m.program
+	p_int.jit_body, p_int.jit_init = nil, nil
 
+	varyings := [2]Varying {
+		{}, // populated per layer size below
+		{a = {0.25, -0.5, 1.25, 0}, dx = {0.03125, 0.015625, -0.0078125, 0}, dy = {-0.015625, 0.0625, 0.03125, 0}},
+	}
+	SENTINEL :: [4]f32{-12345.0, 67890.0, -42.5, 999.25}
+	scratch := temp_scratch()
 
+	Region_Case :: struct {
+		x, y, w, h: int,
+	}
+
+	for dims in ([2][2]int{{40, 70}, {37, 67}}) {
+		W, H := dims[0], dims[1]
+		varyings[0] = {
+			a  = {0, 0, 0, 0},
+			dx = {1.0 / f32(W), 0, 0, 0},
+			dy = {0, 1.0 / f32(H), 0, 0},
+		}
+		for use_vars in ([2]bool{false, true}) {
+			vars_slice := varyings[:] if use_vars else nil
+
+			ref_j, ref_i: [3][][4]f32
+			for k in 0 ..< 3 {
+				ref_j[k] = make([][4]f32, W * H, context.temp_allocator)
+				ref_i[k] = make([][4]f32, W * H, context.temp_allocator)
+				for &px in ref_j[k] {px = SENTINEL}
+				for &px in ref_i[k] {px = SENTINEL}
+			}
+			run_targets(&m.program, nil, W, H, ref_j[:], scratch, {varyings = vars_slice})
+			run_targets(&p_int, nil, W, H, ref_i[:], scratch, {varyings = vars_slice})
+			for k in 0 ..< 3 {
+				testing.expect(t, slice.equal(slice.reinterpret([]u32, ref_j[k]), slice.reinterpret([]u32, ref_i[k])))
+			}
+
+			regions := make([dynamic]Region_Case, 0, 16, context.temp_allocator)
+			// 32-row full-width bands including shorter last band (o3d's exact call pattern).
+			for by := 0; by < H; by += 32 {
+				append(&regions, Region_Case{0, by, W, min(32, H - by)})
+			}
+			// 1-row bands at top, odd row, interior, and bottom.
+			append(&regions, Region_Case{0, 0, W, 1})
+			append(&regions, Region_Case{0, 1, W, 1})
+			append(&regions, Region_Case{0, 33, W, 1})
+			append(&regions, Region_Case{0, H - 1, W, 1})
+			// Aligned interior region with x > 0, y > 0 (hits full_tile fast path in both 8x8 interpreter and 4x2 JIT).
+			append(&regions, Region_Case{8, 8, 24, 16})
+			// Unaligned sub-regions with x > 0, y > 0, odd starts and odd sizes.
+			append(&regions, Region_Case{5, 7, 23, 19})
+			append(&regions, Region_Case{3, 12, W - 4, 21})
+
+			crop_ref := make([][4]f32, W * H, context.temp_allocator)
+			check_crop :: proc(t: ^testing.T, got, full: [][4]f32, W: int, rc: Region_Case, tmp: [][4]f32) {
+				n := rc.w * rc.h
+				for ry in 0 ..< rc.h {
+					copy(tmp[ry * rc.w:(ry + 1) * rc.w], full[(rc.y + ry) * W + rc.x:][:rc.w])
+				}
+				if !slice.equal(slice.reinterpret([]u32, got[:n]), slice.reinterpret([]u32, tmp[:n])) {
+					testing.expectf(t, false, "region crop mismatch for W=%d rc=%v", W, rc)
+				}
+			}
+
+			for rc in regions {
+				n := rc.w * rc.h
+				ropts := Run_Options{
+					x              = rc.x,
+					y              = rc.y,
+					w              = rc.w,
+					h              = rc.h,
+					region_targets = true,
+					varyings       = vars_slice,
+				}
+
+				for prog in ([2]^Program{&m.program, &p_int}) {
+					// run_f32 (with extra tail elements to verify nothing writes past w * h).
+					f32_buf := make([][4]f32, n + 7, context.temp_allocator)
+					for &px in f32_buf {px = SENTINEL}
+					run_f32(prog, nil, W, H, f32_buf, scratch, ropts)
+					check_crop(t, f32_buf[:n], ref_j[0], W, rc, crop_ref)
+					for tail_px in f32_buf[n:] {
+						testing.expect_value(t, tail_px, SENTINEL)
+					}
+
+					// 1, 2, and 3 targets with nil entries (including {nil, b1, b2} like o3d's far plane).
+					Mask3 :: bit_set[0 ..< 3;u8]
+					for mask in ([6]Mask3{{0}, {0, 1}, {1}, {1, 2}, {0, 2}, {0, 1, 2}}) {
+						bs: [3][][4]f32
+						tlen := 1
+						if 2 in mask {
+							tlen = 3
+						} else if 1 in mask {
+							tlen = 2
+						}
+						for k in 0 ..< tlen {
+							if k in mask {
+								bs[k] = make([][4]f32, n, context.temp_allocator)
+								for &px in bs[k] {px = SENTINEL}
+							}
+						}
+						run_targets(prog, nil, W, H, bs[:tlen], scratch, ropts)
+						for k in 0 ..< tlen {
+							if k in mask {
+								check_crop(t, bs[k], ref_j[k], W, rc, crop_ref)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+@(test)
+test_region_targets_ensure_no_region_w :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	buf: [16][4]f32
+	targets := [1][][4]f32{buf[:]}
+	testing.expect_assert_message(t, "oksl: region_targets requires opts.w > 0 and opts.h > 0")
+	run_targets(&m.program, nil, 8, 8, targets[:], temp_scratch(), {w = 0, h = 4, region_targets = true})
+}
+
+@(test)
+test_region_targets_ensure_no_region_h :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	p_int := m.program
+	p_int.jit_body, p_int.jit_init = nil, nil
+	buf: [16][4]f32
+	targets := [1][][4]f32{buf[:]}
+	testing.expect_assert_message(t, "oksl: region_targets requires opts.w > 0 and opts.h > 0")
+	run_targets(&p_int, nil, 8, 8, targets[:], temp_scratch(), {w = 4, h = 0, region_targets = true})
+}
+
+@(test)
+test_region_targets_ensure_neg_x :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	buf: [16][4]f32
+	targets := [1][][4]f32{buf[:]}
+	testing.expect_assert_message(t, "oksl: region_targets region lies outside the layer")
+	run_targets(&m.program, nil, 8, 8, targets[:], temp_scratch(), {x = -1, y = 0, w = 4, h = 4, region_targets = true})
+}
+
+@(test)
+test_region_targets_ensure_neg_y :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	buf: [16][4]f32
+	targets := [1][][4]f32{buf[:]}
+	testing.expect_assert_message(t, "oksl: region_targets region lies outside the layer")
+	run_targets(&m.program, nil, 8, 8, targets[:], temp_scratch(), {x = 0, y = -1, w = 4, h = 4, region_targets = true})
+}
+
+@(test)
+test_region_targets_ensure_outside_x :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	buf: [16][4]f32
+	targets := [1][][4]f32{buf[:]}
+	testing.expect_assert_message(t, "oksl: region_targets region lies outside the layer")
+	run_targets(&m.program, nil, 8, 8, targets[:], temp_scratch(), {x = 5, y = 0, w = 4, h = 4, region_targets = true})
+}
+
+@(test)
+test_region_targets_ensure_outside_y :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	buf: [16][4]f32
+	targets := [1][][4]f32{buf[:]}
+	testing.expect_assert_message(t, "oksl: region_targets region lies outside the layer")
+	run_targets(&m.program, nil, 8, 8, targets[:], temp_scratch(), {x = 0, y = 5, w = 4, h = 4, region_targets = true})
+}
+
+@(test)
+test_region_targets_ensure_short_target :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	buf: [15][4]f32
+	targets := [2][][4]f32{nil, buf[:]}
+	testing.expect_assert_message(t, "oksl: target is shorter than opts.w * opts.h")
+	run_targets(&m.program, nil, 8, 8, targets[:], temp_scratch(), {x = 2, y = 2, w = 4, h = 4, region_targets = true})
+}
+
+@(test)
+test_region_targets_ensure_short_run_f32 :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	buf: [15][4]f32
+	testing.expect_assert_message(t, "oksl: target is shorter than opts.w * opts.h")
+	run_f32(&m.program, nil, 8, 8, buf[:], temp_scratch(), {x = 0, y = 0, w = 4, h = 4, region_targets = true})
+}
+
+@(test)
+test_region_targets_ensure_nil_run_f32 :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	testing.expect_assert_message(t, "oksl: target is shorter than opts.w * opts.h")
+	run_f32(&m.program, nil, 8, 8, nil, temp_scratch(), {x = 0, y = 0, w = 4, h = 4, region_targets = true})
+}
+
+@(test)
+test_region_targets_ensure_run_rgba8 :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	buf: [64]u8
+	testing.expect_assert_message(t, "oksl: region_targets applies to float targets (run_f32 and run_targets), not run")
+	run(&m.program, nil, 8, 8, buf[:], 16, temp_scratch(), {x = 0, y = 0, w = 4, h = 4, region_targets = true})
+}
+
+@(test)
+test_runner_run_region_sampler_lanes :: proc(t: ^testing.T) {
+	src := `#version 310 es
+precision highp float;
+layout(location = 0) in vec2 vUV;
+uniform sampler2D s0;
+uniform sampler2D s1;
+layout(location = 0) out vec4 o;
+void main() {
+    vec4 a = texture(s0, vUV);
+    vec4 b = texelFetch(s1, ivec2(gl_FragCoord.xy), 0);
+    o = a + b;
+}`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	testing.expectf(t, ok, "region sampler compile failed:\n%s", format_errors(errs, context.temp_allocator))
+	if !ok {
+		return
+	}
+	p_int := m.program
+	p_int.jit_body, p_int.jit_init = nil, nil
+
+	Region_Sampler_State :: struct {
+		lw, lh:                  int,
+		start_x, start_y:        int,
+		end_x, end_y:            int,
+		calls:                   [2]int,
+		bad_uv:                  int,
+	}
+	region_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		st := (^Region_Sampler_State)(user)
+		if channel < 0 || channel >= 2 {
+			st.bad_uv += 1
+			return {}
+		}
+		st.calls[channel] += 1
+		fx := uv.x * f32(st.lw) - 0.5
+		fy := uv.y * f32(st.lh) - 0.5
+		px := int(math.round(fx))
+		py := int(math.round(fy))
+		if abs(fx - f32(px)) > 1e-4 || abs(fy - f32(py)) > 1e-4 {
+			st.bad_uv += 1
+			return {}
+		}
+		qx, qy := px &~ 1, py &~ 1
+		if !(qx + 1 >= st.start_x && qx < st.end_x && qy + 1 >= st.start_y && qy < st.end_y) {
+			st.bad_uv += 1
+		}
+		return {uv.x, uv.y, f32(channel), 1}
+	}
+
+	SENTINEL :: [4]f32{-77.0, 88.0, -99.0, 11.0}
+	scratch := temp_scratch()
+
+	Rect :: struct {
+		x, y, w, h: int,
+	}
+	// Powers-of-two denominators aren't needed because `region_cb` checks within 1e-4, so odd layer sizes work directly.
+	for dims in ([4][2]int{{5, 5}, {9, 7}, {13, 11}, {12, 10}}) {
+		LW, LH := dims[0], dims[1]
+		sizes := [2][3]i32{{i32(LW), i32(LH), 1}, {i32(LW), i32(LH), 1}}
+		rects := [?]Rect {
+			{0, 0, LW, LH},       // full odd/even layer
+			{1, 1, 4, 2},         // odd start (1,1), odd end (5,3) -> 3x2 quads (hits exec == 0x0F on right batch!)
+			{1, 1, 1, 1},         // 1x1 at odd (1,1) -> 1x1 quad (hits exec == 0x0F!)
+			{1, 1, 2, 3},         // odd start (1,1), odd end x=3, even end y=4 -> 2x2 quads
+			{3, 1, LW - 4, LH - 2}, // odd start (3,1) to (LW-1, LH-1)
+			{0, 1, 5, 3},         // 5 wide (3 quad cols -> exec == 0x0F!), odd y
+		}
+		for rc in rects {
+			if rc.w <= 0 || rc.h <= 0 || rc.x + rc.w > LW || rc.y + rc.h > LH {
+				continue
+			}
+			sx, sy := rc.x, rc.y
+			ex, ey := rc.x + rc.w, rc.y + rc.h
+			nq_x, nq_y := 0, 0
+			for qx := sx &~ 1; qx < ex; qx += 2 {
+				if qx + 1 >= sx {nq_x += 1}
+			}
+			for qy := sy &~ 1; qy < ey; qy += 2 {
+				if qy + 1 >= sy {nq_y += 1}
+			}
+			want_calls := 4 * nq_x * nq_y
+
+			full_j := make([][4]f32, LW * LH, context.temp_allocator)
+			full_i := make([][4]f32, LW * LH, context.temp_allocator)
+			for use_reg in ([2]bool{false, true}) {
+				st_j := Region_Sampler_State{lw = LW, lh = LH, start_x = sx, start_y = sy, end_x = ex, end_y = ey}
+				st_i := st_j
+
+				n_out := rc.w * rc.h if use_reg else LW * LH
+				bj := make([][4]f32, n_out, context.temp_allocator)
+				bi := make([][4]f32, n_out, context.temp_allocator)
+				for &px in bj {px = SENTINEL}
+				for &px in bi {px = SENTINEL}
+				tj := [1][][4]f32{bj}
+				ti := [1][][4]f32{bi}
+
+				opts_j := Run_Options{
+					sampler        = region_cb,
+					user           = &st_j,
+					x              = rc.x,
+					y              = rc.y,
+					w              = rc.w,
+					h              = rc.h,
+					region_targets = use_reg,
+					channel_sizes  = sizes[:],
+				}
+				opts_i := opts_j
+				opts_i.user = &st_i
+
+				run_targets(&m.program, nil, LW, LH, tj[:], scratch, opts_j)
+				run_targets(&p_int, nil, LW, LH, ti[:], scratch, opts_i)
+
+				testing.expect_value(t, st_j.calls[0], want_calls)
+				testing.expect_value(t, st_j.calls[1], want_calls)
+				testing.expect_value(t, st_j.bad_uv, 0)
+				testing.expect_value(t, st_i.calls[0], want_calls)
+				testing.expect_value(t, st_i.calls[1], want_calls)
+				testing.expect_value(t, st_i.bad_uv, 0)
+				testing.expect(t, slice.equal(slice.reinterpret([]u32, bj), slice.reinterpret([]u32, bi)))
+
+				if !use_reg {
+					copy(full_j, bj)
+					copy(full_i, bi)
+				} else {
+					for ry in 0 ..< rc.h {
+						row_got := bj[ry * rc.w:(ry + 1) * rc.w]
+						row_ref := full_j[(rc.y + ry) * LW + rc.x:][:rc.w]
+						testing.expect(t, slice.equal(slice.reinterpret([]u32, row_got), slice.reinterpret([]u32, row_ref)))
+					}
+				}
+			}
+		}
+	}
+}
 
