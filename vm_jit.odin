@@ -607,6 +607,9 @@ vpbroadcastd_mem :: #force_inline proc(buf: ^[dynamic]u8, dst, base: u8, disp: i
 @(private) OFF_CI_TOP :: i32(offset_of(Chan_Img, top))
 @(private) OFF_CI_UNORM :: i32(offset_of(Chan_Img, unorm))
 @(private) OFF_CI_LEVELS :: i32(offset_of(Chan_Img, levels))
+@(private) OFF_CI_NLAYERS :: i32(offset_of(Chan_Img, n_layers))
+@(private) OFF_CI_LTOP :: i32(offset_of(Chan_Img, ltop))
+@(private) OFF_CI_LPITCH :: i32(offset_of(Chan_Img, lpitch))
 @(private) OFF_LV_PTR :: i32(offset_of(Chan_Level, ptr))
 @(private) OFF_LV_MIS :: i32(offset_of(Chan_Level, mis))
 @(private) OFF_LV_PITCH :: i32(offset_of(Chan_Level, pitch))
@@ -927,6 +930,7 @@ emit_chan_gather_rgba :: proc(buf: ^[dynamic]u8, chan_base: u8, chan_disp: i32, 
 @(private) SF_WL :: i32(96)  // and l0 + 1's weight of 256
 @(private) SF_X0 :: i32(128)
 @(private) SF_X1 :: i32(160)
+@(private) SF_LAYER :: i32(192) // each lane's layer
 @(private) SF_Y0 :: i32(224) // rows: y * pitch
 @(private) SF_Y1 :: i32(256)
 @(private) SF_TX :: i32(320) // the weights as fractions, w / 256
@@ -1001,12 +1005,14 @@ emit_chan_axis :: proc(buf: ^[dynamic]u8, ax: i32, f_c, f_i0, f_i1, f_w: i32, ne
 	vop38_d(buf, 0x39, 4, 4, 0)
 	x_land(buf, done)
 	if ax == 1 {
-		// Rows: y * pitch, for the texels' indexes y * pitch + x.
+		// Rows: y * pitch (and the layer's offset), for the texels'
+		// indexes y * pitch + x.
 		vpbroadcastd_mem(buf, 0, GPR_RSI, OFF_LV_PITCH)
 		vop38_d(buf, 0x40, 4, 4, 0)
 		if !nearest {
 			vop38_d(buf, 0x40, 5, 5, 0)
 		}
+		emit_chan_layer_rows(buf, SF_LAYER, 4, 0 if nearest else 5, 0)
 	}
 	x_st(buf, GPR_RSP, f_i0, 4)
 	if !nearest {
@@ -1018,6 +1024,26 @@ emit_chan_axis :: proc(buf: ^[dynamic]u8, ax: i32, f_c, f_i0, f_i1, f_w: i32, ne
 		x_st(buf, GPR_RSP, f_i1, 5)
 		x_st(buf, GPR_RSP, f_w, 6)
 	}
+}
+
+// With layers (n_layers > 1): ymm(a) (and ymm(b) unless it is 0) += each
+// lane's layer at [rsp + f_layer] times level r9d's layer pitch, through
+// ymm(t). Clobbers eax.
+@(private)
+emit_chan_layer_rows :: proc(buf: ^[dynamic]u8, f_layer: i32, a, b, t: u8) {
+	emit_b(buf, 0x83) // cmp dword [rdi + n_layers], 1
+	emit_modrm_mem(buf, 7, GPR_RDI, OFF_CI_NLAYERS)
+	emit_b(buf, 1)
+	one := x_jump(buf, JCC_JBE)
+	emit_bytes(buf, 0x42, 0x8B, 0x84, 0x8F) // mov eax, [rdi + r9 * 4 + lpitch]
+	emit_i32(buf, OFF_CI_LPITCH)
+	x_bcast_gpr(buf, t, GPR_RAX)
+	x_d38_m(buf, 0x40, t, t, GPR_RSP, f_layer) // vpmulld
+	vop_d(buf, 0xFE, a, a, t)
+	if b != 0 {
+		vop_d(buf, 0xFE, b, b, t)
+	}
+	x_land(buf, one)
 }
 
 // Decodes the texel at ([rsp + f_x], [rsp + f_y]) of level rsi into ymm0..3.
@@ -1262,8 +1288,9 @@ emit_chan_bilinear_sub :: proc(buf: ^[dynamic]u8, fma: bool) {
 	emit_i32(buf, BF_FRAME)
 	x_st(buf, GPR_RSP, BF_U, 0)
 	x_st(buf, GPR_RSP, BF_V, 1)
-	emit_bytes(buf, 0x48, 0x8D, 0x77) // lea rsi, [rdi + levels]
-	emit_b(buf, u8(OFF_CI_LEVELS))
+	emit_b(buf, 0x48) // lea rsi, [rdi + levels]
+	emit_b(buf, 0x8D)
+	emit_modrm_mem(buf, GPR_RSI, GPR_RDI, OFF_CI_LEVELS)
 	if fma {
 		x_cmp_b(buf, GPR_RDI, OFF_CI_LIN_F32, 0)
 		wide := x_jump(buf, JCC_JNE)
@@ -1320,7 +1347,8 @@ emit_chan_bilinear_sub :: proc(buf: ^[dynamic]u8, fma: bool) {
 }
 
 // sample_sub: texture(), textureLod and textureGrad of a bound channel.
-//   in:  ymm0 = u, ymm1 = v, ymm2 = lod, rdi = ^Chan_Img, dl = live components
+//   in:  ymm0 = u, ymm1 = v, ymm2 = lod, ymm3 = the layer (with layers:
+//        clamped, as i32), rdi = ^Chan_Img, dl = live components
 //   out: ymm0..3; preserves rbx, rbp, r12..r14 and ymm8..15.
 @(private)
 emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma: bool) {
@@ -1329,8 +1357,9 @@ emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma
 	// registers, the texel decoded.
 	x_cmp_b(buf, GPR_RDI, OFF_CI_ROUTE, 0)
 	general := x_jump(buf, JCC_JNE)
-	emit_bytes(buf, 0x48, 0x8D, 0x77) // lea rsi, [rdi + levels]
-	emit_b(buf, u8(OFF_CI_LEVELS))
+	emit_b(buf, 0x48) // lea rsi, [rdi + levels]
+	emit_b(buf, 0x8D)
+	emit_modrm_mem(buf, GPR_RSI, GPR_RDI, OFF_CI_LEVELS)
 	if fma {
 		x_cmp_b(buf, GPR_RDI, OFF_CI_NEAR_ROUTE, 1)
 		wide := x_jump(buf, JCC_JNE)
@@ -1352,6 +1381,7 @@ emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma
 	emit_i32(buf, SF_FRAME)
 	x_st(buf, GPR_RSP, SF_U, 0)
 	x_st(buf, GPR_RSP, SF_V, 1)
+	x_st(buf, GPR_RSP, SF_LAYER, 3)
 
 	// Levels: l0 and l0 + 1's weight w per lane (Channel_Image), the levels
 	// some lane uses as bits in r8d; r10d = 1 with more than one level.
@@ -1484,12 +1514,14 @@ emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma
 @(private) FF_LOD :: i32(64)
 @(private) FF_R :: i32(96) // [4] results
 @(private) FF_M :: i32(224) // this level's lanes in range
-@(private) FF_FRAME :: i32(256)
+@(private) FF_LAYER :: i32(256)
+@(private) FF_FRAME :: i32(288)
 
 // fetch_sub: texelFetch of a bound channel, each lane's texel at its level,
 // (0, 0, 0, 0) out of range.
-//   in:  ymm0 = x, ymm1 = y, ymm2 = level, rdi = ^Chan_Img, dl = live
-//        components, dh bit 0 = flip y
+//   in:  ymm0 = x, ymm1 = y, ymm2 = level (a layer outside the image's as
+//        a level outside its levels), ymm3 = layer (read with layers
+//        only), rdi = ^Chan_Img, dl = live components, dh bit 0 = flip y
 //   out: ymm0..3; preserves rbx, rbp, r12..r14 and ymm8..15.
 @(private)
 emit_chan_fetch_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int) {
@@ -1497,6 +1529,7 @@ emit_chan_fetch_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int) {
 	emit_i32(buf, FF_FRAME)
 	x_st(buf, GPR_RSP, FF_X, 0)
 	x_st(buf, GPR_RSP, FF_Y, 1)
+	x_st(buf, GPR_RSP, FF_LAYER, 3)
 	x_st(buf, GPR_RSP, FF_LOD, 2)
 	x_live_held(buf)
 	vzero(buf, 0)
@@ -1538,6 +1571,7 @@ emit_chan_fetch_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int) {
 	vpbroadcastd_mem(buf, 5, GPR_RSI, OFF_LV_PITCH)
 	vop38_d(buf, 0x40, 4, 1, 5)
 	vop_d(buf, 0xFE, 4, 4, 0)
+	emit_chan_layer_rows(buf, FF_LAYER, 4, 0, 5)
 	vop_d(buf, 0xDB, 4, 4, 2) // other lanes read texel 0
 	x_st(buf, GPR_RSP, FF_M, 2)
 	x_call(buf, decode_calls)
@@ -2308,7 +2342,8 @@ jit_help_texel_fetch :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bou
 				continue
 			}
 			flod := f32(lb[l]) if uint_lod else f32(i32(lb[l]))
-			c := opts.sampler(opts.user, ch, {ux[l], uy[l]}, flod, 0)
+			layer := int(i32(slots[in_.a + 2][l])) if in_.n == 3 else 0
+			c := opts.sampler(opts.user, ch, {ux[l], uy[l]}, flod, layer)
 			for i in 0 ..< i32(4) {
 				slots[dst + i][l] = fbits(c[i])
 			}
@@ -2333,7 +2368,7 @@ jit_help_texture_size :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bo
 	ch := int(in_.k)
 	chan_imgs := ([^]Chan_Img)(uintptr(slots) - JIT_CHAN_BYTES)
 	if im := &chan_imgs[ch]; im.ptr != nil {
-		bound_size_lanes(im, in_.d != 0, raw_data(&slots[in_.a]), raw_data(&slots[in_.dst]), raw_data(&slots[in_.dst + 1]), JIT_LANES)
+		bound_size_lanes(im, in_.d != 0, raw_data(&slots[in_.a]), raw_data(&slots[in_.dst]), raw_data(&slots[in_.dst + 1]), raw_data(&slots[in_.dst + 2]) if in_.n == 3 else nil, JIT_LANES)
 		return
 	}
 	opts := ctx.opts
@@ -4337,6 +4372,15 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 						}
 					}
 				}
+				if in_.n == 3 {
+					// A sampler2DArray's layer coordinate in memory, for the stub.
+					for &cs, idx in e.cache {
+						if cs.slot == a + 2 && cs.dirty {
+							vmovaps_store(&e.buf, a + 2, u8(8 + idx))
+							cs.dirty = false
+						}
+					}
+				}
 			}
 			chan_disp := i32(in_.k) * size_of(Chan_Img) - JIT_CHAN_BYTES
 			emit_bytes(&e.buf, 0x48, 0x8B) // mov rsi, [rbx + chan_disp + OFF_CHAN_PTR]
@@ -4707,7 +4751,21 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 		chan_disp := i32(in_.k) * size_of(Chan_Img) - JIT_CHAN_BYTES
 		emit_bytes(&e.buf, 0x48, 0x8D) // lea rdi, [rbx + chan_disp]
 		emit_modrm_mem(&e.buf, GPR_RDI, GPR_RBX, chan_disp)
-		if in_.op == .Texel_Fetch {
+		if in_.op == .Texel_Fetch && in_.n == 3 {
+			// A sampler2DArray's: its layer p.z, outside [0, n_layers) as a
+			// level outside the levels (all ones).
+			vmovaps_load(&e.buf, 3, in_.a + 2)
+			vpbroadcastd_mem(&e.buf, 5, GPR_RDI, OFF_CI_NLAYERS)
+			vop_d_tab(&e.buf, 0xFA, 5, 5, OFF_TAB_ONE_U)
+			vop38_d(&e.buf, 0x3B, 6, 3, 5) // vpminud
+			vop_d(&e.buf, 0x76, 6, 6, 3)   // in range
+			vop_d(&e.buf, 0x76, 7, 7, 7)
+			vop_d(&e.buf, 0xEF, 6, 6, 7)
+			vop_d(&e.buf, 0xEB, 2, 2, 6)
+			emit_b(&e.buf, 0xBA) // mov edx, live components | flip y << 8
+			emit_u32(&e.buf, u32(stub.comp_mask) | u32(in_.d & 1) << 8)
+			x_call(&e.buf, &e.fetch_calls)
+		} else if in_.op == .Texel_Fetch {
 			// F32 with one level: inline, the texel at level 0 or 0 (rsi = its texels).
 			x_cmp_b(&e.buf, GPR_RDI, OFF_CI_FETCH_ROUTE, 0)
 			general := x_jump(&e.buf, JCC_JNE)
@@ -4782,6 +4840,17 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 				emit_bytes(&e.buf, 0x48, 0x8D)
 				emit_modrm_mem(&e.buf, GPR_RDI, GPR_RBX, chan_disp)
 				x_land(&e.buf, one)
+			}
+			if in_.n == 3 {
+				// A sampler2DArray's layer: clamp(round_even(r), 0,
+				// layers - 1), NaN as 0 (bound_layer).
+				vmovaps_load(&e.buf, 3, in_.a + 2)
+				vroundps(&e.buf, 3, 3, 0x08)
+				vzero(&e.buf, 4)
+				vop_ps(&e.buf, 0x5F, 3, 3, 4)
+				vbroadcastss_mem(&e.buf, 4, GPR_RDI, OFF_CI_LTOP)
+				vop_ps(&e.buf, 0x5D, 3, 3, 4)
+				x_ps2dq_t(&e.buf, 3, 3)
 			}
 			emit_b(&e.buf, 0xBA) // mov edx, live components
 			emit_u32(&e.buf, u32(stub.comp_mask))

@@ -2735,7 +2735,8 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	case .Texel_Fetch:
 		rules := PROFILE_RULES[u.profile]
 		flags := i32(rules.flip_y) | (i32(rules.header) << 1) | (i32(vals[2].t.base == .Uint) << 2)
-		emit(l, .Texel_Fetch, n = 2, k = int(vals[0].slot), d = flags, dst = s, a = vals[1].slot, b = vals[2].slot, c = vals[3].slot if rules.header else vals[2].slot)
+		// n: 3 for a sampler2DArray's, its layer at a + 2.
+		emit(l, .Texel_Fetch, n = cc(l, vals[1].t), k = int(vals[0].slot), d = flags, dst = s, a = vals[1].slot, b = vals[2].slot, c = vals[3].slot if rules.header else vals[2].slot)
 	case .Texture:
 		emit(l, .Texture_Bias, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
 	case .Texture_Size:

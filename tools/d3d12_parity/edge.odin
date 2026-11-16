@@ -220,6 +220,20 @@ void main() {
         o = vec4(ps[pix[px]].a, ps[pix[px]].b, ps[big].b);
     }
 }`, glsl = true, f32 = true},
+	// texelFetch of a sampler2DArray (its layer in z) and of a sampler2D at levels 0-2, and textureSize's layers.
+	{name = "edge_fetch_layers", source = `#version 310 es
+precision highp float;
+uniform sampler2DArray layers;
+uniform sampler2D plain;
+out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    int lod = (p.x / 64) % 3;
+    int z = (p.y / 16) % 3;
+    ivec2 q = ivec2(p.x % (64 >> lod), p.y % (64 >> lod));
+    vec3 size = vec3(textureSize(layers, lod));
+    o = texelFetch(layers, ivec3(q, z), lod) * 0.5 + texelFetch(plain, q, lod) * 0.25 + vec4(size.xy / 256.0, size.z / 12.0, 0.25);
+}`, glsl = true},
 	// textureGrad with different x and y gradients, cross of vectors that are not symmetric.
 	{name = "edge_grad_cross", source = `void mainImage(out vec4 c, in vec2 f) {
     vec2 uv = f / iResolution.xy;

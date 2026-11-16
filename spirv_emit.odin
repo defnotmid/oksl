@@ -929,7 +929,14 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		rules := PROFILE_RULES[u.profile]
 		v2 := vec_type(.Float, 2)
 		v2t := type_id(s, v2)
-		pf := convert(s, args[1], types[1], v2)
+		arr := at == T_SAMPLER_ARRAY
+		p := args[1]
+		iv2 := vec_type(.Int, 2)
+		if arr {
+			// A sampler2DArray's: (x, y) as a sampler2D's, its layer p.z.
+			p = swizzle_value(s, args[1], types[1], {0, 1, 0, 0}, 2)
+		}
+		pf := convert(s, p, iv2 if arr else types[1], v2)
 		half := const_f32(s, 0.5)
 		centre := binop_raw(s, .F_Add, v2t, pf, construct(s, v2t, half, half))
 		sz: u32
@@ -943,10 +950,15 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 			sampled := new_id(s)
 			inst(&s.body, .Load, type_id(s, at), sampled, args[0])
 			qimg := new_id(s)
-			inst(&s.body, .Image, s.t_image[0], qimg, sampled)
-			iv2 := vec_type(.Int, 2)
+			inst(&s.body, .Image, s.t_image[int(arr)], qimg, sampled)
 			isz := new_id(s)
-			inst(&s.body, .Image_Query_Size_Lod, type_id(s, iv2), isz, qimg, args[2])
+			if arr {
+				iv3 := vec_type(.Int, 3)
+				inst(&s.body, .Image_Query_Size_Lod, type_id(s, iv3), isz, qimg, args[2])
+				isz = swizzle_value(s, isz, iv3, {0, 1, 0, 0}, 2)
+			} else {
+				inst(&s.body, .Image_Query_Size_Lod, type_id(s, iv2), isz, qimg, args[2])
+			}
 			sz = convert(s, isz, iv2, v2)
 		}
 		uv := binop_raw(s, .F_Div, v2t, centre, sz)
@@ -956,6 +968,10 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 			uv = binop_raw(s, .F_Add, v2t, binop_raw(s, .F_Mul, v2t, uv, scale), offset)
 		}
 		flod := convert(s, args[2], types[2], T_FLOAT)
+		if arr {
+			layer := convert(s, swizzle_value(s, args[1], types[1], {2, 0, 0, 0}, 1), T_INT, T_FLOAT)
+			uv = construct(s, type_id(s, vec_type(.Float, 3)), extract(s, type_id(s, T_FLOAT), uv, 0), extract(s, type_id(s, T_FLOAT), uv, 1), layer)
+		}
 		img := new_id(s)
 		inst(&s.body, .Load, type_id(s, at), img, args[0])
 		r := new_id(s)

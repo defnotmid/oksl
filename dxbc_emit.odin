@@ -2147,6 +2147,10 @@ dx_texture :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 			fy.neg = true
 			dx_ins(&d.code, .Add, 0, uv2, 0x2, dx_imm_f(1), fy)
 		}
+		if expr_type(u, argx[0]) == T_SAMPLER_ARRAY {
+			// A sampler2DArray's layer p.z, in z.
+			dx_ins(&d.code, .Itof, 0, uv2, 0x4, dx_comp(args[0], 2))
+		}
 		flod := dx_op(d, .Utof if expr_type(u, argx[2]).base == .Uint else .Itof, 1, dx_comp(args[1], 0))
 		return dx_sample(d, .Sample_L, ch, uv2, {dx_comp(flod, 0)})
 	}

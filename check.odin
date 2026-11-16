@@ -2577,10 +2577,12 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		return check_builtin(c, id, .Texture_Grad)
 	}
 	if e.name == "texelFetch" {
-		if st != T_SAMPLER {
+		// A sampler2DArray's takes ivec3 (its layer in z), outside the
+		// inputs header's profiles (whose channels are sampler2Ds).
+		if st != T_SAMPLER && (st != T_SAMPLER_ARRAY || c.rules.header) {
 			return no_overload(c, e, args)
 		}
-		p, ok := coerce(c, args[1], iv2)
+		p, ok := coerce(c, args[1], vec_type(.Int, 3) if st == T_SAMPLER_ARRAY else iv2)
 		if !ok || !is_integer_base(expr_type(u, args[2]).base) || !is_scalar(expr_type(u, args[2])) {
 			return no_overload(c, e, args)
 		}

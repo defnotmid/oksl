@@ -313,9 +313,320 @@ bound_compare :: proc(m: ^oksl.Module, im: oksl.Channel_Image, queries: [][4]f32
 	return fmt.tprintf("worst %.3g, exact %.2f%%, over %.2g: %d", worst, 100 * f64(exact) / f64(W * H * 4), tol, bad), bad == 0
 }
 
+// ---- layered bound images (bound_layers_compare) -------------------------------------------
+
+// The bound format images with BOUND_LAYERS layers: layer 0 is
+// bound_fmt_texels', the others their own pseudo-random texels; packed for
+// the CPU as each level's layers one after another.
+BOUND_LAYERS :: 3
+bound_layer_texels: [4][BOUND_LAYERS][BOUND_FMT_LEVELS][]u8
+bound_layer_packed: [4][BOUND_FMT_LEVELS][]u8
+// What BOUND_LAYERS_FRAG samples at each pixel: (u, v, lod, layer), or
+// with lod <= -1000 texelFetch's (x, y, -1000 - level, layer).
+bound_layer_queries: [W * H][4]f32
+
+make_bound_layer_data :: proc() {
+	state := u32(777)
+	next :: proc(s: ^u32) -> u32 {
+		s^ = s^ * 1664525 + 1013904223
+		return s^ >> 8
+	}
+	formats := BOUND_FORMATS
+	for f, fi in formats {
+		for k in 0 ..< BOUND_LAYERS {
+			for l in 0 ..< BOUND_FMT_LEVELS {
+				if k == 0 {
+					bound_layer_texels[fi][k][l] = bound_fmt_texels[fi][l]
+					continue
+				}
+				b := make([]u8, len(bound_fmt_texels[fi][l]))
+				if f == .Rgba16f {
+					for i := 0; i < len(b); i += 2 {
+						hv := transmute(u16)f16(f32(i32(next(&state) & 0xffff) - 0x8000) / 8192)
+						b[i], b[i + 1] = u8(hv), u8(hv >> 8)
+					}
+				} else {
+					for &x in b {
+						x = u8(next(&state))
+					}
+				}
+				bound_layer_texels[fi][k][l] = b
+			}
+		}
+		for l in 0 ..< BOUND_FMT_LEVELS {
+			n := len(bound_fmt_texels[fi][l])
+			b := make([]u8, n * BOUND_LAYERS)
+			for k in 0 ..< BOUND_LAYERS {
+				copy(b[k * n:], bound_layer_texels[fi][k][l])
+			}
+			bound_layer_packed[fi][l] = b
+		}
+	}
+	// Quarter by quarter: magnified at every tie of the layer coordinate
+	// and either side of it; minified across the levels at random layers;
+	// NaN, infinite, huge and negative layers; texelFetch at in-range
+	// texels, levels and layers.
+	specials := [?]f32{math.nan_f32(), math.inf_f32(1), math.inf_f32(-1), 1e30, -1e30, -0.0, 0.5, 1.5, 2.5, -0.5, 3.5, 0.49999997, 0.50000006, 1.4999999, 1.5000001}
+	for &q, i in bound_layer_queries {
+		x, y := i % W, i / W
+		r0, r1, r2 := f32(next(&state)) / 16777216, f32(next(&state)) / 16777216, f32(next(&state)) / 16777216
+		switch (y * 4) / H {
+		case 0:
+			t := f32(x % 12) * 0.5 - 1.5
+			e := [3]f32{0, 1.2e-7, -1.2e-7}
+			q = {r0 * 1.6 - 0.3, r1 * 1.6 - 0.3, 0, t + e[y % 3] * max(1, abs(t))}
+		case 1:
+			q = {r0 * 1.4 - 0.2, r1 * 1.4 - 0.2, r2 * (BOUND_FMT_LEVELS + 0.5) - 0.5, f32(next(&state) % 900) / 150 - 1.5}
+		case 2:
+			q = {r0 * 1.4 - 0.2, r1 * 1.4 - 0.2, r2 * 3 - 0.5, specials[(x + y) % len(specials)]}
+		case:
+			l := int(next(&state) % BOUND_FMT_LEVELS)
+			w, h := bound_fmt_size(l)
+			q = {f32(next(&state) % u32(w)), f32(next(&state) % u32(h)), -1000 - f32(l), f32(next(&state) % BOUND_LAYERS)}
+		}
+	}
+}
+
+// Format fi's layered image with `filter` and `wrap`, all its levels.
+bound_layer_image :: proc(fi: int, filter: oksl.Channel_Filter, wrap: [2]oksl.Channel_Wrap) -> oksl.Channel_Image {
+	levels := make([]oksl.Channel_Level, BOUND_FMT_LEVELS - 1, context.temp_allocator)
+	for &lv, i in levels {
+		w, h := bound_fmt_size(i + 1)
+		lv = {texels = bound_layer_packed[fi][i + 1], width = w, height = h}
+	}
+	formats := BOUND_FORMATS
+	return {format = formats[fi], pixels = bound_layer_packed[fi][0], width = BOUND_FMT_W, height = BOUND_FMT_H, filter = filter, wrap = wrap, levels = levels, layers = BOUND_LAYERS}
+}
+
+// Samples the layered image at each pixel's query.
+BOUND_LAYERS_FRAG :: `#version 310 es
+precision highp float;
+readonly buffer Q { vec4 q[]; };
+uniform sampler2DArray s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 c = q[p.y * 256 + p.x];
+    if (c.z <= -1000.0) {
+        o = texelFetch(s, ivec3(c.xyw), int(-1000.0 - c.z));
+    } else {
+        o = textureLod(s, c.xyw, c.z);
+    }
+}`
+
+// One draw of BOUND_LAYERS_FRAG with a layered format image against the
+// CPU (bound_compare).
+bound_layers_compare :: proc(m: ^oksl.Module, fi: int, filter: oksl.Channel_Filter, wrap: [2]oksl.Channel_Wrap, gpu_f: [][4]f32, scratch: ^oksl.Scratch, metal: bool) -> (string, bool) {
+	return bound_compare(m, bound_layer_image(fi, filter, wrap), bound_layer_queries[:], gpu_f, scratch, metal)
+}
+
+// ---- built levels (built_levels_compare) --------------------------------------------------
+
+// The formats and sizes (width, height, layers) built_levels checks
+// channel_build_levels against GenerateMipmapsForGPUTexture with: even,
+// odd and 1-pixel sizes, 1280 x 720 and 960 x 540 as o3d's frame maps.
+Built_Format :: struct {
+	format: oksl.Channel_Format,
+	comps:  int,
+}
+BUILT_FORMATS :: [7]Built_Format{{.Rgba8, 0}, {.Gray8, 0}, {.Gray16, 0}, {.Rgba16f, 0}, {.F32, 1}, {.F32, 2}, {.F32, 4}}
+BUILT_SIZES :: [?][3]int{{37, 23, 2}, {64, 32, 1}, {1, 37, 1}, {37, 1, 1}, {2, 1, 1}, {5, 7, 1}, {15, 15, 1}, {513, 5, 1}, {257, 3, 1}, {300, 200, 1}, {960, 540, 1}, {1280, 720, 1}}
+
+// n bytes, 16-byte aligned (a []u8 from an arena may start anywhere; the
+// formats read u16 and f32).
+built_bytes :: proc(n: int, allocator := context.allocator) -> []u8 {
+	return slice.to_bytes(make([][4]u32, (n + 15) / 16, allocator))[:n]
+}
+
+built_texel_bytes :: proc(bf: Built_Format) -> int {
+	switch bf.format {
+	case .F32:     return 4 * bf.comps
+	case .Rgba8:   return 4
+	case .Gray8:   return 1
+	case .Gray16:  return 2
+	case .Rgba16f: return 8
+	}
+	return 0
+}
+
+built_components :: proc(bf: Built_Format) -> int {
+	return bf.comps if bf.format == .F32 else (4 if bf.format == .Rgba8 || bf.format == .Rgba16f else 1)
+}
+
+// Level 0 of the size's image, its layers one after another: bytes,
+// halves in [-4, 4] (one in 64 times 15000 larger), floats in [-4, 4].
+built_level0 :: proc(bf: Built_Format, size: [3]int, seed: u32) -> []u8 {
+	state := seed * 2654435761 + 1
+	next :: proc(s: ^u32) -> u32 {
+		s^ = s^ * 1664525 + 1013904223
+		return s^ >> 8
+	}
+	b := built_bytes(size[0] * size[1] * size[2] * built_texel_bytes(bf))
+	#partial switch bf.format {
+	case .Rgba16f:
+		for i := 0; i < len(b); i += 2 {
+			v := f32(next(&state)) / 2097152 - 4
+			if next(&state) % 64 == 0 {
+				v *= 15000
+			}
+			(^f16)(&b[i])^ = f16(v)
+		}
+	case .F32:
+		for i := 0; i < len(b); i += 4 {
+			(^f32)(&b[i])^ = f32(next(&state)) / 2097152 - 4
+		}
+	case:
+		for &x in b {
+			x = u8(next(&state) >> 16) // the LCG's top bits
+		}
+	}
+	return b
+}
+
+// A component of texel i of a level (`bytes`, its layers one after
+// another) as the GPU reads it: unorm as its integer, halves and floats.
+built_value :: proc(bf: Built_Format, bytes: []u8, i, k: int) -> f64 {
+	tb := built_texel_bytes(bf)
+	p := bytes[i * tb:]
+	switch bf.format {
+	case .F32:     return f64((^f32)(&p[4 * k])^)
+	case .Rgba8:   return f64(p[k])
+	case .Gray8:   return f64(p[0])
+	case .Gray16:  return f64(u16(p[0]) | u16(p[1]) << 8)
+	case .Rgba16f: return f64(f32((^f16)(&p[2 * k])^))
+	}
+	return 0
+}
+
+// Two values apart in the format's steps: unorm integers, halves' and
+// floats' ulps.
+built_steps :: proc(bf: Built_Format, a, b: f64) -> f64 {
+	if a == b || (a != a && b != b) {
+		return 0
+	}
+	#partial switch bf.format {
+	case .Rgba8, .Gray8, .Gray16:
+		return abs(a - b)
+	case .Rgba16f:
+		ord16 :: proc(x: f64) -> i64 {
+			h := transmute(u16)f16(f32(x))
+			return i64(h & 0x7fff) if h & 0x8000 == 0 else -i64(h & 0x7fff)
+		}
+		return f64(abs(ord16(a) - ord16(b)))
+	}
+	ord32 :: proc(x: f64) -> i64 {
+		u := transmute(u32)f32(x)
+		return i64(u & 0x7fffffff) if u & 0x80000000 == 0 else -i64(u & 0x7fffffff)
+	}
+	return f64(abs(ord32(a) - ord32(b)))
+}
+
+// How far one format's built levels are from the GPU's.
+Built_Stats :: struct {
+	total, exact, one: int, // components, equal, within one step
+	worst_steps:       f64, // each level built from the GPU's level above
+	worst_chain:       f64, // the whole chain built from level 0
+	worst_rel:         f64, // |cpu - gpu| over the largest of its four parents
+	over:              int, // past the tolerance (built_levels_compare)
+	worst_where:       string,
+	unwritten:         [dynamic]string, // levels the GPU left as they were
+}
+
+built_stats_destroy :: proc(st: ^Built_Stats) {
+	delete(st.worst_where)
+	for s in st.unwritten {
+		delete(s)
+	}
+	delete(st.unwritten)
+}
+
+// One size of format bf against the GPU's levels `gpu` (each level's
+// layers one after another; written[l] false where the GPU left level l
+// as it was): channel_build_levels from each GPU level the one below
+// (the rule, step by step) and from level 0 (the chain). A component
+// passes within a weight step of its four parents' spread plus two of
+// the format's steps (RADV writes halves toward zero and filters them in
+// less than f32's precision: Rgba16f also 2e-3 of the largest parent).
+built_levels_compare :: proc(bf: Built_Format, size: [3]int, gpu: [][]u8, written: []bool, st: ^Built_Stats) {
+	w0, h0, layers := size[0], size[1], size[2]
+	n := len(gpu)
+	tb := built_texel_bytes(bf)
+	nc := built_components(bf)
+	chain := make([]oksl.Channel_Level, n - 1, context.temp_allocator)
+	chain_bytes := built_bytes(oksl.channel_levels_bytes(bf.format, bf.comps, w0, h0, n, layers), context.temp_allocator)
+	oksl.channel_levels_layout(chain, chain_bytes, bf.format, bf.comps, w0, h0, layers)
+	image :: proc(bf: Built_Format, texels: []u8, w, h, layers: int, levels: []oksl.Channel_Level) -> oksl.Channel_Image {
+		im := oksl.Channel_Image{format = bf.format, components = bf.comps, width = w, height = h, layers = layers, levels = levels}
+		if bf.format == .F32 {
+			im.data = slice.reinterpret([]f32, texels)
+		} else {
+			im.pixels = texels
+		}
+		return im
+	}
+	oksl.channel_build_levels(image(bf, gpu[0], w0, h0, layers, chain))
+	for l in 1 ..< n {
+		pw, ph := max(w0 >> uint(l - 1), 1), max(h0 >> uint(l - 1), 1)
+		lw, lh := max(w0 >> uint(l), 1), max(h0 >> uint(l), 1)
+		if !written[l] {
+			append(&st.unwritten, fmt.aprintf("%dx%d L%d", w0, h0, l))
+			continue
+		}
+		step := built_bytes(lw * lh * layers * tb, context.temp_allocator)
+		one := [1]oksl.Channel_Level{{texels = step, width = lw, height = lh}}
+		oksl.channel_build_levels(image(bf, gpu[l - 1], pw, ph, layers, one[:]))
+		for k in 0 ..< layers {
+			for y in 0 ..< lh {
+				for x in 0 ..< lw {
+					i := (k * lh + y) * lw + x
+					// The parents the rule reads (its taps' clamped texels).
+					px0 := min(int(math.floor((f64(x) + 0.5) * f64(pw) / f64(lw) - 0.5)), pw - 1)
+					py0 := min(int(math.floor((f64(y) + 0.5) * f64(ph) / f64(lh) - 0.5)), ph - 1)
+					for c in 0 ..< nc {
+						g := built_value(bf, gpu[l], i, c)
+						v := built_value(bf, step, i, c)
+						lo, hi, big := math.INF_F64, -math.INF_F64, 0.0
+						for dy in 0 ..< 2 {
+							for dx in 0 ..< 2 {
+								p := built_value(bf, gpu[l - 1], (k * ph + min(py0 + dy, ph - 1)) * pw + min(px0 + dx, pw - 1), c)
+								lo, hi, big = min(lo, p), max(hi, p), max(big, abs(p))
+							}
+						}
+						d := built_steps(bf, v, g)
+						st.total += 1
+						if d == 0 {
+							st.exact += 1
+						} else if d <= 1 {
+							st.one += 1
+						}
+						unit := 1.0
+						#partial switch bf.format {
+						case .Rgba16f: unit = abs(v) * (1.0 / 1024) + 1.0 / 16777216
+						case .F32:     unit = abs(v) * (1.0 / 8388608) + 1e-45
+						}
+						tol := (hi - lo) / 256 + 2 * unit + (2e-3 * big if bf.format == .Rgba16f else 0)
+						if !(abs(v - g) <= tol) {
+							st.over += 1
+						}
+						st.worst_rel = max(st.worst_rel, abs(v - g) / max(big, 1e-30))
+						if d > st.worst_steps {
+							st.worst_steps = d
+							delete(st.worst_where)
+							st.worst_where = fmt.aprintf("%dx%d L%d layer %d (%d, %d)[%d]: cpu %v gpu %v", w0, h0, l, k, x, y, c, v, g)
+						}
+						cv := built_value(bf, chain[l - 1].texels, i, c)
+						st.worst_chain = max(st.worst_chain, built_steps(bf, cv, g))
+					}
+				}
+			}
+		}
+	}
+}
+
 make_data :: proc() {
 	make_bound_fmt_data()
 	make_bound_fetch_data()
+	make_bound_layer_data()
 	for &w, i in test_words {
 		w = transmute(u32)(f32((i * 37 + 11) % 256) / 255)
 	}

@@ -234,8 +234,10 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   layers) and `texelFetch` samples the texel's centre at its level, so
   both take sampler parameters too. A `sampler2DArray` takes `vec3(uv,
   layer)` in `texture`, `textureLod` and `textureGrad` (the layer rounded
-  to nearest even and clamped, as GPUs take it); `texelFetch` takes 2D
-  samplers only. `textureGrad(s, uv, dPdx, dPdy)` samples at the level
+  to nearest even and clamped, as GPUs take it; RADV does, not GLSL ES's
+  `floor(r + 0.5)`) and `ivec3(x, y, layer)` in `texelFetch` (GLSL
+  profiles; the GPU backends sample the texel's centre at that layer).
+  `textureGrad(s, uv, dPdx, dPdy)` samples at the level
   those derivatives pick, in any stage.
 - **Storage buffers:** in vertex and fragment shaders, read-only, GLSL ES
   3.1's block with one runtime-sized array: `layout(std430) readonly buffer
@@ -611,9 +613,10 @@ RGBA8, or `run_f32` for float RGBA, from the output at location 0;
 `Scratch` (registers and masks) grows to the largest program it has run,
 so runs that reuse one allocate nothing. `Run_Options` takes a
 sampler callback (`proc(user, channel, uv, lod, layer) -> [4]f32`; `.eval`
-passes lod 0; `layer` is a `sampler2DArray`'s, rounded to nearest even,
-for the host to clamp to its layers), the channels' sizes in texels (and
-layers), optional bound 2D images (`channel_images`, below), the
+passes lod 0; `layer` is a `sampler2DArray`'s, rounded to nearest even
+and saturated to an int (NaN as 0), or texelFetch's `p.z` as it is, for
+the host to clamp to its layers), the channels' sizes in texels (and
+layers), optional bound images (`channel_images`, below), the
 storage buffers' words (`buffers`, one `[]u32` per buffer in
 `Module.storage_buffers` order; a read past one gives 0 and a write past
 one is dropped), the compute storage images (`images`, one `Storage_Image`
@@ -804,13 +807,97 @@ levels, on the CPU as on the GPU), `max_lod` at or above the top level
 (`SDL_GPUSamplerCreateInfo`'s zero default pins every lookup to level 0;
 `tools/gpu_parity` sets 1000), and no anisotropy. A textureSize lod
 outside the levels (below 0 or past the top) differs: the CPU clamps it,
-GPU backends give 0 or an undefined size. Bindings are validated up front via `ensure` (a `sampler2DArray`
-channel, components, format, filter and wrap values, dimensions, strides,
-level sizes and counts, data lengths, 2-byte alignment for Gray16 and
-Rgba16f, 4-byte for F32 levels). An entry with neither `data` nor `pixels`, or past
-`len(channel_images)`, stays unbound and calls `Run_Options.sampler`
-(`sampler2DArray` and sRGB-decoding textures still need it), and bound and
-unbound channels may mix in the same pass.
+GPU backends give 0 or an undefined size. Bindings are validated up front via `ensure` (layers only on a
+`sampler2DArray` channel, components, format, filter and wrap values,
+dimensions, strides, layer strides, level sizes and counts, data lengths,
+2-byte alignment for Gray16 and Rgba16f, 4-byte for F32 levels). An entry
+with neither `data` nor `pixels`, or past `len(channel_images)`, stays
+unbound and calls `Run_Options.sampler` (sRGB-decoding textures still need
+it), and bound and unbound channels may mix in the same pass.
+
+**Layers.** A `sampler2DArray` channel binds a `Channel_Image` with
+`layers` (0 or 1: one), each layer the same size, format, wrap and levels,
+layer `i` of each level `i * layer_stride` bytes after the level's first
+texel (`Channel_Image.layer_stride` for level 0, `Channel_Level.layer_stride`
+for the others; 0: right after the layer before, `height` rows on):
+
+```odin
+// o3d's frame map: the light and the runs, each a whole chain, one after
+// the other in one table of halves.
+oksl.Channel_Image{format = .Rgba16f, pixels = light_bytes, width = w, height = h,
+	filter = .Linear, levels = levels, layers = 2, layer_stride = chain_bytes}
+```
+
+A sample reads layer `clamp(round_even(r), 0, layers - 1)` for its layer
+coordinate `r`, NaN as 0: what RADV reads at every tie from -8 to 20, a
+few ulps and 2^-1 to 2^-24 either side of each, NaN, the infinities and
+huge values (`tools/gpu_parity`'s `bound_layers`; GLSL ES 3.10's `floor(r
++ 0.5)` differs at 0.5, 2.5, ...). It is the layer the sampler callback
+gets, clamped to the layers. `texelFetch` reads layer `p.z`, `(0, 0, 0,
+0)` outside `[0, layers)` as for a texel outside its level; `textureSize`'s
+z is `layers`. A 2D image is the one-layer case of the same path in both
+engines; images with layers always take the general one (in the JIT the
+general sampling and fetch subroutines), while one-layer images keep the
+one-level shortcuts.
+
+**Building the levels.** `channel_build_levels(im)` fills `im.levels`
+from level 0 as SDL_GPU's `GenerateMipmapsForGPUTexture` does, each level
+from the one above and each layer on its own, into levels the caller owns
+and sizes, allocating nothing:
+
+```odin
+n := oksl.channel_level_count(w, h)               // the whole chain, at most 16
+buf := make([][4]f16, oksl.channel_levels_bytes(.Rgba16f, 0, w, h, n, layers) / 8)
+levels := make([]oksl.Channel_Level, n - 1)
+oksl.channel_levels_layout(levels, buf, .Rgba16f, 0, w, h, layers)
+im := oksl.Channel_Image{format = .Rgba16f, pixels = level0, width = w, height = h, layers = layers, levels = levels}
+oksl.channel_build_levels(im)
+```
+
+`channel_levels_layout` takes the texels as any slice type: allocated as
+`[][4]f16` (as here), `[]u16` or `[]f32`, they are aligned as the format
+reads them (2 bytes for Gray16 and Rgba16f, 4 for F32) on any allocator,
+where a `[]u8` from an arena or `context.temp_allocator` may start at any
+byte and fails the layout's alignment check.
+
+Texel `(x, y)` of a `w x h` level reads its `sw x sh` parent at its
+centre's coordinate, `(x + 0.5) * sw / w - 0.5` exactly (likewise y), the
+four texels around it clamped to the edge, blended by each axis's fraction
+rounded to 1/256 to nearest even (the sampling rule's weights), exactly,
+on the texels as the GPU reads them (`byte / 255`, `u16 / 65535`, halves,
+floats), rounded once to f32 and stored: F32 as it is, Rgba16f to the
+nearest half (even), the unsigned normalized formats `round_even(v *
+255)` (65535). Even sizes come out as the 2x2 box; odd ones spread each
+level over its whole parent. Chosen against RADV's
+`GenerateMipmapsForGPUTexture` (`tools/gpu_parity`'s `built_levels`, each
+level built from the GPU's level above, every format at even, odd and
+1-pixel sizes up to 1280 x 720):
+
+| format | exact | within one step | worst |
+|---|---|---|---|
+| Rgba8, Gray8 | 87% | 100% | 1 step |
+| Gray16 | 97% | 100% | 1 step |
+| Rgba16f | 67% | 96% | 2.0e-3 of the largest parent |
+| F32 (1, 2, 4) | 99.7-99.9% | 99.9% | 4e-7 of the largest parent |
+
+The misses are RADV's: its 8-bit filtering keeps fewer bits, so where
+the exact blend lies just above a half step it often stores the one
+below; it filters halves in less than f32's precision and writes them
+rounded toward zero (79% exact with that rounding; the builder rounds
+to nearest even, as the CPU's rgba16f stores do); at large odd sizes (1023 x 767) its interpolated
+coordinates miss a few centres that lie within 1/500 of a weight step's
+tie, one weight step off. On the same sizes the alternatives measured
+worse: a 2x2 box (8 bits 86% exact but up to 151 steps off at odd sizes,
+F32 92.5%), o3d's blit imitation (f32 `(x + 0.5) * sw / w - 0.5`, weights
+rounded half away from zero, `a * (1 - t) + b * t`: 8 bits 84.6%, Gray16
+93.8% with a 227-step miss, F32 95.4%; halves the same 66.5%), and the
+sampling rule's own f32 `a + (b - a) * t` on stored values (8 bits 88%,
+a point better, but Gray16 88% and F32 87.6%). Rounding weights half away
+from zero differs only at exact ties, which RADV rounds to even (513 x 3
+-> 256 x 1 is all ties). SDL 3.4's Vulkan path leaves a level as it was
+when `width >> l` or `height >> l` is 0 (37 x 23's last level, 1280 x
+720's 1 x 1, every level of a 1 x n image): the builder makes those as
+it makes the others, and `built_levels` lists and skips them.
 
 - **Inlining:** every function is inlined into one flat `[]Instr` program
   over SoA registers. A slot is one scalar component for `LANES` (64)

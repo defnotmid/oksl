@@ -1956,9 +1956,16 @@ msl_builtin :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 		rules := PROFILE_RULES[u.profile]
 		tex, smp := msl_sampler(m, args[0])
 		sz := a[3] if rules.header else fmt.aprintf("float2(int2(%s.get_width(uint(%s)), %s.get_height(uint(%s))))", tex, a[2], tex, a[2])
-		uv := fmt.aprintf("((float2(%s) + float2(0.5f)) / %s)", a[1], sz)
+		arr := expr_type(u, args[0]) == T_SAMPLER_ARRAY
+		// A sampler2DArray's: (x, y) as a sampler2D's, its layer p.z
+		// (a[1] is a temporary if anything has side effects).
+		p := fmt.aprintf("(%s).xy", a[1]) if arr else a[1]
+		uv := fmt.aprintf("((float2(%s) + float2(0.5f)) / %s)", p, sz)
 		if rules.flip_y {
 			uv = fmt.aprintf("((%s * float2(1.0f, -1.0f)) + float2(0.0f, 1.0f))", uv)
+		}
+		if arr {
+			return wrap_pre(pre[:], fmt.aprintf("%s(%s, %s, float3(%s, float((%s).z)), float(%s))", msl_array_helper(m, .Texture_Lod), tex, smp, uv, a[1], a[2]))
 		}
 		return wrap_pre(pre[:], fmt.aprintf("%s.sample(%s, %s, level(float(%s)))", tex, smp, uv, a[2]))
 	case .Texture_Size:

@@ -6631,10 +6631,12 @@ compile_simple_frag_for_ensure :: proc(t: ^testing.T, src := "#version 310 es\np
 
 @(test)
 test_channel_image_ensure_array :: proc(t: ^testing.T) {
-	m := compile_simple_frag_for_ensure(t, "#version 310 es\nprecision highp float;\nuniform sampler2DArray s;\nout vec4 o;\nvoid main() { o = textureLod(s, vec3(0.5), 0.0); }")
-	px := [1]f32{1}
-	testing.expect_assert_message(t, "oksl: Channel_Image cannot bind to a sampler2DArray channel")
-	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {channel_image(px[:], 1, 1)}})
+	m := compile_simple_frag_for_ensure(t)
+	px := [2]f32{1, 2}
+	im := channel_image(px[:], 1, 1)
+	im.layers = 2
+	testing.expect_assert_message(t, "oksl: a Channel_Image with layers binds to a sampler2DArray channel")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {im}})
 }
 
 @(test)
@@ -15532,6 +15534,842 @@ void main() {
 		m.program.jit_body, m.program.jit_init = sb, si
 		for p, i in px {
 			testing.expectf(t, p == {0, 0, 0, 128}, "engine %d, %08x: %v", engine, words[i], p)
+		}
+	}
+}
+
+// ---- layered bound images and the mip builder ---------------------------------------------
+
+// A layered test image: `layers` images from make_test_image (one seed
+// each, the same stride), each level's layers `pad` texels apart past a
+// layer's rows (pad < 0: tightly, layer_stride 0), with sentinel bytes in
+// the gaps and after the last layer; and each layer alone as a 2D image.
+@(private = "file")
+Layered_Test :: struct {
+	im:    Channel_Image,
+	views: [8]Channel_Image,
+}
+
+@(private = "file")
+make_layered_image :: proc(format: Channel_Format, comps, w, h: int, mips: bool, layers, pad: int, seed: u32) -> (lt: Layered_Test) {
+	tb := channel_texel_bytes(format, comps)
+	src: [8]Channel_Image
+	for k in 0 ..< layers {
+		// Seeds of one parity: one level-0 stride.
+		src[k] = make_test_image(format, comps, w, h, mips, seed + u32(2 * k))
+	}
+	n := 1 + len(src[0].levels)
+	levels := make([]Channel_Level, n - 1, context.temp_allocator)
+	for &v in lt.views[:layers] {
+		v = src[0]
+		v.levels = make([]Channel_Level, n - 1, context.temp_allocator)
+	}
+	lt.im = src[0]
+	lt.im.layers = layers
+	for l in 0 ..< n {
+		bytes0, lw, lh, pitch := ref_level(&src[0], l)
+		span := pitch * (lh - 1) + lw * tb
+		lstride := pitch * lh if pad < 0 else span + pad * tb
+		total := lstride * (layers - 1) + span
+		buf := make([]u8, total + 64, context.temp_allocator)
+		for &b in buf {
+			b = 0x7f // a NaN half and float, 127 in bytes
+		}
+		for k in 0 ..< layers {
+			b, _, _, _ := ref_level(&src[k], l)
+			copy(buf[k * lstride:][:span], b[:span])
+		}
+		_ = bytes0
+		ls := 0 if pad < 0 else lstride
+		if l == 0 {
+			if format == .F32 {
+				lt.im.data = ([^]f32)(raw_data(buf))[:total / 4]
+			} else {
+				lt.im.pixels = buf[:total]
+			}
+			lt.im.layer_stride = ls
+		} else {
+			levels[l - 1] = {texels = buf[:total], width = lw, height = lh, stride = src[0].levels[l - 1].stride, layer_stride = ls}
+		}
+		for k in 0 ..< layers {
+			v := &lt.views[k]
+			if l == 0 {
+				if format == .F32 {
+					v.data = ([^]f32)(&buf[k * lstride])[:span / 4]
+				} else {
+					v.pixels = buf[k * lstride:][:span]
+				}
+			} else {
+				v.levels[l - 1] = {texels = buf[k * lstride:][:span], width = lw, height = lh, stride = src[0].levels[l - 1].stride}
+			}
+		}
+	}
+	lt.im.levels = levels
+	return
+}
+
+// The callback reference for layers: the layer the sampler2DArray passes
+// (round_even), clamped to the layers, through that layer's 2D image;
+// texelFetch's layer p.z, 0 outside the layers.
+@(private = "file")
+Ref_Layers :: struct {
+	lt:     ^Layered_Test,
+	layers: int,
+}
+
+@(private = "file")
+ref_layers_sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+	r := (^Ref_Layers)(user)
+	if channel == 1 {
+		if layer < 0 || layer >= r.layers {
+			return {}
+		}
+		return ref_bound_fetch(&r.lt.views[layer], uv.x, uv.y, lod)
+	}
+	return ref_bound_sample(&r.lt.views[clamp(layer, 0, r.layers - 1)], uv.x, uv.y, lod)
+}
+
+@(private = "file")
+BOUND_LAYERS_SRC :: `#version 310 es
+precision highp float;
+uniform sampler2DArray s;
+uniform sampler2DArray sFetch;
+uniform vec4 uXform;
+uniform vec4 uLod;
+uniform float uZero;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
+void main() {
+    vec2 fc = gl_FragCoord.xy;
+    ivec2 p = ivec2(fc);
+    vec2 uv = fc * uXform.xy + uXform.zw;
+    if (p.x == 0) uv.x = uZero / uZero;
+    float lod = fc.x * uLod.x + fc.y * 0.37 + uLod.y;
+    if (p.y == 1) lod = uZero / uZero;
+    // Every tie from -1.5 to 5.5, a little either side of it, then NaN,
+    // the infinities and huge values.
+    float r = float(p.x % 15) * 0.5 - 1.5 + float(p.y % 3 - 1) * 1.2e-7 * max(1.0, abs(float(p.x % 15) * 0.5 - 1.5));
+    if (p.y == 5) r = uZero / uZero;
+    if (p.y == 6) r = 1.0 / uZero;
+    if (p.y == 7) r = -1.0 / uZero;
+    if (p.y == 8) r = fc.x * 1.0e9 - 3.0e9;
+    if (p.y == 9) r = -0.0 * fc.x;
+    int z = p.x % 6 - 1;
+    if (p.y == 10) z = 2147483647;
+    if (p.y == 11) z = -2147483647 - 1;
+    o0 = texture(s, vec3(uv * (1.0 + fc.y * uLod.w), r), uLod.z);
+    o1 = textureLod(s, vec3(uv, r), lod);
+    o2 = textureGrad(s, vec3(uv, r), vec2(uLod.w * fc.x * 0.4, 0.003), vec2(0.002, uLod.w * fc.y * 0.5));
+    o3 = texelFetch(sFetch, ivec3(p.x - 3, p.y - 2, z), (p.x + p.y) % 7 - 1);
+}`
+
+// Layered images in every format, filter, wrap and level count, with 1 to
+// 5 layers tightly packed or apart: the JIT and the interpreter equal bit
+// for bit the callback taking the layer the sampler2DArray passes, clamped,
+// through that layer alone as a 2D image (so a layer reads as a sampler2D
+// of it does), at ties of the layer coordinate, NaN, infinities and huge
+// values, texelFetch in and out of the layers; sentinels around and
+// between the layers catch reads outside them.
+@(test)
+test_bound_layers_rule :: proc(t: ^testing.T) {
+	m, errs, ok := compile(BOUND_LAYERS_SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	W, H :: 30, 14
+	Config :: struct {
+		format: Channel_Format,
+		comps:  int,
+	}
+	configs := [?]Config{{.F32, 1}, {.F32, 2}, {.F32, 4}, {.Rgba8, 4}, {.Gray8, 1}, {.Gray16, 1}, {.Rgba16f, 4}}
+	TW, TH :: 11, 6
+	xforms := [?][4]f32{{1.6 / W, 1.6 / H, -0.3, -0.3}, {80.0 / W, 70.0 / H, -40, -33}, {9.0 / W, 7.0 / H, 0.01, -0.02}}
+	lods := [?][4]f32{{0.21, -1.3, 0, 0.11}, {0.05, 0.5, -0.75, 0.9}, {0.4, 2.0, 1.5, 0.02}}
+	mismatches, n_cases := 0, 0
+	for cfg, ci in configs {
+		for filter in Channel_Filter {
+			for wrap in ([2][2]Channel_Wrap{{.Clamp, .Clamp}, {.Repeat, .Clamp}}) {
+				for mips in ([2]bool{false, true}) {
+					for layers in ([?]int{1, 2, 5}) {
+						for pad in ([?]int{-1, 3}) {
+							lt := make_layered_image(cfg.format, cfg.comps, TW, TH, mips, layers, pad, u32(ci * 31 + int(filter) * 7 + int(mips) + layers * 3))
+							lt.im.filter, lt.im.wrap = filter, wrap
+							for &v in lt.views[:layers] {
+								v.filter, v.wrap = filter, wrap
+							}
+							imgs := [2]Channel_Image{lt.im, lt.im}
+							sizes := [2][3]i32{{TW, TH, i32(layers)}, {TW, TH, i32(layers)}}
+							ref := Ref_Layers{&lt, layers}
+							for xf_, xi in xforms {
+								xf := xf_
+								lx := lods[(xi + int(mips)) % len(lods)]
+								set_uniform(m, block, "uXform", xf[:])
+								set_uniform(m, block, "uLod", lx[:])
+								set_uniform(m, block, "uZero", {0})
+								outs: [4][4][][4]f32
+								for &o in outs {
+									for &tg in o {
+										tg = make([][4]f32, W * H, context.temp_allocator)
+									}
+								}
+								b_opts := Run_Options{channel_images = imgs[:]}
+								c_opts := Run_Options{sampler = ref_layers_sampler, user = &ref, channel_sizes = sizes[:]}
+								run_targets(&m.program, block, W, H, outs[0][:], temp_scratch(), b_opts)
+								run_targets_interp(&m.program, block, W, H, outs[1][:], temp_scratch(), b_opts)
+								run_targets(&m.program, block, W, H, outs[2][:], temp_scratch(), c_opts)
+								run_targets_interp(&m.program, block, W, H, outs[3][:], temp_scratch(), c_opts)
+								n_cases += 1
+								for target in 0 ..< 4 {
+									wj := slice.reinterpret([]u32, outs[0][target])
+									wv := slice.reinterpret([]u32, outs[1][target])
+									wc := slice.reinterpret([]u32, outs[2][target])
+									wcv := slice.reinterpret([]u32, outs[3][target])
+									for i in 0 ..< len(wj) {
+										if wj[i] != wv[i] || wj[i] != wc[i] || wc[i] != wcv[i] {
+											if mismatches < 12 {
+												testing.expectf(t, false, "%v/%d %v %v mips=%v layers=%d pad=%d xform %d target %d pixel (%d, %d) comp %d: jit %08x vm %08x callback %08x/%08x",
+													cfg.format, cfg.comps, filter, wrap, mips, layers, pad, xi, target, (i / 4) % W, i / 4 / W, i % 4, wj[i], wv[i], wc[i], wcv[i])
+											}
+											mismatches += 1
+											break
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	testing.expectf(t, mismatches == 0, "%d mismatching targets in %d cases", mismatches, n_cases)
+}
+
+// The layer a sample reads, clamp(round_even(r), 0, layers - 1) with NaN
+// as 0 (RADV's, measured with tools/gpu_parity's bound_layers), at the
+// values that decide it, in both engines; textureSize's z is the layers.
+@(test)
+test_bound_layer_clamp :: proc(t: ^testing.T) {
+	SRC :: `#version 310 es
+precision highp float;
+readonly buffer R { float r[]; };
+uniform sampler2DArray s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    o = vec4(textureLod(s, vec3(0.5, 0.5, r[p.y * 8 + p.x]), 0.0).x, vec3(textureSize(s, 0)));
+}`
+	m, errs, ok := compile(SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	inf, nan := math.inf_f32(1), math.nan_f32()
+	rs := [40]f32{
+		nan, -nan, inf, -inf, -0.0, 0, 1e-45, -1e-45, 0.5, 0.49999997, 0.50000006, 1.5, 2.5, 3.5, 4.5, 5.5,
+		6.5, 7.5, -0.5, -0.50000006, -1.5, 2147483520, -2147483520, 3e38, -3e38, 16777216, 16777218, 8388607.5, 6, 7, 8, 1.4999999,
+		0, 0, 0, 0, 0, 0, 0, 0, // the signaling NaNs below
+	}
+	// Signaling NaNs of both signs read layer 0 too (on arm64 the clamp is
+	// fmaxnm, which a signaling NaN would pass as NaN and then the last
+	// layer).
+	SNANS :: [?]u32{0x7f800001, 0xff800001, 0x7fa00000, 0xffbfffff, 0x7fbfffff, 0xff800100, 0x7f800001, 0xffa00000}
+	for b, i in SNANS {
+		rs[32 + i] = transmute(f32)b
+	}
+	for layers in ([?]int{1, 2, 3, 7}) {
+		px := make([]f32, layers, context.temp_allocator)
+		for &v, i in px {
+			v = f32(i)
+		}
+		im := channel_image(px, 1, 1)
+		im.layers = layers
+		words := slice.reinterpret([]u32, rs[:])
+		for jit in ([2]bool{true, false}) {
+			out := make([][4]f32, len(rs), context.temp_allocator)
+			opts := Run_Options{channel_images = {im}, buffers = {words}}
+			if jit {
+				run_f32(&m.program, nil, 8, 5, out, temp_scratch(), opts)
+			} else {
+				run_f32_interp(&m.program, nil, 8, 5, out, temp_scratch(), opts)
+			}
+			for r, i in rs {
+				want: f32
+				if r == r {
+					e := f32(math.round(f64(r)))
+					if abs(f64(r) - math.trunc(f64(r))) == 0.5 {
+						e = f32(2 * math.round(f64(r) / 2))
+					}
+					want = f32(i32(clamp(e, 0, f32(layers - 1))))
+				}
+				testing.expectf(t, transmute([4]u32)out[i] == transmute([4]u32)[4]f32{want, 1, 1, f32(layers)}, "layers %d jit=%v r=%v (%08x): got %v, want layer %v", layers, jit, r, transmute(u32)r, out[i], want)
+			}
+		}
+	}
+}
+
+// Level sizes: channel_level_count and channel_levels_bytes for every
+// shape, the layout's levels packed one after another, and a chain whose
+// levels it lays out passes Channel_Image's checks.
+@(test)
+test_channel_level_sizes :: proc(t: ^testing.T) {
+	Case :: struct {
+		w, h, n: int,
+	}
+	cases := [?]Case{{1, 1, 1}, {2, 1, 2}, {1, 2, 2}, {3, 3, 2}, {4, 4, 3}, {5, 7, 3}, {37, 23, 6}, {1, 1025, 11}, {1920, 1080, 11}, {1 << 15, 1, 16}, {1 << 16, 3, 16}, {(1 << 20) + 1, 1, 16}}
+	for c in cases {
+		testing.expectf(t, channel_level_count(c.w, c.h) == c.n, "%dx%d: %d levels, want %d", c.w, c.h, channel_level_count(c.w, c.h), c.n)
+	}
+	for f in Channel_Format {
+		for comps in ([?]int{1, 2, 4}) {
+			if f != .F32 && comps != 1 {
+				continue
+			}
+			tb := channel_texel_bytes(f, comps if f == .F32 else (4 if f == .Rgba8 || f == .Rgba16f else 1))
+			for c in cases[:9] {
+				for layers in ([?]int{0, 1, 3}) {
+					want := 0
+					for l in 1 ..< c.n {
+						want += max(c.w >> uint(l), 1) * max(c.h >> uint(l), 1) * tb * max(layers, 1)
+					}
+					got := channel_levels_bytes(f, comps, c.w, c.h, c.n, layers)
+					testing.expectf(t, got == want, "%v/%d %dx%d layers %d: %d bytes, want %d", f, comps, c.w, c.h, layers, got, want)
+					words := make([]u32, got / 4 + 4, context.temp_allocator)
+					buf := slice.to_bytes(words)
+					levels := make([]Channel_Level, c.n - 1, context.temp_allocator)
+					channel_levels_layout(levels, buf[:got], f, comps, c.w, c.h, layers)
+					at := 0
+					for lv, i in levels {
+						l := uint(i + 1)
+						n := max(c.w >> l, 1) * max(c.h >> l, 1) * tb * max(layers, 1)
+						testing.expect(t, lv.width == max(c.w >> l, 1) && lv.height == max(c.h >> l, 1) && lv.stride == 0 && lv.layer_stride == 0)
+						testing.expect(t, raw_data(lv.texels) == &buf[at] && len(lv.texels) == n)
+						at += n
+					}
+					testing.expect(t, at == got)
+				}
+			}
+		}
+	}
+}
+
+// The builder's reference, independent of it: each axis's tap in integers
+// (the centre's coordinate x = ((2d + 1) * sn - n) / 2n exactly, its
+// weight round_even(128 * remainder / n)), the bilinear blend as a sum of
+// the four texels times their weights' products, Odin's f16 conversion
+// and round_even for the unsigned normalized formats.
+@(private = "file")
+ref_build_tap :: proc(d, sn, n: int) -> (i0, i1, w: int) {
+	num := (2 * d + 1) * sn - n
+	i := num / (2 * n)
+	rem := num - i * 2 * n
+	q, r := (128 * rem) / n, (128 * rem) % n
+	if 2 * r > n || (2 * r == n && q % 2 == 1) {
+		q += 1
+	}
+	if q == 256 {
+		i, q = i + 1, 0
+	}
+	return min(i, sn - 1), min(i + 1, sn - 1), q
+}
+
+@(private = "file")
+ref_read_texel :: proc(b: []u8, f: Channel_Format, comps, k: int) -> f64 {
+	switch f {
+	case .F32:     return f64((^f32)(&b[4 * k])^)
+	case .Rgba8:   return f64(f32(b[k]) / 255)
+	case .Gray8:   return f64(f32(b[0]) / 255)
+	case .Gray16:  return f64(f32(u16(b[0]) | u16(b[1]) << 8) / 65535)
+	case .Rgba16f: return f64(f32((^f16)(&b[2 * k])^))
+	}
+	return 0
+}
+
+@(private = "file")
+ref_build_level :: proc(src: []u8, sw, sh, spitch: int, dst: []u8, dw, dh, dpitch: int, f: Channel_Format, comps: int) {
+	tb := channel_texel_bytes(f, comps)
+	nc := comps if f == .F32 else (4 if f == .Rgba8 || f == .Rgba16f else 1)
+	for y in 0 ..< dh {
+		y0, y1, wy := ref_build_tap(y, sh, dh)
+		for x in 0 ..< dw {
+			x0, x1, wx := ref_build_tap(x, sw, dw)
+			for k in 0 ..< nc {
+				c := [4]f64{
+					ref_read_texel(src[y0 * spitch + x0 * tb:], f, comps, k), ref_read_texel(src[y0 * spitch + x1 * tb:], f, comps, k),
+					ref_read_texel(src[y1 * spitch + x0 * tb:], f, comps, k), ref_read_texel(src[y1 * spitch + x1 * tb:], f, comps, k),
+				}
+				v := f32((c[0] * f64((256 - wx) * (256 - wy)) + c[1] * f64(wx * (256 - wy)) + c[2] * f64((256 - wx) * wy) + c[3] * f64(wx * wy)) / 65536)
+				o := dst[y * dpitch + x * tb:]
+				switch f {
+				case .F32:
+					(^f32)(&o[4 * k])^ = v
+				case .Rgba16f:
+					(^f16)(&o[2 * k])^ = f16(v)
+				case .Rgba8, .Gray8, .Gray16:
+					mx := 255.0 if f != .Gray16 else 65535.0
+					y := f64(v) * mx
+					r := math.round(y)
+					if abs(y - math.trunc(y)) == 0.5 {
+						r = 2 * math.round(y / 2)
+					}
+					if f == .Gray16 {
+						o[0], o[1] = u8(u32(r)), u8(u32(r) >> 8)
+					} else {
+						o[k] = u8(u32(r))
+					}
+				}
+			}
+		}
+	}
+}
+
+// channel_build_levels in every format at even, odd and 1-pixel sizes,
+// with one and three layers, tightly packed and with row and layer
+// padding: every level equals the independent reference bit for bit, the
+// bytes between rows, between layers and after each level stay as they
+// were, each layer builds as it would alone, even levels are the 2x2
+// box's averages (F32), and a chain of 1x1 has nothing to build.
+@(test)
+test_channel_build_levels :: proc(t: ^testing.T) {
+	Config :: struct {
+		format: Channel_Format,
+		comps:  int,
+	}
+	configs := [?]Config{{.F32, 1}, {.F32, 2}, {.F32, 4}, {.Rgba8, 4}, {.Gray8, 1}, {.Gray16, 1}, {.Rgba16f, 4}}
+	// 513 x 5's first level is every tie; 1023 x 3's has centres within
+	// 1/500 of a weight's tie (an f32 coordinate misses some); 600 x 3's
+	// is wider than a run of columns.
+	sizes := [?][2]int{{1, 1}, {2, 1}, {1, 2}, {1, 7}, {7, 1}, {2, 2}, {3, 3}, {5, 7}, {16, 8}, {37, 23}, {64, 32}, {513, 5}, {300, 2}, {3, 129}, {1023, 3}, {600, 3}}
+	bad := 0
+	for cfg, ci in configs {
+		tb := channel_texel_bytes(cfg.format, cfg.comps)
+		for sz in sizes {
+			for layers in ([?]int{1, 3}) {
+				for padded in ([2]bool{false, true}) {
+					w, h := sz[0], sz[1]
+					n := channel_level_count(w, h)
+					// Level 0 and the levels, each row `rpad` texels and each
+					// layer `lpad` bytes past its rows, sentinel bytes there.
+					rpad, lpad := 2 if padded else 0, 3 * tb if padded else 0
+					Lv :: struct {
+						buf:            []u8,
+						w, h, pitch:    int,
+						lstride:        int,
+					}
+					lvs := make([]Lv, n, context.temp_allocator)
+					state := u32(ci * 1000 + w * 7 + h * 13 + layers + int(padded))
+					for &lv, l in lvs {
+						lv.w, lv.h = max(w >> uint(l), 1), max(h >> uint(l), 1)
+						lv.pitch = (lv.w + rpad) * tb
+						lv.lstride = lv.pitch * lv.h + lpad
+						lv.buf = make([]u8, lv.lstride * layers + 32, context.temp_allocator)
+						for &b in lv.buf {
+							b = 0xA5
+						}
+					}
+					// Level 0's texels: random, finite (NaN and infinities
+					// blend as the GPU's arithmetic does: not the point here).
+					for k in 0 ..< layers {
+						for y in 0 ..< h {
+							row := lvs[0].buf[k * lvs[0].lstride + y * lvs[0].pitch:][:w * tb]
+							#partial switch cfg.format {
+							case .F32:
+								for i := 0; i < len(row); i += 4 {
+									state = state * 1664525 + 1013904223
+									(^f32)(&row[i])^ = f32(i32(state >> 8) - (1 << 23)) / 1048576
+								}
+							case .Rgba16f:
+								for i := 0; i < len(row); i += 2 {
+									state = state * 1664525 + 1013904223
+									(^f16)(&row[i])^ = f16(f32(i32(state >> 8) - (1 << 23)) / 1048576)
+								}
+							case:
+								for &b in row {
+									state = state * 1664525 + 1013904223
+									b = u8(state >> 16)
+								}
+							}
+						}
+					}
+					im := Channel_Image{format = cfg.format, components = cfg.comps if cfg.format == .F32 else 0, width = w, height = h, layers = layers}
+					span0 := lvs[0].pitch * (h - 1) + w * tb
+					total0 := lvs[0].lstride * (layers - 1) + span0
+					if cfg.format == .F32 {
+						im.data = ([^]f32)(raw_data(lvs[0].buf))[:(total0 + 3) / 4]
+					} else {
+						im.pixels = lvs[0].buf[:total0]
+					}
+					if padded {
+						im.stride, im.layer_stride = lvs[0].pitch, lvs[0].lstride
+					}
+					levels := make([]Channel_Level, n - 1, context.temp_allocator)
+					for &cl, i in levels {
+						lv := lvs[i + 1]
+						span := lv.pitch * (lv.h - 1) + lv.w * tb
+						cl = {texels = lv.buf[:lv.lstride * (layers - 1) + span], width = lv.w, height = lv.h}
+						if padded {
+							cl.stride, cl.layer_stride = lv.pitch, lv.lstride
+						}
+					}
+					im.levels = levels
+					// The reference first, into copies (same sentinels).
+					refs := make([][]u8, n, context.temp_allocator)
+					refs[0] = lvs[0].buf
+					for l in 1 ..< n {
+						refs[l] = slice.clone(lvs[l].buf, context.temp_allocator)
+						for k in 0 ..< layers {
+							s, d := lvs[l - 1], lvs[l]
+							ref_build_level(refs[l - 1][k * s.lstride:], s.w, s.h, s.pitch, refs[l][k * d.lstride:], d.w, d.h, d.pitch, cfg.format, cfg.comps)
+						}
+					}
+					channel_build_levels(im)
+					for l in 1 ..< n {
+						if !slice.equal(lvs[l].buf, refs[l]) {
+							if bad < 12 {
+								first := 0
+								for b, i in lvs[l].buf {
+									if b != refs[l][i] {
+										first = i
+										break
+									}
+								}
+								testing.expectf(t, false, "%v/%d %dx%d layers %d padded=%v level %d: first differing byte %d: %02x, want %02x", cfg.format, cfg.comps, w, h, layers, padded, l, first, lvs[l].buf[first], refs[l][first])
+							}
+							bad += 1
+						}
+					}
+					// Even levels: the 2x2 averages.
+					if cfg.format == .F32 && cfg.comps == 1 && n > 1 && w % 2 == 0 && h % 2 == 0 {
+						l1 := lvs[1]
+						for y in 0 ..< l1.h {
+							for x in 0 ..< l1.w {
+								s := lvs[0].buf[2 * y * lvs[0].pitch + 2 * x * 4:]
+								s1 := lvs[0].buf[(2 * y + 1) * lvs[0].pitch + 2 * x * 4:]
+								a := f64((^f32)(&s[0])^) + f64((^f32)(&s[4])^) + f64((^f32)(&s1[0])^) + f64((^f32)(&s1[4])^)
+								got := (^f32)(&l1.buf[y * l1.pitch + x * 4])^
+								testing.expectf(t, got == f32(a / 4), "%dx%d (%d, %d): %v, want the average %v", w, h, x, y, got, f32(a / 4))
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	testing.expectf(t, bad == 0, "%d levels differ from the reference", bad)
+}
+
+// channel_build_levels checks its image as a binding does.
+@(test)
+test_channel_build_levels_short :: proc(t: ^testing.T) {
+	px := make([]u8, 8 * 8 * 4, context.temp_allocator)
+	short := make([]u8, 4 * 4 * 4 - 1, context.temp_allocator)
+	testing.expect_assert_message(t, "oksl: Channel_Image texels are shorter than its rows")
+	channel_build_levels({format = .Rgba8, pixels = px, width = 8, height = 8, levels = {{texels = short, width = 4, height = 4}}})
+}
+
+@(test)
+test_channel_build_levels_size :: proc(t: ^testing.T) {
+	px := make([]u8, 8 * 8 * 4, context.temp_allocator)
+	lv := make([]u8, 4 * 4 * 4, context.temp_allocator)
+	testing.expect_assert_message(t, "oksl: Channel_Level l must be max(width >> l, 1) x max(height >> l, 1)")
+	channel_build_levels({format = .Rgba8, pixels = px, width = 8, height = 8, levels = {{texels = lv, width = 4, height = 3}}})
+}
+
+// The builder's taps equal the integer reference: for every parent size
+// sn up to 300 and every n <= sn (more than level sizes need), for every
+// level size (n = max(sn >> 1, 1)) with sn up to 4096, every texel d, and
+// for sampled sizes up to 2^31 - 4 at the first, last and random texels.
+// Two pinned cases: 513 to 256 at d = 127, where the weight rounds up to
+// 256 and is the next texel's 0, and 8,389,119 to 4,194,559 at d =
+// 4,186,366, whose exact weight 127.49999988 an f64 coordinate rounds
+// onto the tie 127.5 (and then to 128).
+@(test)
+test_channel_build_tap :: proc(t: ^testing.T) {
+	bad := 0
+	check :: proc(t: ^testing.T, d, sn, n: int, bad: ^int) {
+		i0, i1, w := ref_build_tap(d, sn, n)
+		got := build_tap(d, sn, n)
+		if int(got.i0) != i0 || int(got.i1) != i1 || got.t != f64(w) / 256 {
+			if bad^ < 10 {
+				testing.expectf(t, false, "d %d sn %d n %d: {{%d, %d, %v}}, want {{%d, %d, %d / 256}}", d, sn, n, got.i0, got.i1, got.t, i0, i1, w)
+			}
+			bad^ += 1
+		}
+	}
+	for sn in 1 ..= 300 {
+		for n in 1 ..= sn {
+			for d in 0 ..< n {
+				check(t, d, sn, n, &bad)
+			}
+		}
+	}
+	for sn in 301 ..= 4096 {
+		n := max(sn >> 1, 1)
+		for d in 0 ..< n {
+			check(t, d, sn, n, &bad)
+		}
+	}
+	state := u64(0x9E3779B97F4A7C15)
+	next :: proc(s: ^u64) -> u64 {
+		s^ = s^ * 6364136223846793005 + 1442695040888963407
+		return s^ >> 11
+	}
+	for _ in 0 ..< 20000 {
+		sn := int(next(&state) % u64(int(max(i32)) - 4)) + 1
+		n := max(sn >> 1, 1)
+		for d in ([?]int{0, 1, n - 2, n - 1, int(next(&state) % u64(n))}) {
+			if d >= 0 && d < n {
+				check(t, d, sn, n, &bad)
+			}
+		}
+	}
+	testing.expectf(t, bad == 0, "%d taps differ from the reference", bad)
+	fold := build_tap(127, 513, 256)
+	testing.expectf(t, fold == Build_Tap{255, 256, 0}, "513 to 256 at 127: %v, want {{255, 256, 0}}", fold)
+	tie := build_tap(4186366, 8389119, 4194559)
+	testing.expectf(t, tie == Build_Tap{8372733, 8372734, 127.0 / 256}, "8389119 to 4194559 at 4186366: %v, want {{8372733, 8372734, 127 / 256}}", tie)
+}
+
+// Where the weight rounds up to 256 the builder reads the next texel with
+// weight 0, as the reference: 513 x 1 to 256 x 1 at x = 127 reads l0[255]
+// alone, so an infinite l0[254] beside it doesn't make NaN, and a -0.0 is
+// kept.
+@(test)
+test_channel_build_levels_fold :: proc(t: ^testing.T) {
+	l0 := make([]f32, 513, context.temp_allocator)
+	for &v, i in l0 {
+		v = f32(i)
+	}
+	l1 := make([]f32, 256, context.temp_allocator)
+	levels := [1]Channel_Level{channel_level(l1, 256, 1)}
+	im := channel_image(l0, 513, 1)
+	im.levels = levels[:]
+	l0[254], l0[255] = math.inf_f32(1), 7
+	channel_build_levels(im)
+	testing.expectf(t, l1[127] == 7, "inf beside the texel: %v, want 7", l1[127])
+	nz := transmute(f32)u32(0x80000000)
+	l0[254], l0[255], l0[256] = 1, nz, nz
+	channel_build_levels(im)
+	testing.expectf(t, transmute(u32)l1[127] == 0x80000000, "-0.0: %v (%08x), want -0.0", l1[127], transmute(u32)l1[127])
+}
+
+// channel_levels_bytes checks its format, F32 components and level count;
+// channel_levels_layout its texels' alignment, so a []u8 from an arena
+// fails there rather than in channel_build_levels; and a typed slice
+// lays out as its bytes.
+@(test)
+test_channel_levels_bytes_format :: proc(t: ^testing.T) {
+	testing.expect_assert_message(t, "oksl: channel_levels_bytes: invalid Channel_Format")
+	_ = channel_levels_bytes(Channel_Format(5), 0, 8, 8, 4, 1)
+}
+
+@(test)
+test_channel_levels_bytes_components :: proc(t: ^testing.T) {
+	testing.expect_assert_message(t, "oksl: channel_levels_bytes: F32 components must be 1, 2 or 4")
+	_ = channel_levels_bytes(.F32, 0, 8, 8, 4, 1)
+}
+
+@(test)
+test_channel_levels_bytes_components_three :: proc(t: ^testing.T) {
+	testing.expect_assert_message(t, "oksl: channel_levels_bytes: F32 components must be 1, 2 or 4")
+	_ = channel_levels_bytes(.F32, 3, 8, 8, 4, 1)
+}
+
+@(test)
+test_channel_levels_bytes_count :: proc(t: ^testing.T) {
+	testing.expect(t, channel_levels_bytes(.Gray8, 0, 1 << 20, 1, CHANNEL_MAX_LEVELS, 1) == (1 << 20) - (1 << 5))
+	testing.expect_assert_message(t, "oksl: channel_levels_bytes: more than 16 levels")
+	_ = channel_levels_bytes(.Gray8, 0, 1 << 20, 1, CHANNEL_MAX_LEVELS + 1, 1)
+}
+
+@(test)
+test_channel_levels_bytes_count_shift :: proc(t: ^testing.T) {
+	testing.expect_assert_message(t, "oksl: channel_levels_bytes: more than 16 levels")
+	_ = channel_levels_bytes(.Rgba8, 0, 8, 8, 100, 1)
+}
+
+@(test)
+test_channel_levels_layout_typed :: proc(t: ^testing.T) {
+	n := channel_levels_bytes(.Rgba16f, 0, 7, 5, 3, 2)
+	texels := make([][4]f16, n / 8, context.temp_allocator)
+	levels: [2]Channel_Level
+	channel_levels_layout(levels[:], texels, .Rgba16f, 0, 7, 5, 2)
+	base := uintptr(raw_data(texels))
+	testing.expect(t, uintptr(raw_data(levels[0].texels)) == base && len(levels[0].texels) == 3 * 2 * 8 * 2)
+	testing.expect(t, uintptr(raw_data(levels[1].texels)) == base + 96 && len(levels[1].texels) == 1 * 1 * 8 * 2)
+	testing.expect(t, levels[1].width == 1 && levels[1].height == 1)
+}
+
+@(test)
+test_channel_levels_layout_short :: proc(t: ^testing.T) {
+	texels := make([][4]f16, 4 * 4 + 2 * 2 + 1 - 1, context.temp_allocator)
+	levels: [3]Channel_Level
+	testing.expect_assert_message(t, "oksl: channel_levels_layout texels are shorter than the levels")
+	channel_levels_layout(levels[:], texels, .Rgba16f, 0, 8, 8, 1)
+}
+
+@(test)
+test_channel_levels_layout_align_f32 :: proc(t: ^testing.T) {
+	words := make([]u32, 64, context.temp_allocator)
+	levels: [2]Channel_Level
+	testing.expect_assert_message(t, "oksl: channel_levels_layout texels must be 4-byte aligned for F32, 2-byte for Gray16 and Rgba16f")
+	channel_levels_layout(levels[:], slice.to_bytes(words)[2:], .F32, 1, 8, 8, 1)
+}
+
+@(test)
+test_channel_levels_layout_align_half :: proc(t: ^testing.T) {
+	words := make([]u32, 64, context.temp_allocator)
+	levels: [2]Channel_Level
+	testing.expect_assert_message(t, "oksl: channel_levels_layout texels must be 4-byte aligned for F32, 2-byte for Gray16 and Rgba16f")
+	channel_levels_layout(levels[:], slice.to_bytes(words)[1:], .Gray16, 0, 8, 8, 1)
+}
+
+// Byte formats take any start, and F32 2-byte starts are refused: the
+// alignment follows the format (Gray8, Rgba8 at an odd byte pass).
+@(test)
+test_channel_levels_layout_align_bytes :: proc(t: ^testing.T) {
+	words := make([]u32, 64, context.temp_allocator)
+	levels: [2]Channel_Level
+	channel_levels_layout(levels[:], slice.to_bytes(words)[1:], .Gray8, 0, 8, 8, 1)
+	channel_levels_layout(levels[:], slice.to_bytes(words)[1:], .Rgba8, 0, 8, 8, 1)
+	channel_levels_layout(levels[:], slice.to_bytes(words)[2:], .Rgba16f, 0, 8, 8, 1)
+	testing.expect(t, uintptr(raw_data(levels[0].texels)) == uintptr(raw_data(words)) + 2)
+}
+
+// Each level is checked for the image's layers: level 0 of a 2-layer
+// image is valid, its level 1 too short for the second layer, or with
+// layers overlapping.
+@(test)
+test_channel_image_ensure_level_layers_short :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t, "#version 310 es\nprecision highp float;\nuniform sampler2DArray s;\nout vec4 o;\nvoid main() { o = textureLod(s, vec3(0.5), 0.0); }")
+	px := make([]f32, 2 * 16, context.temp_allocator)
+	l1 := make([]f32, 2 * 4 - 1, context.temp_allocator)
+	levels := [1]Channel_Level{channel_level(l1, 2, 2)}
+	im := channel_image(px[:], 4, 4)
+	im.layers, im.levels = 2, levels[:]
+	testing.expect_assert_message(t, "oksl: Channel_Image texels are shorter than its rows")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {im}})
+}
+
+@(test)
+test_channel_image_ensure_level_layer_stride :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t, "#version 310 es\nprecision highp float;\nuniform sampler2DArray s;\nout vec4 o;\nvoid main() { o = textureLod(s, vec3(0.5), 0.0); }")
+	px := make([]f32, 2 * 16, context.temp_allocator)
+	l1 := make([]f32, 2 * 4, context.temp_allocator)
+	levels := [1]Channel_Level{channel_level(l1, 2, 2)}
+	levels[0].layer_stride = 12
+	im := channel_image(px[:], 4, 4)
+	im.layers, im.levels = 2, levels[:]
+	testing.expect_assert_message(t, "oksl: Channel_Image.layer_stride must be 0 or a multiple of the texel size, at least a layer's rows")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {im}})
+}
+
+// Layers with a layer stride shorter than a layer's rows, or texels short
+// of the last layer, are rejected.
+@(test)
+test_channel_image_ensure_layer_stride :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t, "#version 310 es\nprecision highp float;\nuniform sampler2DArray s;\nout vec4 o;\nvoid main() { o = textureLod(s, vec3(0.5), 0.0); }")
+	px := make([]f32, 64, context.temp_allocator)
+	im := channel_image(px[:], 4, 4)
+	im.layers, im.layer_stride = 2, 60
+	testing.expect_assert_message(t, "oksl: Channel_Image.layer_stride must be 0 or a multiple of the texel size, at least a layer's rows")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {im}})
+}
+
+@(test)
+test_channel_image_ensure_layers_short :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t, "#version 310 es\nprecision highp float;\nuniform sampler2DArray s;\nout vec4 o;\nvoid main() { o = textureLod(s, vec3(0.5), 0.0); }")
+	px := make([]f32, 16 * 3 - 1, context.temp_allocator)
+	im := channel_image(px[:], 4, 4)
+	im.layers = 3
+	testing.expect_assert_message(t, "oksl: Channel_Image texels are shorter than its rows")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {im}})
+}
+
+@(test)
+test_channel_image_ensure_layers_range :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t, "#version 310 es\nprecision highp float;\nuniform sampler2DArray s;\nout vec4 o;\nvoid main() { o = textureLod(s, vec3(0.5), 0.0); }")
+	px := make([]f32, 16, context.temp_allocator)
+	im := channel_image(px[:], 4, 4)
+	im.layers = -1
+	testing.expect_assert_message(t, "oksl: Channel_Image.layers out of range")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {im}})
+}
+
+// texelFetch of a sampler2DArray (ivec3, its layer in z) in every backend:
+// SPIR-V through spirv-val, DXBC through dxbc_program and vkd3d, MSL
+// through its array helper, in fragment and compute shaders; on the CPU
+// the sampler callback gets the layer p.z as it is (JIT and interpreter),
+// and an ivec2 is no overload.
+@(test)
+test_texel_fetch_layers :: proc(t: ^testing.T) {
+	FRAG :: `#version 310 es
+precision highp float;
+uniform sampler2DArray s;
+uniform int uZ;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec3 q = ivec3(p, p.x * 3 - 7 + uZ);
+    if (p.y == 3) q.z = 2147483647;
+    o = texelFetch(s, q, p.y % 2) + vec4(textureSize(s, 1), 0.0);
+}`
+	COMP :: `#version 310 es
+layout(local_size_x = 4) in;
+uniform sampler2DArray s;
+buffer Out { vec4 v[]; } dst;
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    dst.v[i] = texelFetch(s, ivec3(i, 1, i - 1), 0);
+}`
+	for src, si in ([2]string{FRAG, COMP}) {
+		stage: Stage = .Fragment if si == 0 else .Compute
+		m, errs, ok := compile(src, {profile = .Glsl, stage = stage, dxbc = true})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%v: %s", stage, format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		if have_spirv_val() {
+			expect_valid_spirv(t, "texelFetch layers", m.spirv)
+		}
+		dxbc_program(t, m, "texelFetch layers")
+		if have_vkd3d() {
+			expect_valid_dxbc(t, "texelFetch layers", m.dxbc)
+		}
+		testing.expectf(t, strings.contains(m.msl, "oksl_sample_level(") && strings.contains(m.msl, ".z)), float("), "%v MSL:\n%s", stage, m.msl)
+	}
+	mb, _, bad := compile("#version 310 es\nprecision highp float;\nuniform sampler2DArray s;\nout vec4 o;\nvoid main() { o = texelFetch(s, ivec2(0), 0); }", {profile = .Glsl, stage = .Fragment})
+	destroy(mb)
+	testing.expect(t, !bad)
+
+	m, errs, ok := compile(FRAG, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	set_uniform(m, block, "uZ", {2})
+	layer_of :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		return {f32(layer), lod, 0, 0}
+	}
+	sizes := [1][3]i32{{16, 8, 3}}
+	for jit in ([2]bool{true, false}) {
+		out := make([][4]f32, 8 * 4, context.temp_allocator)
+		opts := Run_Options{sampler = layer_of, channel_sizes = sizes[:]}
+		if jit {
+			run_f32(&m.program, block, 8, 4, out, temp_scratch(), opts)
+		} else {
+			run_f32_interp(&m.program, block, 8, 4, out, temp_scratch(), opts)
+		}
+		for y in 0 ..< 4 {
+			for x in 0 ..< 8 {
+				z := f32(x * 3 - 7 + 2) if y != 3 else 2147483647
+				testing.expectf(t, out[y * 8 + x] == {z + 8, f32(y % 2) + 4, 3, 0}, "jit=%v (%d, %d): %v, want layer %v", jit, x, y, out[y * 8 + x], z)
+			}
 		}
 	}
 }
