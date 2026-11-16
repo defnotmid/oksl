@@ -7908,6 +7908,44 @@ test_region_targets_ensure_run_rgba8 :: proc(t: ^testing.T) {
 	run(&m.program, nil, 8, 8, buf[:], 16, temp_scratch(), {x = 0, y = 0, w = 4, h = 4, region_targets = true})
 }
 
+// A bounds check failing: ud2 (SIGILL, 4 on POSIX and in Windows' C
+// runtime; Windows raises an array-bounds exception, which the test runner
+// counts as SIGILL) on x86-64, brk (SIGTRAP, 5) on arm64.
+@(private = "file")
+BOUNDS_TRAP :: i32(4) when ODIN_ARCH == .amd64 else i32(5)
+
+@(private = "file")
+SHORT_SRC :: "#version 310 es\nprecision highp float;\nlayout(location = 0) out vec4 o;\nlayout(location = 1) out vec2 p;\nvoid main() { o = vec4(1); p = vec2(2); }"
+
+// Without region_targets, a target shorter than width * height traps before
+// the run writes anything (run_f32, and run_targets' second location).
+@(test)
+test_runner_short_target_traps :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t, SHORT_SRC)
+	buf: [15][4]f32
+	testing.expect_signal(t, BOUNDS_TRAP)
+	run_f32(&m.program, nil, 4, 4, buf[:], temp_scratch())
+}
+
+@(test)
+test_runner_short_second_target_traps :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t, SHORT_SRC)
+	a: [16][4]f32
+	b: [15][4]f32
+	targets := [2][][4]f32{a[:], b[:]}
+	testing.expect_signal(t, BOUNDS_TRAP)
+	run_targets(&m.program, nil, 4, 4, targets[:], temp_scratch())
+}
+
+// run's RGBA8 output one byte short of its last row at an odd stride.
+@(test)
+test_runner_short_rgba8_traps :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t, SHORT_SRC)
+	buf: [3 * 19 + 4 * 4 - 1]u8
+	testing.expect_signal(t, BOUNDS_TRAP)
+	run(&m.program, nil, 4, 4, buf[:], 19, temp_scratch())
+}
+
 @(test)
 test_runner_run_region_sampler_lanes :: proc(t: ^testing.T) {
 	src := `#version 310 es
@@ -8038,6 +8076,253 @@ void main() {
 						row_got := bj[ry * rc.w:(ry + 1) * rc.w]
 						row_ref := full_j[(rc.y + ry) * LW + rc.x:][:rc.w]
 						testing.expect(t, slice.equal(slice.reinterpret([]u32, row_got), slice.reinterpret([]u32, row_ref)))
+					}
+				}
+			}
+		}
+	}
+}
+
+// The layer runner in the JIT against the interpreter, bit for bit, with
+// sentinels around every target and in every RGBA8 row's padding: outputs of
+// 1, 2 and 4 components, float and integer, at up to 4 of 5 locations, with
+// nil targets and locations nothing writes; run_targets, run_f32, and run's
+// RGBA8 at an odd stride; the whole layer, clipped and odd sub-regions, and
+// region_targets; layers of 1x1, 3x5, 61x45 and 1280x720; discard; inputs
+// from varyings (float and flat integer) or the layer's uv; and a sampler,
+// through a counting callback whose calls must match or a bound image.
+@(test)
+test_runner_run_targets_and_shapes :: proc(t: ^testing.T) {
+	srcs := [?]string {
+		// 4, 1, 2 and 4 components at locations 0-3.
+		`#version 310 es
+precision highp float;
+layout(location = 0) in vec2 vUV;
+layout(location = 1) in vec3 vVar;
+layout(location = 2) flat in ivec2 vId;
+uniform vec2 uSpecial;
+uniform sampler2D s0;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out float o1;
+layout(location = 2) out vec2 o2;
+layout(location = 3) out vec4 o3;
+void main() {
+    int ix = int(gl_FragCoord.x);
+    int iy = int(gl_FragCoord.y);
+    if (((ix * 7 + iy * 3) % 11) == 0 || (ix >= 8 && ix < 16 && iy >= 4 && iy < 8)) {
+        discard;
+    }
+    vec4 s = texture(s0, vUV * 3.0 + vVar.xy);
+    float d = dFdx(vUV.x * vUV.y * 37.0) + dFdy(vVar.z);
+    o0 = vec4(vUV, gl_FragCoord.xy * 0.0625) + s;
+    o1 = d * 3.5 + float(vId.x - vId.y) + (gl_FrontFacing ? 0.5 : -0.5);
+    o2 = vec2(vVar.x - vVar.y, gl_FragCoord.z + gl_FragCoord.w * float(iy));
+    o3 = vec4(s.wzy * 2.0 - 0.5, (ix % 3) == 0 ? uSpecial.x : ((ix % 3) == 1 ? uSpecial.y : vVar.z * vUV.x));
+}`,
+		// Integer outputs at 0 and 1, a float at 3, none at 2.
+		`#version 310 es
+precision highp float;
+layout(location = 0) in vec2 vUV;
+layout(location = 2) flat in ivec2 vId;
+layout(location = 0) out ivec2 i0;
+layout(location = 1) out uvec4 u1;
+layout(location = 3) out float f3;
+void main() {
+    int ix = int(gl_FragCoord.x);
+    int iy = int(gl_FragCoord.y);
+    if (((ix + iy * 5) % 7) == 3) {
+        discard;
+    }
+    i0 = ivec2(ix - 30, iy * -3) + vId;
+    u1 = uvec4(uint(ix) * 2654435761u, uint(iy), 0xFFFFFFFFu, uint(vUV.x * 255.0));
+    f3 = vUV.y - 0.25;
+}`,
+		// One float, from the uv or a varying.
+		`#version 310 es
+precision highp float;
+layout(location = 0) in vec2 vUV;
+layout(location = 0) out float o;
+void main() {
+    if (int(gl_FragCoord.y) == 2 && int(gl_FragCoord.x) > 1) {
+        discard;
+    }
+    o = gl_FragCoord.x * 0.01 - 0.2 + vUV.y;
+}`,
+		// 2 components at 0 and 4 at 2, no inputs but gl_FragCoord, no discard.
+		`#version 310 es
+precision highp float;
+layout(location = 0) out vec2 a;
+layout(location = 2) out vec4 b;
+void main() {
+    a = gl_FragCoord.yx * 0.5;
+    b = vec4(gl_FragCoord.x * 0.002, 1.0 / gl_FragCoord.y, -2.0, 0.25);
+}`,
+	}
+	Counter :: struct {
+		calls: int,
+		sum:   u64,
+	}
+	counting :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		st := (^Counter)(user)
+		st.calls += 1
+		h := u64(channel + 1) * 0x9E37_79B9_7F4A_7C15
+		h ~= u64(transmute(u32)uv.x) * 0xC2B2_AE3D_27D4_EB4F
+		h ~= u64(transmute(u32)uv.y) * 0x1656_67B1_9E37_79F9
+		h ~= u64(transmute(u32)lod) * 0x27D4_EB2F_1656_67C5
+		st.sum += h ~ (h >> 29)
+		return {uv.x * 2 - 0.5, uv.y, lod, f32(channel)}
+	}
+	Region :: struct {
+		x, y, w, h: int,
+	}
+	Layer :: struct {
+		w, h:    int,
+		regions: []Region,
+	}
+	layers := [?]Layer {
+		{1, 1, {{0, 0, 1, 1}}},
+		{3, 5, {{1, 1, 1, 3}, {0, 1, 3, 3}, {1, 0, 2, 5}, {2, 4, 1, 1}, {-1, -2, 3, 4}}},
+		{61, 45, {{3, 5, 37, 29}, {0, 0, 61, 45}, {1, 2, 1, 1}, {60, 44, 1, 1}, {0, 31, 61, 14}, {7, 0, 2, 45}, {-3, -1, 10, 9}, {55, 40, 20, 20}}},
+		{1280, 720, {{0, 32, 1280, 32}, {5, 3, 1271, 701}}},
+	}
+	Locations :: bit_set[0 ..< 5]
+	target_sets := [?]Locations{{0, 1, 2, 3}, {0}, {0, 1}, {0, 1, 2}, {1, 3}, {0, 2}, {0, 1, 2, 3, 4}, {}}
+	SENTINEL :: [4]f32{-12345.0, 67890.0, -42.5, 999.25}
+	PAD :: 5
+	BYTE_SENTINEL :: u8(0xA5)
+
+	img := make([][4]f32, 7 * 5, context.temp_allocator)
+	for &tx, i in img {
+		tx = {f32(i) * 0.03, f32(i % 7) * 0.2 - 0.3, f32(i / 7) * 0.25, 1.5 - f32(i) * 0.01}
+	}
+	imgs := [1]Channel_Image{channel_image(img, 7, 5)}
+	scratch := [2]^Scratch{temp_scratch(), temp_scratch()}
+
+	for src, si in srcs {
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		p_int := m.program
+		p_int.jit_body, p_int.jit_init = nil, nil
+		progs := [2]^Program{&m.program, &p_int}
+		block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+		set_uniform(m, block, "uSpecial", {transmute(f32)u32(0x7fc0_0000), math.inf_f32(1)})
+
+		for layer in layers {
+			W, H := layer.w, layer.h
+			big := W * H > 100_000
+			varyings := [3]Varying {
+				{a = {0.03125, -0.0625, 0, 0}, dx = {1.0 / f32(W), 0.0078125, 0, 0}, dy = {0.015625, 1.0 / f32(H), 0, 0}},
+				{a = {0.25, -0.5, 1.25, 0}, dx = {0.03125, 0.015625, -0.0078125, 0}, dy = {-0.015625, 0.0625, 0.03125, 0}},
+				{a = {3, -7, 0, 0}, dx = {1, 0.5, 0, 0}, dy = {0.25, -1, 0, 0}},
+			}
+			n_targets := 4 if big else 5
+			bufs: [2][5][][4]f32
+			for e in 0 ..< 2 {
+				for k in 0 ..< n_targets {
+					bufs[e][k] = make([][4]f32, W * H + 2 * PAD)
+				}
+			}
+			stride := W * 4 + 3
+			bytes := [2][]u8{make([]u8, H * stride + 2 * PAD), make([]u8, H * stride + 2 * PAD)}
+			defer {
+				for e in 0 ..< 2 {
+					for k in 0 ..< n_targets {
+						delete(bufs[e][k])
+					}
+					delete(bytes[e])
+				}
+			}
+
+			for use_vars in ([2]bool{false, true}) {
+				for use_img in ([2]bool{false, true}) {
+					if big && (!use_vars || use_img) {
+						continue
+					}
+					for ri in -1 ..< len(layer.regions) {
+						rg := Region{} if ri < 0 else layer.regions[ri]
+						inside := ri >= 0 && rg.x >= 0 && rg.y >= 0 && rg.x + rg.w <= W && rg.y + rg.h <= H
+						for rt in ([2]bool{false, true}) {
+							if rt && !inside {
+								continue
+							}
+							n := rg.w * rg.h if rt else W * H
+							for cfg in 0 ..< len(target_sets) + 2 {
+								is_f32 := cfg == len(target_sets)
+								is_rgba8 := cfg == len(target_sets) + 1
+								if (is_rgba8 && rt) || (big && cfg != 0 && !is_rgba8) {
+									continue
+								}
+								set := Locations{0} if is_f32 else (Locations{} if is_rgba8 else target_sets[cfg])
+								nt := 2 if set == {} else 0
+								for k in 0 ..< 5 {
+									if k in set {
+										nt = k + 1
+									}
+								}
+								counters: [2]Counter
+								for e in 0 ..< 2 {
+									opts := Run_Options {
+										x              = rg.x,
+										y              = rg.y,
+										w              = rg.w,
+										h              = rg.h,
+										region_targets = rt,
+										varyings       = varyings[:] if use_vars else nil,
+										sampler        = counting,
+										user           = &counters[e],
+										channel_images = imgs[:] if use_img else nil,
+									}
+									targets: [5][][4]f32
+									for k in 0 ..< 5 {
+										if k in set {
+											slice.fill(bufs[e][k][:n + 2 * PAD], SENTINEL)
+											targets[k] = bufs[e][k][PAD:][:n]
+										}
+									}
+									switch {
+									case is_rgba8:
+										slice.fill(bytes[e], BYTE_SENTINEL)
+										run(progs[e], block, W, H, bytes[e][PAD:][:H * stride], stride, scratch[e], opts)
+									case is_f32:
+										run_f32(progs[e], block, W, H, targets[0], scratch[e], opts)
+									case:
+										run_targets(progs[e], block, W, H, targets[:nt], scratch[e], opts)
+									}
+								}
+								what := fmt.tprintf("src %d layer %dx%d vars %v img %v region %v rt %v cfg %d", si, W, H, use_vars, use_img, rg, rt, cfg)
+								if !testing.expectf(t, counters[0] == counters[1], "%s: sampler calls %v against %v", what, counters[0], counters[1]) {
+									return
+								}
+								if is_rgba8 {
+									if !testing.expectf(t, slice.equal(bytes[0], bytes[1]), "%s: RGBA8 differs", what) {
+										return
+									}
+									for i in 0 ..< PAD {
+										if !testing.expectf(t, bytes[0][i] == BYTE_SENTINEL && bytes[0][len(bytes[0]) - 1 - i] == BYTE_SENTINEL, "%s: RGBA8 written outside", what) {
+											return
+										}
+									}
+									continue
+								}
+								for k in 0 ..< 5 {
+									if k not_in set {
+										continue
+									}
+									bj, bi := bufs[0][k][:n + 2 * PAD], bufs[1][k][:n + 2 * PAD]
+									if !testing.expectf(t, slice.equal(slice.reinterpret([]u32, bj), slice.reinterpret([]u32, bi)), "%s: target %d differs", what, k) {
+										return
+									}
+									for i in 0 ..< PAD {
+										if !testing.expectf(t, bj[i] == SENTINEL && bj[n + PAD + i] == SENTINEL, "%s: target %d written outside", what, k) {
+											return
+										}
+									}
+								}
+							}
+						}
 					}
 				}
 			}

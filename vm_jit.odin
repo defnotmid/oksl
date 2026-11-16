@@ -4347,17 +4347,9 @@ jit_pack_u8 :: #force_inline proc "contextless" (v: Simd_F8) -> Simd_U8 {
 	return transmute(Simd_U8)Simd_I8(clamped * Simd_F8(255) + Simd_F8(0.5))
 }
 
-@(private, rodata)
-JIT_LX := [JIT_LANES]int{0, 1, 0, 1, 2, 3, 2, 3}
-@(private, rodata)
-JIT_LY := [JIT_LANES]int{0, 0, 1, 1, 0, 0, 1, 1}
-@(private, rodata)
-JIT_LXF := Jit_Floats{0.5, 1.5, 0.5, 1.5, 2.5, 3.5, 2.5, 3.5}
-@(private, rodata)
-JIT_LYF := Jit_Floats{0.5, 0.5, 1.5, 1.5, 0.5, 0.5, 1.5, 1.5}
-@(private, rodata)
-JIT_ROW_LANES := [2][4]int{{0, 1, 4, 5}, {2, 3, 6, 7}}
-
+// The first and last pixel the run writes in every target and in the RGBA8
+// output, read with bounds checks (jit_runner_run has none), so a short
+// buffer traps before anything is written.
 @(private)
 jit_validate_run :: proc(p: ^Program, out_x, out_y, out_stride, start_x, start_y, end_x, end_y: int, out: []u8, stride: int, targets: [][][4]f32) {
 	first_px := (start_y - out_y) * out_stride + (start_x - out_x)
@@ -4422,6 +4414,115 @@ jit_validate_fragment :: proc(p: ^Program, meta: ^Jit_Meta, quads: Fragment_Quad
 	}
 }
 
+// The layer runner's tile: 4x2 pixels, quads side by side, lane l at
+// (JIT_RUN_DX[l], JIT_RUN_DY[l]) - 0.5 from its top-left pixel.
+@(private)
+JIT_RUN_DX :: Simd_F8{0.5, 1.5, 0.5, 1.5, 2.5, 3.5, 2.5, 3.5}
+@(private)
+JIT_RUN_DY :: Simd_F8{0.5, 0.5, 1.5, 1.5, 0.5, 0.5, 1.5, 1.5}
+@(private, rodata)
+JIT_RUN_LX := [JIT_LANES]int{0, 1, 0, 1, 2, 3, 2, 3}
+@(private, rodata)
+JIT_RUN_LY := [JIT_LANES]int{0, 0, 1, 1, 0, 0, 1, 1}
+
+// An input component from a Varying: a + dx * x + dy * y at the lanes' pixel centres.
+@(private)
+Jit_Run_Varying :: struct {
+	dst:       ^Simd_F8,
+	a, dx, dy: f32,
+}
+
+// A component converted from float columns to `base`, every tile: an integer
+// input staged as floats, or an integer output for the float stores.
+@(private)
+Jit_Run_Conv :: struct {
+	src:  ^Jit_Slot,
+	dst:  ^Jit_Slot,
+	base: Base,
+}
+
+// Input components at most: 16 locations of 4, gl_FragCoord's 4 and
+// gl_FrontFacing.
+@(private)
+JIT_RUN_MAX_IN :: 16 * 4 + 4 + 1
+
+// What one call fills per row and per tile: each input component as a
+// destination, written as floats (staged, then converted, when its base
+// isn't float). gl_FragCoord and location 0 occur at most once, so their
+// destinations are single (nil when absent); the counts say what is set.
+@(private)
+Jit_Run_Inputs :: struct {
+	x, y:    ^Simd_F8, // gl_FragCoord.x, .y
+	ux, uy:  ^Simd_F8, // location 0's uv without varyings
+	vars:    [JIT_RUN_MAX_IN]Jit_Run_Varying,
+	convs:   [JIT_RUN_MAX_IN]Jit_Run_Conv,
+	staged:  [JIT_RUN_MAX_IN]Simd_F8,
+	nvars:   int,
+	nconvs:  int,
+	nstaged: int,
+}
+
+@(private)
+jit_run_input_dst :: proc(ins: ^Jit_Run_Inputs, slot: ^Jit_Slot, base: Base) -> ^Simd_F8 {
+	if base == .Float {
+		return (^Simd_F8)(slot)
+	}
+	staged := &ins.staged[ins.nstaged]
+	ins.nstaged += 1
+	ins.convs[ins.nconvs] = {src = (^Jit_Slot)(staged), dst = slot, base = base}
+	ins.nconvs += 1
+	return staged
+}
+
+// The inputs' plan, and their components that are the same in every tile
+// (gl_FragCoord.zw, gl_FrontFacing, inputs without a varying) filled once:
+// input slots are only read.
+@(private, enable_target_feature = "avx2")
+jit_run_plan_inputs :: proc(ins: ^Jit_Run_Inputs, p: ^Program, slots: [^]Jit_Slot, varyings: []Varying) {
+	ins.x, ins.y, ins.ux, ins.uy = nil, nil, nil, nil
+	ins.nvars, ins.nconvs, ins.nstaged = 0, 0, 0
+	for v in p.inputs {
+		for k in 0 ..< int(v.n) {
+			slot := &slots[v.slot + i32(k)]
+			#partial switch v.kind {
+			case .Frag_Coord:
+				switch k {
+				case 0:
+					ins.x = jit_run_input_dst(ins, slot, v.base)
+				case 1:
+					ins.y = jit_run_input_dst(ins, slot, v.base)
+				case:
+					jit_fill_slot(slot, 1 if k == 3 else 0, v.base)
+				}
+			case .Front_Facing:
+				// A layer faces the camera.
+				jit_fill_slot(slot, 1, v.base)
+			case:
+				if int(v.location) < len(varyings) {
+					vy := varyings[v.location]
+					ins.vars[ins.nvars] = {jit_run_input_dst(ins, slot, v.base), vy.a[k], vy.dx[k], vy.dy[k]}
+					ins.nvars += 1
+				} else if v.location == 0 && k == 0 {
+					ins.ux = jit_run_input_dst(ins, slot, v.base)
+				} else if v.location == 0 && k == 1 {
+					ins.uy = jit_run_input_dst(ins, slot, v.base)
+				} else {
+					jit_fill_slot(slot, 0, v.base)
+				}
+			}
+		}
+	}
+}
+
+// Runs a fragment program over a layer (runner_run validated the options) in
+// 4x2 tiles, two quads each. What a call needs is planned once: the input
+// columns by how they step (per tile with x, per row with y, constant), the
+// targets with their four columns (missing components from constant
+// columns, integer outputs converted into floats), and the lanes' pixel
+// offsets; each tile then fills its spans, runs, and stores the pixels its
+// region and discards leave: per float target one 4x2 transpose, then each
+// pixel's [4]f32 (32-byte pair stores measured slower: on Zen 5 the next
+// tile's body stalls on a full retire queue), and RGBA8 a row at a time.
 @(private, enable_target_feature = "avx2")
 jit_runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) #no_bounds_check {
 	x0, y0 := opts.x, opts.y
@@ -4445,130 +4546,121 @@ jit_runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Ru
 	slots := ctx.slots
 	masks := ctx.masks
 	body_fn := Jit_Fn(p.jit_body)
-	fw, fh := f32(width), f32(height)
 
-	// Hoist constant Frag_Coord z/w and Front_Facing fills out of the tile loop.
-	for v in p.inputs {
-		if v.kind == .Frag_Coord && v.base == .Float {
-			if v.n > 2 {(^Jit_Floats)(&slots[v.slot + 2])^ = 0}
-			if v.n > 3 {(^Jit_Floats)(&slots[v.slot + 3])^ = 1}
-		} else if v.kind == .Front_Facing {
-			for k in 0 ..< int(v.n) {
-				jit_fill_slot(&slots[v.slot + i32(k)], 1, v.base)
+	ins: Jit_Run_Inputs = ---
+	jit_run_plan_inputs(&ins, p, slots, opts.varyings)
+
+	// The outputs: a float target per written location, RGBA8 from location 0.
+	targs: [FRAGMENT_OUTPUTS]Jit_Out_Target
+	n_targs := 0
+	rgba8: Jit_Out_Target
+	has_rgba8 := false
+	out_convs: [FRAGMENT_OUTPUTS * 4]Jit_Run_Conv
+	out_cols: [FRAGMENT_OUTPUTS * 4]Simd_F8
+	n_out_convs := 0
+	for v in p.outputs {
+		if v.kind != .Stage_Out {
+			continue
+		}
+		target := targets[v.location] if int(v.location) < len(targets) else nil
+		bytes := v.location == 0 && out != nil
+		if target == nil && !bytes {
+			continue
+		}
+		cols := [4]^Jit_Floats{&jit_tables.zero_f, &jit_tables.zero_f, &jit_tables.zero_f, &jit_tables.one_f}
+		for k in 0 ..< int(v.n) {
+			slot := &slots[v.slot + i32(k)]
+			if v.base == .Float {
+				cols[k] = (^Jit_Floats)(slot)
+				continue
 			}
+			col := &out_cols[n_out_convs]
+			out_convs[n_out_convs] = {src = slot, dst = (^Jit_Slot)(col), base = v.base}
+			n_out_convs += 1
+			cols[k] = (^Jit_Floats)(col)
+		}
+		if target != nil {
+			targs[n_targs] = {dst = raw_data(target), c0 = cols[0], c1 = cols[1], c2 = cols[2], c3 = cols[3]}
+			n_targs += 1
+		}
+		if bytes {
+			rgba8 = {c0 = cols[0], c1 = cols[1], c2 = cols[2], c3 = cols[3]}
+			has_rgba8 = true
 		}
 	}
+	bptr := raw_data(out)
+	// Each lane's pixel from its tile's top-left: in a target, in the bytes.
+	lane_off, lane_boff: [JIT_LANES]int
+	for l in 0 ..< JIT_LANES {
+		lane_off[l] = JIT_RUN_LY[l] * out_stride + JIT_RUN_LX[l]
+		lane_boff[l] = JIT_RUN_LY[l] * stride + JIT_RUN_LX[l] * 4
+	}
 
-	for by := start_y &~ 1; by < end_y; by += JIT_BATCH_H {
-		py := f32(by) + JIT_LYF
-		for v in p.inputs {
-			if v.kind == .Frag_Coord && v.base == .Float && v.n > 1 {
-				(^Jit_Floats)(&slots[v.slot + 1])^ = py
+	fw, fh := Simd_F8(f32(width)), Simd_F8(f32(height))
+	for by := start_y &~ 1; by < end_y; by += 2 {
+		py := Simd_F8(f32(by)) + JIT_RUN_DY
+		if ins.y != nil {ins.y^ = py}
+		if ins.uy != nil {ins.uy^ = py / fh}
+		// The row's lanes in the region, and its pixel (0, by) in a target and the bytes.
+		row_mask := (u8(0x33) if by >= start_y else 0) | (u8(0xCC) if by + 1 < end_y else 0)
+		row_px := (by - out_y) * out_stride - out_x
+		row_byte := by * stride
+		for bx := start_x &~ 1; bx < end_x; bx += 4 {
+			px := Simd_F8(f32(bx)) + JIT_RUN_DX
+			if ins.x != nil {ins.x^ = px}
+			if ins.ux != nil {ins.ux^ = px / fw}
+			for vr in ins.vars[:ins.nvars] {
+				vr.dst^ = Simd_F8(vr.a) + Simd_F8(vr.dx) * px + Simd_F8(vr.dy) * py
 			}
-		}
-		for bx := start_x &~ 1; bx < end_x; bx += JIT_BATCH_W {
-			px := f32(bx) + JIT_LXF
-			for v in p.inputs {
-				if v.kind == .Frag_Coord && v.base == .Float {
-					(^Jit_Floats)(&slots[v.slot])^ = px
-					continue
-				}
-				if v.kind == .Front_Facing {
-					continue
-				}
-				for k in 0 ..< int(v.n) {
-					col: Jit_Floats
-					switch {
-					case v.kind == .Frag_Coord:
-						col = px if k == 0 else (py if k == 1 else (1 if k == 3 else 0))
-					case int(v.location) < len(opts_local.varyings):
-						vy := opts_local.varyings[v.location]
-						col = vy.a[k] + vy.dx[k] * px + vy.dy[k] * py
-					case v.location == 0 && k < 2:
-						col = px / fw if k == 0 else py / fh
-					}
-					jit_fill_slot(&slots[v.slot + i32(k)], col, v.base)
-				}
+			for c in ins.convs[:ins.nconvs] {
+				jit_fill_slot(c.dst, (^Jit_Floats)(c.src)^, c.base)
 			}
 
-			inside := bx >= start_x && by >= start_y && bx + JIT_BATCH_W <= end_x && by + JIT_BATCH_H <= end_y
-			exec := u8(0xFF)
-			if !inside {
-				exec = 0
-				if bx + 1 >= start_x && bx < end_x && by + 1 >= start_y && by < end_y {
-					exec |= 0x0F
-				}
-				if bx + 3 >= start_x && bx + 2 < end_x && by + 1 >= start_y && by < end_y {
-					exec |= 0xF0
-				}
-			}
-			ctx.lanes = exec
+			// The quads the region touches run, all four lanes of each (as
+			// a GPU's helpers): the left one always, the right one unless
+			// it starts past the region.
+			ctx.lanes = 0x0F | (u8(0xF0) if bx + 2 < end_x else 0)
 			masks[MASK_DISCARD] = 0
 			body_fn(&ctx)
 
-			alive := ~masks[MASK_DISCARD]
-			if alive == 0 {
+			col_mask := (u8(0x05) if bx >= start_x else 0) | (u8(0x0A) if bx + 1 < end_x else 0) | (u8(0x50) if bx + 2 < end_x else 0) | (u8(0xA0) if bx + 3 < end_x else 0)
+			write := ~masks[MASK_DISCARD] & row_mask & col_mask
+			if write == 0 {
 				continue
 			}
-			full_tile := inside && alive == 0xFF
-			for v in p.outputs {
-				if v.kind != .Stage_Out {
-					continue
+			for c in out_convs[:n_out_convs] {
+				for l in 0 ..< JIT_LANES {
+					(^Jit_Floats)(c.dst)[l] = float_of(c.src[l], c.base)
 				}
-				target := targets[v.location] if int(v.location) < len(targets) else nil
-				bytes := out if v.location == 0 else nil
-				if target == nil && bytes == nil {
-					continue
+			}
+			tile_px := row_px + bx
+			tile_byte := row_byte + bx * 4
+			if write == 0xFF {
+				for t in targs[:n_targs] {
+					pixels := transmute([JIT_LANES][4]f32)jit_out_pixels(t)
+					for l in 0 ..< JIT_LANES {
+						t.dst[tile_px + lane_off[l]] = pixels[l]
+					}
 				}
-				if full_tile && v.base == .Float && v.n == 4 {
-					r0 := (^Jit_Floats)(&slots[v.slot])
-					r1 := (^Jit_Floats)(&slots[v.slot + 1])
-					r2 := (^Jit_Floats)(&slots[v.slot + 2])
-					r3 := (^Jit_Floats)(&slots[v.slot + 3])
-					if target != nil {
-						tptr := ([^][4]f32)(raw_data(target))
-						for ry in 0 ..< 2 {
-							base_px := (by + ry - out_y) * out_stride + (bx - out_x)
-							lanes_r := JIT_ROW_LANES[ry]
-							for rx in 0 ..< 4 {
-								l := lanes_r[rx]
-								tptr[base_px + rx] = {r0[l], r1[l], r2[l], r3[l]}
-							}
-						}
-					}
-					if bytes != nil {
-						bptr := raw_data(bytes)
-						rgba := jit_pack_u8((^Simd_F8)(r0)^) |
-						        intrinsics.simd_shl(jit_pack_u8((^Simd_F8)(r1)^), Simd_U8(8)) |
-						        intrinsics.simd_shl(jit_pack_u8((^Simd_F8)(r2)^), Simd_U8(16)) |
-						        intrinsics.simd_shl(jit_pack_u8((^Simd_F8)(r3)^), Simd_U8(24))
-						p8 := transmute([8]u32)rgba
-						intrinsics.unaligned_store((^[4]u32)(&bptr[by * stride + bx * 4]), [4]u32{p8[0], p8[1], p8[4], p8[5]})
-						intrinsics.unaligned_store((^[4]u32)(&bptr[(by + 1) * stride + bx * 4]), [4]u32{p8[2], p8[3], p8[6], p8[7]})
-					}
-					continue
+				if has_rgba8 {
+					rgba := jit_pack_rgba8(rgba8)
+					intrinsics.unaligned_store((^[4]u32)(&bptr[tile_byte]), [4]u32{rgba[0], rgba[1], rgba[4], rgba[5]})
+					intrinsics.unaligned_store((^[4]u32)(&bptr[tile_byte + stride]), [4]u32{rgba[2], rgba[3], rgba[6], rgba[7]})
 				}
-				for lane in 0 ..< JIT_LANES {
-					x := bx + JIT_LX[lane]
-					y := by + JIT_LY[lane]
-					if x < start_x || y < start_y || x >= end_x || y >= end_y || (alive & (1 << uint(lane))) == 0 {
-						continue
-					}
-					c := [4]f32{0, 0, 0, 1}
-					for k in 0 ..< int(v.n) {
-						c[k] = float_of(slots[v.slot + i32(k)][lane], v.base)
-					}
-					if target != nil {
-						target[(y - out_y) * out_stride + (x - out_x)] = c
-					}
-					if bytes != nil {
-						o := y * stride + x * 4
-						for k in 0 ..< 4 {
-							cv := c[k]
-							if !(cv > 0) {cv = 0}
-							bytes[o + k] = u8(min(cv, 1) * 255 + 0.5)
-						}
-					}
+				continue
+			}
+			for t in targs[:n_targs] {
+				pixels := transmute([JIT_LANES][4]f32)jit_out_pixels(t)
+				for m := write; m != 0; m &= m - 1 {
+					l := intrinsics.count_trailing_zeros(m)
+					t.dst[tile_px + lane_off[l]] = pixels[l]
+				}
+			}
+			if has_rgba8 {
+				rgba := jit_pack_rgba8(rgba8)
+				for m := write; m != 0; m &= m - 1 {
+					l := intrinsics.count_trailing_zeros(m)
+					intrinsics.unaligned_store((^u32)(&bptr[tile_byte + lane_boff[l]]), rgba[l])
 				}
 			}
 		}
@@ -4655,8 +4747,10 @@ Jit_Out_Target :: struct {
 	c3:  ^Jit_Floats,
 }
 
+// An output's 8 lanes as RGBA pixels, two lanes a register: lanes 0-1, 2-3,
+// 4-5 and 6-7.
 @(private, enable_target_feature = "avx2")
-jit_store_pair :: #force_inline proc "contextless" (t: Jit_Out_Target, base_out: int) #no_bounds_check {
+jit_out_pixels :: #force_inline proc "contextless" (t: Jit_Out_Target) -> [4]Simd_F8 #no_bounds_check {
 	r := (^Simd_F8)(t.c0)^
 	g := (^Simd_F8)(t.c1)^
 	b := (^Simd_F8)(t.c2)^
@@ -4669,10 +4763,32 @@ jit_store_pair :: #force_inline proc "contextless" (t: Jit_Out_Target, base_out:
 	p15 := intrinsics.simd_shuffle(rg_lo, ba_lo, 2, 3, 10, 11, 6, 7, 14, 15)
 	p26 := intrinsics.simd_shuffle(rg_hi, ba_hi, 0, 1, 8, 9, 4, 5, 12, 13)
 	p37 := intrinsics.simd_shuffle(rg_hi, ba_hi, 2, 3, 10, 11, 6, 7, 14, 15)
-	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 0]), intrinsics.simd_shuffle(p04, p15, 0, 1, 2, 3, 8, 9, 10, 11))
-	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 2]), intrinsics.simd_shuffle(p26, p37, 0, 1, 2, 3, 8, 9, 10, 11))
-	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 4]), intrinsics.simd_shuffle(p04, p15, 4, 5, 6, 7, 12, 13, 14, 15))
-	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 6]), intrinsics.simd_shuffle(p26, p37, 4, 5, 6, 7, 12, 13, 14, 15))
+	return {
+		intrinsics.simd_shuffle(p04, p15, 0, 1, 2, 3, 8, 9, 10, 11),
+		intrinsics.simd_shuffle(p26, p37, 0, 1, 2, 3, 8, 9, 10, 11),
+		intrinsics.simd_shuffle(p04, p15, 4, 5, 6, 7, 12, 13, 14, 15),
+		intrinsics.simd_shuffle(p26, p37, 4, 5, 6, 7, 12, 13, 14, 15),
+	}
+}
+
+// Two quads' pixels, consecutive from base_out (run_fragment).
+@(private, enable_target_feature = "avx2")
+jit_store_pair :: #force_inline proc "contextless" (t: Jit_Out_Target, base_out: int) #no_bounds_check {
+	px := jit_out_pixels(t)
+	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 0]), px[0])
+	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 2]), px[1])
+	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 4]), px[2])
+	intrinsics.unaligned_store((^Simd_F8)(&t.dst[base_out + 6]), px[3])
+}
+
+// An output's 8 lanes as RGBA8 pixels, as run rounds them.
+@(private, enable_target_feature = "avx2")
+jit_pack_rgba8 :: #force_inline proc "contextless" (t: Jit_Out_Target) -> [JIT_LANES]u32 #no_bounds_check {
+	rgba := jit_pack_u8((^Simd_F8)(t.c0)^) |
+	        intrinsics.simd_shl(jit_pack_u8((^Simd_F8)(t.c1)^), Simd_U8(8)) |
+	        intrinsics.simd_shl(jit_pack_u8((^Simd_F8)(t.c2)^), Simd_U8(16)) |
+	        intrinsics.simd_shl(jit_pack_u8((^Simd_F8)(t.c3)^), Simd_U8(24))
+	return transmute([JIT_LANES]u32)rgba
 }
 
 @(private, enable_target_feature = "avx2")
