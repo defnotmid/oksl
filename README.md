@@ -716,13 +716,20 @@ pass.
   atomics in workgroups of more than 8 invocations, other targets,
   machines without AVX2, environments that refuse executable memory
   (`PROT_EXEC`), and builds with `-define:OKSL_JIT=false` run on the
-  64-lane interpreter with the same results, apart from NaN bit patterns,
-  values computed in lanes that aren't running and, in compute, the
-  outcome of unsynchronized accesses (all undefined on GPUs too), and one
-  open case: `clamp` of a negative zero at a zero bound
-  (`clamp(-0.0, 0.0, x)`) gives `+0.0` in the JIT and `-0.0` in the
-  interpreter (IEEE 754 allows either sign for `max(-0.0, 0.0)`). CI runs
-  the tests and goldens both ways and requires identical output.
+  64-lane interpreter with the same results, apart from NaN bit patterns
+  and, in compute, the outcome of unsynchronized accesses (both undefined
+  on GPUs too). Lanes that aren't running compute their own values: a
+  variable, parameter or return value takes its first value in every
+  lane (its initializer; 0 for one without an initializer, a declaration
+  directly in a `switch` body, a `?:` result, and the result of a function
+  that can return early) and later writes only in the lanes that run them,
+  so what the lanes of a sampled quad that aren't running pass a `sampler`
+  callback, and the derivatives and `texture` level that read them, are
+  the same in both. Signed zeros agree: `clamp` is GLSL's
+  `min(max(x, lo), hi)` with `max(x, y)` = `x < y ? y : x`, so
+  `clamp(-0.0, 0.0, 1.0)` is `-0.0`, and a NaN operand gives the other
+  one. CI runs the tests and goldens both ways and requires identical
+  output.
 - **Uniform work:** what follows from constants and uniforms alone moves
   to the front of the program and runs once per run, before the batches,
   even from inside loops and branches: a raymarcher's `rot(iTime)` is

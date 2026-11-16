@@ -1355,7 +1355,7 @@ fn3_lanes :: #force_inline proc "contextless" (regs: []Reg, in_: Instr, $B: Buil
 @(private)
 fn3 :: #force_inline proc "contextless" (x, y, z: f32, $B: Builtin) -> f32 {
 	when B == .Clamp {
-		return min(max(x, y), z)
+		return clamp_f32(x, y, z)
 	} else when B == .Mix {
 		return x * (1 - z) + y * z
 	} else when B == .Smoothstep {
@@ -1364,6 +1364,18 @@ fn3 :: #force_inline proc "contextless" (x, y, z: f32, $B: Builtin) -> f32 {
 	} else {
 		#panic("not a three-operand float built-in")
 	}
+}
+
+// GLSL ES 3.10's clamp, min(max(x, lo), hi), with its max(x, y) = `y if
+// x < y else x` and min(x, y) = `y if y < x else x`: a bound equal to x
+// leaves x, so clamp(-0.0, 0.0, 1.0) is -0.0. A NaN operand gives the other
+// one (clamp(NaN, 0, 1) = 0). Spelled out rather than Odin's min and max,
+// which are LLVM's minnum and maxnum and leave the sign of an equal zero to
+// the target. The JIT's F_Fn3 Clamp matches it.
+@(private)
+clamp_f32 :: #force_inline proc "contextless" (x, lo, hi: f32) -> f32 {
+	t := lo if x != x || lo > x else x
+	return hi if t != t || hi < t else t
 }
 
 @(private)

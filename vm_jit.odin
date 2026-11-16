@@ -913,6 +913,9 @@ Jit_Emitter :: struct {
 	buf:              [dynamic]u8,
 	mem_mask:         []u16,
 	tex_mask:         []u8,
+	// Slots holding a constant that isn't NaN (Program.consts; nothing
+	// else writes them).
+	num_const:        []bool,
 	pc_to_bb:         []i32,
 	last_use:         []i32,
 	def_off:          []i32,
@@ -3197,19 +3200,26 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			bi := Builtin(in_.k)
 			#partial switch bi {
 			case .Clamp:
-				// Match Odin's min(max(x, lo), hi) (IEEE maxNum / minNum):
-				// return the non-NaN operand whenever either argument is NaN.
+				// clamp_f32 (vm_run.odin): GLSL's min(max(x, lo), hi) with
+				// max(x, y) = `y if x < y else x`, so a bound equal to x (a
+				// zero of the other sign) leaves x; a NaN operand gives the other.
 				for i in 0 ..< n {
 					yx := read_slot(e, a + i, 1)
 					ylo := read_slot(e, b + i, 2, pin_bit(yx))
 					yhi := read_slot(e, c + i, 3, pin_bit(yx) | pin_bit(ylo))
-					vop_ps(&e.buf, 0x5F, 4, yx, ylo)
-					vcmpps(&e.buf, 5, ylo, ylo, 0x03)
-					vblendvps(&e.buf, 0, 4, yx, 5)
-					vop_ps(&e.buf, 0x5D, 4, 0, yhi)
-					vcmpps(&e.buf, 5, yhi, yhi, 0x03)
+					vop_ps(&e.buf, 0x5F, 4, ylo, yx) // lo > x ? lo : x
+					vcmpps(&e.buf, 5, yx, yx, 0x03)
+					vblendvps(&e.buf, 0, 4, ylo, 5)  // x NaN: lo
 					yd := prep_dst(e, dst + i, 0, pin_bit(yx) | pin_bit(ylo) | pin_bit(yhi))
-					vblendvps(&e.buf, yd, 4, 0, 5)
+					if e.num_const[b + i] {
+						// t is NaN only where x and lo both are, so never
+						// with a constant lo: hi < t ? hi : t is all.
+						vop_ps(&e.buf, 0x5D, yd, yhi, 0)
+					} else {
+						vop_ps(&e.buf, 0x5D, 4, yhi, 0)
+						vcmpps(&e.buf, 5, 0, 0, 0x03)
+						vblendvps(&e.buf, yd, 4, yhi, 5) // t NaN: hi
+					}
 					commit_dst(e, dst + i, yd)
 				}
 			case .Mix:
@@ -3654,11 +3664,11 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 
 			// Uniform fast path: 64-bit unsigned bounds-checked vbroadcastss into yd[0..n-1].
 			emit_vex_rr(&e.buf, 1, 1, 0, 0, 0x7E, yidx, 0, GPR_RAX) // vmovd eax, xmm(yidx)
+			// A std430 element is at least one word (declare_buffer), so the
+			// stride is at least 1, as in emit_store_buf.
 			stride := u32(in_.b)
 			off := u32(in_.c)
-			if stride == 0 {
-				emit_bytes(&e.buf, 0x31, 0xC0) // xor eax, eax
-			} else if stride != 1 {
+			if stride != 1 {
 				emit_bytes(&e.buf, 0x69, 0xC0) // imul eax, eax, stride
 				emit_u32(&e.buf, stride)
 			}
@@ -3687,9 +3697,7 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 
 			// Divergent path: hardware AVX2 vpgatherdd (< 2^31 words inline; > 2^31 words out of line).
 			patch_i32(e.buf[:], div_patch, i32(len(e.buf) - (div_patch + 4)))
-			if stride == 0 {
-				vzero(&e.buf, 4)
-			} else if stride == 1 {
+			if stride == 1 {
 				vmovaps_rr(&e.buf, 4, yidx)
 			} else {
 				emit_b(&e.buf, 0xB8) // mov eax, stride
@@ -4118,6 +4126,7 @@ jit_compile :: proc(p: ^Program) {
 		buf              = make([dynamic]u8, 0, max(len(p.code) * 24, 256), heap),
 		mem_mask         = make([]u16, max_code, heap),
 		tex_mask         = make([]u8, max_code, heap),
+		num_const        = make([]bool, num_slots, heap),
 		pc_to_bb         = make([]i32, max_code + 1, heap),
 		last_use         = make([]i32, num_slots, heap),
 		def_off          = make([]i32, max_code, heap),
@@ -4139,6 +4148,10 @@ jit_compile :: proc(p: ^Program) {
 	defer delete(e.buf)
 	defer delete(e.mem_mask, heap)
 	defer delete(e.tex_mask, heap)
+	defer delete(e.num_const, heap)
+	for c in p.consts {
+		e.num_const[c[0]] = (c[1] & 0x7fff_ffff) <= 0x7f80_0000
+	}
 	defer delete(e.pc_to_bb, heap)
 	defer delete(e.last_use, heap)
 	defer delete(e.def_off, heap)

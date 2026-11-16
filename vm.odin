@@ -288,6 +288,9 @@ Lower :: struct {
 	ret_mark:  i32,
 	// The symbols the program writes (assigned, incremented or passed out).
 	written:   []bool,
+	// Declarations directly in a switch body, given their slot and first
+	// value by lower_switch before its labels.
+	switch_decl: []bool,
 	// The slots of the outputs and globals, [lo, hi): what an inlined
 	// function can write besides its own variables.
 	globals:   [2]i32,
@@ -304,6 +307,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 		sym_slot  = make([]i32, len(u.syms)),
 		sym_chan  = make([]i32, len(u.syms)),
 		sym_img   = make([]i32, len(u.syms)),
+		switch_decl = make([]bool, len(u.syms)),
 		consts    = make(map[u32]i32),
 		const_list = make([dynamic][2]u32),
 		fills     = make([dynamic]Uniform_Fill),
@@ -579,6 +583,16 @@ widen :: proc(l: ^Lower, v: Val, n: int) -> i32 {
 	s := alloc_slots(l, n)
 	emit(l, .Splat, n = n, dst = s, a = v.slot)
 	return s
+}
+
+// Zero as a new slot's first value. A slot's first write covers every lane
+// (Mov, Splat), its later ones only the running lanes (Store): lanes that
+// aren't running compute their own values, never see what the slot held
+// before, and so pass the same to a sampler and to derivatives in the JIT
+// and the interpreter.
+@(private)
+define_zero :: proc(l: ^Lower, dst: i32, n: int) {
+	emit(l, .Splat, n = n, dst = dst, a = const_val(l, .Float, 0).slot)
 }
 
 // Masked store of a value's components.
@@ -955,9 +969,17 @@ lower_stmt :: proc(l: ^Lower, id: Stmt_Id) {
 			v := u.vars[d]
 			t := sym_type(u, v.sym)
 			n := cc(l, t)
+			if l.switch_decl[v.sym] {
+				// Defined by lower_switch: the lanes this case runs store.
+				if v.init != 0 {
+					val := lower_expr(l, v.init)
+					emit(l, .Store, n = n, dst = l.sym_slot[v.sym], a = val.slot)
+				}
+				continue
+			}
 			if v.init == 0 {
 				l.sym_slot[v.sym] = alloc_slots(l, n)
-				emit(l, .Store_Zero, n = n, dst = l.sym_slot[v.sym])
+				define_zero(l, l.sym_slot[v.sym], n)
 				continue
 			}
 			// The checker resolves the initializer before declaring the
@@ -972,7 +994,7 @@ lower_stmt :: proc(l: ^Lower, id: Stmt_Id) {
 				continue
 			}
 			l.sym_slot[v.sym] = alloc_slots(l, n)
-			emit(l, .Store, n = n, dst = l.sym_slot[v.sym], a = val.slot)
+			emit(l, .Mov, n = n, dst = l.sym_slot[v.sym], a = val.slot)
 		}
 	case .Expr:
 		lower_expr(l, st.expr)
@@ -1022,7 +1044,7 @@ lower_stmt :: proc(l: ^Lower, id: Stmt_Id) {
 				l.ret_val = v.slot
 			} else {
 				l.ret_val = alloc_slots(l, cc(l, v.t))
-				store_val(l, l.ret_val, v)
+				emit(l, .Mov, n = cc(l, v.t), dst = l.ret_val, a = v.slot)
 			}
 		}
 		// Without a return mask the return is the function's last
@@ -1194,6 +1216,21 @@ lower_switch :: proc(l: ^Lower, st: Stmt) {
 	entry := alloc_mask(l)
 	joining := alloc_mask(l)
 	brk := alloc_mask(l)
+	// A label can jump over an earlier case's declaration, so the body's own
+	// declarations get their slots and first values here, in every lane:
+	// lanes that skip one see 0, whichever cases a batch runs.
+	for b in body {
+		if u.stmts[b].kind != .Decl {
+			continue
+		}
+		for d in list(u, u.stmts[b].decls) {
+			sym := u.vars[d].sym
+			n := cc(l, sym_type(u, sym))
+			l.sym_slot[sym] = alloc_slots(l, n)
+			define_zero(l, l.sym_slot[sym], n)
+			l.switch_decl[sym] = true
+		}
+	}
 	emit(l, .Mask_Copy, dst = entry, a = MASK_EXEC)
 	emit(l, .Mask_Clear, dst = brk)
 	emit(l, .Mask_Clear, dst = MASK_EXEC)
@@ -1261,7 +1298,7 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, res_args: []i
 				continue
 			}
 			l.sym_slot[p.sym] = alloc_slots(l, n)
-			emit(l, .Store, n = n, dst = l.sym_slot[p.sym], a = arg)
+			emit(l, .Mov, n = n, dst = l.sym_slot[p.sym], a = arg)
 			continue
 		}
 		slot := alloc_slots(l, n)
@@ -1274,9 +1311,9 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, res_args: []i
 			} else {
 				src_slot = load_buf_lv(l, buf_lvs[i]).slot if is_buf_lv != nil && is_buf_lv[i] else load_lv(l, lvs[i]).slot
 			}
-			emit(l, .Store, n = n, dst = slot, a = src_slot)
+			emit(l, .Mov, n = n, dst = slot, a = src_slot)
 		case .Out:
-			emit(l, .Store_Zero, n = n, dst = slot)
+			define_zero(l, slot, n)
 		}
 	}
 	ret_t := ty(u, u.funcs[f].ret)
@@ -1290,9 +1327,7 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, res_args: []i
 	l.ret_slot, l.ret_val, l.ret_mark = -1, -1, mark
 	if ret_t != T_VOID && framed {
 		result.slot = alloc_slots(l, cc(l, ret_t))
-		if !always_returns(u, body) {
-			emit(l, .Store_Zero, n = cc(l, ret_t), dst = result.slot)
-		}
+		define_zero(l, result.slot, cc(l, ret_t))
 		l.ret_slot = result.slot
 	}
 	save: i32
@@ -1308,7 +1343,7 @@ inline_call :: proc(l: ^Lower, f: Func_Id, vals: []Val, lvs: []LV, res_args: []i
 			result.slot = l.ret_val
 		} else {
 			result.slot = alloc_slots(l, cc(l, ret_t))
-			emit(l, .Store_Zero, n = cc(l, ret_t), dst = result.slot)
+			define_zero(l, result.slot, cc(l, ret_t))
 		}
 	}
 	l.brk, l.cont, l.ret, l.ret_slot, l.ret_val, l.ret_mark = outer[0], outer[1], outer[2], outer[3], outer[4], outer[5]
@@ -1468,6 +1503,7 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 			return {res, t}
 		}
 		res := alloc_slots(l, n)
+		define_zero(l, res, n)
 		save := alloc_mask(l)
 		then_m := alloc_mask(l)
 		emit(l, .Mask_Copy, dst = save, a = MASK_EXEC)

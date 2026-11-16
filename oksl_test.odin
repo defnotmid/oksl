@@ -12111,3 +12111,405 @@ test_compute_jit_pool :: proc(t: ^testing.T) {
 	cjit_expect_same(t, "nv12 pool vs one", r_pool, r_one)
 	cjit_expect_same(t, "nv12 one vs interp", r_one, r_interp)
 }
+
+// The operands of test_jit_signed_zeros: every (x, lo, hi) over signed zeros,
+// ±1, NaN and the infinities, then tiny and ordinary x in [0, 1].
+@(private = "file")
+SZ_VALUES :: [7]u32{0x8000_0000, 0, 0xbf80_0000, 0x3f80_0000, 0x7fc0_0000, 0x7f80_0000, 0xff80_0000}
+@(private = "file")
+SZ_EXTRA :: [5]u32{0xb22b_cc77, 0x322b_cc77, 0x3f00_0000, 0xbf00_0000, 0x8000_0001} // -1e-8, 1e-8, 0.5, -0.5, -denormal
+@(private = "file")
+SZ_CASES :: 7 * 7 * 7 + len(SZ_EXTRA)
+@(private = "file")
+SZ_W, SZ_H :: 16, 22
+
+@(private = "file")
+sz_inputs: [SZ_W * SZ_H * 3]u32
+
+@(private = "file")
+sz_fill_inputs :: proc() {
+	vals := SZ_VALUES
+	extra := SZ_EXTRA
+	k := 0
+	for x in vals {
+		for lo in vals {
+			for hi in vals {
+				sz_inputs[k * 3], sz_inputs[k * 3 + 1], sz_inputs[k * 3 + 2] = x, lo, hi
+				k += 1
+			}
+		}
+	}
+	for x in extra {
+		sz_inputs[k * 3], sz_inputs[k * 3 + 1], sz_inputs[k * 3 + 2] = x, 0, 0x3f80_0000
+		k += 1
+	}
+}
+
+// Twenty results per (x, lo, hi): clamp scalar, with a vector and with
+// scalar bounds, with constant bounds (a NaN one too, and vectors mixing a
+// NaN and a number), and the functions whose sign at -0 IEEE 754 defines.
+@(private = "file")
+SZ_BODY :: `
+void zeros(float x, float lo, float hi, out vec4 a, out vec4 b, out vec4 c, out vec4 d, out vec4 e) {
+    a = vec4(clamp(x, lo, hi), asin(x), atan(x), sinh(x));
+    b = vec4(tanh(x), asinh(x), atanh(x), atan(x, 1.0));
+    c = vec4(clamp(vec2(x, -x), lo, hi), clamp(vec2(lo, x), vec2(x, lo), vec2(hi, hi)));
+    d = vec4(clamp(x, 0.0, 1.0), clamp(x, -0.0, 0.0), clamp(x, 0.0, hi), clamp(x, uintBitsToFloat(0x7fc00000u), hi));
+    e = vec4(clamp(vec2(x), vec2(0.0, uintBitsToFloat(0x7fc00000u)), vec2(1.0)), clamp(vec2(x), vec2(uintBitsToFloat(0x7fc00000u), 0.0), vec2(hi)));
+}
+`
+
+@(private = "file")
+sz_same :: proc(a, b: u32) -> bool {
+	return a == b || ((a & 0x7fff_ffff) > 0x7f80_0000 && (b & 0x7fff_ffff) > 0x7f80_0000)
+}
+
+// Signed zeros, NaNs and infinities through clamp and the functions odd at 0,
+// in the JIT and the interpreter alike, bit for bit (any NaN equal to any
+// other), in fragment shaders (per-pixel operands from a buffer, and uniform
+// ones, which run once per run) and in compute; and the results GLSL ES 3.10
+// and IEEE 754 define: clamp is min(max(x, lo), hi) with max(x, y) = x < y ? y
+// : x, so a bound equal to x leaves x (clamp(-0.0, 0.0, 1.0) = -0.0), and a
+// NaN operand gives the other; asin, atan, sinh, tanh, asinh, atanh and
+// atan(y, 1) keep -0.
+@(test)
+test_jit_signed_zeros :: proc(t: ^testing.T) {
+	sz_fill_inputs()
+	frag_src := `#version 310 es
+precision highp float;
+layout(std430, binding = 0) readonly buffer In { float v[]; } inp;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
+layout(location = 4) out vec4 o4;
+` + SZ_BODY + `
+void main() {
+    int p = int(gl_FragCoord.y) * 16 + int(gl_FragCoord.x);
+    zeros(inp.v[p * 3], inp.v[p * 3 + 1], inp.v[p * 3 + 2], o0, o1, o2, o3, o4);
+}
+`
+	m, errs, ok := compile(frag_src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "fragment: %s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	N :: SZ_W * SZ_H
+	tj, ti: [5][N][4]f32
+	tsj := [5][][4]f32{tj[0][:], tj[1][:], tj[2][:], tj[3][:], tj[4][:]}
+	tsi := [5][][4]f32{ti[0][:], ti[1][:], ti[2][:], ti[3][:], ti[4][:]}
+	bufs := [1][]u32{sz_inputs[:]}
+	run_targets(&m.program, nil, SZ_W, SZ_H, tsj[:], temp_scratch(), {buffers = bufs[:]})
+	{
+		sb, si := m.program.jit_body, m.program.jit_init
+		m.program.jit_body, m.program.jit_init = nil, nil
+		run_targets(&m.program, nil, SZ_W, SZ_H, tsi[:], temp_scratch(), {buffers = bufs[:]})
+		m.program.jit_body, m.program.jit_init = sb, si
+	}
+	bits :: proc(r: ^[5][N][4]f32, p, k: int) -> u32 {
+		return transmute(u32)r[k / 4][p][k % 4]
+	}
+	bad := 0
+	for p in 0 ..< SZ_CASES {
+		for k in 0 ..< 20 {
+			a, b := bits(&tj, p, k), bits(&ti, p, k)
+			if !sz_same(a, b) && bad < 8 {
+				testing.expectf(t, false, "fragment (x, lo, hi) = (%08x, %08x, %08x) result %d: jit %08x interp %08x", sz_inputs[p * 3], sz_inputs[p * 3 + 1], sz_inputs[p * 3 + 2], k, a, b)
+				bad += 1
+			}
+		}
+	}
+
+	// The defined results, from the interpreter (equal to the JIT above).
+	Want :: struct {
+		x, lo, hi: u32,
+		k:         int,
+		want:      u32,
+	}
+	NEG0, POS0, ONE, NEG1, NAN, INF :: u32(0x8000_0000), u32(0), u32(0x3f80_0000), u32(0xbf80_0000), u32(0x7fc0_0000), u32(0x7f80_0000)
+	wants := [?]Want {
+		{NEG0, POS0, ONE, 0, NEG0},   // clamp(-0.0, 0.0, 1.0)
+		{POS0, NEG0, ONE, 0, POS0},   // clamp(0.0, -0.0, 1.0)
+		{NEG0, NEG1, POS0, 0, NEG0},  // clamp(-0.0, -1.0, 0.0)
+		{POS0, NEG1, NEG0, 0, POS0},  // clamp(0.0, -1.0, -0.0)
+		{NEG0, POS0, POS0, 0, NEG0},  // clamp(-0.0, 0.0, 0.0)
+		{NEG0, POS0, ONE, 8, NEG0},   // clamp(vec2(-0.0, 0.0), 0.0, 1.0).x
+		{NEG0, POS0, ONE, 9, POS0},   // .y: -x is +0
+		{NEG0, POS0, ONE, 10, POS0},  // clamp(lo = 0.0, x = -0.0, 1.0)
+		{NEG0, POS0, ONE, 11, NEG0},  // clamp(x = -0.0, lo = 0.0, 1.0)
+		{NAN, POS0, ONE, 0, POS0},    // clamp(NaN, 0, 1) = 0
+		{ONE, NAN, NEG1, 0, NEG1},    // clamp(1, NaN, -1) = min(1, -1)
+		{NEG1, POS0, NAN, 0, POS0},   // clamp(-1, 0, NaN) = max(-1, 0)
+		{INF, POS0, ONE, 0, ONE},
+		{NEG0, POS0, ONE, 1, NEG0},   // asin(-0.0)
+		{NEG0, POS0, ONE, 2, NEG0},   // atan(-0.0)
+		{NEG0, POS0, ONE, 3, NEG0},   // sinh(-0.0)
+		{NEG0, POS0, ONE, 4, NEG0},   // tanh(-0.0)
+		{NEG0, POS0, ONE, 5, NEG0},   // asinh(-0.0)
+		{NEG0, POS0, ONE, 6, NEG0},   // atanh(-0.0)
+		{NEG0, POS0, ONE, 7, NEG0},   // atan(-0.0, 1.0)
+		{NEG0, POS0, ONE, 12, NEG0},  // clamp(-0.0, 0.0, 1.0), constant bounds
+		{POS0, POS0, ONE, 13, POS0},  // clamp(0.0, -0.0, 0.0)
+		{NEG0, POS0, ONE, 13, NEG0},  // clamp(-0.0, -0.0, 0.0)
+		{NAN, POS0, ONE, 12, POS0},   // clamp(NaN, 0.0, 1.0)
+		{NAN, POS0, ONE, 13, NEG0},   // clamp(NaN, -0.0, 0.0) = min(-0.0, 0.0)
+		{NEG0, POS0, NEG0, 14, NEG0}, // clamp(-0.0, 0.0, -0.0)
+		{NEG1, POS0, NEG0, 14, POS0}, // clamp(-1.0, 0.0, -0.0) = min(0.0, -0.0)
+		{NEG1, POS0, NAN, 14, POS0},  // clamp(-1.0, 0.0, NaN) = max(-1.0, 0.0)
+		{NAN, POS0, NAN, 14, POS0},   // clamp(NaN, 0.0, NaN)
+		{NAN, POS0, ONE, 16, POS0},   // clamp(vec2(NaN), vec2(0.0, NaN), vec2(1.0)).x
+		{NAN, POS0, ONE, 17, ONE},    // .y: NaN, then hi
+		{NAN, POS0, ONE, 18, ONE},    // clamp(vec2(NaN), vec2(NaN, 0.0), vec2(hi)).x
+		{NAN, POS0, ONE, 19, POS0},   // .y
+		{NEG0, POS0, ONE, 16, NEG0},  // clamp(-0.0, 0.0, 1.0) in a vector
+		{NEG1, NEG1, NEG1, 15, NEG1}, // clamp(-1, NaN, -1): max gives x
+		{NAN, POS0, ONE, 15, ONE},    // clamp(NaN, NaN, 1.0): NaN then hi
+	}
+	for w in wants {
+		for p in 0 ..< SZ_CASES {
+			if sz_inputs[p * 3] == w.x && sz_inputs[p * 3 + 1] == w.lo && sz_inputs[p * 3 + 2] == w.hi {
+				got := bits(&ti, p, w.k)
+				testing.expectf(t, got == w.want, "(%08x, %08x, %08x) result %d: %08x, want %08x", w.x, w.lo, w.hi, w.k, got, w.want)
+			}
+		}
+	}
+	// sinh(-1e-8) keeps its sign (core:math's (e^x - e^-x) / 2 gives -0.0).
+	p_tiny := 7 * 7 * 7
+	testing.expectf(t, bits(&ti, p_tiny, 3) & 0x8000_0000 != 0, "sinh(-1e-8) = %08x", bits(&ti, p_tiny, 3))
+
+	// Uniform operands: the work runs once per run, before the batches.
+	{
+		usrc := `#version 310 es
+precision highp float;
+uniform float ux;
+uniform float ulo;
+uniform float uhi;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
+layout(location = 4) out vec4 o4;
+` + SZ_BODY + `
+void main() { zeros(ux, ulo, uhi, o0, o1, o2, o3, o4); }
+`
+		um, uerrs, uok := compile(usrc, {profile = .Glsl, stage = .Fragment})
+		defer destroy(um)
+		if !testing.expectf(t, uok, "uniform: %s", format_errors(uerrs, context.temp_allocator)) {
+			return
+		}
+		when JIT_ENABLED {
+			if jit_avx2_ready {
+				testing.expect(t, um.program.jit_init != nil)
+			}
+		}
+		block := make([]u8, um.block_size, context.temp_allocator)
+		vals := [4]u32{NEG0, POS0, NAN, ONE}
+		for x in vals {
+			for lo in vals {
+				for hi in vals {
+					set_uniform(um, block, "ux", {transmute(f32)x})
+					set_uniform(um, block, "ulo", {transmute(f32)lo})
+					set_uniform(um, block, "uhi", {transmute(f32)hi})
+					uj, ui: [5][4][4]f32
+					usj := [5][][4]f32{uj[0][:], uj[1][:], uj[2][:], uj[3][:], uj[4][:]}
+					usi := [5][][4]f32{ui[0][:], ui[1][:], ui[2][:], ui[3][:], ui[4][:]}
+					run_targets(&um.program, block, 2, 2, usj[:], temp_scratch())
+					sb, si := um.program.jit_body, um.program.jit_init
+					um.program.jit_body, um.program.jit_init = nil, nil
+					run_targets(&um.program, block, 2, 2, usi[:], temp_scratch())
+					um.program.jit_body, um.program.jit_init = sb, si
+					for k in 0 ..< 20 {
+						a, b := transmute(u32)uj[k / 4][3][k % 4], transmute(u32)ui[k / 4][3][k % 4]
+						testing.expectf(t, sz_same(a, b), "uniform (%08x, %08x, %08x) result %d: jit %08x interp %08x", x, lo, hi, k, a, b)
+					}
+					if x == NEG0 && lo == POS0 && hi == ONE {
+						testing.expectf(t, transmute(u32)ui[0][3][0] == NEG0, "uniform clamp(-0.0, 0.0, 1.0) = %08x", transmute(u32)ui[0][3][0])
+					}
+				}
+			}
+		}
+	}
+
+	// Compute: the same body over batches of 8 and a workgroup of 64.
+	for size in ([2]int{8, 64}) {
+		csrc := fmt.tprintf(`#version 310 es
+layout(local_size_x = %d) in;
+layout(std430, binding = 0) readonly buffer In {{ float v[]; }} inp;
+layout(std430, binding = 1) buffer Out {{ vec4 w[]; }} o;
+%s
+void main() {{
+    uint p = gl_GlobalInvocationID.x;
+    vec4 a, b, c, d, e;
+    zeros(inp.v[p * 3u], inp.v[p * 3u + 1u], inp.v[p * 3u + 2u], a, b, c, d, e);
+    o.w[p * 5u] = a;
+    o.w[p * 5u + 1u] = b;
+    o.w[p * 5u + 2u] = c;
+    o.w[p * 5u + 3u] = d;
+    o.w[p * 5u + 4u] = e;
+}}
+`, size, SZ_BODY)
+		cm, cok := cjit_compile(t, csrc)
+		if !cok {
+			continue
+		}
+		init :: proc(bi: int, words: []u32) {
+			if bi == 0 {
+				copy(words, sz_inputs[:])
+			}
+		}
+		cjit_compare(t, fmt.tprintf("compute signed zeros, local size %d", size), cm, nil, {N / size + 1, 1, 1}, {N * 3, (N / size + 1) * size * 20}, init = init)
+		destroy(cm)
+	}
+}
+
+@(private = "file")
+Sl_Rec :: struct {
+	ch:      int,
+	u, v, l: u32,
+}
+
+@(private = "file")
+sl_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+	append((^[dynamic]Sl_Rec)(user), Sl_Rec{channel, transmute(u32)uv.x, transmute(u32)uv.y, transmute(u32)lod})
+	return {uv.x * 2 + 0.25, uv.y - 0.5, lod, f32(channel)}
+}
+
+@(private = "file")
+sl_less :: proc(a, b: Sl_Rec) -> bool {
+	if a.ch != b.ch {
+		return a.ch < b.ch
+	}
+	if a.u != b.u {
+		return a.u < b.u
+	}
+	if a.v != b.v {
+		return a.v < b.v
+	}
+	return a.l < b.l
+}
+
+// A sampler callback in a fragment shader is called for the lanes of every
+// quad with a running lane (in the JIT and the interpreter alike: the same
+// quads, so the same count), lanes that aren't running included, as a GPU
+// quad's helpers sample. Their coordinates are what the lane computes from
+// its own values, the same in both: temporaries, variables the lane wrote,
+// and the first value (initializer or 0) of every variable, parameter and
+// return value, which lanes that don't run its later writes keep. In a
+// branch, after discard, through texelFetch, with the level from the quad's
+// derivatives (texture), through return values, out parameters, locals
+// without an initializer, a branching ?: and a switch whose label jumps over
+// an earlier case's declaration; most after a block (SKIP) that leaves the
+// two engines' stale bits different, so a first write that kept them would
+// show. Every call is recorded with its arguments
+// and the sorted lists compared, with the results; run_f32 at 16x16 and 13x9
+// (partial batches) and run_fragment with helper lanes.
+@(test)
+test_jit_sampler_lane_args :: proc(t: ^testing.T) {
+	COND :: "(int(gl_FragCoord.x) + int(gl_FragCoord.y) / 2) % 2 == 0"
+	// A block the JIT skips in batches the interpreter runs it in (x 8-11):
+	// its temporaries leave each engine's registers different, so a slot
+	// the lowering reuses holds different bits in lanes that don't write it.
+	SKIP :: "if (gl_FragCoord.x > 11.0) o.x += sin(gl_FragCoord.y * 1.7) + cos(gl_FragCoord.x * 0.3); "
+	Case :: struct {
+		name, body: string,
+	}
+	cases := [?]Case {
+		{"temporary in a branch", "if (" + COND + ") o = textureLod(s0, gl_FragCoord.xy * 0.125, 0.5);"},
+		{"implicit level in a branch", "if (" + COND + ") o = texture(s0, gl_FragCoord.xy * vec2(0.125, 0.0625) + vec2(gl_FragCoord.x * gl_FragCoord.y * 0.01, 0.0));"},
+		{"after discard", "if (" + COND + ") discard; o = texture(s0, gl_FragCoord.yx * 0.1);"},
+		{"texelFetch in a branch", "if (" + COND + ") o = texelFetch(s0, ivec2(gl_FragCoord.xy) / 2, 0);"},
+		{"variable written before the branch", "vec2 q = gl_FragCoord.xy * 0.2; if (gl_FragCoord.x > 5.0) q += 1.0; if (" + COND + ") o = texture(s0, q);"},
+		{"return value in a branch", "if (" + COND + ") o = textureLod(s0, f(gl_FragCoord.xy), 0.0);"},
+		{"return value, implicit level", "if (" + COND + ") o = texture(s0, f(gl_FragCoord.xy));"},
+		{"return value after discard", "if (" + COND + ") discard; o = textureLod(s0, f(gl_FragCoord.xy), 1.0);"},
+		{"out parameter", "if (" + COND + ") { vec2 q; o = h(q, gl_FragCoord.xy); }"},
+		{"local without an initializer", "if (" + COND + ") { vec2 uv; if (gl_FragCoord.y > 4.0) uv = gl_FragCoord.xy * 0.125; o = texture(s0, uv); }"},
+		{"branching ?:", "if (" + COND + ") o = texture(s0, gl_FragCoord.y > 3.0 ? f(gl_FragCoord.xy) : gl_FragCoord.yx * 0.1);"},
+		{"written declaration", "if (" + COND + ") { " + SKIP + "vec2 q = gl_FragCoord.xy * 0.1; q.y += 0.25; o = texture(s0, q); }"},
+		{"local without an initializer, after a skipped block", "if (" + COND + ") { " + SKIP + "vec2 uv; if (gl_FragCoord.y > 4.0) uv = gl_FragCoord.xy * 0.125; o = texture(s0, uv); }"},
+		{"returning a parameter", "if (" + COND + ") { " + SKIP + "o = texture(s0, g(gl_FragCoord.xy * 0.3)); }"},
+		{"written in parameter", "if (" + COND + ") { " + SKIP + "o = texture(s0, k(gl_FragCoord.xy)); }"},
+		{"inout parameter", "vec2 q = gl_FragCoord.xy * 0.1; if (" + COND + ") { " + SKIP + "o = io(q); }"},
+		{"result not always returned", "if (" + COND + ") { " + SKIP + "o = texture(s0, fr(gl_FragCoord.xy)); }"},
+		{"no return value", "if (" + COND + ") { " + SKIP + "o = texture(s0, nv(gl_FragCoord.xy) + gl_FragCoord.xy * 0.1); }"},
+		{"switch over a declaration", `int x = int(gl_FragCoord.x), y = int(gl_FragCoord.y);
+    int sel = (x >= 4) ? 0 : ((x == 1 && y == 0) ? 1 : 2);
+    switch (sel) {
+    case 0:
+        vec2 uv = vec2(0.25, 0.75);
+        uv += vec2(0.125);
+        o = vec4(uv, 0.0, 1.0);
+        break;
+    case 1:
+        uv = vec2(0.5, 0.5);
+        o = textureLod(s0, uv, 0.0);
+        break;
+    default:
+        break;
+    }`},
+	}
+	sizes := [?][3]i32{{8, 8, 1}}
+	for c in cases {
+		src := fmt.tprintf("#version 310 es\nprecision highp float;\nuniform sampler2D s0;\nlayout(location = 0) out vec4 o;\nvec2 f(vec2 p) {{ if (p.x > 0.0) return p * 0.25; return vec2(7.0); }}\nvec4 h(out vec2 r, vec2 p) {{ if (p.y > 2.0) r = p * 0.25; return texture(s0, r); }}\nvec2 g(vec2 p) {{ return p; }}\nvec2 k(vec2 p) {{ p *= 0.2; return p; }}\nvec4 io(inout vec2 p) {{ if (p.y > 0.5) p *= 1.5; return texture(s0, p); }}\nvec2 fr(vec2 p) {{ if (p.x > 9.0) return p * 0.25; if (p.y > 12.0) return p; }}\nvec2 nv(vec2 p) {{ }}\nvoid main() {{ o = vec4(-1.0); %s }}\n", c.body)
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%s: %s", c.name, format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		compare :: proc(t: ^testing.T, what: string, c: Case, rj, ri: []Sl_Rec, oj, oi: [][4]f32) {
+			testing.expectf(t, len(rj) == len(ri), "%s / %s: %d calls in the JIT, %d in the interpreter", c.name, what, len(rj), len(ri))
+			testing.expectf(t, len(rj) > 0, "%s / %s: no calls", c.name, what)
+			testing.expectf(t, slice.equal(slice.reinterpret([]u32, oj), slice.reinterpret([]u32, oi)), "%s / %s: results differ", c.name, what)
+			if len(rj) != len(ri) {
+				return
+			}
+			slice.sort_by(rj, sl_less)
+			slice.sort_by(ri, sl_less)
+			for k in 0 ..< len(rj) {
+				if rj[k] != ri[k] {
+					testing.expectf(t, false, "%s / %s: call %d of %d: jit %v interp %v", c.name, what, k, len(rj), rj[k], ri[k])
+					break
+				}
+			}
+		}
+		// run_f32, each engine on its own Scratch reused across the sizes.
+		sj, si := temp_scratch(), temp_scratch()
+		for wh in ([2][2]int{{16, 16}, {13, 9}}) {
+			w, h := wh[0], wh[1]
+			oj := make([][4]f32, w * h, context.temp_allocator)
+			oi := make([][4]f32, w * h, context.temp_allocator)
+			rj := make([dynamic]Sl_Rec, context.temp_allocator)
+			ri := make([dynamic]Sl_Rec, context.temp_allocator)
+			run_f32(&m.program, nil, w, h, oj, sj, {sampler = sl_cb, user = &rj, channel_sizes = sizes[:]})
+			run_f32_interp(&m.program, nil, w, h, oi, si, {sampler = sl_cb, user = &ri, channel_sizes = sizes[:]})
+			compare(t, fmt.tprintf("run_f32 %dx%d", w, h), c, rj[:], ri[:], oj, oi)
+		}
+		// run_fragment: 7 quads, some with helper lanes.
+		{
+			Q :: 7
+			origins := [Q][2]i32{{0, 0}, {2, 0}, {4, 2}, {6, 6}, {10, 2}, {0, 8}, {12, 12}}
+			helpers := [Q]Quad_Lanes{{}, {1}, {}, {0, 3}, {2}, {}, {1, 2, 3}}
+			fq := Fragment_Quads{count = Q, origin = origins[:], helpers = helpers[:]}
+			oj, oi: [Q * 4][4]f32
+			tj := [1][][4]f32{oj[:]}
+			ti := [1][][4]f32{oi[:]}
+			shj, shi: [Q]Quad_Lanes
+			rj := make([dynamic]Sl_Rec, context.temp_allocator)
+			ri := make([dynamic]Sl_Rec, context.temp_allocator)
+			run_fragment(&m.program, nil, fq, tj[:], shj[:], sj, {sampler = sl_cb, user = &rj, channel_sizes = sizes[:]})
+			sb, sii := m.program.jit_body, m.program.jit_init
+			m.program.jit_body, m.program.jit_init = nil, nil
+			run_fragment(&m.program, nil, fq, ti[:], shi[:], si, {sampler = sl_cb, user = &ri, channel_sizes = sizes[:]})
+			m.program.jit_body, m.program.jit_init = sb, sii
+			testing.expectf(t, shj == shi, "%s / run_fragment: shaded %v and %v", c.name, shj, shi)
+			for q in 0 ..< Q {
+				for l in 0 ..< 4 {
+					if l not_in shi[q] {
+						oj[q * 4 + l], oi[q * 4 + l] = {}, {}
+					}
+				}
+			}
+			compare(t, "run_fragment", c, rj[:], ri[:], oj[:], oi[:])
+		}
+	}
+}
