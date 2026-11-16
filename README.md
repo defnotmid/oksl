@@ -613,7 +613,7 @@ so runs that reuse one allocate nothing. `Run_Options` takes a
 sampler callback (`proc(user, channel, uv, lod, layer) -> [4]f32`; `.eval`
 passes lod 0; `layer` is a `sampler2DArray`'s, rounded to nearest even,
 for the host to clamp to its layers), the channels' sizes in texels (and
-layers), optional bound 2D float images (`channel_images`, below), the
+layers), optional bound 2D images (`channel_images`, below), the
 storage buffers' words (`buffers`, one `[]u32` per buffer in
 `Module.storage_buffers` order; a read past one gives 0 and a write past
 one is dropped), the compute storage images (`images`, one `Storage_Image`
@@ -726,24 +726,88 @@ higher), and where uv jumps inside a quad (a `fract` seam) which pixels
 they difference decides it; `tools/gpu_parity` samples a mip chain to
 show both.
 
-For flat 2D float maps owned by the caller, `Run_Options.channel_images`
-(`[]Channel_Image`, indexed by channel; `oksl.channel_image(texels, width,
-height, filter)` accepts `[]f32`, `[][2]f32` or `[][4]f32`) binds tightly
-packed 1-, 2- or 4-component `f32` texels directly to any `run*` entry
-point without calling `sampler` per lane (lowered to in-JIT AVX2 gathers
-on x86-64). Missing components read `(0, 0, 0, 1)`. Both filters clamp to
-the edge (`.Nearest`: `clamp(floor(uv * size), 0, size - 1)`; `.Linear`:
-`uv * size - 0.5` with fractional weights). A bound image has one level:
-`texture`, `textureLod` and `textureGrad` at any lod read level 0,
-`texelFetch` reads its texel or `(0, 0, 0, 0)` out of range (flipping `y`
-in the Shadertoy profile), and `textureSize` returns `(width, height)`.
-Bindings are validated up front via `ensure`, which panics on a
-`sampler2DArray` channel, invalid component count, filter or dimensions,
-or `data` shorter than `width * height * components`. Any channel with
-`len(data) == 0` or past `len(channel_images)` stays unbound and continues
-to use `Run_Options.sampler` (for mipmaps, wrap modes, `sampler2DArray` or
-sRGB `u8` textures), and bound and unbound channels may mix in the same
-pass.
+For images the caller owns, `Run_Options.channel_images` (`[]Channel_Image`,
+indexed by channel) binds a channel's texels directly to any `run*` entry
+point, sampled in the JIT (AVX2 gathers on x86-64) and the interpreter
+without calling `sampler` per lane:
+
+```odin
+// f32 maps, one level, clamped (as before): []f32, [][2]f32 or [][4]f32
+oksl.channel_image(texels, width, height, .Linear)
+// any format, wrap and mip chain (levels: []Channel_Level the caller owns,
+// each oksl.channel_level(texels, width, height))
+oksl.Channel_Image{format = .Rgba8, pixels = rgba_bytes, width = w, height = h,
+	filter = .Linear, wrap = {.Repeat, .Clamp}, levels = levels[:]}
+```
+
+- **Formats:** `.F32` (1, 2 or 4 floats a texel, in `data`), and in
+  `pixels`: `.Rgba8` and `.Gray8` (`byte / 255`), `.Gray16` (little-endian
+  `u16 / 65535`), `.Rgba16f` (IEEE halves; NaN quieted). Missing
+  components read `(0, 0, 0, 1)`: the Gray formats are `(g, 0, 0, 1)`.
+  Nothing is decoded from sRGB: the shader decodes what it filters, as a
+  GPU does with a `_UNORM` texture (bind the GPU texture as `_UNORM`, not
+  `_UNORM_SRGB`, for the same values). Rows are `stride` bytes apart
+  (0: tightly packed).
+- **Addressing:** `wrap` per axis, `{u, v}`: `.Clamp` clamps the texel
+  index to the edge, `.Repeat` wraps it (floored modulo), so repeating in u
+  and clamping in v (an equirectangular map) is `{.Repeat, .Clamp}`. Bound
+  images are addressed as the GPU addresses a texture: uv (0, 0) is the
+  first texel of the first row, no flips.
+- **Filtering, one rule for every format (measured against RADV,
+  `tools/gpu_parity`'s `bound_formats`):** the coordinate is scaled to the
+  level's texels exactly, in f64 (`x = u * size`, minus 0.5 for
+  `.Linear`). `.Nearest` reads the texel at `floor(x)`. `.Linear` blends
+  the four around it by each axis's fraction rounded to 1/256, to nearest
+  even (257 steps, the 8 bits of GPU filtering), in f32 as `a + (b - a) *
+  t`: the row at `floor(y)` across x, the next row across x, then the
+  two across y, on the texels' stored values (bytes and u16 as integers);
+  the unsigned normalized formats are divided by 255 or 65535 last. On
+  RADV this is within 3e-7 of the GPU for every format but Rgba16f
+  (which RADV filters in less than f32's precision: within 1e-3), and
+  exact for 49-100% of components (`.Nearest`: all). Apple GPUs (Metal,
+  M4) filter differently: they round the lod to a half float and blend
+  levels by its fraction truncated to 1/64, round texel weights half up
+  from an f32 `u * n - 0.5`, and return a filtered 8-bit texel to 1/16 of
+  a step, Gray16 to a step and halves to a half. So on Metal the worst
+  distance is about 3.9e-3 for the unorm formats' `.Linear` and 0.031 for
+  Rgba16f's, where RADV is within 3e-7 and 1e-3 (the parity check's
+  tolerances follow). A NaN coordinate reads index -2^31 (clamped: the
+  first texel) with weight 0.
+- **Levels:** `levels` holds levels 1 and up (`max(width >> l, 1) x
+  max(height >> l, 1)` each, at most 16 in all), as the caller built them.
+  texture() takes its bias plus the level the quad's derivatives pick in
+  level 0's texels (as the callback gets it), textureLod and textureGrad
+  theirs. A lod not above 0 (NaN included) reads level 0; otherwise `l =
+  min(lod, levels - 1)` reads level `l0 = trunc(l)`, blended toward `l0 +
+  1` as `c0 + (c1 - c0) * w / 256` with `w` the fraction `l - l0` rounded
+  to 1/256 (to nearest even), as GPUs blend levels.
+- **texelFetch** reads its level's texel, `(0, 0, 0, 0)` for a level or
+  texel out of range (flipping `y` in the Shadertoy profile);
+  **textureSize** gives level `clamp(lod, 0, levels - 1)`'s size (a
+  `uint` lod clamped unsigned, so `0x80000000u` and up give the top level).
+
+Since v0.0.21 the rule changed for `.F32` images too: `.Linear` weights are
+rounded to 1/256 and the coordinate scaled exactly (before: unrounded
+weights from the f32 product), `.Nearest` floors the exact product (before:
+the f32 one, which picks the next texel where it rounds up to a whole
+number), and texelFetch past the one level reads 0 (before: level 0). On
+RADV the f32 linear error falls from 2e-2 to 6e-7 (values in [-4, 4]).
+
+On the GPU the host binds a texture with the matching sampler: the same
+format as `_UNORM` or `_FLOAT`, `CLAMP_TO_EDGE` or `REPEAT` per axis,
+`NEAREST` or `LINEAR` min and mag filters, `mipmap_mode = LINEAR` with the
+same levels uploaded (so `.Nearest` with levels still blends between two
+levels, on the CPU as on the GPU), `max_lod` at or above the top level
+(`SDL_GPUSamplerCreateInfo`'s zero default pins every lookup to level 0;
+`tools/gpu_parity` sets 1000), and no anisotropy. A textureSize lod
+outside the levels (below 0 or past the top) differs: the CPU clamps it,
+GPU backends give 0 or an undefined size. Bindings are validated up front via `ensure` (a `sampler2DArray`
+channel, components, format, filter and wrap values, dimensions, strides,
+level sizes and counts, data lengths, 2-byte alignment for Gray16 and
+Rgba16f, 4-byte for F32 levels). An entry with neither `data` nor `pixels`, or past
+`len(channel_images)`, stays unbound and calls `Run_Options.sampler`
+(`sampler2DArray` and sRGB-decoding textures still need it), and bound and
+unbound channels may mix in the same pass.
 
 - **Inlining:** every function is inlined into one flat `[]Instr` program
   over SoA registers. A slot is one scalar component for `LANES` (64)

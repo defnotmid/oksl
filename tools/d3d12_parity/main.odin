@@ -97,6 +97,10 @@ Gpu :: struct {
 	readback, constants, quad:             rawptr,
 	resources:                             [Srv]rawptr,
 	vs:                                    []u8,
+	// WARP (Windows without -hardware): its Linear weights differ from
+	// the 1/256 rounding at some coordinates, as D3D's 8-bit minimum
+	// allows (parity.bound_channels_compare's coarse_weights).
+	warp:                                  bool,
 }
 
 SHADER_READ :: d3d12.RESOURCE_STATES{.NON_PIXEL_SHADER_RESOURCE, .PIXEL_SHADER_RESOURCE}
@@ -469,7 +473,7 @@ main :: proc() {
 	data_dir := args[1] if len(args) > 1 else "testdata"
 	os.make_directory_all(out_dir)
 	parity.make_data()
-	g: Gpu
+	g := Gpu{warp = ODIN_OS == .Windows && !hardware}
 	if !gpu_init(&g, hardware) || debug_messages() > 0 {
 		fmt.eprintln("no D3D12 device")
 		os.exit(2)
@@ -589,7 +593,7 @@ fragment_check :: proc(g: ^Gpu, name, src: string, options: oksl.Options, edge: 
 	}
 	defer delete(gpu_px)
 	if name == "bound_channels" {
-		detail, bc_ok := parity.bound_channels_compare(m, block, slice.reinterpret([][4]f32, gpu_px), "d3d12", out_dir, scratch)
+		detail, bc_ok := parity.bound_channels_compare(m, block, slice.reinterpret([][4]f32, gpu_px), "d3d12", out_dir, scratch, g.warp)
 		fmt.printfln("%-20s %s  %s", name, detail, "ok" if bc_ok else "MISMATCH")
 		return bc_ok
 	}

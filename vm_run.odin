@@ -51,30 +51,96 @@ Run_Options :: struct {
 	// (Module.storage_images: read-only first, then read-write/writeonly).
 	// Out-of-bounds loads read 0 and out-of-bounds stores are dropped.
 	images:         []Storage_Image,
-	// Optional single-level 2D float images indexed by channel. Channels with
-	// `len(data) > 0` sample directly from the image (all mip levels reading
-	// level 0, `texelFetch` returning 0 out of range, `textureSize` returning
-	// `width x height`); unbound channels continue to call `sampler`.
+	// Optional 2D images bound to sampled channels, indexed by channel
+	// (Channel_Image); the others, and entries without texels, call
+	// `sampler`.
 	channel_images: []Channel_Image,
 }
 
+// How a bound channel filters, as GPU texture units do (measured against
+// RADV with tools/gpu_parity's bound images). The coordinate is scaled to
+// the level's texels exactly (`x = f64(u) * f64(n)`, minus 0.5 for Linear):
+//   Nearest: the texel at floor(x);
+//   Linear:  the four around it, blended by each axis's fraction `t`
+//            rounded to 1/256 (to nearest even: 257 steps, as GPU
+//            filtering's 8 bits), in f32 as `a + (b - a) * t`: the row
+//            at floor(y) across x, the next row across x, then the two
+//            across y.
+// Both blend the texels' stored values (bytes and u16 as integers, halves
+// and floats as they are); the unsigned normalized formats are divided by
+// 255 or 65535 last. This is what the GPU computes to within its last
+// bits.
 Channel_Filter :: enum u8 {
 	Nearest,
 	Linear,
 }
 
-// A 2D single-level float image bound to a sampled channel on the CPU:
-// `width x height` tightly packed texels of `components` (1, 2 or 4) floats
-// in `data`, clamped to the edge, missing components reading (0, 0, 0, 1).
-// An entry with `len(data) == 0` leaves the channel unbound so
-// `Run_Options.sampler` is used.
+// A bound channel's texels. F32 takes `components` floats a texel from
+// `data`; the others read `pixels`: Rgba8 and Gray8 bytes and Gray16
+// little-endian u16 as unsigned normalized (`/ 255`, `/ 65535`), Rgba16f
+// IEEE half floats. Missing components read (0, 0, 0, 1): Gray8 and Gray16
+// are (g, 0, 0, 1).
+Channel_Format :: enum u8 {
+	F32,
+	Rgba8,
+	Gray8,
+	Gray16,
+	Rgba16f,
+}
+
+// How a bound channel addresses one axis, from the texel index `i =
+// floor(x)` (NaN as -2^31, within [-2^31, 2^31 - 2]) on an axis of `n`:
+//   Clamp:  clamp(i, 0, n - 1), and i + 1 likewise;
+//   Repeat: i mod n, floored, and the next one (0 after n - 1).
+Channel_Wrap :: enum u8 {
+	Clamp,
+	Repeat,
+}
+
+// The most levels a bound channel has: level 0 and 15 more.
+CHANNEL_MAX_LEVELS :: 16
+
+// One mip level above level 0, in the image's format: `max(width >> l, 1)
+// x max(height >> l, 1)` texels for level l, rows `stride` bytes apart (0:
+// tightly packed).
+Channel_Level :: struct {
+	texels:        []u8,
+	width, height: int,
+	stride:        int,
+}
+
+// A 2D image bound to a sampled channel on the CPU: `width x height`
+// texels (level 0) of `format`, rows `stride` bytes apart (0: tightly
+// packed), each axis addressed by `wrap` ({u, v}), filtered by `filter`,
+// with the mip levels above level 0 in `levels`. An entry with neither
+// `data` nor `pixels` leaves the channel unbound so `Run_Options.sampler`
+// is used. Coordinates address it as the GPU addresses a texture: uv (0, 0)
+// is the first texel of the first row.
+//
+// The level: texture() takes the bias plus the level the quad's
+// derivatives pick in level 0's texels (as it passes the sampler),
+// textureLod and textureGrad theirs. With more than one level, a level
+// `lod` that is not above 0 (NaN included) reads level 0; otherwise `l =
+// min(lod, levels - 1)` reads level `l0 = trunc(l)`, blended toward level
+// `l0 + 1` (when there is one) as `c0 + (c1 - c0) * w / 256`, `w` the
+// fraction `l - l0` rounded to 1/256 (to nearest even) as GPUs blend
+// levels, where w > 0.
+// `texelFetch` reads its level's texel, (0, 0, 0, 0) out of range;
+// `textureSize` gives level `clamp(lod, 0, levels - 1)`'s size.
 Channel_Image :: struct {
 	data:          []f32,
 	width, height: int,
 	components:    int,
 	filter:        Channel_Filter,
+	format:        Channel_Format,
+	pixels:        []u8,
+	stride:        int,
+	wrap:          [2]Channel_Wrap,
+	levels:        []Channel_Level,
 }
 
+// A single-level F32 image from tightly packed 1-, 2- or 4-component
+// texels, both axes clamped to the edge.
 channel_image :: proc "contextless" (texels: []$T, width, height: int, filter := Channel_Filter.Nearest) -> Channel_Image
 	where T == f32 || T == [2]f32 || T == [4]f32 {
 	N :: size_of(T) / size_of(f32)
@@ -87,60 +153,212 @@ channel_image :: proc "contextless" (texels: []$T, width, height: int, filter :=
 	}
 }
 
-@(private)
-Chan_Img :: struct {
-	ptr:    [^]f32,
-	fw:     f32,
-	fh:     f32,
-	w:      i32,
-	max_x:  i32,
-	max_y:  i32,
-	comps:  u8,
-	shift:  u8,
-	filter: Channel_Filter,
-	_pad:   u8,
+// A mip level from its texels (any element type: `u8`, `[4]u8`, `u16`,
+// `[4]f16`, `f32`, `[2]f32`, `[4]f32`, ...), tightly packed.
+channel_level :: proc "contextless" (texels: []$T, width, height: int) -> Channel_Level {
+	return {texels = ([^]u8)(raw_data(texels))[:len(texels) * size_of(T)], width = width, height = height}
 }
 
-#assert(size_of(Chan_Img) == 32)
+// A bound channel as the samplers read it: its levels' addresses and
+// sizes, made once per run.
+@(private)
+Chan_Level :: struct {
+	// The level's first texel; Gray8 and Gray16 aligned down to 4 bytes
+	// (moved down `mis` bytes) for whole-word reads.
+	ptr:   [^]u8,
+	mis:   i32,
+	pitch: i32, // texels a row
+	size:  [2]i32,
+	max:   [2]i32,
+	fs:    [2]f64, // f64(size)
+	inv:   [2]f64, // 1 / size, for Repeat
+}
+
+#assert(size_of(Chan_Level) == 64)
+
+@(private)
+Chan_Img :: struct {
+	ptr:      rawptr, // level 0's texels; nil: unbound
+	format:   Channel_Format,
+	filter:   Channel_Filter,
+	wrap:     [2]Channel_Wrap,
+	comps:    u8, // components a texel holds (F32: 1, 2 or 4; Gray: 1; Rgba: 4)
+	shift:    u8, // F32: log2(comps)
+	held:     u8, // (1 << comps) - 1
+	// 0: one level, Nearest, both axes Clamp (the JIT's short path); 1: the rest.
+	route:    u8,
+	n_levels: i32,
+	top:      f32, // f32(n_levels - 1)
+	unorm:    f32, // 255, 65535; 0 for halves and floats
+	// 0: F32 with one level (the JIT stubs' inline texelFetch); 1: the rest.
+	fetch_route: u8,
+	// 0: F32, one level, Nearest, both axes Clamp (the stubs' inline read);
+	// 1: another format so with sides below 2^24 (sample_sub's FMA floor).
+	near_route: u8,
+	// 0: F32, one level, Linear, both axes Clamp (the JIT's bilinear_sub).
+	lin_route: u8,
+	// 0: lin_route 0 with both sides at most 32768 (bilinear_sub in f32
+	// with FMA).
+	lin_f32:  u8,
+	fn512:    [2]f32, // 512 * level 0's size (bilinear_sub in f32)
+	half:     f64, // what x subtracts: 0.5 for Linear, 0 for Nearest
+	fs32:     [2]f32, // level 0's size as f32 (near_route: exact)
+	fmax32:   [2]f32, // and its largest index
+	levels:   [CHANNEL_MAX_LEVELS]Chan_Level,
+}
+
+#assert(size_of(Chan_Img) == 64 + CHANNEL_MAX_LEVELS * 64)
+
+@(private)
+channel_texel_bytes :: proc "contextless" (format: Channel_Format, components: int) -> int {
+	switch format {
+	case .F32:     return 4 * components
+	case .Rgba8:   return 4
+	case .Gray8:   return 1
+	case .Gray16:  return 2
+	case .Rgba16f: return 8
+	}
+	return 0
+}
+
+@(private)
+channel_bound :: #force_inline proc "contextless" (im: Channel_Image) -> bool {
+	return len(im.data) > 0 || len(im.pixels) > 0
+}
+
+// One level's texels, `w x h` of `tb` bytes in rows `stride` bytes apart
+// (0: w * tb), checked to be there and addressable in 32 bits.
+@(private)
+validate_channel_level :: proc(texels: int, w, h, stride, tb: int, format: Channel_Format, ptr: rawptr) {
+	ensure(w > 0 && h > 0, "oksl: Channel_Image dimensions out of range")
+	row, r_ovf := intrinsics.overflow_mul(w, tb)
+	ensure(!r_ovf && row <= int(max(i32)), "oksl: Channel_Image dimensions out of range")
+	pitch := stride if stride != 0 else row
+	ensure(pitch >= row && pitch % tb == 0, "oksl: Channel_Image.stride must be 0 or a multiple of the texel size, at least width texels")
+	span, s_ovf := intrinsics.overflow_mul(pitch, h - 1)
+	need, n_ovf := intrinsics.overflow_add(span, row)
+	// F32 reads index floats, the byte formats bytes (and a word around a
+	// Gray texel): both within 31 bits.
+	limit := int(max(i32)) * 4 if format == .F32 else int(max(i32)) - 3
+	ensure(!s_ovf && !n_ovf && need <= limit, "oksl: Channel_Image dimensions out of range")
+	ensure(texels >= need, "oksl: Channel_Image texels are shorter than its rows")
+	// Halves load as u16s (rows stay aligned: pitch is whole texels).
+	if format == .Gray16 || format == .Rgba16f {
+		ensure(uintptr(ptr) % 2 == 0, "oksl: Channel_Image Gray16 and Rgba16f texels must be 2-byte aligned")
+	}
+}
 
 @(private)
 validate_channel_images :: proc(p: ^Program, opts: Run_Options) {
 	for im, ch in opts.channel_images {
-		if len(im.data) == 0 {
+		if !channel_bound(im) {
 			continue
 		}
 		ensure(ch not_in p.channel_arrays, "oksl: Channel_Image cannot bind to a sampler2DArray channel")
-		ensure(im.components == 1 || im.components == 2 || im.components == 4, "oksl: Channel_Image.components must be 1, 2 or 4")
 		ensure(im.filter == .Nearest || im.filter == .Linear, "oksl: invalid Channel_Image.filter")
-		ensure(im.width > 0 && im.height > 0, "oksl: Channel_Image dimensions out of range")
-		px, p_ovf := intrinsics.overflow_mul(im.width, im.height)
-		need, n_ovf := intrinsics.overflow_mul(px, im.components)
-		ensure(!p_ovf && !n_ovf && need <= int(max(i32)), "oksl: Channel_Image dimensions out of range")
-		ensure(len(im.data) >= need, "oksl: Channel_Image.data is shorter than width * height * components")
+		ensure(im.format >= .F32 && im.format <= .Rgba16f, "oksl: invalid Channel_Image.format")
+		for wr in im.wrap {
+			ensure(wr == .Clamp || wr == .Repeat, "oksl: invalid Channel_Image.wrap")
+		}
+		comps := im.components
+		if im.format == .F32 {
+			ensure(comps == 1 || comps == 2 || comps == 4, "oksl: Channel_Image.components must be 1, 2 or 4")
+			ensure(len(im.pixels) == 0, "oksl: an F32 Channel_Image takes its texels in data, not pixels")
+		} else {
+			ensure(len(im.data) == 0, "oksl: a byte-format Channel_Image takes its texels in pixels, not data")
+			fc := 4 if im.format == .Rgba8 || im.format == .Rgba16f else 1
+			ensure(comps == 0 || comps == fc, "oksl: Channel_Image.components must be 0 or the format's")
+			comps = fc
+		}
+		tb := channel_texel_bytes(im.format, comps)
+		if im.format == .F32 {
+			validate_channel_level(len(im.data) * 4, im.width, im.height, im.stride, tb, .F32, raw_data(im.data))
+		} else {
+			validate_channel_level(len(im.pixels), im.width, im.height, im.stride, tb, im.format, raw_data(im.pixels))
+		}
+		ensure(len(im.levels) < CHANNEL_MAX_LEVELS, "oksl: Channel_Image has more than 16 levels")
+		for lv, i in im.levels {
+			l := uint(i + 1)
+			ensure(lv.width == max(im.width >> l, 1) && lv.height == max(im.height >> l, 1), "oksl: Channel_Level l must be max(width >> l, 1) x max(height >> l, 1)")
+			validate_channel_level(len(lv.texels), lv.width, lv.height, lv.stride, tb, im.format, raw_data(lv.texels))
+			if im.format == .F32 {
+				ensure(uintptr(raw_data(lv.texels)) % 4 == 0, "oksl: Channel_Level F32 texels must be 4-byte aligned")
+			}
+		}
 	}
 }
 
 @(private)
-fill_chan_imgs :: proc "contextless" (dst: ^[SAMPLER_COUNT]Chan_Img, images: []Channel_Image) {
-	n := min(len(images), SAMPLER_COUNT)
-	for i in 0 ..< n {
-		im := images[i]
-		if len(im.data) == 0 {
+fill_chan_level :: proc "contextless" (dst: ^Chan_Level, texels: rawptr, w, h, stride, tb: int, format: Channel_Format) {
+	ptr := uintptr(texels)
+	mis := 0
+	if format == .Gray8 || format == .Gray16 {
+		mis = int(ptr & 3)
+		ptr -= uintptr(mis)
+	}
+	pitch := (stride if stride != 0 else w * tb) / tb
+	dst^ = {
+		ptr   = ([^]u8)(ptr),
+		mis   = i32(mis),
+		pitch = i32(pitch),
+		size  = {i32(w), i32(h)},
+		max   = {i32(w - 1), i32(h - 1)},
+		fs    = {f64(w), f64(h)},
+		inv   = {1 / f64(w), 1 / f64(h)},
+	}
+}
+
+// Channels past `images` and unbound entries get ptr = nil; the rest
+// their levels (validated by validate_channel_images).
+@(private)
+fill_chan_imgs :: proc "contextless" (dst: []Chan_Img, images: []Channel_Image) {
+	for i in 0 ..< len(dst) {
+		if i >= len(images) || !channel_bound(images[i]) {
+			dst[i].ptr = nil
 			continue
 		}
-		dst[i] = {
-			ptr    = raw_data(im.data),
-			fw     = f32(im.width),
-			fh     = f32(im.height),
-			w      = i32(im.width),
-			max_x  = i32(im.width - 1),
-			max_y  = i32(im.height - 1),
-			comps  = u8(im.components),
-			shift  = u8(im.components >> 1),
-			filter = im.filter,
+		im := images[i]
+		d := &dst[i]
+		comps := im.components
+		switch im.format {
+		case .F32:
+		case .Rgba8, .Rgba16f: comps = 4
+		case .Gray8, .Gray16:  comps = 1
+		}
+		tb := channel_texel_bytes(im.format, comps)
+		n := 1 + len(im.levels)
+		d.ptr = raw_data(im.data) if im.format == .F32 else raw_data(im.pixels)
+		unorm: f32 = 255 if im.format == .Rgba8 || im.format == .Gray8 else (65535 if im.format == .Gray16 else 0)
+		d.unorm = unorm
+		d.half = 0.5 if im.filter == .Linear else 0
+		d.format, d.filter, d.wrap = im.format, im.filter, im.wrap
+		d.comps = u8(comps)
+		d.shift = u8(comps >> 1)
+		d.held = u8(1 << uint(comps)) - 1
+		d.route = 0 if n == 1 && im.filter == .Nearest && im.wrap == {.Clamp, .Clamp} else 1
+		d.fetch_route = 0 if n == 1 && im.format == .F32 else 1
+		d.near_route = 2
+		if d.route == 0 && im.width < 1 << 24 && im.height < 1 << 24 {
+			d.near_route = 0 if im.format == .F32 else 1
+		}
+		d.fs32 = {f32(im.width), f32(im.height)}
+		d.fmax32 = {f32(im.width - 1), f32(im.height - 1)}
+		d.fn512 = {f32(512 * im.width), f32(512 * im.height)}
+		// (bilinear_sub's indexes stay under 2^23)
+		d.lin_route = 0 if n == 1 && im.format == .F32 && im.filter == .Linear && im.wrap == {.Clamp, .Clamp} && im.width < 1 << 22 && im.height < 1 << 22 else 1
+		d.lin_f32 = 0 if d.lin_route == 0 && im.width <= 1 << 15 && im.height <= 1 << 15 else 1
+		d.n_levels = i32(n)
+		d.top = f32(n - 1)
+		fill_chan_level(&d.levels[0], d.ptr, im.width, im.height, im.stride, tb, im.format)
+		for lv, l in im.levels {
+			fill_chan_level(&d.levels[l + 1], raw_data(lv.texels), lv.width, lv.height, lv.stride, tb, im.format)
 		}
 	}
 }
+
+// No channel bound: what runs without channel_images reads.
+@(private, rodata)
+CHAN_IMGS_NONE: [SAMPLER_COUNT]Chan_Img
 
 // A 2D storage image for run_compute: `width x height` texels in `data`,
 // `stride` bytes per row (0 means tightly packed: width * texel bytes).
@@ -195,12 +413,14 @@ Scratch :: struct {
 	regs:   [dynamic]Reg,
 	masks:  [dynamic]Lane_Mask,
 	shared: [dynamic]u32,
+	chans:  [dynamic]Chan_Img,
 }
 
 scratch_destroy :: proc(s: ^Scratch) {
 	delete(s.regs)
 	delete(s.masks)
 	delete(s.shared)
+	delete(s.chans)
 }
 
 @(private)
@@ -211,7 +431,7 @@ Runner :: struct {
 	shared:        []u32,
 	uniforms:      []u8,
 	opts:          Run_Options,
-	chan_imgs:     [SAMPLER_COUNT]Chan_Img,
+	chan_imgs:     ^[SAMPLER_COUNT]Chan_Img,
 	// The batch's lanes: the exec mask it starts with.
 	lanes:         Lane_Mask,
 	split_barrier: bool,
@@ -227,8 +447,14 @@ runner_begin :: proc(p: ^Program, scratch: ^Scratch, uniforms: []u8, opts: Run_O
 	if len(scratch.masks) < max(p.num_masks, 2) {
 		resize(&scratch.masks, max(p.num_masks, 2))
 	}
-	r := Runner{p = p, regs = scratch.regs[:], masks = scratch.masks[:], uniforms = uniforms, opts = opts}
-	fill_chan_imgs(&r.chan_imgs, opts.channel_images)
+	r := Runner{p = p, regs = scratch.regs[:], masks = scratch.masks[:], uniforms = uniforms, opts = opts, chan_imgs = &CHAN_IMGS_NONE}
+	if len(opts.channel_images) > 0 {
+		if len(scratch.chans) < SAMPLER_COUNT {
+			resize(&scratch.chans, SAMPLER_COUNT)
+		}
+		r.chan_imgs = (^[SAMPLER_COUNT]Chan_Img)(raw_data(scratch.chans))
+		fill_chan_imgs(r.chan_imgs[:], opts.channel_images)
+	}
 	for c in p.consts {
 		r.regs[c[0]] = c[1]
 	}
@@ -1942,10 +2168,8 @@ execute :: proc(r: ^Runner, code: []Instr, start_pc := 0) -> int #no_bounds_chec
 			regs[dst + 1] = u32(h)
 		case .Texture_Size:
 			ch := int(in_.k)
-			if r.chan_imgs[ch].ptr != nil {
-				im := &r.chan_imgs[ch]
-				regs[dst] = u32(im.w)
-				regs[dst + 1] = u32(im.max_y + 1)
+			if im := &r.chan_imgs[ch]; im.ptr != nil {
+				bound_size_lanes(im, in_.d != 0, raw_data(&regs[a]), raw_data(&regs[dst]), raw_data(&regs[dst + 1]), LANES)
 				break
 			}
 			size := channel_size(r, ch)
@@ -2043,123 +2267,458 @@ execute :: proc(r: ^Runner, code: []Instr, start_pc := 0) -> int #no_bounds_chec
 @(private)
 MAX_TEXEL_F32 :: f32(2147483520.0) // 0x4effffff, largest exact f32 < 2^31
 
+// The texel index floor(x) gives: NaN as -2^31, within [-2^31, 2^31 - 2].
 @(private)
-coord_nearest :: #force_inline proc "contextless" (u, size_f: f32, max_i: i32) -> i32 {
-	p := u * size_f
-	p = p if p > 0 else 0
-	p = p if p < MAX_TEXEL_F32 else MAX_TEXEL_F32
-	i := i32(p)
-	return i if i < max_i else max_i
+bound_index :: #force_inline proc "contextless" (g: f64) -> i32 {
+	h := g if g > -2147483648.0 else -2147483648.0
+	h = h if h < 2147483646.0 else 2147483646.0
+	return i32(h)
 }
 
+// Texel index i on an axis of n texels, and the next one, as `W` addresses them.
 @(private)
-coord_linear :: #force_inline proc "contextless" (u, size_f: f32, max_i: i32) -> (i0, i1: i32, f: f32) {
-	p := u * size_f - 0.5
-	fl := ffloor(p)
-	df := p - fl
-	f = df if df > 0 else 0
-	fl_c := fl if fl > -1 else -1
-	fl_c = fl_c if fl_c < MAX_TEXEL_F32 else MAX_TEXEL_F32
-	iv := i32(fl_c)
-	c0 := iv if iv > 0 else 0
-	i0 = c0 if c0 < max_i else max_i
-	c1 := iv + 1
-	i1 = c1 if c1 < max_i else max_i
+bound_wrap :: #force_inline proc "contextless" (i, n: i32, $W: Channel_Wrap) -> (i0, i1: i32) {
+	when W == .Repeat {
+		i0 = i %% n
+		i1 = 0 if i0 + 1 == n else i0 + 1
+	} else {
+		a, b := i if i > 0 else 0, i + 1 if i + 1 > 0 else 0
+		i0 = a if a < n - 1 else n - 1
+		i1 = b if b < n - 1 else n - 1
+	}
 	return
 }
 
+// A fraction's weight of 256: t * 256 (t in [0, 1)) rounded to nearest even.
 @(private)
-sample_bound_nearest :: #force_inline proc "contextless" (im: ^Chan_Img, regs: []Reg, a, dst: i32, $C: int) #no_bounds_check {
-	u, v := fl(&regs[a]), fl(&regs[a + 1])
-	d0 := fl(&regs[dst])
-	when C >= 2 {d1 := fl(&regs[dst + 1])}
-	when C == 4 {d2, d3 := fl(&regs[dst + 2]), fl(&regs[dst + 3])}
-	fw, fh, w, max_x, max_y, ptr := im.fw, im.fh, im.w, im.max_x, im.max_y, im.ptr
-	for l in 0 ..< LANES {
-		x := coord_nearest(u[l], fw, max_x)
-		y := coord_nearest(v[l], fh, max_y)
-		off := int(y * w + x) * C
-		d0[l] = ptr[off]
-		when C >= 2 {d1[l] = ptr[off + 1]}
-		when C == 4 {
-			d2[l] = ptr[off + 2]
-			d3[l] = ptr[off + 3]
-		}
-	}
-	when C == 1 {
-		regs[dst + 1] = 0
-		regs[dst + 2] = 0
-		regs[dst + 3] = 0x3f800000
-	} else when C == 2 {
-		regs[dst + 2] = 0
-		regs[dst + 3] = 0x3f800000
-	}
+bound_weight :: #force_inline proc "contextless" (t: f64) -> i32 {
+	y := t * 256
+	f := i32(y)
+	d := y - f64(f)
+	return f + (i32(d > 0.5) | (i32(d == 0.5) & f & 1)) // without a branch
 }
 
+// A texel's stored values (the unsigned normalized formats' integers),
+// components past the format's 0.
 @(private)
-sample_bound_linear :: #force_inline proc "contextless" (im: ^Chan_Img, regs: []Reg, a, dst: i32, $C: int) #no_bounds_check {
-	u, v := fl(&regs[a]), fl(&regs[a + 1])
-	d0 := fl(&regs[dst])
-	when C >= 2 {d1 := fl(&regs[dst + 1])}
-	when C == 4 {d2, d3 := fl(&regs[dst + 2]), fl(&regs[dst + 3])}
-	fw, fh, w, max_x, max_y, ptr := im.fw, im.fh, im.w, im.max_x, im.max_y, im.ptr
-	for l in 0 ..< LANES {
-		x0, x1, fx := coord_linear(u[l], fw, max_x)
-		y0, y1, fy := coord_linear(v[l], fh, max_y)
-		r0, r1 := y0 * w, y1 * w
-		o00, o10 := int(r0 + x0) * C, int(r0 + x1) * C
-		o01, o11 := int(r1 + x0) * C, int(r1 + x1) * C
+bound_raw :: #force_inline proc "contextless" (lv: ^Chan_Level, x, y: i32, $F: Channel_Format, $C: int) -> [4]f32 #no_bounds_check {
+	i := int(y) * int(lv.pitch) + int(x)
+	when F == .F32 {
+		t := ([^]f32)(lv.ptr)[i * C:]
 		when C == 1 {
-			top := ptr[o00] + (ptr[o10] - ptr[o00]) * fx
-			bot := ptr[o01] + (ptr[o11] - ptr[o01]) * fx
-			d0[l] = top + (bot - top) * fy
+			return {t[0], 0, 0, 0}
 		} else when C == 2 {
-			c00, c10 := ((^[2]f32)(&ptr[o00]))^, ((^[2]f32)(&ptr[o10]))^
-			c01, c11 := ((^[2]f32)(&ptr[o01]))^, ((^[2]f32)(&ptr[o11]))^
-			top := c00 + (c10 - c00) * fx
-			bot := c01 + (c11 - c01) * fx
-			res := top + (bot - top) * fy
-			d0[l], d1[l] = res[0], res[1]
+			return {t[0], t[1], 0, 0}
 		} else {
-			c00, c10 := ((^[4]f32)(&ptr[o00]))^, ((^[4]f32)(&ptr[o10]))^
-			c01, c11 := ((^[4]f32)(&ptr[o01]))^, ((^[4]f32)(&ptr[o11]))^
-			top := c00 + (c10 - c00) * fx
-			bot := c01 + (c11 - c01) * fx
-			res := top + (bot - top) * fy
-			d0[l], d1[l], d2[l], d3[l] = res[0], res[1], res[2], res[3]
+			return {t[0], t[1], t[2], t[3]}
 		}
+	} else when F == .Rgba8 {
+		b := lv.ptr[i * 4:]
+		return {f32(b[0]), f32(b[1]), f32(b[2]), f32(b[3])}
+	} else when F == .Gray8 {
+		return {f32(lv.ptr[int(lv.mis) + i]), 0, 0, 0}
+	} else when F == .Gray16 {
+		b := lv.ptr[int(lv.mis) + i * 2:]
+		return {f32(u16(b[0]) | u16(b[1]) << 8), 0, 0, 0}
+	} else {
+		h := ([^]u16)(&lv.ptr[i * 8])
+		return {f16_to_f32(h[0]), f16_to_f32(h[1]), f16_to_f32(h[2]), f16_to_f32(h[3])}
 	}
-	when C == 1 {
-		regs[dst + 1] = 0
-		regs[dst + 2] = 0
-		regs[dst + 3] = 0x3f800000
-	} else when C == 2 {
-		regs[dst + 2] = 0
-		regs[dst + 3] = 0x3f800000
+}
+
+// Texel (x, y) of a level, decoded, missing components (0, 0, 0, 1).
+@(private)
+bound_texel :: #force_inline proc "contextless" (lv: ^Chan_Level, x, y: i32, $F: Channel_Format, $C: int) -> [4]f32 #no_bounds_check {
+	i := int(y) * int(lv.pitch) + int(x)
+	when F == .F32 {
+		t := ([^]f32)(lv.ptr)[i * C:]
+		when C == 1 {
+			return {t[0], 0, 0, 1}
+		} else when C == 2 {
+			return {t[0], t[1], 0, 1}
+		} else {
+			return {t[0], t[1], t[2], t[3]}
+		}
+	} else when F == .Rgba8 {
+		b := lv.ptr[i * 4:]
+		return {UNORM8_TO_F32[b[0]], UNORM8_TO_F32[b[1]], UNORM8_TO_F32[b[2]], UNORM8_TO_F32[b[3]]}
+	} else when F == .Gray8 {
+		return {UNORM8_TO_F32[lv.ptr[int(lv.mis) + i]], 0, 0, 1}
+	} else when F == .Gray16 {
+		b := lv.ptr[int(lv.mis) + i * 2:]
+		return {f32(u16(b[0]) | u16(b[1]) << 8) / 65535, 0, 0, 1}
+	} else {
+		h := ([^]u16)(&lv.ptr[i * 8])
+		return {f16_to_f32(h[0]), f16_to_f32(h[1]), f16_to_f32(h[2]), f16_to_f32(h[3])}
+	}
+}
+
+// One axis of every lane's tap at its level `lvl`: the texel indexes and,
+// for Linear, the fraction w / 256.
+@(private)
+Bound_Axis :: struct {
+	i0, i1: [LANES]i32,
+	t:      F_Lanes,
+}
+
+@(private)
+bound_axis_lanes :: proc "contextless" (im: ^Chan_Img, c: ^F_Lanes, lvl: ^[LANES]i32, ax: int, out: ^Bound_Axis, $FI: Channel_Filter, $W: Channel_Wrap, $MIPS: bool) #no_bounds_check {
+	half := im.half
+	lv0 := &im.levels[0]
+	for l in 0 ..< LANES {
+		lv := lv0
+		when MIPS {
+			lv = &im.levels[lvl[l]]
+		}
+		// x within +-2^52 (NaN as -2^52), where every f64 is whole: the
+		// same index and weight as floor(x) and x - floor(x) give, without
+		// a branch.
+		x := f64(c[l]) * lv.fs[ax] - half
+		x = x if x > -4503599627370496 else -4503599627370496
+		x = x if x < 4503599627370496 else 4503599627370496
+		t := f64(i64(x))
+		g := t - 1 if t > x else t
+		out.i0[l], out.i1[l] = bound_wrap(bound_index(g), lv.size[ax], W)
+		when FI == .Linear {
+			out.t[l] = f32(bound_weight(x - g)) * (1.0 / 256)
+		}
 	}
 }
 
 @(private)
-fetch_bound_lanes :: #force_inline proc "contextless" (im: ^Chan_Img, regs: []Reg, a, dst: i32, flip: bool, $C: int) #no_bounds_check {
-	px, py := &regs[a], &regs[a + 1]
+bound_axis :: proc "contextless" (im: ^Chan_Img, c: ^F_Lanes, lvl: ^[LANES]i32, ax: int, out: ^Bound_Axis, $FI: Channel_Filter, $MIPS: bool) {
+	if im.wrap[ax] == .Repeat {
+		bound_axis_lanes(im, c, lvl, ax, out, FI, .Repeat, MIPS)
+	} else {
+		bound_axis_lanes(im, c, lvl, ax, out, FI, .Clamp, MIPS)
+	}
+}
+
+// Every lane's tap at its level `lvl`: the stored values blended
+// (Channel_Filter), not yet divided by an unsigned normalized format's
+// largest; the components a format lacks unset.
+@(private)
+bound_tap_lanes :: proc "contextless" (im: ^Chan_Img, u, v: ^F_Lanes, lvl: ^[LANES]i32, out: ^[LANES][4]f32, $F: Channel_Format, $C: int, $FI: Channel_Filter, $MIPS: bool) #no_bounds_check {
+	ax, ay: Bound_Axis = ---, ---
+	bound_axis(im, u, lvl, 0, &ax, FI, MIPS)
+	bound_axis(im, v, lvl, 1, &ay, FI, MIPS)
+	lv0 := &im.levels[0]
+	for l in 0 ..< LANES {
+		lv := lv0
+		when MIPS {
+			lv = &im.levels[lvl[l]]
+		}
+		when FI == .Nearest {
+			out[l] = bound_raw(lv, ax.i0[l], ay.i0[l], F, C)
+		} else {
+			tx, ty := ax.t[l], ay.t[l]
+			top := bound_raw(lv, ax.i0[l], ay.i0[l], F, C)
+			top += (bound_raw(lv, ax.i1[l], ay.i0[l], F, C) - top) * tx
+			bot := bound_raw(lv, ax.i0[l], ay.i1[l], F, C)
+			bot += (bound_raw(lv, ax.i1[l], ay.i1[l], F, C) - bot) * tx
+			out[l] = top + (bot - top) * ty
+		}
+	}
+}
+
+// Every lane's sample: level l0's tap, blended toward level l0 + 1's by
+// w / 256 where w > 0, then divided by the unsigned normalized formats'
+// largest stored value.
+@(private)
+bound_sample_lanes :: proc "contextless" (im: ^Chan_Img, u, v: ^F_Lanes, lvl0, wl: ^[LANES]i32, blend: bool, out: ^[4]F_Lanes, $F: Channel_Format, $C: int, $FI: Channel_Filter) #no_bounds_check {
+	s: [LANES][4]f32 = ---
+	if im.n_levels > 1 {
+		bound_tap_lanes(im, u, v, lvl0, &s, F, C, FI, true)
+	} else {
+		bound_tap_lanes(im, u, v, lvl0, &s, F, C, FI, false)
+	}
+	if blend {
+		s1: [LANES][4]f32 = ---
+		lvl1: [LANES]i32 = ---
+		for l in 0 ..< LANES {
+			lvl1[l] = lvl0[l] + 1 if wl[l] > 0 else lvl0[l]
+		}
+		bound_tap_lanes(im, u, v, &lvl1, &s1, F, C, FI, true)
+		for l in 0 ..< LANES {
+			if wl[l] > 0 {
+				s[l] += (s1[l] - s[l]) * (f32(wl[l]) * (1.0 / 256))
+			}
+		}
+	}
+	for k in 0 ..< C {
+		for l in 0 ..< LANES {
+			out[k][l] = s[l][k]
+		}
+	}
+	when F == .Rgba8 || F == .Gray8 || F == .Gray16 {
+		unorm := im.unorm
+		for k in 0 ..< C {
+			for l in 0 ..< LANES {
+				out[k][l] /= unorm
+			}
+		}
+	}
+	when C == 1 {
+		out[1], out[2] = {}, {}
+		out[3] = 1
+	} else when C == 2 {
+		out[2] = {}
+		out[3] = 1
+	}
+}
+
+@(private)
+bound_sample_filter :: proc "contextless" (im: ^Chan_Img, u, v: ^F_Lanes, lvl0, wl: ^[LANES]i32, blend: bool, out: ^[4]F_Lanes, $F: Channel_Format, $C: int) {
+	if im.filter == .Nearest {
+		bound_sample_lanes(im, u, v, lvl0, wl, blend, out, F, C, .Nearest)
+	} else {
+		bound_sample_lanes(im, u, v, lvl0, wl, blend, out, F, C, .Linear)
+	}
+}
+
+// The level the derivatives of quad `o` pick in `w x h` texels, as
+// texture() passes the sampler it.
+@(private)
+quad_level :: #force_inline proc "contextless" (u, v: [^]f32, o: int, w, h: f32) -> f32 {
+	dx := [2]f32{(u[o + 1] - u[o]) * w, (v[o + 1] - v[o]) * h}
+	dy := [2]f32{(u[o + 2] - u[o]) * w, (v[o + 2] - v[o]) * h}
+	return 0.5 * math.log2(max(dx.x * dx.x + dx.y * dx.y, dy.x * dy.x + dy.y * dy.y))
+}
+
+// A lane's levels at lod `L` of a chain whose top level is `top`: level
+// l0, and l0 + 1's weight of 256 (0 without one).
+@(private)
+bound_levels :: #force_inline proc "contextless" (L, top: f32) -> (l0, w: i32) {
+	if !(L > 0) {
+		return 0, 0
+	}
+	lc := L if L < top else top
+	l0 = i32(lc)
+	w = bound_weight(f64(lc - f32(l0))) // 0 at the top level, where lc = l0
+	return
+}
+
+// F32 with one level, both axes clamped: every lane in one loop. Clamped
+// to the edge, a coordinate outside [0, 1] (or NaN) reads the edge texel
+// twice, as one at 0 or 1 does, whatever the weight; so the coordinate is
+// clamped to [0, 1] first and T = f64(c) * 256n - 128 (Linear) stays small:
+// the index floor(T) >> 8, the weight round_even(T) - 256 * index, as the
+// JIT's bilinear_sub takes them. The same rule as bound_sample_lanes.
+@(private)
+bound_clamped_f32 :: proc "contextless" (im: ^Chan_Img, u, v: ^F_Lanes, out: ^[4]F_Lanes, $C: int, $FI: Channel_Filter) #no_bounds_check {
+	lv := &im.levels[0]
+	t := ([^]f32)(lv.ptr)
+	pitch := int(lv.pitch)
+	mx, my := lv.max[0], lv.max[1]
+	when FI == .Nearest {
+		fx, fy := lv.fs[0], lv.fs[1]
+		for l in 0 ..< LANES {
+			x, y := f64(u[l]) * fx, f64(v[l]) * fy
+			x = x if x > 0 else 0
+			y = y if y > 0 else 0
+			x = x if x < 2147483646 else 2147483646
+			y = y if y < 2147483646 else 2147483646
+			ix, iy := i32(x), i32(y)
+			ix = ix if ix < mx else mx
+			iy = iy if iy < my else my
+			p := t[(int(iy) * pitch + int(ix)) * C:]
+			out[0][l] = p[0]
+			when C >= 2 {out[1][l] = p[1]}
+			when C == 4 {out[2][l], out[3][l] = p[2], p[3]}
+		}
+	} else {
+		nx, ny := lv.fs[0] * 256, lv.fs[1] * 256
+		axis :: #force_inline proc "contextless" (c: f32, n256: f64, mx: i32) -> (i0, i1: i32, tw: f32) {
+			cc := c if c > 0 else 0
+			cc = cc if cc < 1 else 1
+			T := f64(cc) * n256 - 128
+			// round_even(T) by 1.5 * 2^52 (|T| < 2^31), then floor(T) from it.
+			rt := (T + 6755399441055744.0) - 6755399441055744.0
+			ft := rt - 1 if rt > T else rt
+			i := i32(ft) >> 8
+			w := i32(rt) - (i << 8)
+			i0 = i if i > 0 else 0
+			i1 = i + 1 if i + 1 < mx else mx
+			tw = f32(w) * (1.0 / 256)
+			return
+		}
+		ax, ay: Bound_Axis = ---, ---
+		for l in 0 ..< LANES {
+			ax.i0[l], ax.i1[l], ax.t[l] = axis(u[l], nx, mx)
+		}
+		for l in 0 ..< LANES {
+			ay.i0[l], ay.i1[l], ay.t[l] = axis(v[l], ny, my)
+		}
+		for l in 0 ..< LANES {
+			x0, x1, tx := ax.i0[l], ax.i1[l], ax.t[l]
+			y0, y1, ty := ay.i0[l], ay.i1[l], ay.t[l]
+			r0, r1 := int(y0) * pitch, int(y1) * pitch
+			p00, p10 := t[(r0 + int(x0)) * C:], t[(r0 + int(x1)) * C:]
+			p01, p11 := t[(r1 + int(x0)) * C:], t[(r1 + int(x1)) * C:]
+			when C == 4 {
+				c00, c10 := ((^[4]f32)(p00))^, ((^[4]f32)(p10))^
+				c01, c11 := ((^[4]f32)(p01))^, ((^[4]f32)(p11))^
+				top := c00 + (c10 - c00) * tx
+				bot := c01 + (c11 - c01) * tx
+				res := top + (bot - top) * ty
+				out[0][l], out[1][l], out[2][l], out[3][l] = res[0], res[1], res[2], res[3]
+			} else {
+				for k in 0 ..< C {
+					top := p00[k] + (p10[k] - p00[k]) * tx
+					bot := p01[k] + (p11[k] - p01[k]) * tx
+					out[k][l] = top + (bot - top) * ty
+				}
+			}
+		}
+	}
+	when C == 1 {
+		out[1], out[2] = {}, {}
+		out[3] = 1
+	} else when C == 2 {
+		out[2] = {}
+		out[3] = 1
+	}
+}
+
+// texture(), textureLod and textureGrad of a bound channel, every lane.
+@(private)
+sample_bound :: proc(r: ^Runner, im: ^Chan_Img, bias: bool, a, b, dst: i32) #no_bounds_check {
+	regs := r.regs
+	u, v := fl(&regs[a]), fl(&regs[a + 1])
+	lvl0, wl: [LANES]i32
+	blend := false
+	if im.n_levels > 1 {
+		lod := fl(&regs[b])
+		level := lod^
+		if bias {
+			w, h := f32(im.levels[0].size[0]), f32(im.levels[0].size[1])
+			for o := 0; o < LANES; o += 4 {
+				q := quad_level(raw_data(u), raw_data(v), o, w, h)
+				for l in o ..< o + 4 {
+					level[l] = lod[l] + q
+				}
+			}
+		}
+		for l in 0 ..< LANES {
+			lvl0[l], wl[l] = bound_levels(level[l], im.top)
+			blend |= wl[l] > 0
+		}
+	}
+	out := (^[4]F_Lanes)(&regs[dst])
+	if im.n_levels == 1 && im.format == .F32 && im.wrap == {.Clamp, .Clamp} && im.levels[0].size[0] < 1 << 22 && im.levels[0].size[1] < 1 << 22 {
+		switch im.comps {
+		case 1:  if im.filter == .Nearest {bound_clamped_f32(im, u, v, out, 1, .Nearest)} else {bound_clamped_f32(im, u, v, out, 1, .Linear)}
+		case 2:  if im.filter == .Nearest {bound_clamped_f32(im, u, v, out, 2, .Nearest)} else {bound_clamped_f32(im, u, v, out, 2, .Linear)}
+		case:    if im.filter == .Nearest {bound_clamped_f32(im, u, v, out, 4, .Nearest)} else {bound_clamped_f32(im, u, v, out, 4, .Linear)}
+		}
+		return
+	}
+	switch im.format {
+	case .F32:
+		switch im.comps {
+		case 1: bound_sample_filter(im, u, v, &lvl0, &wl, blend, out, .F32, 1)
+		case 2: bound_sample_filter(im, u, v, &lvl0, &wl, blend, out, .F32, 2)
+		case:   bound_sample_filter(im, u, v, &lvl0, &wl, blend, out, .F32, 4)
+		}
+	case .Rgba8:   bound_sample_filter(im, u, v, &lvl0, &wl, blend, out, .Rgba8, 4)
+	case .Gray8:   bound_sample_filter(im, u, v, &lvl0, &wl, blend, out, .Gray8, 1)
+	case .Gray16:  bound_sample_filter(im, u, v, &lvl0, &wl, blend, out, .Gray16, 1)
+	case .Rgba16f: bound_sample_filter(im, u, v, &lvl0, &wl, blend, out, .Rgba16f, 4)
+	}
+}
+
+@(private)
+fetch_bound_lanes :: proc "contextless" (im: ^Chan_Img, regs: []Reg, a, b, dst: i32, flip: bool, $F: Channel_Format, $C: int) #no_bounds_check {
+	px, py, lb := &regs[a], &regs[a + 1], &regs[b]
 	d0, d1, d2, d3 := fl(&regs[dst]), fl(&regs[dst + 1]), fl(&regs[dst + 2]), fl(&regs[dst + 3])
-	w, max_x, max_y, ptr := im.w, im.max_x, im.max_y, im.ptr
+	n := u32(im.n_levels)
+	for l in 0 ..< LANES {
+		// A negative int lod is a huge uint one: out of range either way.
+		ok := lb[l] < n
+		lv := &im.levels[lb[l] if ok else 0]
+		x := i32(px[l])
+		y := i32(u32(lv.max[1]) - py[l]) if flip else i32(py[l])
+		c: [4]f32
+		if ok && u32(x) <= u32(lv.max[0]) && u32(y) <= u32(lv.max[1]) {
+			c = bound_texel(lv, x, y, F, C)
+		}
+		d0[l], d1[l], d2[l], d3[l] = c[0], c[1], c[2], c[3]
+	}
+}
+
+// texelFetch of a bound channel: its level's texel, 0 out of range.
+// texelFetch of F32 with one level: level 0's texel where the lod is 0.
+@(private)
+fetch_bound_f32 :: proc "contextless" (im: ^Chan_Img, regs: []Reg, a, b, dst: i32, flip: bool, $C: int) #no_bounds_check {
+	px, py, lb := &regs[a], &regs[a + 1], &regs[b]
+	d0, d1, d2, d3 := fl(&regs[dst]), fl(&regs[dst + 1]), fl(&regs[dst + 2]), fl(&regs[dst + 3])
+	lv := &im.levels[0]
+	t := ([^]f32)(lv.ptr)
+	pitch, mx, my := lv.pitch, lv.max[0], lv.max[1]
 	for l in 0 ..< LANES {
 		x := i32(px[l])
-		y := i32(u32(max_y) - py[l]) if flip else i32(py[l])
-		if u32(x) > u32(max_x) || u32(y) > u32(max_y) {
+		y := i32(u32(my) - py[l]) if flip else i32(py[l])
+		if lb[l] != 0 || u32(x) > u32(mx) || u32(y) > u32(my) {
 			d0[l], d1[l], d2[l], d3[l] = 0, 0, 0, 0
 			continue
 		}
-		off := int(y * w + x) * C
+		off := int(y * pitch + x) * C
 		when C == 1 {
-			d0[l], d1[l], d2[l], d3[l] = ptr[off], 0, 0, 1
+			d0[l], d1[l], d2[l], d3[l] = t[off], 0, 0, 1
 		} else when C == 2 {
-			d0[l], d1[l], d2[l], d3[l] = ptr[off], ptr[off + 1], 0, 1
+			d0[l], d1[l], d2[l], d3[l] = t[off], t[off + 1], 0, 1
 		} else {
-			t := ((^[4]f32)(&ptr[off]))^
-			d0[l], d1[l], d2[l], d3[l] = t[0], t[1], t[2], t[3]
+			c := ((^[4]f32)(&t[off]))^
+			d0[l], d1[l], d2[l], d3[l] = c[0], c[1], c[2], c[3]
 		}
+	}
+}
+
+@(private)
+fetch_bound :: proc "contextless" (im: ^Chan_Img, regs: []Reg, a, b, dst: i32, flip: bool) {
+	switch im.format {
+	case .F32:
+		if im.n_levels == 1 {
+			switch im.comps {
+			case 1: fetch_bound_f32(im, regs, a, b, dst, flip, 1)
+			case 2: fetch_bound_f32(im, regs, a, b, dst, flip, 2)
+			case:   fetch_bound_f32(im, regs, a, b, dst, flip, 4)
+			}
+			return
+		}
+		switch im.comps {
+		case 1: fetch_bound_lanes(im, regs, a, b, dst, flip, .F32, 1)
+		case 2: fetch_bound_lanes(im, regs, a, b, dst, flip, .F32, 2)
+		case:   fetch_bound_lanes(im, regs, a, b, dst, flip, .F32, 4)
+		}
+	case .Rgba8:   fetch_bound_lanes(im, regs, a, b, dst, flip, .Rgba8, 4)
+	case .Gray8:   fetch_bound_lanes(im, regs, a, b, dst, flip, .Gray8, 1)
+	case .Gray16:  fetch_bound_lanes(im, regs, a, b, dst, flip, .Gray16, 1)
+	case .Rgba16f: fetch_bound_lanes(im, regs, a, b, dst, flip, .Rgba16f, 4)
+	}
+}
+
+// textureSize of a bound channel: level clamp(lod, 0, levels - 1)'s size,
+// an int lod clamped signed and a uint one unsigned (Texture_Size's d).
+@(private)
+bound_size_lanes :: proc "contextless" (im: ^Chan_Img, uint_lod: bool, lods: [^]u32, dx, dy: [^]u32, n: int) {
+	if uint_lod {
+		bound_size_lod_lanes(im, lods, dx, dy, n, true)
+	} else {
+		bound_size_lod_lanes(im, lods, dx, dy, n, false)
+	}
+}
+
+@(private)
+bound_size_lod_lanes :: proc "contextless" (im: ^Chan_Img, lods: [^]u32, dx, dy: [^]u32, n: int, $UNSIGNED: bool) #no_bounds_check {
+	top := u32(im.n_levels - 1)
+	for l in 0 ..< n {
+		L := lods[l]
+		when !UNSIGNED {
+			L = u32(max(i32(L), 0))
+		}
+		lv := &im.levels[min(L, top)]
+		dx[l], dy[l] = u32(lv.size[0]), u32(lv.size[1])
 	}
 }
 
@@ -2187,27 +2746,13 @@ sample_texture :: proc(r: ^Runner, in_: Instr, exec: Lane_Mask) #no_bounds_check
 	regs := r.regs
 	ch := int(in_.k)
 	dst := in_.dst
-	if r.chan_imgs[ch].ptr != nil {
-		im := &r.chan_imgs[ch]
+	if im := &r.chan_imgs[ch]; im.ptr != nil {
 		if in_.op == .Texel_Fetch {
-			flip := (in_.d & 1) != 0
-			switch im.comps {
-			case 1: fetch_bound_lanes(im, regs, in_.a, dst, flip, 1)
-			case 2: fetch_bound_lanes(im, regs, in_.a, dst, flip, 2)
-			case:   fetch_bound_lanes(im, regs, in_.a, dst, flip, 4)
-			}
-		} else if im.filter == .Nearest {
-			switch im.comps {
-			case 1: sample_bound_nearest(im, regs, in_.a, dst, 1)
-			case 2: sample_bound_nearest(im, regs, in_.a, dst, 2)
-			case:   sample_bound_nearest(im, regs, in_.a, dst, 4)
-			}
+			fetch_bound(im, regs, in_.a, in_.b, in_.dst, (in_.d & 1) != 0)
 		} else {
-			switch im.comps {
-			case 1: sample_bound_linear(im, regs, in_.a, dst, 1)
-			case 2: sample_bound_linear(im, regs, in_.a, dst, 2)
-			case:   sample_bound_linear(im, regs, in_.a, dst, 4)
-			}
+			// Fields, not the Instr: an Instr passed by reference out of
+			// line would make execute keep every instruction in memory.
+			sample_bound(r, im, in_.op == .Texture_Bias, in_.a, in_.b, in_.dst)
 		}
 		return
 	}
@@ -2296,10 +2841,7 @@ sample_texture :: proc(r: ^Runner, in_: Instr, exec: Lane_Mask) #no_bounds_check
 		}
 		level: f32 = 0
 		if in_.op == .Texture_Bias && size.xy != {} {
-			w, h := f32(size.x), f32(size.y)
-			dx := [2]f32{(u[o + 1] - u[o]) * w, (v[o + 1] - v[o]) * h}
-			dy := [2]f32{(u[o + 2] - u[o]) * w, (v[o + 2] - v[o]) * h}
-			level = 0.5 * math.log2(max(dx.x * dx.x + dx.y * dx.y, dy.x * dy.x + dy.y * dy.y))
+			level = quad_level(raw_data(u), raw_data(v), o, f32(size.x), f32(size.y))
 		}
 		for l in o ..< o + 4 {
 			if (have >> uint(l)) & 1 == 0 {

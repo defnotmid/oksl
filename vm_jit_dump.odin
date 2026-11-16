@@ -127,13 +127,25 @@ jit_dump_program :: proc(p: ^Program, e: ^Jit_Emitter, mem_slice: []u8, init_byt
 		fmt.sbprintfln(&sb, "STUB idx=%d pc=%d op=%v k=%d off=0x%x..0x%x bytes=%d", len(e.bound_tex) + si, stub.pc, in_.op, in_.k, s0, s1, s1 - s0)
 	}
 
-	subs: [4]struct {
+	subs: [8]struct {
 		name: string,
 		off:  int,
 	}
 	n_subs := 0
-	if e.bilinear_off > 0 {
-		subs[n_subs] = {"BILINEAR_SUB", e.bilinear_off - body_off}
+	if e.chan_sample_off > 0 {
+		subs[n_subs] = {"CHAN_SAMPLE_SUB", e.chan_sample_off - body_off}
+		n_subs += 1
+	}
+	if e.chan_bilinear_off > 0 {
+		subs[n_subs] = {"CHAN_BILINEAR_SUB", e.chan_bilinear_off - body_off}
+		n_subs += 1
+	}
+	if e.chan_fetch_off > 0 {
+		subs[n_subs] = {"CHAN_FETCH_SUB", e.chan_fetch_off - body_off}
+		n_subs += 1
+	}
+	if e.chan_decode_off > 0 {
+		subs[n_subs] = {"CHAN_DECODE_SUB", e.chan_decode_off - body_off}
 		n_subs += 1
 	}
 	if e.helper_ymm_off > 0 {

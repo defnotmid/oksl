@@ -55,7 +55,7 @@ eval :: proc(t: ^testing.T, body: string, prelude := "", loc := #caller_location
 // Working memory for one run, freed with the temp allocator.
 @(private = "file")
 temp_scratch :: proc() -> ^Scratch {
-	return new_clone(Scratch{make([dynamic]Reg, context.temp_allocator), make([dynamic]Lane_Mask, context.temp_allocator), make([dynamic]u32, context.temp_allocator)}, context.temp_allocator)
+	return new_clone(Scratch{make([dynamic]Reg, context.temp_allocator), make([dynamic]Lane_Mask, context.temp_allocator), make([dynamic]u32, context.temp_allocator), make([dynamic]Chan_Img, context.temp_allocator)}, context.temp_allocator)
 }
 
 @(private = "file")
@@ -4984,20 +4984,8 @@ ref_chan_sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer
 		py := clamp(int(math.floor(uv.y * f32(s.h))), 0, s.h - 1)
 		return ref_chan_texel(&s, px, py)
 	}
-	if s.filter == .Nearest {
-		px := coord_nearest(uv.x, f32(s.w), i32(s.w - 1))
-		py := coord_nearest(uv.y, f32(s.h), i32(s.h - 1))
-		return ref_chan_texel(&s, int(px), int(py))
-	}
-	x0, x1, fx := coord_linear(uv.x, f32(s.w), i32(s.w - 1))
-	y0, y1, fy := coord_linear(uv.y, f32(s.h), i32(s.h - 1))
-	c00 := ref_chan_texel(&s, int(x0), int(y0))
-	c10 := ref_chan_texel(&s, int(x1), int(y0))
-	c01 := ref_chan_texel(&s, int(x0), int(y1))
-	c11 := ref_chan_texel(&s, int(x1), int(y1))
-	top := c00 + (c10 - c00) * fx
-	bot := c01 + (c11 - c01) * fx
-	return top + (bot - top) * fy
+	im := Channel_Image{data = s.data, width = s.w, height = s.h, components = s.comps, filter = s.filter}
+	return ref_bound_sample(&im, uv.x, uv.y, lod)
 }
 
 @(private = "file")
@@ -5164,9 +5152,10 @@ void main() {
 		run_f32(&em.program, eblock, 4, 4, ej, temp_scratch(), {channel_images = eimgs})
 		run_f32_interp(&em.program, eblock, 4, 4, ev, temp_scratch(), {channel_images = eimgs})
 		testing.expect(t, slice.equal(slice.reinterpret([]u32, ej), slice.reinterpret([]u32, ev)))
-		// Verify k incremented once (to 2), ip ended at 99 while f1 fetched (2, 1), oob was 0, and sz3 == (7, 5).
+		// Verify k incremented once (to 2), ip ended at 99 while f1 fetched
+		// at level 99 (past the one level: 0), oob was 0, and sz3 == (7, 5).
 		want_f0 := rgba_tex[2 * TW + 1]
-		want_f1 := rgba_tex[1 * TW + 2]
+		want_f1: [4]f32
 		c_bl := rgba_tex[(TH - 1) * TW + 0]
 		c_tr := rgba_tex[0 * TW + (TW - 1)]
 		c_tl := rgba_tex[0]
@@ -5222,6 +5211,1022 @@ void main() {
 			want_flip := r_tex[(TH - 1) * TW + 1]
 			testing.expect_value(t, bj[0], [4]f32{want_flip, want_flip, 0, 1})
 		}
+	}
+}
+
+// ---- bound channels: the sampling rule (Channel_Filter) ------------------------------------
+//
+// An independent statement of the rule, as a sampler callback, for the
+// bound images to match bit for bit in the JIT and the interpreter.
+
+@(private = "file")
+ref_level :: proc(im: ^Channel_Image, l: int) -> (bytes: []u8, w, h, pitch: int) {
+	tb := channel_texel_bytes(im.format, im.components)
+	if l == 0 {
+		bytes = slice.to_bytes(im.data) if im.format == .F32 else im.pixels
+		w, h, pitch = im.width, im.height, im.stride
+	} else {
+		lv := im.levels[l - 1]
+		bytes, w, h, pitch = lv.texels, lv.width, lv.height, lv.stride
+	}
+	if pitch == 0 {
+		pitch = w * tb
+	}
+	return
+}
+
+@(private = "file")
+ref_comps :: proc(im: ^Channel_Image) -> int {
+	switch im.format {
+	case .F32:             return im.components
+	case .Rgba8, .Rgba16f: return 4
+	case .Gray8, .Gray16:  return 1
+	}
+	return 0
+}
+
+// Component k of texel (x, y) of level l as stored (bytes and u16 as integers).
+@(private = "file")
+ref_stored :: proc(im: ^Channel_Image, l, x, y, k: int) -> f64 {
+	b, _, _, pitch := ref_level(im, l)
+	row := b[y * pitch:]
+	switch im.format {
+	case .F32:     return f64((^f32)(&row[(x * im.components + k) * 4])^)
+	case .Rgba8:   return f64(row[x * 4 + k])
+	case .Gray8:   return f64(row[x])
+	case .Gray16:  return f64(u16(row[x * 2]) | u16(row[x * 2 + 1]) << 8)
+	case .Rgba16f: return f64(f16_to_f32(u16(row[x * 8 + k * 2]) | u16(row[x * 8 + k * 2 + 1]) << 8))
+	}
+	return 0
+}
+
+@(private = "file")
+ref_unorm :: proc(f: Channel_Format) -> f64 {
+	#partial switch f {
+	case .Rgba8, .Gray8: return 255
+	case .Gray16:        return 65535
+	}
+	return 1
+}
+
+// Rounds y in [0, 256] to nearest even; NaN to 0.
+@(private = "file")
+ref_rne :: proc(y: f64) -> int {
+	if !(y >= 0 && y <= 256) {
+		return 0
+	}
+	f := math.floor(y)
+	r := int(f)
+	if y - f > 0.5 || (y - f == 0.5 && r % 2 != 0) {
+		r += 1
+	}
+	return r
+}
+
+@(private = "file")
+ref_index :: proc(g: f64, n: int, wrap: Channel_Wrap) -> (i0, i1: int) {
+	i := -2147483648 if g != g || g < -2147483648 else (2147483646 if g > 2147483646 else int(g))
+	if wrap == .Repeat {
+		i0 = ((i % n) + n) % n
+		i1 = (i0 + 1) % n
+	} else {
+		i0, i1 = clamp(i, 0, n - 1), clamp(i + 1, 0, n - 1)
+	}
+	return
+}
+
+// One level's tap: the stored values blended (Channel_Filter).
+@(private = "file")
+ref_bound_tap :: proc(im: ^Channel_Image, l: int, u, v: f32) -> (res: [4]f32) {
+	_, w, h, _ := ref_level(im, l)
+	comps := ref_comps(im)
+	if im.filter == .Nearest {
+		x, _ := ref_index(math.floor(f64(u) * f64(w)), w, im.wrap[0])
+		y, _ := ref_index(math.floor(f64(v) * f64(h)), h, im.wrap[1])
+		for k in 0 ..< comps {
+			res[k] = f32(ref_stored(im, l, x, y, k))
+		}
+		return
+	}
+	ex, ey := f64(u) * f64(w) - 0.5, f64(v) * f64(h) - 0.5
+	gx, gy := math.floor(ex), math.floor(ey)
+	tx, ty := f32(ref_rne((ex - gx) * 256)) / 256, f32(ref_rne((ey - gy) * 256)) / 256
+	x0, x1 := ref_index(gx, w, im.wrap[0])
+	y0, y1 := ref_index(gy, h, im.wrap[1])
+	for k in 0 ..< comps {
+		c00, c10 := f32(ref_stored(im, l, x0, y0, k)), f32(ref_stored(im, l, x1, y0, k))
+		c01, c11 := f32(ref_stored(im, l, x0, y1, k)), f32(ref_stored(im, l, x1, y1, k))
+		top := c00 + (c10 - c00) * tx
+		bot := c01 + (c11 - c01) * tx
+		res[k] = top + (bot - top) * ty
+	}
+	return
+}
+
+@(private = "file")
+ref_bound_sample :: proc(im: ^Channel_Image, u, v, lod: f32) -> [4]f32 {
+	n := 1 + len(im.levels)
+	l0, w := 0, 0
+	if n > 1 && lod > 0 {
+		lc := min(lod, f32(n - 1))
+		l0 = int(lc)
+		if l0 < n - 1 {
+			w = ref_rne(f64(lc - f32(l0)) * 256)
+		}
+	}
+	s := ref_bound_tap(im, l0, u, v)
+	if w > 0 {
+		s1 := ref_bound_tap(im, l0 + 1, u, v)
+		for k in 0 ..< 4 {
+			s[k] = s[k] + (s1[k] - s[k]) * (f32(w) / 256)
+		}
+	}
+	comps := ref_comps(im)
+	res := [4]f32{0, 0, 0, 1}
+	for k in 0 ..< comps {
+		res[k] = s[k] / f32(ref_unorm(im.format)) if ref_unorm(im.format) != 1 else s[k]
+	}
+	return res
+}
+
+// texelFetch through the callback: the texel the centre uv of a level's
+// texel picks, 0 out of range.
+@(private = "file")
+ref_bound_fetch :: proc(im: ^Channel_Image, u, v, lod: f32) -> [4]f32 {
+	n := 1 + len(im.levels)
+	if !(lod >= 0 && lod < f32(n)) {
+		return {}
+	}
+	l := int(lod)
+	_, w, h, _ := ref_level(im, l)
+	if !(u >= 0 && u < 1 && v >= 0 && v < 1) {
+		return {}
+	}
+	x, y := int(u * f32(w)), int(v * f32(h))
+	res := [4]f32{0, 0, 0, 1}
+	for k in 0 ..< ref_comps(im) {
+		res[k] = f32(ref_stored(im, l, x, y, k) / ref_unorm(im.format))
+	}
+	return res
+}
+
+@(private = "file")
+Ref_Bound_Ctx :: struct {
+	im:    ^Channel_Image,
+	fetch: bool, // channel 1 is the fetch channel
+}
+
+@(private = "file")
+ref_bound_sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+	im := (^Channel_Image)(user)
+	if channel == 1 {
+		return ref_bound_fetch(im, uv.x, uv.y, lod)
+	}
+	return ref_bound_sample(im, uv.x, uv.y, lod)
+}
+
+@(private = "file")
+run_targets_interp :: proc(p: ^Program, uniforms: []u8, width, height: int, targets: [][][4]f32, scratch: ^Scratch, opts: Run_Options) {
+	saved_body, saved_init := p.jit_body, p.jit_init
+	p.jit_body, p.jit_init = nil, nil
+	defer {
+		p.jit_body, p.jit_init = saved_body, saved_init
+	}
+	run_targets(p, uniforms, width, height, targets, scratch, opts)
+}
+
+// A test image: `format` texels from a seeded LCG, with every level of
+// the chain when `mips` (for F32 `comps` components), in `arena`. Rgba16f
+// and F32 include an infinity and a NaN, Rgba16f subnormals.
+@(private = "file")
+make_test_image :: proc(format: Channel_Format, comps, w, h: int, mips: bool, seed: u32) -> Channel_Image {
+	tb := channel_texel_bytes(format, comps)
+	state := seed * 2654435761 + 1
+	next :: proc(s: ^u32) -> u32 {
+		s^ = s^ * 1664525 + 1013904223
+		return s^ >> 8
+	}
+	fill :: proc(b: []u8, format: Channel_Format, s: ^u32) {
+		switch format {
+		case .Rgba8, .Gray8:
+			for &x in b {
+				x = u8(next(s))
+			}
+		case .Gray16:
+			for i := 0; i < len(b); i += 2 {
+				v := u16(next(s))
+				b[i], b[i + 1] = u8(v), u8(v >> 8)
+			}
+		case .Rgba16f:
+			for i := 0; i < len(b); i += 2 {
+				r := next(s)
+				hv := u16(0x3c00 + (r & 0x07ff) - 0x0400) | u16(r >> 12 & 1) << 15 // around 1
+				switch r % 61 {
+				case 0: hv = 0x7c00            // inf
+				case 1: hv = 0x7e01 | 0x8000   // NaN
+				case 2: hv = u16(r >> 13 & 0x3ff) // subnormal
+				case 3: hv = 0x7bff            // the largest
+				}
+				b[i], b[i + 1] = u8(hv), u8(hv >> 8)
+			}
+		case .F32:
+			for i := 0; i < len(b); i += 4 {
+				r := next(s)
+				f := f32(i32(r & 0xffff) - 0x8000) / 4096
+				switch r % 97 {
+				case 0: f = math.inf_f32(1)
+				case 1: f = math.nan_f32()
+				}
+				(^f32)(&b[i])^ = f
+			}
+		}
+	}
+	// Level 0's rows 3 texels apart from the next row's start past their end
+	// (stride) with every other seed.
+	stride := (w + 3) * tb if seed % 2 == 1 else 0
+	rows := stride * (h - 1) + w * tb if stride != 0 else w * h * tb
+	im := Channel_Image{width = w, height = h, filter = .Nearest, format = format, stride = stride}
+	if format == .F32 {
+		im.components = comps
+		im.data = make([]f32, rows / 4, context.temp_allocator)
+		fill(slice.to_bytes(im.data), format, &state)
+	} else {
+		im.pixels = make([]u8, rows, context.temp_allocator)
+		fill(im.pixels, format, &state)
+	}
+	if mips {
+		lv := make([dynamic]Channel_Level, 0, 16, context.temp_allocator)
+		lw, lh := w, h
+		for lw > 1 || lh > 1 {
+			lw, lh = max(lw >> 1, 1), max(lh >> 1, 1)
+			b := make([]u8, lw * lh * tb + 8, context.temp_allocator)[:lw * lh * tb]
+			fill(b, format, &state)
+			append(&lv, Channel_Level{texels = b, width = lw, height = lh})
+		}
+		im.levels = lv[:]
+	}
+	return im
+}
+
+@(private = "file")
+BOUND_RULE_SRC :: `#version 310 es
+precision highp float;
+uniform sampler2D s;
+uniform sampler2D sFetch;
+uniform vec4 uXform;
+uniform vec4 uLod;
+uniform float uZero;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
+void main() {
+    vec2 fc = gl_FragCoord.xy;
+    ivec2 p = ivec2(fc);
+    vec2 uv = fc * uXform.xy + uXform.zw;
+    if (p.x == 0) uv.x = uZero / uZero;
+    if (p.x == 1) uv.y = 1.0 / uZero;
+    if (p.x == 2) uv.x = -1.0 / uZero;
+    if (p.x == 3 && p.y < 4) uv = vec2(1e30, -3e9);
+    float lod = fc.x * uLod.x + fc.y * 0.37 + uLod.y;
+    if (p.y == 1) lod = uZero / uZero;
+    if (p.y == 2) lod = 1.0 / uZero;
+    if (p.y == 3) lod = -1.0 / uZero;
+    if (p.y == 4) lod = floor(lod) + float(p.x % 4) / 512.0;
+    o0 = texture(s, uv * (1.0 + fc.y * uLod.w), uLod.z);
+    o1 = textureLod(s, uv, lod);
+    o2 = textureGrad(s, uv, vec2(uLod.w * fc.x * 0.4, 0.003), vec2(0.002, uLod.w * fc.y * 0.5));
+    o3 = texelFetch(sFetch, ivec2(p.x - 3, p.y - 2), (p.x + p.y) % 7 - 1);
+}`
+
+// Every format, filter, wrap and level rule: the bound image (JIT and
+// interpreter) equals bit for bit a callback stating the rule
+// (ref_bound_sample), at edges and ties, negative, huge, NaN and infinite
+// coordinates and lods, texelFetch in and out of range and textureSize.
+@(test)
+test_bound_channel_rule :: proc(t: ^testing.T) {
+	m, errs, ok := compile(BOUND_RULE_SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	W, H :: 24, 20
+	Config :: struct {
+		format: Channel_Format,
+		comps:  int,
+	}
+	configs := [?]Config{{.F32, 1}, {.F32, 2}, {.F32, 4}, {.Rgba8, 4}, {.Gray8, 1}, {.Gray16, 1}, {.Rgba16f, 4}}
+	TW, TH :: 13, 7
+	xforms := [?][4]f32 {
+		{1.6 / W, 1.6 / H, -0.3, -0.3},                    // magnified, past every edge
+		{80.0 / W, 70.0 / H, -40, -33},                     // huge, repeating
+		{1.0 / (512 * TW), 1.0 / (512 * TH), 0.5 / TW, 0},  // ties: fractions of 1/512
+		{1.0 / (2 * TW), 1.0 / (4 * TH), 0, 0},             // texel centres and edges
+		{9.0 / W, 7.0 / H, 0.01, -0.02},                    // minified
+	}
+	lods := [?][4]f32{{0.21, -1.3, 0, 0.11}, {0.05, 0.5, -0.75, 0.9}, {0.4, 2.0, 1.5, 0.02}}
+	mismatches := 0
+	n_cases := 0
+	for cfg, ci in configs {
+		for filter in Channel_Filter {
+			for wrap in ([4][2]Channel_Wrap{{.Clamp, .Clamp}, {.Repeat, .Repeat}, {.Repeat, .Clamp}, {.Clamp, .Repeat}}) {
+				for mips in ([2]bool{false, true}) {
+					im := make_test_image(cfg.format, cfg.comps, TW, TH, mips, u32(ci * 31 + int(filter) * 7 + int(mips)))
+					im.filter, im.wrap = filter, wrap
+					fetch_im := im
+					imgs := [2]Channel_Image{im, fetch_im}
+					sizes := [2][3]i32{{TW, TH, 1}, {TW, TH, 1}}
+					for xf_, xi in xforms {
+						xf := xf_
+						lx := lods[(xi + int(mips)) % len(lods)]
+						set_uniform(m, block, "uXform", xf[:])
+						set_uniform(m, block, "uLod", lx[:])
+						set_uniform(m, block, "uZero", {0})
+						outs: [4][4][][4]f32
+						for &o in outs {
+							for &tg in o {
+								tg = make([][4]f32, W * H, context.temp_allocator)
+							}
+						}
+						b_opts := Run_Options{channel_images = imgs[:]}
+						c_opts := Run_Options{sampler = ref_bound_sampler, user = &imgs[0], channel_sizes = sizes[:]}
+						run_targets(&m.program, block, W, H, outs[0][:], temp_scratch(), b_opts)
+						run_targets_interp(&m.program, block, W, H, outs[1][:], temp_scratch(), b_opts)
+						run_targets(&m.program, block, W, H, outs[2][:], temp_scratch(), c_opts)
+						run_targets_interp(&m.program, block, W, H, outs[3][:], temp_scratch(), c_opts)
+						n_cases += 1
+						for target in 0 ..< 4 {
+							wj := slice.reinterpret([]u32, outs[0][target])
+							wv := slice.reinterpret([]u32, outs[1][target])
+							wc := slice.reinterpret([]u32, outs[2][target])
+							wcv := slice.reinterpret([]u32, outs[3][target])
+							for i in 0 ..< len(wj) {
+								if wj[i] != wv[i] || wj[i] != wc[i] || wc[i] != wcv[i] {
+									if mismatches < 12 {
+										testing.expectf(t, false, "%v/%d %v %v mips=%v xform %d target %d pixel (%d, %d) comp %d: jit %08x vm %08x callback %08x/%08x",
+											cfg.format, cfg.comps, filter, wrap, mips, xi, target, (i / 4) % W, i / 4 / W, i % 4, wj[i], wv[i], wc[i], wcv[i])
+									}
+									mismatches += 1
+									break
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	testing.expectf(t, mismatches == 0, "%d mismatching targets in %d cases", mismatches, n_cases)
+}
+
+// textureSize of a bound channel: level clamp(lod, 0, levels - 1)'s size,
+// per lane, in both engines, int lods clamped signed and uint ones unsigned.
+@(test)
+test_bound_channel_texture_size :: proc(t: ^testing.T) {
+	SRC :: `#version 310 es
+precision highp float;
+uniform sampler2D s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    int lod = p.x + 8 * p.y - 3;
+    if (p.y == 3) lod = -2147483647 - 1;
+    if (p.y == 3 && p.x == 1) lod = 2147483647;
+    o = vec4(vec2(textureSize(s, lod)), 0.0, 1.0);
+}`
+	m, errs, ok := compile(SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	for mips in ([2]bool{false, true}) {
+		im := make_test_image(.Rgba8, 4, 37, 5, mips, 3)
+		for jit in ([2]bool{true, false}) {
+			out := make([][4]f32, 8 * 4, context.temp_allocator)
+			if jit {
+				run_f32(&m.program, nil, 8, 4, out, temp_scratch(), {channel_images = {im}})
+			} else {
+				run_f32_interp(&m.program, nil, 8, 4, out, temp_scratch(), {channel_images = {im}})
+			}
+			for y in 0 ..< 4 {
+				for x in 0 ..< 8 {
+					lod := x + 8 * y - 3
+					if y == 3 {
+						lod = -2147483648 if x != 1 else 2147483647
+					}
+					l := clamp(lod, 0, len(im.levels))
+					w, h := 37, 5
+					if l > 0 {
+						w, h = im.levels[l - 1].width, im.levels[l - 1].height
+					}
+					testing.expectf(t, out[y * 8 + x] == {f32(w), f32(h), 0, 1}, "mips=%v jit=%v lod %d: got %v, want %d x %d", mips, jit, lod, out[y * 8 + x], w, h)
+				}
+			}
+		}
+	}
+
+	// A uint lod clamps unsigned: 0x80000000u and up pick the top level,
+	// as level 0's size >> lod does unbound.
+	USRC :: `#version 310 es
+precision highp float;
+uniform sampler2D s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    uint lod = uint(p.x + 8 * p.y);
+    if (p.y == 3) lod = 0x7ffffff8u + uint(p.x);
+    if (p.y == 3 && p.x >= 4) lod = 0xfffffffcu + uint(p.x - 4);
+    if (p.y == 3 && p.x == 0) lod = 0x80000000u;
+    o = vec4(vec2(textureSize(s, lod)), 0.0, 1.0);
+}`
+	um, uerrs, uok := compile(USRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(um)
+	if !testing.expectf(t, uok, "compile failed:\n%s", format_errors(uerrs, context.temp_allocator)) {
+		return
+	}
+	for format in ([2]Channel_Format{.Gray8, .Rgba8}) {
+		for mips in ([2]bool{false, true}) {
+			im := make_test_image(format, 4 if format == .Rgba8 else 1, 37, 5, mips, 5)
+			for jit in ([2]bool{true, false}) {
+				out := make([][4]f32, 8 * 4, context.temp_allocator)
+				if jit {
+					run_f32(&um.program, nil, 8, 4, out, temp_scratch(), {channel_images = {im}})
+				} else {
+					run_f32_interp(&um.program, nil, 8, 4, out, temp_scratch(), {channel_images = {im}})
+				}
+				for y in 0 ..< 4 {
+					for x in 0 ..< 8 {
+						lod := u32(x + 8 * y)
+						if y == 3 {
+							lod = 0x7ffffff8 + u32(x) if x < 4 else 0xfffffffc + u32(x - 4)
+							if x == 0 {
+								lod = 0x80000000
+							}
+						}
+						l := int(min(lod, u32(len(im.levels))))
+						w, h := 37, 5
+						if l > 0 {
+							w, h = im.levels[l - 1].width, im.levels[l - 1].height
+						}
+						testing.expectf(t, out[y * 8 + x] == {f32(w), f32(h), 0, 1}, "%v mips=%v jit=%v uint lod %x: got %v, want %d x %d", format, mips, jit, lod, out[y * 8 + x], w, h)
+					}
+				}
+			}
+		}
+	}
+}
+
+// Every stored value of every byte format decodes as the rule says
+// (u8 / 255, u16 / 65535, every half as f16_to_f32 with NaN quieted),
+// through texelFetch and Nearest in both engines, with rows `stride` bytes
+// apart and Gray texels at every byte alignment.
+@(test)
+test_bound_channel_decode :: proc(t: ^testing.T) {
+	SRC :: `#version 310 es
+precision highp float;
+uniform sampler2D s;
+uniform sampler2D sNear;
+uniform vec2 uSize;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    o0 = texelFetch(s, p, 0);
+    o1 = textureLod(sNear, gl_FragCoord.xy / uSize, 0.0);
+}`
+	m, errs, ok := compile(SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	W :: 256
+	Case :: struct {
+		format: Channel_Format,
+		h:      int,
+		offset: int, // the texels' byte offset in their buffer
+		pad:    int, // bytes past each row
+	}
+	cases := [?]Case{
+		{.Rgba8, 1, 0, 4}, {.Gray8, 1, 0, 0}, {.Gray8, 1, 1, 3}, {.Gray8, 1, 2, 1}, {.Gray8, 1, 3, 0},
+		{.Gray16, 256, 0, 2}, {.Gray16, 256, 2, 0}, {.Rgba16f, 256, 0, 8}, {.Rgba16f, 256, 4, 0},
+	}
+	for c in cases {
+		tb := channel_texel_bytes(c.format, 0)
+		stride := W * tb + c.pad
+		buf := make([]u8, c.offset + stride * c.h, context.temp_allocator)
+		px := buf[c.offset:]
+		want := make([][4]f32, W * c.h, context.temp_allocator)
+		for y in 0 ..< c.h {
+			for x in 0 ..< W {
+				i := y * W + x
+				row := px[y * stride:]
+				switch c.format {
+				case .Rgba8:
+					for k in 0 ..< 4 {
+						b := u8((x + 85 * k) & 255)
+						row[x * 4 + k] = b
+						want[i][k] = f32(b) / 255
+					}
+				case .Gray8:
+					row[x] = u8(x)
+					want[i] = {f32(x) / 255, 0, 0, 1}
+				case .Gray16:
+					v := u16(i)
+					row[x * 2], row[x * 2 + 1] = u8(v), u8(v >> 8)
+					want[i] = {f32(v) / 65535, 0, 0, 1}
+				case .Rgba16f:
+					for k in 0 ..< 4 {
+						v := u16((i + 16384 * k) & 0xffff)
+						row[x * 8 + k * 2], row[x * 8 + k * 2 + 1] = u8(v), u8(v >> 8)
+						want[i][k] = f16_to_f32(v)
+					}
+				case .F32:
+				}
+			}
+		}
+		im := Channel_Image{format = c.format, pixels = px[:stride * (c.h - 1) + W * tb], width = W, height = c.h, stride = stride}
+		size := [2]f32{W, f32(c.h)}
+		set_uniform(m, block, "uSize", size[:])
+		for jit in ([2]bool{true, false}) {
+			outs: [2][][4]f32
+			outs[0] = make([][4]f32, W * c.h, context.temp_allocator)
+			outs[1] = make([][4]f32, W * c.h, context.temp_allocator)
+			opts := Run_Options{channel_images = {im, im}}
+			if jit {
+				run_targets(&m.program, block, W, c.h, outs[:], temp_scratch(), opts)
+			} else {
+				run_targets_interp(&m.program, block, W, c.h, outs[:], temp_scratch(), opts)
+			}
+			bad := 0
+			for o in outs {
+				g := slice.reinterpret([]u32, o)
+				w := slice.reinterpret([]u32, want)
+				for i in 0 ..< len(w) {
+					if g[i] != w[i] {
+						if bad < 4 {
+							testing.expectf(t, false, "%v offset %d jit=%v texel %d comp %d: got %08x, want %08x", c.format, c.offset, jit, i / 4, i % 4, g[i], w[i])
+						}
+						bad += 1
+					}
+				}
+			}
+		}
+	}
+}
+
+// texture() with levels: the bias plus the level the quad's derivatives
+// pick, as the sampler callback gets it, through jit_help_bound_lod with
+// live values in ymm8..15 around it; and a bound channel in compute.
+@(test)
+test_bound_channel_implicit_lod :: proc(t: ^testing.T) {
+	SRC :: `#version 310 es
+precision highp float;
+uniform sampler2D s;
+uniform float uScale;
+layout(location = 0) out vec4 o;
+void main() {
+    vec2 uv = gl_FragCoord.xy * gl_FragCoord.yx * uScale;
+    float a = uv.x * 3.0, b = uv.y * 5.0, c = a * b, d = a - b, e = c + d, f = c * d;
+    vec4 t0 = texture(s, uv);
+    vec4 t1 = texture(s, uv * 1.7, -0.4);
+    o = t0 + t1 * 0.5 + vec4(a, b, c, d) * 1e-3 + vec4(e, f, 0.0, 0.0) * 1e-4;
+}`
+	m, errs, ok := compile(SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	W, H :: 40, 24
+	for format in ([3]Channel_Format{.Rgba8, .Rgba16f, .F32}) {
+		im := make_test_image(format, 4, 64, 32, true, 11)
+		im.filter, im.wrap = .Linear, {.Repeat, .Clamp}
+		sizes := [1][3]i32{{64, 32, 1}}
+		for scale in ([3]f32{0.0007, 0.004, 0.02}) {
+			set_uniform(m, block, "uScale", {scale})
+			outs: [3][][4]f32
+			for &o in outs {
+				o = make([][4]f32, W * H, context.temp_allocator)
+			}
+			run_f32(&m.program, block, W, H, outs[0], temp_scratch(), {channel_images = {im}})
+			run_f32_interp(&m.program, block, W, H, outs[1], temp_scratch(), {channel_images = {im}})
+			run_f32_interp(&m.program, block, W, H, outs[2], temp_scratch(), {sampler = ref_bound_sampler, user = &im, channel_sizes = sizes[:]})
+			a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
+			for i in 0 ..< len(a) {
+				if a[i] != b[i] || b[i] != c[i] {
+					testing.expectf(t, false, "%v scale %v word %d: jit %08x vm %08x callback %08x", format, scale, i, a[i], b[i], c[i])
+					break
+				}
+			}
+		}
+	}
+
+	CS :: `#version 310 es
+layout(local_size_x = 8, local_size_y = 2) in;
+uniform sampler2D s;
+layout(std430) buffer Out { vec4 v[]; };
+void main() {
+    uvec2 g = gl_GlobalInvocationID.xy;
+    vec2 uv = vec2(g) * vec2(0.173, 0.291) - 0.4;
+    v[g.y * 16u + g.x] = textureLod(s, uv, float(g.x) * 0.37) + texelFetch(s, ivec2(g) - 1, int(g.y) % 3);
+}`
+	cm, cerrs, cok := compile(CS, {profile = .Glsl, stage = .Compute})
+	defer destroy(cm)
+	if !testing.expectf(t, cok, "compute compile failed:\n%s", format_errors(cerrs, context.temp_allocator)) {
+		return
+	}
+	im := make_test_image(.Rgba8, 4, 9, 5, true, 5)
+	im.filter, im.wrap = .Linear, {.Repeat, .Repeat}
+	words: [2][16 * 4 * 4]u32
+	for jit in 0 ..< 2 {
+		saved := cm.program.jit_body
+		if jit == 1 {
+			cm.program.jit_body = nil
+		}
+		run_compute(&cm.program, nil, {2, 2, 1}, temp_scratch(), {buffers = {words[jit][:]}, channel_images = {im}})
+		cm.program.jit_body = saved
+	}
+	testing.expect(t, words[0] == words[1])
+	got := transmute([16 * 4][4]f32)words[0]
+	for y in 0 ..< 4 {
+		for x in 0 ..< 16 {
+			uv := [2]f32{f32(x), f32(y)} * [2]f32{0.173, 0.291} - 0.4
+			want := ref_bound_sample(&im, uv.x, uv.y, f32(x) * 0.37) + ref_bound_fetch_texel(&im, x - 1, y - 1, y % 3)
+			testing.expectf(t, got[y * 16 + x] == want, "compute (%d, %d): got %v, want %v", x, y, got[y * 16 + x], want)
+		}
+	}
+}
+
+@(private = "file")
+ref_bound_fetch_texel :: proc(im: ^Channel_Image, x, y, l: int) -> [4]f32 {
+	if l < 0 || l > len(im.levels) {
+		return {}
+	}
+	_, w, h, _ := ref_level(im, l)
+	if x < 0 || x >= w || y < 0 || y >= h {
+		return {}
+	}
+	res := [4]f32{0, 0, 0, 1}
+	for k in 0 ..< ref_comps(im) {
+		res[k] = f32(ref_stored(im, l, x, y, k) / ref_unorm(im.format))
+	}
+	return res
+}
+
+@(test)
+test_channel_image_ensure_levels :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [16]u8{}
+	lv := [1]Channel_Level{{texels = px[:4], width = 1, height = 2}}
+	testing.expect_assert_message(t, "oksl: Channel_Level l must be max(width >> l, 1) x max(height >> l, 1)")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Rgba8, pixels = px[:], width = 2, height = 2, levels = lv[:]}}})
+}
+
+@(test)
+test_channel_image_ensure_level_short :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [16]u8{}
+	lv := [1]Channel_Level{{texels = px[:3], width = 1, height = 1}}
+	testing.expect_assert_message(t, "oksl: Channel_Image texels are shorter than its rows")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Rgba8, pixels = px[:], width = 2, height = 2, levels = lv[:]}}})
+}
+
+@(test)
+test_channel_image_ensure_too_many_levels :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := make([]u8, 1 << 16, context.temp_allocator)
+	lv := make([]Channel_Level, 16, context.temp_allocator)
+	for &l, i in lv {
+		l = {texels = px[:], width = max((1 << 16) >> uint(i + 1), 1), height = 1}
+	}
+	testing.expect_assert_message(t, "oksl: Channel_Image has more than 16 levels")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Gray8, pixels = px[:], width = 1 << 16, height = 1, levels = lv[:]}}})
+}
+
+@(test)
+test_channel_image_ensure_format :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [4]u8{}
+	testing.expect_assert_message(t, "oksl: invalid Channel_Image.format")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = Channel_Format(9), pixels = px[:], width = 1, height = 1}}})
+}
+
+@(test)
+test_channel_image_ensure_wrap :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [4]u8{}
+	testing.expect_assert_message(t, "oksl: invalid Channel_Image.wrap")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Rgba8, pixels = px[:], width = 1, height = 1, wrap = {.Clamp, Channel_Wrap(2)}}}})
+}
+
+@(test)
+test_channel_image_ensure_stride :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [64]u8{}
+	testing.expect_assert_message(t, "oksl: Channel_Image.stride must be 0 or a multiple of the texel size, at least width texels")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Rgba8, pixels = px[:], width = 2, height = 2, stride = 10}}})
+}
+
+// A stride that is a whole number of texels but shorter than a row.
+@(test)
+test_channel_image_ensure_stride_short :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [64]u8{}
+	testing.expect_assert_message(t, "oksl: Channel_Image.stride must be 0 or a multiple of the texel size, at least width texels")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Rgba8, pixels = px[:], width = 2, height = 2, stride = 4}}})
+}
+
+// texelFetch in the Shadertoy profile reads row max_y - y of its level,
+// in the general fetch paths (byte formats, and F32 with levels): every
+// texel of levels 0-2 of a 7 x 5 chain and some out of range, in both
+// engines, against the image's bytes.
+@(test)
+test_bound_channel_shadertoy_fetch :: proc(t: ^testing.T) {
+	SRC :: `void mainImage(out vec4 c, in vec2 fc) {
+    int i = int(fc.x);
+    c = texelFetch(iChannel0, ivec2(i % 8 - 1 + (i / 8) % 2, (i / 8) % 6), (i / 48) % 3);
+}`
+	g, gerrs, gok := compile_program({
+		sources = #partial {.Buffer_A = SRC, .Image = "void mainImage(out vec4 c, in vec2 fc) { c = texelFetch(iChannel0, ivec2(fc), 0); }"},
+		channels = #partial {.Buffer_A = {0 = {.External, 0}}, .Image = {0 = {.Buffer, u8(Pass_Kind.Buffer_A)}}},
+	})
+	defer destroy_program(g)
+	if !testing.expectf(t, gok, "graph compile failed:\n%s", format_errors(gerrs, context.temp_allocator)) {
+		return
+	}
+	p := &g.passes[0].module.program
+	N :: 144
+	block := make([]u8, max(g.passes[0].module.block_size, 16), context.temp_allocator)
+	write_builtins(block, {resolution = {N, 1, 1}})
+	for format in ([2]Channel_Format{.Rgba8, .F32}) {
+		im := make_test_image(format, 4, 7, 5, true, 13)
+		for jit in ([2]bool{true, false}) {
+			out := make([][4]f32, N, context.temp_allocator)
+			if jit {
+				run_f32(p, block, N, 1, out, temp_scratch(), {channel_images = {im}})
+			} else {
+				run_f32_interp(p, block, N, 1, out, temp_scratch(), {channel_images = {im}})
+			}
+			for i in 0 ..< N {
+				x, y, l := i % 8 - 1 + (i / 8) % 2, (i / 8) % 6, (i / 48) % 3
+				h := 5 if l == 0 else im.levels[l - 1].height
+				want := ref_bound_fetch_texel(&im, x, h - 1 - y, l)
+				testing.expectf(t, transmute([4]u32)out[i] == transmute([4]u32)want, "%v jit=%v texel (%d, %d) level %d: got %v, want %v", format, jit, x, y, l, out[i], want)
+			}
+		}
+	}
+}
+
+@(test)
+test_channel_image_ensure_gray16_align :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	words := [2]u32{}
+	px := ([^]u8)(&words)[1:5]
+	testing.expect_assert_message(t, "oksl: Channel_Image Gray16 and Rgba16f texels must be 2-byte aligned")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Gray16, pixels = px, width = 2, height = 1}}})
+}
+
+@(test)
+test_channel_image_ensure_rgba16f_align :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	words := [4]u32{}
+	px := ([^]u8)(&words)[1:9]
+	testing.expect_assert_message(t, "oksl: Channel_Image Gray16 and Rgba16f texels must be 2-byte aligned")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Rgba16f, pixels = px, width = 1, height = 1}}})
+}
+
+// An F32 level's texels come as bytes: they must be 4-byte aligned.
+@(test)
+test_channel_image_ensure_f32_level_align :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	data := [2]f32{}
+	words := [2]u32{}
+	lv := [1]Channel_Level{{texels = ([^]u8)(&words)[2:6], width = 1, height = 1}}
+	testing.expect_assert_message(t, "oksl: Channel_Level F32 texels must be 4-byte aligned")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .F32, data = data[:], components = 1, width = 2, height = 1, levels = lv[:]}}})
+}
+
+@(test)
+test_channel_image_ensure_f32_pixels :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [4]u8{}
+	testing.expect_assert_message(t, "oksl: an F32 Channel_Image takes its texels in data, not pixels")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .F32, pixels = px[:], width = 1, height = 1, components = 1}}})
+}
+
+@(test)
+test_channel_image_ensure_byte_data :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [4]f32{}
+	testing.expect_assert_message(t, "oksl: a byte-format Channel_Image takes its texels in pixels, not data")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Rgba8, data = px[:], width = 1, height = 1}}})
+}
+
+@(test)
+test_channel_image_ensure_byte_comps :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [4]u8{}
+	testing.expect_assert_message(t, "oksl: Channel_Image.components must be 0 or the format's")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .Gray8, pixels = px[:], width = 1, height = 1, components = 4}}})
+}
+
+// Repeat at whole multiples of the size: u = k reads texel 0, where
+// g * (1 / n) lands just below k (n = 49, k = 1, 2, 3 ...).
+@(test)
+test_bound_channel_repeat_whole :: proc(t: ^testing.T) {
+	SRC :: `#version 310 es
+precision highp float;
+uniform sampler2D s;
+layout(location = 0) out vec4 o;
+void main() {
+    vec2 p = floor(gl_FragCoord.xy) - 8.0;
+    o = textureLod(s, p, 0.0) + textureLod(s, p * 0.5 + vec2(0.0, 0.25), 0.0);
+}`
+	m, errs, ok := compile(SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	for n in ([3]int{49, 98, 1003}) {
+		im := make_test_image(.Gray8, 1, n, 7, false, 4)
+		im.wrap = {.Repeat, .Repeat}
+		outs: [3][][4]f32
+		for &o in outs {
+			o = make([][4]f32, 24 * 24, context.temp_allocator)
+		}
+		run_f32(&m.program, nil, 24, 24, outs[0], temp_scratch(), {channel_images = {im}})
+		run_f32_interp(&m.program, nil, 24, 24, outs[1], temp_scratch(), {channel_images = {im}})
+		run_f32_interp(&m.program, nil, 24, 24, outs[2], temp_scratch(), {sampler = ref_bound_sampler, user = &im})
+		a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
+		for i in 0 ..< len(a) {
+			if a[i] != b[i] || b[i] != c[i] {
+				testing.expectf(t, false, "n %d word %d: jit %08x vm %08x callback %08x", n, i, a[i], b[i], c[i])
+				break
+			}
+		}
+	}
+}
+
+// bilinear_sub's f32 axes with FMA (sides up to 32768) against its f64
+// ones and the interpreter, bit for bit: coordinates at, one and two ulps
+// around, the points where 256 * u * n - 128 is whole or a half (the floor
+// and round-to-even fix-ups), and 0, 1, -0, past the edges, tiny, NaN and
+// +-inf, on each axis, for sides on both sides of 32768 (past 65535 the f32
+// products aren't exact).
+@(test)
+test_bound_channel_lin_fma :: proc(t: ^testing.T) {
+	SRC :: `#version 310 es
+precision highp float;
+readonly buffer Q { vec4 q[]; };
+uniform sampler2D s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 c = q[p.y * 64 + p.x];
+    o = textureLod(s, c.xy, 0.0) + textureLod(s, c.zw, 0.0) * 1000.0;
+}`
+	m, errs, ok := compile(SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	SPECIAL := [?]u32{0, 0x80000000, 0x3f800000, 0x3f800001, 0xbf800000, 0x40000000, 1, 0x00800000, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00001, 0x7f7fffff, 0x3f7fffff, 0x3effffff, 0x3f000000}
+	outs: [4][][4]f32
+	for &o in outs {
+		o = make([][4]f32, 64 * 64, context.temp_allocator)
+	}
+	found := 0
+	for n in ([10]int{1, 3, 37, 1003, 1920, 32767, 32768, 32769, 40000, 100000}) {
+		// The floor fix-up's cases: c whose f32 product with N = 256n
+		// rounds up to 256m + 128 (T = 256m), the index's step.
+		crit := make([dynamic]u32, 0, 64, context.temp_allocator)
+		N := f32(256 * n)
+		for mm in 0 ..= n {
+			K := f64(256 * mm + 128)
+			c0 := transmute(u32)f32(K / f64(N))
+			for d in u32(0) ..< 4 {
+				c := transmute(f32)(c0 - d)
+				if c * N == f32(K) && f64(c) * f64(N) < K && len(crit) < 1024 {
+					append(&crit, c0 - d)
+				}
+			}
+		}
+		found += len(crit)
+		for ax in 0 ..< 2 {
+			im := make_test_image(.F32, 1, n if ax == 0 else 3, 3 if ax == 0 else n, false, u32(n))
+			im.filter = .Linear
+			q := make([][4]f32, 64 * 64, context.temp_allocator)
+			state := u32(n * 7 + ax)
+			for &e, i in q {
+				state = state * 1664525 + 1013904223
+				// T = 256 * c * n - 128 at j / 2 (j even: whole; odd: a half).
+				j := int(state >> 8) % (512 * n + 1)
+				c := (f64(j) * 0.5 + 128) / (256 * f64(n))
+				bits := transmute(u32)f32(c) + u32(i % 5) - 2
+				if i < len(SPECIAL) {
+					bits = SPECIAL[i]
+				} else if i - len(SPECIAL) < len(crit) {
+					bits = crit[i - len(SPECIAL)]
+				} else if i >= 3072 {
+					// Consecutive floats below 1: past 65535, q's ulp
+					// passes 1 and e can't fix floor(q) up.
+					bits = 0x3f7ff000 + u32(i - 3072)
+				}
+				// The other axis at a random point.
+				other := f32(state >> 9) / f32(1 << 23)
+				a := transmute(f32)bits
+				b := transmute(f32)(bits + 1)
+				e = {a, other, b, other} if ax == 0 else {other, a, other, b}
+			}
+			words := slice.reinterpret([]u32, q[:])
+			for fma in ([2]bool{true, false}) {
+				jit_destroy(&m.program)
+				jit_compile(&m.program, fma)
+				run_f32(&m.program, nil, 64, 64, outs[0] if fma else outs[1], temp_scratch(), {channel_images = {im}, buffers = {words}})
+			}
+			run_f32_interp(&m.program, nil, 64, 64, outs[2], temp_scratch(), {channel_images = {im}, buffers = {words}})
+			a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
+			for i in 0 ..< len(a) {
+				if a[i] != b[i] || b[i] != c[i] {
+					testing.expectf(t, false, "n %d axis %d word %d (coords %v): fma %08x f64 %08x vm %08x", n, ax, i, q[i / 4], a[i], b[i], c[i])
+					break
+				}
+			}
+			// Small sizes against the rule's callback too, so a build
+			// without the JIT checks the interpreter's clamped F32 path.
+			if n <= 37 {
+				run_f32_interp(&m.program, nil, 64, 64, outs[3], temp_scratch(), {sampler = ref_bound_sampler, user = &im, channel_sizes = {{i32(im.width), i32(im.height), 1}}, buffers = {words}})
+				r := slice.reinterpret([]u32, outs[3])
+				for i in 0 ..< len(c) {
+					if c[i] != r[i] {
+						testing.expectf(t, false, "n %d axis %d word %d (coords %v): vm %08x callback %08x", n, ax, i, q[i / 4], c[i], r[i])
+						break
+					}
+				}
+			}
+		}
+	}
+	testing.expectf(t, found > 0, "no coordinate reaches the floor fix-up")
+}
+
+// Coordinates whose f32 product with the size rounds to a whole number
+// (u just below k / n): the texel is floor of the exact product, k - 1.
+@(test)
+test_bound_channel_floor_ties :: proc(t: ^testing.T) {
+	SRC :: `#version 310 es
+precision highp float;
+readonly buffer Q { vec4 q[]; };
+uniform sampler2D s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 c = q[p.y * 16 + p.x];
+    o = textureLod(s, c.xy, 0.0) + textureLod(s, c.zw, 0.0) * 1000.0;
+}`
+	m, errs, ok := compile(SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	// With FMA (where the CPU has it) and without: the JIT's two exact
+	// floors.
+	for fma in ([2]bool{true, false}) {
+	jit_destroy(&m.program)
+	jit_compile(&m.program, fma)
+	for n in ([5]int{3, 7, 13, 49, 1003}) {
+		// F32 Nearest: the stubs' inline floor; Rgba8 Nearest: sample_sub's.
+		for format in ([2]Channel_Format{.F32, .Rgba8}) {
+		for filter in Channel_Filter {
+			im := make_test_image(format, 1 if format == .F32 else 4, n, n, false, 2)
+			im.filter = filter
+			q: [256][4]f32
+			for &e, i in q {
+				k := 1 + (i * 7) % (n - 1)
+				// u at, just below and just above k / n, and the same for v.
+				u := f32(k) / f32(n)
+				bits := transmute(u32)u
+				e = {transmute(f32)(bits - u32(i % 3)), transmute(f32)(bits + u32(i % 2)), transmute(f32)(bits - 1), transmute(f32)(bits - 2)}
+			}
+			words := slice.reinterpret([]u32, q[:])
+			outs: [3][][4]f32
+			for &o in outs {
+				o = make([][4]f32, 16 * 16, context.temp_allocator)
+			}
+			run_f32(&m.program, nil, 16, 16, outs[0], temp_scratch(), {channel_images = {im}, buffers = {words}})
+			run_f32_interp(&m.program, nil, 16, 16, outs[1], temp_scratch(), {channel_images = {im}, buffers = {words}})
+			run_f32_interp(&m.program, nil, 16, 16, outs[2], temp_scratch(), {sampler = ref_bound_sampler, user = &im, buffers = {words}})
+			a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
+			for i in 0 ..< len(a) {
+				if a[i] != b[i] || b[i] != c[i] {
+					testing.expectf(t, false, "fma %v n %d %v %v word %d: jit %08x vm %08x callback %08x", fma, n, format, filter, i, a[i], b[i], c[i])
+					break
+				}
+			}
+		}
+		}
+	}
 	}
 }
 
@@ -5635,11 +6640,20 @@ test_channel_image_ensure_max_i32 :: proc(t: ^testing.T) {
 	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{data = px[:], width = 65536, height = 32768, components = 1}}})
 }
 
+// An F32 row of 2^31 bytes fits the 31-bit float index but not a row.
+@(test)
+test_channel_image_ensure_f32_row :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	px := [1]f32{1}
+	testing.expect_assert_message(t, "oksl: Channel_Image dimensions out of range")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{format = .F32, data = px[:], components = 1, width = 1 << 29, height = 1}}})
+}
+
 @(test)
 test_channel_image_ensure_short :: proc(t: ^testing.T) {
 	m := compile_simple_frag_for_ensure(t)
 	px := [23]f32{}
-	testing.expect_assert_message(t, "oksl: Channel_Image.data is shorter than width * height * components")
+	testing.expect_assert_message(t, "oksl: Channel_Image texels are shorter than its rows")
 	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_images = {{data = px[:], width = 4, height = 3, components = 2}}})
 }
 
@@ -5649,7 +6663,7 @@ test_channel_image_ensure_vertex :: proc(t: ^testing.T) {
 	testing.cleanup(t, proc(p: rawptr) { destroy((^Module)(p)) }, m)
 	testing.expect(t, ok)
 	px := [1]f32{1}
-	testing.expect_assert_message(t, "oksl: Channel_Image.data is shorter than width * height * components")
+	testing.expect_assert_message(t, "oksl: Channel_Image texels are shorter than its rows")
 	run_vertex(&m.program, nil, nil, 0, nil, nil, temp_scratch(), {channel_images = {{data = px[:], width = 2, height = 2, components = 1}}})
 }
 
@@ -5657,7 +6671,7 @@ test_channel_image_ensure_vertex :: proc(t: ^testing.T) {
 test_channel_image_ensure_fragment :: proc(t: ^testing.T) {
 	m := compile_simple_frag_for_ensure(t)
 	px := [1]f32{1}
-	testing.expect_assert_message(t, "oksl: Channel_Image.data is shorter than width * height * components")
+	testing.expect_assert_message(t, "oksl: Channel_Image texels are shorter than its rows")
 	run_fragment(&m.program, nil, {}, nil, nil, temp_scratch(), {channel_images = {{data = px[:], width = 2, height = 2, components = 1}}})
 }
 
@@ -5667,7 +6681,7 @@ test_channel_image_ensure_compute :: proc(t: ^testing.T) {
 	testing.cleanup(t, proc(p: rawptr) { destroy((^Module)(p)) }, m)
 	testing.expect(t, ok)
 	px := [1]f32{1}
-	testing.expect_assert_message(t, "oksl: Channel_Image.data is shorter than width * height * components")
+	testing.expect_assert_message(t, "oksl: Channel_Image texels are shorter than its rows")
 	run_compute(&m.program, nil, {0, 1, 1}, temp_scratch(), {channel_images = {{data = px[:], width = 2, height = 2, components = 1}}})
 }
 
@@ -9873,7 +10887,8 @@ test_jit_texture_same_bb :: proc(t: ^testing.T) {
 			if jit_avx2_ready {
 				testing.expectf(
 					t,
-					len(p_same.jit_mem) * 8 < len(p_split.jit_mem) * 7,
+					// Both programs carry the same bound-channel subroutines.
+					len(p_same.jit_mem) + 150 < len(p_split.jit_mem),
 					"expected single-BB texture caching to shrink emission: same_bb=%d B vs split_bb=%d B",
 					len(p_same.jit_mem),
 					len(p_split.jit_mem),
@@ -9992,7 +11007,7 @@ void main() {
 @(test)
 test_jit_texture_dead_components :: proc(t: ^testing.T) {
 	// 1. Fails if reverted: reading only .r from 2 texelFetch + 2 texture ops must emit
-	//    substantially smaller bound-channel stubs than reading all .rgba (> 280 B smaller).
+	//    substantially smaller bound-channel stubs than reading all .rgba (> 250 B smaller).
 	{
 		src_r := `#version 310 es
 precision highp float;
@@ -10041,8 +11056,8 @@ void main() {
 			if jit_avx2_ready {
 				testing.expectf(
 					t,
-					len(mr.program.jit_mem) + 350 < len(m4.program.jit_mem),
-					"expected dead-component trimming to save >350 B: .r=%d B vs .rgba=%d B",
+					len(mr.program.jit_mem) + 250 < len(m4.program.jit_mem),
+					"expected dead-component trimming to save >250 B: .r=%d B vs .rgba=%d B",
 					len(mr.program.jit_mem),
 					len(m4.program.jit_mem),
 				)

@@ -2716,7 +2716,8 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	case .Texture:
 		emit(l, .Texture_Bias, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
 	case .Texture_Size:
-		emit(l, .Texture_Size, n = n, k = int(vals[0].slot), dst = s, a = vals[1].slot)
+		// d: the lod is a uint (a bound channel clamps it unsigned).
+		emit(l, .Texture_Size, n = n, k = int(vals[0].slot), d = i32(vals[1].t.base == .Uint), dst = s, a = vals[1].slot)
 	case .Image_Load:
 		emit(l, .Image_Load, n = 4, k = int(vals[0].slot), dst = s, a = vals[1].slot)
 	case .Image_Size:

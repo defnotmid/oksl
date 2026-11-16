@@ -9,6 +9,7 @@ package parity
 
 import "core:fmt"
 import "core:math"
+import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:thread"
@@ -45,6 +46,16 @@ bound_r_texels: [BOUND_R_W * BOUND_R_H]f32
 bound_rg_texels: [BOUND_RG_W * BOUND_RG_H][2]f32
 bound_rgba_texels: [BOUND_RGBA_W * BOUND_RGBA_H][4]f32
 
+// The bound byte and half formats (bound_formats_compare): a 37 x 23 image
+// with its whole chain of levels, each its own pseudo-random texels.
+BOUND_FMT_W :: 37
+BOUND_FMT_H :: 23
+BOUND_FMT_LEVELS :: 6
+BOUND_FORMATS :: [4]oksl.Channel_Format{.Rgba8, .Gray8, .Gray16, .Rgba16f}
+bound_fmt_texels: [4][BOUND_FMT_LEVELS][]u8
+// What bound_formats.frag samples at each pixel: (u, v, lod, 0).
+bound_fmt_queries: [W * H][4]f32
+
 // The layer quad: position in target pixels, uv; counter-clockwise on
 // screen, so front-facing under SDL_GPU's default front face (as the CPU's
 // gl_FrontFacing is).
@@ -54,7 +65,149 @@ Vertex :: struct {
 
 QUAD := [6]Vertex{{{0, 0}, {0, 0}}, {{0, H}, {0, 1}}, {{W, H}, {1, 1}}, {{0, 0}, {0, 0}}, {{W, H}, {1, 1}}, {{W, 0}, {1, 0}}}
 
+// Level l's size of the bound format image.
+bound_fmt_size :: proc(l: int) -> (w, h: int) {
+	return max(BOUND_FMT_W >> uint(l), 1), max(BOUND_FMT_H >> uint(l), 1)
+}
+
+make_bound_fmt_data :: proc() {
+	state := u32(12345)
+	next :: proc(s: ^u32) -> u32 {
+		s^ = s^ * 1664525 + 1013904223
+		return s^ >> 8
+	}
+	formats := BOUND_FORMATS
+	for f, fi in formats {
+		tbs := [4]int{4, 1, 2, 8}
+		tb := tbs[fi]
+		for l in 0 ..< BOUND_FMT_LEVELS {
+			w, h := bound_fmt_size(l)
+			b := make([]u8, w * h * tb)
+			if f == .Rgba16f {
+				for i := 0; i < len(b); i += 2 {
+					hv := transmute(u16)f16(f32(i32(next(&state) & 0xffff) - 0x8000) / 8192)
+					b[i], b[i + 1] = u8(hv), u8(hv >> 8)
+				}
+			} else {
+				for &x in b {
+					x = u8(next(&state))
+				}
+			}
+			bound_fmt_texels[fi][l] = b
+		}
+	}
+	// Quarter by quarter: magnified past the edges, huge (repeating),
+	// ties of the weights' 1/256 steps, and minified across the levels.
+	for &q, i in bound_fmt_queries {
+		x, y := i % W, i / W
+		r0, r1, r2 := f32(next(&state)) / 16777216, f32(next(&state)) / 16777216, f32(next(&state)) / 16777216
+		switch (y * 4) / H {
+		case 0: q = {r0 * 1.6 - 0.3, r1 * 1.6 - 0.3, 0, 0}
+		case 1: q = {r0 * 80 - 40, r1 * 80 - 40, 0, 0}
+		case 2: q = {(f32(x % 64) + 0.5 + f32(x % 7) / 256) / BOUND_FMT_W, (f32(y % 23) + 0.5 + f32(x % 5) / 512) / BOUND_FMT_H, 0, 0}
+		case:   q = {r0 * 1.4 - 0.2, r1 * 1.4 - 0.2, r2 * (BOUND_FMT_LEVELS + 0.5) - 0.5, 0}
+		}
+	}
+}
+
+// Format fi's image with `filter` and `wrap`, all its levels.
+bound_fmt_image :: proc(fi: int, filter: oksl.Channel_Filter, wrap: [2]oksl.Channel_Wrap) -> oksl.Channel_Image {
+	levels := make([]oksl.Channel_Level, BOUND_FMT_LEVELS - 1, context.temp_allocator)
+	for &lv, i in levels {
+		w, h := bound_fmt_size(i + 1)
+		lv = {texels = bound_fmt_texels[fi][i + 1], width = w, height = h}
+	}
+	formats := BOUND_FORMATS
+	return {format = formats[fi], pixels = bound_fmt_texels[fi][0], width = BOUND_FMT_W, height = BOUND_FMT_H, filter = filter, wrap = wrap, levels = levels}
+}
+
+// Samples the bound image at each pixel's query.
+BOUND_FMT_FRAG :: `#version 310 es
+precision highp float;
+readonly buffer Q { vec4 q[]; };
+uniform sampler2D s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 c = q[p.y * 256 + p.x];
+    o = textureLod(s, c.xy, c.z);
+}`
+
+// The wraps bound_formats_compare draws: both clamped, both repeating, u
+// repeating with v clamped.
+BOUND_FMT_WRAPS :: [3][2]oksl.Channel_Wrap{{.Clamp, .Clamp}, {.Repeat, .Repeat}, {.Repeat, .Clamp}}
+
+// One draw of BOUND_FMT_FRAG with a bound format image against the CPU
+// (bound_compare).
+bound_formats_compare :: proc(m: ^oksl.Module, fi: int, filter: oksl.Channel_Filter, wrap: [2]oksl.Channel_Wrap, gpu_f: [][4]f32, scratch: ^oksl.Scratch, metal: bool) -> (string, bool) {
+	return bound_compare(m, bound_fmt_image(fi, filter, wrap), bound_fmt_queries[:], gpu_f, scratch, metal)
+}
+
+// Metal's level of detail (Apple GPUs, measured on the M4 with
+// tools/gpu_parity's queries): the lod rounded to a half float, its
+// fraction truncated to 1/64 (oksl's rule and RADV round it to 1/256, to
+// nearest even). A query's lod given the CPU as this, the CPU blends
+// levels with Metal's weights; texelFetch's (lod <= -1000) as they are,
+// and lods of 16 and up (past any level; a half overflows to inf at 65520).
+metal_lod :: proc(lod: f32) -> f32 {
+	if !(lod > 0) || lod >= 16 {
+		return lod
+	}
+	l := f32(f16(lod))
+	i := math.floor(l)
+	return i + math.floor((l - i) * 64) / 64
+}
+
+// A draw of `im` at `queries` ((u, v, lod, layer) per pixel, the
+// module's storage buffer) against the CPU: the worst error and the share
+// of exact components. Within 1e-6 (the GPU's last bits where it blends
+// texels or levels), Linear Rgba16f 2e-3 (RADV filters halves in less than
+// f32's precision). On Metal, which blends levels with its own weights
+// (metal_lod, given the CPU), rounds its texel weights half up from an
+// f32 coordinate (`u * n - 0.5`: one 1/256 step from the CPU's at and
+// near ties) and returns a filtered 8-bit texel to 1/16 of a step, a
+// 16-bit one to a step and a half to a half: Nearest within 1.3e-4
+// (8-bit), 8e-6 (Gray16), 1e-3 (halves in [-4, 4]: half a half's ulp);
+// Linear one weight step of the texels' range more, 4.1e-3 (unorm, [0, 1])
+// or 0.033 (halves).
+bound_compare :: proc(m: ^oksl.Module, im: oksl.Channel_Image, queries: [][4]f32, gpu_f: [][4]f32, scratch: ^oksl.Scratch, metal: bool) -> (string, bool) {
+	cpu_f := make([][4]f32, W * H, context.temp_allocator)
+	q := queries
+	if metal {
+		q = slice.clone(queries, context.temp_allocator)
+		for &x in q {
+			x.z = metal_lod(x.z)
+		}
+	}
+	oksl.run_f32(&m.program, nil, W, H, cpu_f, scratch, {channel_images = {im}, buffers = {slice.reinterpret([]u32, q)}})
+	tol: f32 = 2e-3 if im.filter == .Linear && im.format == .Rgba16f else 1e-6
+	if metal {
+		#partial switch im.format {
+		case .Rgba8, .Gray8: tol = 4.1e-3 if im.filter == .Linear else 1.3e-4
+		case .Gray16:        tol = 4.1e-3 if im.filter == .Linear else 8e-6
+		case .Rgba16f:       tol = 0.033 if im.filter == .Linear else 1e-3
+		}
+	}
+	worst: f32
+	exact, bad := 0, 0
+	for i in 0 ..< W * H {
+		for k in 0 ..< 4 {
+			g, c := gpu_f[i][k], cpu_f[i][k]
+			d := abs(g - c)
+			if g == c {
+				exact += 1
+			}
+			if !(d <= tol) {
+				bad += 1
+			}
+			worst = max(worst, d)
+		}
+	}
+	return fmt.tprintf("worst %.3g, exact %.2f%%, over %.2g: %d", worst, 100 * f64(exact) / f64(W * H * 4), tol, bad), bad == 0
+}
+
 make_data :: proc() {
+	make_bound_fmt_data()
 	for &w, i in test_words {
 		w = transmute(u32)(f32((i * 37 + 11) % 256) / 255)
 	}
@@ -326,13 +479,31 @@ bound_channel_images :: proc() -> [6]oksl.Channel_Image {
 }
 
 // testdata/bound_channels.frag: nearest rows (the top half) exact, linear
-// rows within 0.02 except the components a narrow image fills (exact).
-// Writes its PNGs (values mapped from [-2, 2]); a detail line and the
-// verdict.
-bound_channels_compare :: proc(m: ^oksl.Module, block: []u8, gpu_f: [][4]f32, gpu_tag, out_dir: string, scratch: ^oksl.Scratch) -> (string, bool) {
+// rows within 1e-6 (the GPU's last bits) except the components a narrow
+// image fills (exact). With `coarse_weights` (WARP, which D3D's 8-bit
+// minimum lets filter with other weights) a linear row may be one 1/256
+// weight step off on each axis: within 2 * range / 256, range the
+// texels' max - min (3, so 0.0234). Writes its PNGs (values mapped from
+// [-2, 2]) and the GPU's and CPU's floats (bound_channels_*.f32, W x H x 4
+// little-endian, for a probe); a detail line and the verdict.
+bound_channels_compare :: proc(m: ^oksl.Module, block: []u8, gpu_f: [][4]f32, gpu_tag, out_dir: string, scratch: ^oksl.Scratch, coarse_weights: bool) -> (string, bool) {
 	cpu_f := make([][4]f32, W * H, context.temp_allocator)
 	cimgs := bound_channel_images()
 	oksl.run_f32(&m.program, block, W, H, cpu_f, scratch, {channel_images = cimgs[:]})
+	lin_tol: f32 = 1e-6
+	if coarse_weights {
+		lo, hi := f32(max(f32)), f32(min(f32))
+		for t in bound_r_texels {
+			lo, hi = min(lo, t), max(hi, t)
+		}
+		for t in bound_rg_texels {
+			lo, hi = min(lo, t[0], t[1]), max(hi, t[0], t[1])
+		}
+		for t in bound_rgba_texels {
+			lo, hi = min(lo, t[0], t[1], t[2], t[3]), max(hi, t[0], t[1], t[2], t[3])
+		}
+		lin_tol = 2 * (hi - lo) / 256 + 1e-6
+	}
 	near_err, lin_err: f32
 	mismatches := 0
 	gpu_png := make([]u8, W * H * 4, context.temp_allocator)
@@ -354,7 +525,7 @@ bound_channels_compare :: proc(m: ^oksl.Module, block: []u8, gpu_f: [][4]f32, gp
 				} else {
 					lin_err = max(lin_err, d)
 					exact_fill := (x < 64 && k >= 1) || (x >= 64 && x < 128 && k >= 2)
-					tol: f32 = 0 if exact_fill else 0.02
+					tol: f32 = 0 if exact_fill else lin_tol
 					if !(d <= tol) {
 						mismatches += 1
 					}
@@ -371,7 +542,9 @@ bound_channels_compare :: proc(m: ^oksl.Module, block: []u8, gpu_f: [][4]f32, gp
 	write_png(fmt.tprintf("%s/bound_channels_%s.png", out_dir, gpu_tag), gpu_png)
 	write_png(fmt.tprintf("%s/bound_channels_cpu.png", out_dir), cpu_png)
 	write_png(fmt.tprintf("%s/bound_channels_diff.png", out_dir), diff_png)
-	return fmt.tprintf("nearest err %.6f, linear err %.6f, mismatches %d", near_err, lin_err, mismatches), mismatches == 0
+	_ = os.write_entire_file(fmt.tprintf("%s/bound_channels_%s.f32", out_dir, gpu_tag), slice.to_bytes(gpu_f))
+	_ = os.write_entire_file(fmt.tprintf("%s/bound_channels_cpu.f32", out_dir), slice.to_bytes(cpu_f))
+	return fmt.tprintf("nearest err %.6f, linear err %.6f (within %.2g), mismatches %d", near_err, lin_err, lin_tol, mismatches), mismatches == 0
 }
 
 // ---- a tap of the layer vertex shader ---------------------------------------------------
