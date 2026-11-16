@@ -6,8 +6,9 @@
 //     odin run tools/okslc -- shader.sksl [more.sksl tunnel.glsl ...]
 //     odin run tools/okslc -- -o out_prefix shader.sksl
 //
-// `-o` writes out_prefix.spv, out_prefix.metal and, for vertex and fragment
-// shaders, out_prefix.dxbc (one shader).
+// `-o` writes out_prefix.spv, out_prefix.metal and out_prefix.dxbc (one
+// shader). DXBC is always on, so what Direct3D 12 lacks (gl_NumWorkGroups)
+// is an error here.
 package okslc
 
 import "core:fmt"
@@ -36,8 +37,7 @@ main :: proc() {
 		errors: []oksl.Error
 		ok: bool
 		options, _ := oksl.options_of_path(path)
-		// DXBC for every stage that has it.
-		options.dxbc = options.stage != .Compute
+		options.dxbc = true
 		m, errors, ok = oksl.compile(string(data), options)
 		if !ok {
 			failed += 1

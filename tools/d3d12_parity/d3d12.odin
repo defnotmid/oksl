@@ -78,6 +78,13 @@ create_graphics_pipeline_state :: proc(dev: rawptr, desc: ^d3d12.GRAPHICS_PIPELI
 	return
 }
 
+create_compute_pipeline_state :: proc(dev: rawptr, desc: ^d3d12.COMPUTE_PIPELINE_STATE_DESC) -> (out: rawptr, hr: i32) {
+	F :: proc "win64" (this: rawptr, desc: ^d3d12.COMPUTE_PIPELINE_STATE_DESC, iid: ^d3d12.IID, out: ^rawptr) -> i32
+	iid := d3d12.IPipelineState_UUID^
+	hr = (F)(vtbl(dev)[11])(dev, desc, &iid, &out)
+	return
+}
+
 create_command_list :: proc(dev: rawptr, allocator: rawptr) -> (out: rawptr) {
 	F :: proc "win64" (this: rawptr, node_mask: u32, type: d3d12.COMMAND_LIST_TYPE, allocator: rawptr, pso: rawptr, iid: ^d3d12.IID, out: ^rawptr) -> i32
 	iid := d3d12.IGraphicsCommandList_UUID^
@@ -107,6 +114,11 @@ create_root_signature :: proc(dev: rawptr, data: rawptr, size: uint) -> (out: ra
 create_shader_resource_view :: proc(dev: rawptr, res: rawptr, desc: ^d3d12.SHADER_RESOURCE_VIEW_DESC, handle: d3d12.CPU_DESCRIPTOR_HANDLE) {
 	F :: proc "win64" (this: rawptr, res: rawptr, desc: ^d3d12.SHADER_RESOURCE_VIEW_DESC, handle: d3d12.CPU_DESCRIPTOR_HANDLE)
 	(F)(vtbl(dev)[18])(dev, res, desc, handle)
+}
+
+create_unordered_access_view :: proc(dev: rawptr, res: rawptr, desc: ^d3d12.UNORDERED_ACCESS_VIEW_DESC, handle: d3d12.CPU_DESCRIPTOR_HANDLE) {
+	F :: proc "win64" (this: rawptr, res: rawptr, counter: rawptr, desc: ^d3d12.UNORDERED_ACCESS_VIEW_DESC, handle: d3d12.CPU_DESCRIPTOR_HANDLE)
+	(F)(vtbl(dev)[19])(dev, res, nil, desc, handle)
 }
 
 create_render_target_view :: proc(dev: rawptr, res: rawptr, handle: d3d12.CPU_DESCRIPTOR_HANDLE) {
@@ -216,6 +228,11 @@ draw_instanced :: proc(l: rawptr, vertices, first: u32) {
 	(F)(vtbl(l)[12])(l, vertices, 1, first, 0)
 }
 
+dispatch :: proc(l: rawptr, x, y, z: u32) {
+	F :: proc "win64" (this: rawptr, x, y, z: u32)
+	(F)(vtbl(l)[14])(l, x, y, z)
+}
+
 copy_buffer_region :: proc(l: rawptr, dst: rawptr, dst_offset: u64, src: rawptr, src_offset: u64, size: u64) {
 	F :: proc "win64" (this: rawptr, dst: rawptr, dst_offset: u64, src: rawptr, src_offset: u64, size: u64)
 	(F)(vtbl(l)[15])(l, dst, dst_offset, src, src_offset, size)
@@ -260,6 +277,21 @@ transition :: proc(l: rawptr, res: rawptr, before, after: d3d12.RESOURCE_STATES)
 set_descriptor_heaps :: proc(l: rawptr, heaps: []rawptr) {
 	F :: proc "win64" (this: rawptr, count: u32, heaps: [^]rawptr)
 	(F)(vtbl(l)[28])(l, u32(len(heaps)), raw_data(heaps))
+}
+
+set_compute_root_signature :: proc(l: rawptr, rs: rawptr) {
+	F :: proc "win64" (this: rawptr, rs: rawptr)
+	(F)(vtbl(l)[29])(l, rs)
+}
+
+set_compute_root_table :: proc(l: rawptr, index: u32, h: d3d12.GPU_DESCRIPTOR_HANDLE) {
+	F :: proc "win64" (this: rawptr, index: u32, h: d3d12.GPU_DESCRIPTOR_HANDLE)
+	(F)(vtbl(l)[31])(l, index, h)
+}
+
+set_compute_root_cbv :: proc(l: rawptr, index: u32, address: u64) {
+	F :: proc "win64" (this: rawptr, index: u32, address: u64)
+	(F)(vtbl(l)[37])(l, index, address)
 }
 
 set_graphics_root_signature :: proc(l: rawptr, rs: rawptr) {

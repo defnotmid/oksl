@@ -10328,7 +10328,42 @@ dxbc_program :: proc(t: ^testing.T, m: ^Module, name: string, loc := #caller_loc
 	dxbc_check_operands(t, name, out[:], loc)
 	dxbc_check_structure(t, name, out[:], loc)
 	dxbc_check_signatures(t, m, name, out[:], loc)
+	dxbc_check_header(t, m, name, shex[0], out[:], loc)
 	return shex[0], out[:]
+}
+
+// What the program type implies: cs_5_1 has exactly one dcl_thread_group,
+// its dimensions nonzero, z at most 64 and their product at most 1024; sync
+// is in cs_5_1 only, with a fence (_g, _ugroup or _uglobal), not both UAV
+// scopes, and no other flag; SFI0's 64-UAV bit (0x8) is set exactly when a
+// UAV register of 8 or above is declared; _glc (the opcode token's bit 16)
+// on no other declaration.
+@(private = "file")
+dxbc_check_header :: proc(t: ^testing.T, m: ^Module, name: string, version: u32, ins: []Ins, loc := #caller_location) {
+	compute := version >> 16 == 5
+	groups := 0
+	high_uav := false
+	for in_, i in ins {
+		#partial switch Dx_Op(in_.op) {
+		case .Dcl_Thread_Group:
+			groups += 1
+			x, y, z := in_.words[0], in_.words[1], in_.words[2]
+			testing.expectf(t, x > 0 && y > 0 && z > 0 && z <= 64 && x * y * z <= 1024, "%s: dcl_thread_group %d, %d, %d", name, x, y, z, loc = loc)
+		case .Sync:
+			f := in_.ctl
+			testing.expectf(t, compute && f & 0xe != 0 && f & 0xc != 0xc && f & ~u32(0xf) == 0, "%s: sync flags %x (instruction %d) in program type %d", name, f, i, version >> 16, loc = loc)
+		case .Dcl_Uav_Typed, .Dcl_Uav_Raw:
+			high_uav ||= in_.words[2] >= 8 || in_.words[3] >= 8
+		}
+		#partial switch op := Dx_Op(in_.op); op {
+		case .Dcl_Resource, .Dcl_Resource_Raw, .Dcl_Constant_Buffer, .Dcl_Sampler, .Dcl_Tgsm_Raw, .Dcl_Thread_Group:
+			testing.expectf(t, in_.ctl & (1 << 5) == 0, "%s: %v with _glc", name, op, loc = loc)
+		}
+	}
+	testing.expectf(t, groups == (1 if compute else 0), "%s: %d dcl_thread_group in program type %d", name, groups, version >> 16, loc = loc)
+	sfi0 := dxbc_chunk(m.dxbc, "SFI0")
+	flags := slice.reinterpret([]u32, sfi0)[0] if len(sfi0) >= 8 else 0
+	testing.expectf(t, (flags & 0x8 != 0) == high_uav, "%s: SFI0 %x with a UAV past u7: %v", name, flags, high_uav, loc = loc)
 }
 
 // Decodes the operands of an instruction's words.
@@ -10367,12 +10402,16 @@ dxbc_operands :: proc(words: []u32) -> (ops: []Operand, ok: bool) {
 
 // Checks every operand of the program's instructions against the
 // declarations: temps below dcl_temps, x# arrays declared and constant
-// indices inside them, inputs and outputs declared, constant buffer
-// elements inside the buffer, resource and sampler ids declared. Every
-// destination (the first operand, the first two of imul, udiv and sincos)
-// writes through a mask that is not empty (a null destination writes
-// nothing) and names only components its register has (an output's
-// declared ones).
+// indices inside them, inputs and outputs declared (a compute shader's
+// system values too), constant buffer elements inside the buffer,
+// resource, sampler and UAV ids declared, shared memory (g0) declared and
+// every access at an immediate address inside it. Every destination (the
+// first operand, the first two of imul, udiv and sincos) writes through a
+// mask that is not empty (a null destination writes nothing) and names
+// only components its register has (an output's declared ones); a store's
+// is a UAV or g0 (store_uav_typed all four components, store_raw .x, .xy,
+// .xyz or .xyzw), an atomic's old value one component of a temp, its
+// memory a UAV or g0.
 @(private = "file")
 dxbc_check_operands :: proc(t: ^testing.T, name: string, ins: []Ins, loc := #caller_location) {
 	temps: u32
@@ -10381,7 +10420,10 @@ dxbc_check_operands :: proc(t: ^testing.T, name: string, ins: []Ins, loc := #cal
 	outputs := make(map[u32]bool, context.temp_allocator)
 	output_masks := make(map[u32]u32, context.temp_allocator)
 	ids := make(map[[2]u32]bool, context.temp_allocator)
+	// Compute system values (files 32-36) declared.
+	sysvals := make(map[u32]bool, context.temp_allocator)
 	cb_size: u32
+	tgsm_bytes: i64 = -1
 	for in_ in ins {
 		switch Dx_Op(in_.op) {
 		case .Dcl_Temps:
@@ -10389,7 +10431,11 @@ dxbc_check_operands :: proc(t: ^testing.T, name: string, ins: []Ins, loc := #cal
 		case .Dcl_Indexable_Temp:
 			x_sizes[in_.words[0]] = in_.words[1]
 		case .Dcl_Input, .Dcl_Input_Ps, .Dcl_Input_Sgv, .Dcl_Input_Ps_Sgv, .Dcl_Input_Ps_Siv:
-			inputs[in_.words[1]] = true
+			if in_.words[0] >> 20 & 3 == 0 {
+				sysvals[in_.words[0] >> 12 & 0xff] = true
+			} else {
+				inputs[in_.words[1]] = true
+			}
 		case .Dcl_Output, .Dcl_Output_Siv:
 			if in_.words[0] >> 12 & 0xff == 2 {
 				outputs[in_.words[1]] = true
@@ -10397,9 +10443,14 @@ dxbc_check_operands :: proc(t: ^testing.T, name: string, ins: []Ins, loc := #cal
 			}
 		case .Dcl_Constant_Buffer:
 			cb_size = in_.words[4]
-		case .Dcl_Global_Flags:
+		case .Dcl_Global_Flags, .Dcl_Thread_Group:
 		case .Dcl_Resource, .Dcl_Resource_Raw:
 			ids[{7, in_.words[1]}] = true
+		case .Dcl_Uav_Typed, .Dcl_Uav_Raw:
+			ids[{30, in_.words[1]}] = true
+		case .Dcl_Tgsm_Raw:
+			testing.expectf(t, in_.words[1] == 0 && in_.words[2] % 4 == 0 && in_.words[2] > 0 && in_.words[2] <= 32768, "%s: dcl_tgsm_raw g%d, %d", name, in_.words[1], in_.words[2], loc = loc)
+			tgsm_bytes = i64(in_.words[2])
 		case .Dcl_Sampler:
 			ids[{6, in_.words[1]}] = true
 		case .Add, .And, .Break, .Breakc, .Case, .Continue, .Default, .Discard, .Div, .Dp2, .Dp3, .Dp4, .Else, .End_If,
@@ -10407,16 +10458,47 @@ dxbc_check_operands :: proc(t: ^testing.T, name: string, ins: []Ins, loc := #cal
 		     .Ine, .Ineg, .Ishl, .Ishr, .Itof, .Log, .Loop, .Lt, .Mad, .Min, .Max, .Mov, .Movc, .Mul, .Ne, .Not, .Or,
 		     .Resinfo, .Ret, .Round_Ne, .Round_Ni, .Round_Pi, .Round_Z, .Rsq, .Sample, .Sample_L, .Sample_D, .Sample_B,
 		     .Sqrt, .Switch, .Sincos, .Udiv, .Ult, .Uge, .Umax, .Umin, .Ushr, .Utof, .Xor, .Deriv_Rtx_Fine, .Deriv_Rty_Fine,
-		     .Rcp, .Ld_Raw:
+		     .Rcp, .Ld_Raw, .Ld, .Bufinfo, .Ld_Uav_Typed, .Store_Uav_Typed, .Store_Raw, .Imm_Atomic_Iadd, .Imm_Atomic_And,
+		     .Imm_Atomic_Or, .Imm_Atomic_Xor, .Imm_Atomic_Exch, .Imm_Atomic_Cmp_Exch, .Imm_Atomic_Imax, .Imm_Atomic_Imin,
+		     .Imm_Atomic_Umax, .Imm_Atomic_Umin, .Sync:
+			op := Dx_Op(in_.op)
 			ops, ok := dxbc_operands(in_.words)
 			testing.expectf(t, ok, "%s: op %x: operands overrun", name, in_.op, loc = loc)
 			dsts := 0
-			#partial switch Dx_Op(in_.op) {
-			case .Break, .Breakc, .Case, .Continue, .Default, .Discard, .Else, .End_If, .End_Loop, .End_Switch, .If, .Loop, .Ret, .Switch:
+			#partial switch op {
+			case .Break, .Breakc, .Case, .Continue, .Default, .Discard, .Else, .End_If, .End_Loop, .End_Switch, .If, .Loop, .Ret, .Switch, .Sync:
+				// sync's flags: _t 1, _g 2, _ugroup 4, _uglobal 8; a fence
+				// (g or u) is required.
+				testing.expectf(t, op != .Sync || len(ops) == 0 && in_.ctl & 0xe != 0 && in_.ctl & ~u32(0xf) == 0, "%s: sync %v with flags %x", name, ops, in_.ctl, loc = loc)
 			case .Imul, .Udiv, .Sincos:
 				dsts = 2
+			case .Store_Raw, .Store_Uav_Typed:
+				// The memory written, checked below.
+				o := ops[0] if len(ops) > 0 else Operand{}
+				mask := o.sel & 0xf
+				testing.expectf(t, (o.file == 30 || o.file == 31 && op == .Store_Raw) && o.ncomp == 2 && o.mode == 0, "%s: %v writes file %d", name, op, o.file, loc = loc)
+				testing.expectf(t, mask == 0xf if op == .Store_Uav_Typed else (mask == 1 || mask == 3 || mask == 7 || mask == 0xf), "%s: %v mask %x", name, op, mask, loc = loc)
+				if o.file == 31 && len(ops) > 1 && ops[1].file == 4 {
+					words := 1 + (mask >> 1 & 1) + (mask >> 2 & 1) + (mask >> 3 & 1)
+					testing.expectf(t, i64(ops[1].imm) + 4 * i64(words) <= tgsm_bytes, "%s: store_raw g0 at byte %d, %d words, of %d", name, ops[1].imm, words, tgsm_bytes, loc = loc)
+				}
+			case .Imm_Atomic_Iadd, .Imm_Atomic_And, .Imm_Atomic_Or, .Imm_Atomic_Xor, .Imm_Atomic_Exch, .Imm_Atomic_Cmp_Exch, .Imm_Atomic_Imax,
+			     .Imm_Atomic_Imin, .Imm_Atomic_Umax, .Imm_Atomic_Umin:
+				dsts = 1
+				want := 5 if op == .Imm_Atomic_Cmp_Exch else 4
+				m0 := ops[0].sel & 0xf if len(ops) > 0 else 0
+				ok_shape := len(ops) == want && ops[0].file == 0 && ops[0].mode == 0 && (m0 == 1 || m0 == 2 || m0 == 4 || m0 == 8) && (ops[1].file == 30 || ops[1].file == 31) && ops[1].ncomp == 0
+				testing.expectf(t, ok_shape, "%s: %v operands %v", name, op, ops, loc = loc)
+				if ok_shape && ops[1].file == 31 && ops[2].file == 4 {
+					testing.expectf(t, i64(ops[2].imm) + 4 <= tgsm_bytes, "%s: %v g0 at byte %d of %d", name, op, ops[2].imm, tgsm_bytes, loc = loc)
+				}
 			case:
 				dsts = 1
+			}
+			if op == .Ld_Raw && len(ops) == 3 && ops[2].file == 31 && ops[1].file == 4 {
+				mask := ops[0].sel & 0xf
+				words := 1 + (mask >> 1 & 1) + (mask >> 2 & 1) + (mask >> 3 & 1)
+				testing.expectf(t, i64(ops[1].imm) + 4 * i64(words) <= tgsm_bytes, "%s: ld_raw g0 at byte %d, %d words, of %d", name, ops[1].imm, words, tgsm_bytes, loc = loc)
 			}
 			for o, k in ops[:min(dsts, len(ops))] {
 				switch o.file {
@@ -10442,16 +10524,19 @@ dxbc_check_operands :: proc(t: ^testing.T, name: string, ins: []Ins, loc := #cal
 				case 3:
 					size, declared := x_sizes[o.idx[0]]
 					testing.expectf(t, declared && (o.rel >= 0 || o.idx[1] < size), "%s: x%d[%d] of %d", name, o.idx[0], o.idx[1], size, loc = loc)
-				case 6, 7:
+				case 6, 7, 30:
 					testing.expectf(t, ids[{o.file, o.idx[0]}], "%s: %v id %d undeclared", name, o.file, o.idx[0], loc = loc)
 				case 8:
 					testing.expectf(t, o.rel >= 0 || o.idx[2] < cb_size, "%s: cb element %d of %d", name, o.idx[2], cb_size, loc = loc)
+				case 31:
+					testing.expectf(t, o.idx[0] == 0 && tgsm_bytes > 0, "%s: g%d undeclared", name, o.idx[0], loc = loc)
+				case 32, 33, 34, 36:
+					testing.expectf(t, sysvals[o.file], "%s: system value %d undeclared", name, o.file, loc = loc)
 				}
 				if o.rel >= 0 {
 					testing.expectf(t, u32(o.rel) < temps, "%s: relative r%d of %d", name, o.rel, temps, loc = loc)
 				}
 			}
-		case .Ld_Raw + Dx_Op(1) ..= max(Dx_Op):
 		}
 	}
 }
@@ -10483,7 +10568,7 @@ dxbc_check_structure :: proc(t: ^testing.T, name: string, ins: []Ins, loc := #ca
 	}
 	for in_, i in ins {
 		op := Dx_Op(in_.op)
-		if op >= .Dcl_Resource && op <= .Dcl_Global_Flags || op == .Dcl_Resource_Raw {
+		if op >= .Dcl_Resource && op <= .Dcl_Global_Flags || op >= .Dcl_Thread_Group && op <= .Dcl_Resource_Raw {
 			continue
 		}
 		if len(stack) > 0 && stack[len(stack) - 1].op == .Switch && op != .Case && op != .Default && op != .End_Switch {
@@ -10564,6 +10649,8 @@ dxbc_check_signatures :: proc(t: ^testing.T, m: ^Module, name: string, prog: []I
 	fragment := m.stage == .Fragment
 	ins := dxbc_sig(dxbc_chunk(m.dxbc, "ISGN"))
 	outs := dxbc_sig(dxbc_chunk(m.dxbc, "OSGN"))
+	// A compute shader's are empty (its inputs are system values).
+	testing.expectf(t, m.stage != .Compute || len(ins) == 0 && len(outs) == 0, "%s: compute signatures %v %v", name, ins, outs, loc = loc)
 	varyings_in, varyings_out := 0, 0
 	for r in ins {
 		testing.expectf(t, r.rw == r.mask, "%s: input %s%d read mask %x of %x", name, r.name, r.index, r.rw, r.mask, loc = loc)
@@ -10628,7 +10715,7 @@ dxbc_check_signatures :: proc(t: ^testing.T, m: ^Module, name: string, prog: []I
 // with flat and smooth inputs, three targets, gl_FragCoord,
 // gl_FrontFacing, a sampler2D, a sampler2DArray, a storage buffer and
 // uniforms; a vertex shader with attributes, gl_VertexID, a sampler and a
-// storage buffer.
+// storage buffer; a compute shader (dxbc_compute_interface).
 @(test)
 test_dxbc_interface :: proc(t: ^testing.T) {
 	fs := `#version 310 es
@@ -10733,11 +10820,12 @@ void main() {
 	// Vertex shader registers: t[n] and s[n] in space 0, b0 in space 1.
 	want_v := [?][3]u32{{cb, 0, 1}, {sampler, 0, 0}, {resource | 3 << 16, 0, 0}, {raw, 1, 0}}
 	testing.expectf(t, slice.equal(spaces[:], want_v[:]), "vertex %v", spaces)
+
+	dxbc_compute_interface(t)
 }
 
 // DXBC is opt-in: without Options.dxbc no stage has a blob (and the other
-// outputs are as they were); with it, vertex and fragment shaders have
-// one and a compute shader is an error (Dxbc_Compute).
+// outputs are as they were); with it, every stage has one.
 @(test)
 test_dxbc_opt_in :: proc(t: ^testing.T) {
 	Case :: struct {
@@ -10756,12 +10844,8 @@ test_dxbc_opt_in :: proc(t: ^testing.T) {
 		msl := strings.clone(m.msl, context.temp_allocator)
 		destroy(m)
 		dm, derrs, dok := compile_glsl(cs.src, {stage = cs.stage, dxbc = true})
-		if cs.stage == .Compute {
-			testing.expectf(t, !dok && len(derrs) == 1 && derrs[0].code == .Dxbc_Compute, "compute with dxbc: %v", derrs)
-		} else {
-			testing.expectf(t, dok && len(dm.dxbc) > 0, "%v: %s", cs.stage, format_errors(derrs, context.temp_allocator))
-			testing.expectf(t, slice.equal(dm.spirv, spirv) && dm.msl == msl, "%v: DXBC changed the other outputs", cs.stage)
-		}
+		testing.expectf(t, dok && len(dm.dxbc) > 0, "%v: %s", cs.stage, format_errors(derrs, context.temp_allocator))
+		testing.expectf(t, slice.equal(dm.spirv, spirv) && dm.msl == msl, "%v: DXBC changed the other outputs", cs.stage)
 		destroy(dm)
 	}
 }
@@ -10797,23 +10881,37 @@ test_dxbc_lowering :: proc(t: ^testing.T) {
 		src:     string,
 		seqs:    [][]Dx_Op,
 		profile: Profile,
+		stage:   Stage,
 	}
+	CS :: "#version 310 es\nlayout(local_size_x = 8) in;\nshared uint sh[16];\nshared int si;\nbuffer B { uint w[]; } b;\nbuffer V { vec4 v[]; } bv;\nlayout(r32ui) readonly uniform highp uimage2D ru;\nlayout(r32f) uniform highp image2D rf;\nlayout(rgba8) readonly uniform highp image2D r8;\nlayout(rgba16f) writeonly uniform highp image2D w16;\nuniform int uI;\n"
 	cases := [?]Case {
-		{"void mainImage(out vec4 c, in vec2 f) { for (int i = 0; i < 9; i++) { if (f.x > float(i)) discard; } c = vec4(1.0); }", {{.Discard, .Ret, .End_If}}, .Shadertoy},
-		{"void mainImage(out vec4 c, in vec2 f) { if (f.x > 3.0) discard; c = vec4(1.0); }", {{.If, .Discard, .Ret, .End_If}}, .Shadertoy},
-		{"void mainImage(out vec4 c, in vec2 f) { int a = 0; for (int i = 0; i < 4; i++) { switch (int(f.x) % 3) { case 0: continue; default: a++; } } c = vec4(float(a)); }", {{.Loop, .If}, {.End_If, .Mov, .Ilt, .Breakc}, {.Case, .Continue, .Break, .Default}}, .Shadertoy},
-		{"void mainImage(out vec4 c, in vec2 f) { int a = 0, k = 0; do { k++; switch (int(f.x) % 3) { case 1: continue; } a++; } while (k < 4); c = vec4(float(a)); }", {{.Loop, .If, .Ilt, .Breakc, .End_If, .Mov}, {.Case, .Continue, .Break, .End_Switch}}, .Shadertoy},
-		{"void mainImage(out vec4 c, in vec2 f) { int a = 0; while (a < int(f.x)) { a++; if (a == 3) continue; a++; } c = vec4(float(a)); }", {{.Loop, .Ftoi, .Ilt, .Breakc}, {.If, .Continue, .End_If}}, .Shadertoy},
-		{"void mainImage(out vec4 c, in vec2 f) { int x = int(f.x) / int(f.y); c = vec4(float(x)); }", {{.Ieq, .Movc}}, .Shadertoy},
-		{"void mainImage(out vec4 c, in vec2 f) { uint x = uint(f.x) % uint(f.y); c = vec4(float(x)); }", {{.Udiv, .Ieq, .Movc}}, .Shadertoy},
-		{"int find(int n) { for (int i = 0; i < 8; i++) { for (int j = 0; j < 8; j++) { if (i * j == n) return i; } } return -1; }\nvoid mainImage(out vec4 c, in vec2 f) { c = vec4(float(find(int(f.x)))); }", {{.Mov, .Break, .End_If, .End_Loop, .Breakc, .End_Loop, .Breakc}}, .Shadertoy},
-		{"int pick(int a, int b) { switch (a) { case 0: switch (b) { case 1: return 7; } return 3; } return 5; }\nvoid mainImage(out vec4 c, in vec2 f) { c = vec4(float(pick(int(f.x), int(f.y)))); }", {{.End_Switch, .If, .Break, .End_If}}, .Shadertoy},
-		{"void mainImage(out vec4 c, in vec2 f) { float a[4] = float[4](1.0, 2.0, 3.0, 4.0); c = vec4(a[int(f.x)]); }", {{.Imax, .Imin, .Mov}}, .Shadertoy},
-		{"uniform sampler2D s;\nout vec4 c;\nvoid main() { c = vec4(vec2(textureSize(s, 1)), 0.0, 1.0); }", {{.Resinfo}}, .Glsl},
-		{"void mainImage(out vec4 c, in vec2 f) { c = texelFetch(iChannel0, ivec2(f), uint(f.x)); }", {{.Utof, .Sample_L}}, .Shadertoy},
+		{"void mainImage(out vec4 c, in vec2 f) { for (int i = 0; i < 9; i++) { if (f.x > float(i)) discard; } c = vec4(1.0); }", {{.Discard, .Ret, .End_If}}, .Shadertoy, .Fragment},
+		{"void mainImage(out vec4 c, in vec2 f) { if (f.x > 3.0) discard; c = vec4(1.0); }", {{.If, .Discard, .Ret, .End_If}}, .Shadertoy, .Fragment},
+		{"void mainImage(out vec4 c, in vec2 f) { int a = 0; for (int i = 0; i < 4; i++) { switch (int(f.x) % 3) { case 0: continue; default: a++; } } c = vec4(float(a)); }", {{.Loop, .If}, {.End_If, .Mov, .Ilt, .Breakc}, {.Case, .Continue, .Break, .Default}}, .Shadertoy, .Fragment},
+		{"void mainImage(out vec4 c, in vec2 f) { int a = 0, k = 0; do { k++; switch (int(f.x) % 3) { case 1: continue; } a++; } while (k < 4); c = vec4(float(a)); }", {{.Loop, .If, .Ilt, .Breakc, .End_If, .Mov}, {.Case, .Continue, .Break, .End_Switch}}, .Shadertoy, .Fragment},
+		{"void mainImage(out vec4 c, in vec2 f) { int a = 0; while (a < int(f.x)) { a++; if (a == 3) continue; a++; } c = vec4(float(a)); }", {{.Loop, .Ftoi, .Ilt, .Breakc}, {.If, .Continue, .End_If}}, .Shadertoy, .Fragment},
+		{"void mainImage(out vec4 c, in vec2 f) { int x = int(f.x) / int(f.y); c = vec4(float(x)); }", {{.Ieq, .Movc}}, .Shadertoy, .Fragment},
+		{"void mainImage(out vec4 c, in vec2 f) { uint x = uint(f.x) % uint(f.y); c = vec4(float(x)); }", {{.Udiv, .Ieq, .Movc}}, .Shadertoy, .Fragment},
+		{"int find(int n) { for (int i = 0; i < 8; i++) { for (int j = 0; j < 8; j++) { if (i * j == n) return i; } } return -1; }\nvoid mainImage(out vec4 c, in vec2 f) { c = vec4(float(find(int(f.x)))); }", {{.Mov, .Break, .End_If, .End_Loop, .Breakc, .End_Loop, .Breakc}}, .Shadertoy, .Fragment},
+		{"int pick(int a, int b) { switch (a) { case 0: switch (b) { case 1: return 7; } return 3; } return 5; }\nvoid mainImage(out vec4 c, in vec2 f) { c = vec4(float(pick(int(f.x), int(f.y)))); }", {{.End_Switch, .If, .Break, .End_If}}, .Shadertoy, .Fragment},
+		{"void mainImage(out vec4 c, in vec2 f) { float a[4] = float[4](1.0, 2.0, 3.0, 4.0); c = vec4(a[int(f.x)]); }", {{.Imax, .Imin, .Mov}}, .Shadertoy, .Fragment},
+		{"uniform sampler2D s;\nout vec4 c;\nvoid main() { c = vec4(vec2(textureSize(s, 1)), 0.0, 1.0); }", {{.Resinfo}}, .Glsl, .Fragment},
+		{"void mainImage(out vec4 c, in vec2 f) { c = texelFetch(iChannel0, ivec2(f), uint(f.x)); }", {{.Utof, .Sample_L}}, .Shadertoy, .Fragment},
+		// Compute: a shared index clamped, then a byte address; a buffer
+		// store's word clamped to 0x3ffffffc, then a byte address; a buffer
+		// atomic's old value masked by the buffer's size; read-only images
+		// read with ld at mip 0, writable ones with ld_uav_typed, a single
+		// channel format's w masked by the image's size; stores through
+		// store_uav_typed.
+		{CS + "void main() { sh[uI] = 1u; }", {{.Imax, .Imin, .Ishl, .Store_Raw}}, .Glsl, .Compute},
+		{CS + "void main() { b.w[uI] = 3u; bv.v[uI].zx = vec2(1.0); }", {{.Umin, .Ishl, .Store_Raw}, {.Iadd, .Umin, .Ishl, .Store_Raw, .Umin, .Ishl, .Store_Raw}}, .Glsl, .Compute},
+		{CS + "void main() { b.w[0] = atomicAdd(b.w[uI], 2u); }", {{.Imm_Atomic_Iadd, .Bufinfo, .Ult, .And}}, .Glsl, .Compute},
+		{CS + "void main() { b.w[0] = imageLoad(ru, ivec2(uI)).w; }", {{.Mov, .Mov, .Ld, .Resinfo, .Ult, .And, .And}}, .Glsl, .Compute},
+		{CS + "void main() { b.w[0] = floatBitsToUint(imageLoad(rf, ivec2(uI)).w + imageLoad(r8, ivec2(uI)).w); }", {{.Ld_Uav_Typed, .Resinfo, .Ult, .And, .And, .Mov, .Mov, .Ld, .Add}}, .Glsl, .Compute},
+		{CS + "void main() { imageStore(w16, ivec2(uI), vec4(1.0)); b.w[0] = uint(imageSize(w16).x); }", {{.Store_Uav_Typed}, {.Resinfo}}, .Glsl, .Compute},
 	}
 	for cs in cases {
-		m, prog, ok := dxbc_compile(t, cs.src, {profile = cs.profile})
+		m, prog, ok := dxbc_compile(t, cs.src, {profile = cs.profile, stage = cs.stage})
 		defer destroy(m)
 		if !ok {
 			continue
@@ -10993,19 +11091,23 @@ test_dxbc_scratch_reuse :: proc(t: ^testing.T) {
 // emitter's: its scratch is temporary.
 @(test)
 test_dxbc_arena :: proc(t: ^testing.T) {
-	src := #load("testdata/raymarch_sdf.glsl", string)
-	options, _ := options_of_path("raymarch_sdf.glsl")
-	a, _, aok := compile(src, options)
-	defer destroy(a)
-	options.dxbc = true
-	b, _, bok := compile(src, options)
-	defer destroy(b)
-	if !testing.expect(t, aok && bok) {
-		return
+	Case :: struct {
+		name, src: string,
 	}
-	grown := int(b.arena.total_used) - int(a.arena.total_used)
-	// Alignment padding (here and in what follows it) aside.
-	testing.expectf(t, abs(grown - len(b.dxbc)) <= 64, "the arena grew %d bytes for a %d-byte container", grown, len(b.dxbc))
+	cases := [?]Case{{"raymarch_sdf.glsl", #load("testdata/raymarch_sdf.glsl", string)}, {"eval_order.comp", #load("testdata/eval_order.comp", string)}}
+	for cs in cases {
+		options, _ := options_of_path(cs.name)
+		a, _, aok := compile(cs.src, options)
+		options.dxbc = true
+		b, _, bok := compile(cs.src, options)
+		if testing.expect(t, aok && bok) {
+			grown := int(b.arena.total_used) - int(a.arena.total_used)
+			// Alignment padding (here and in what follows it) aside.
+			testing.expectf(t, abs(grown - len(b.dxbc)) <= 64, "%s: the arena grew %d bytes for a %d-byte container", cs.name, grown, len(b.dxbc))
+		}
+		destroy(a)
+		destroy(b)
+	}
 }
 
 // vkd3d is a development tool: tests that use it skip without it.
@@ -11045,8 +11147,8 @@ expect_valid_dxbc :: proc(t: ^testing.T, name: string, blob: []u8, loc := #calle
 	}
 }
 
-// Every testdata vertex and fragment shader's DXBC through dxbc_program's
-// checks, and through vkd3d and spirv-val.
+// Every testdata shader's DXBC through dxbc_program's checks, and through
+// vkd3d and spirv-val (compute with Options.num_work_groups_uniform).
 @(test)
 test_dxbc_vkd3d :: proc(t: ^testing.T) {
 	check_vkd3d := have_vkd3d()
@@ -11056,9 +11158,7 @@ test_dxbc_vkd3d :: proc(t: ^testing.T) {
 	for path in corpus() {
 		src, _ := os.read_entire_file(path, context.temp_allocator)
 		options, _ := options_of_path(path)
-		if options.stage == .Compute {
-			continue
-		}
+		options.num_work_groups_uniform = options.stage == .Compute
 		options.dxbc = true
 		m, errs, ok := compile(string(src), options)
 		defer destroy(m)
@@ -11069,6 +11169,643 @@ test_dxbc_vkd3d :: proc(t: ^testing.T) {
 		if check_vkd3d {
 			expect_valid_dxbc(t, path, m.dxbc)
 		}
+	}
+}
+
+// A compute shader's container and SDL_GPU's D3D12 compute registers:
+// cs_5_1, empty signatures, the thread group, the system values it reads,
+// one g0 of its shared variables packed (13 words); s[n] and t[n] (channel
+// n) in space 0, then read-only images (typed SRVs, with their formats'
+// return types) and read-only buffers (raw SRVs) at t[num_samplers + i] in
+// space 0; read-write and write-only images (typed UAVs) from u0, then
+// read-write and write-only buffers (raw UAVs), in space 1; b0 in space 2;
+// SFI0's 64-UAV flag only with a register past u7.
+@(private = "file")
+dxbc_compute_interface :: proc(t: ^testing.T) {
+	cs := `#version 310 es
+layout(local_size_x = 8, local_size_y = 4, local_size_z = 2) in;
+uniform float uGain;
+uniform sampler2D tex;
+layout(r32ui) readonly uniform highp uimage2D roU;
+layout(rgba8) readonly uniform highp image2D ro8;
+readonly buffer In { vec4 v[]; } src;
+layout(r32i) uniform highp iimage2D rwI;
+layout(rgba16f) writeonly uniform highp image2D wo16;
+buffer Out { uint w[]; } dst;
+writeonly buffer Out2 { float f[]; } dst2;
+shared uint sh[10];
+shared vec3 sv;
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    sh[i % 10u] = gl_GlobalInvocationID.x + gl_WorkGroupID.y + gl_LocalInvocationID.z;
+    barrier();
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    dst.w[i] = sh[(i + 1u) % 10u] + imageLoad(roU, p).x + uint(imageLoad(rwI, p).x);
+    dst2.f[i] = textureLod(tex, vec2(0.5), 0.0).x * uGain + src.v[i].x + imageLoad(ro8, p).y;
+    imageStore(wo16, p, vec4(1.0));
+    imageStore(rwI, p, ivec4(1));
+    sv = vec3(1.0);
+}`
+	m, prog, ok := dxbc_compile(t, cs, {profile = .Glsl, stage = .Compute})
+	defer destroy(m)
+	if !ok {
+		return
+	}
+	version := slice.reinterpret([]u32, dxbc_chunk(m.dxbc, "SHEX"))[0]
+	testing.expect_value(t, version, 0x50051) // cs_5_1
+	testing.expect(t, dxbc_chunk(m.dxbc, "SFI0") == nil)
+	// [opcode | resource dimension << 16, register, space, return type].
+	decls: [dynamic][4]u32
+	decls.allocator = context.temp_allocator
+	sysvals: [dynamic][2]u32
+	sysvals.allocator = context.temp_allocator
+	group: [3]u32
+	tgsm: u32
+	store_g0 := false
+	for in_ in prog {
+		#partial switch Dx_Op(in_.op) {
+		case .Dcl_Constant_Buffer:
+			append(&decls, [4]u32{in_.op, in_.words[2], in_.words[5], 0})
+		case .Dcl_Sampler, .Dcl_Resource_Raw, .Dcl_Uav_Raw:
+			append(&decls, [4]u32{in_.op, in_.words[2], in_.words[4], 0})
+		case .Dcl_Resource, .Dcl_Uav_Typed:
+			append(&decls, [4]u32{in_.op | in_.ctl << 16, in_.words[2], in_.words[5], in_.words[4]})
+		case .Dcl_Input:
+			append(&sysvals, [2]u32{in_.words[0] >> 12 & 0xff, in_.words[0] >> 4 & 0xf})
+		case .Dcl_Thread_Group:
+			group = {in_.words[0], in_.words[1], in_.words[2]}
+		case .Dcl_Tgsm_Raw:
+			tgsm = in_.words[2]
+		case .Store_Raw:
+			// sv = vec3(1.0): g0.xyz at word 10.
+			ops, _ := dxbc_operands(in_.words)
+			store_g0 ||= len(ops) == 3 && ops[0].file == 31 && ops[0].sel & 0xf == 7 && ops[1].file == 4 && ops[1].imm == 40
+		}
+	}
+	cb, sampler, resource, raw := u32(Dx_Op.Dcl_Constant_Buffer), u32(Dx_Op.Dcl_Sampler), u32(Dx_Op.Dcl_Resource), u32(Dx_Op.Dcl_Resource_Raw)
+	uav, uav_raw := u32(Dx_Op.Dcl_Uav_Typed), u32(Dx_Op.Dcl_Uav_Raw)
+	want := [?][4]u32 {
+		{cb, 0, 2, 0},
+		{sampler, 0, 0, 0},
+		{resource | 3 << 16, 0, 0, 0x5555},
+		{resource | 3 << 16, 1, 0, 0x4444},
+		{resource | 3 << 16, 2, 0, 0x5555},
+		{uav | 3 << 16, 0, 1, 0x3333},
+		{uav | 3 << 16, 1, 1, 0x5555},
+		{raw, 3, 0, 0},
+		{uav_raw, 2, 1, 0},
+		{uav_raw, 3, 1, 0},
+	}
+	testing.expectf(t, slice.equal(decls[:], want[:]), "%v", decls)
+	// vThreadID, vThreadGroupID, vThreadIDInGroup (xyz), vThreadIDInGroupFlattened (x).
+	slice.sort_by(sysvals[:], proc(a, b: [2]u32) -> bool {return a[0] < b[0]})
+	want_sv := [?][2]u32{{32, 7}, {33, 7}, {34, 7}, {36, 1}}
+	testing.expectf(t, slice.equal(sysvals[:], want_sv[:]), "%v", sysvals)
+	testing.expect_value(t, group, [3]u32{8, 4, 2})
+	testing.expect_value(t, tgsm, 52)
+	testing.expect(t, store_g0)
+
+	// Each built-in reads its own system value and no other.
+	Builtin_Sv :: struct {
+		name: string,
+		file: u32,
+	}
+	for b in ([]Builtin_Sv{{"gl_GlobalInvocationID.y", 32}, {"gl_WorkGroupID.y", 33}, {"gl_LocalInvocationID.y", 34}, {"gl_LocalInvocationIndex", 36}}) {
+		src := fmt.tprintf("#version 310 es\nlayout(local_size_x = 2, local_size_y = 2) in;\nbuffer B {{ uint w[]; }} b;\nvoid main() {{ b.w[0] = %s; }}", b.name)
+		bm, bprog, bok := dxbc_compile(t, src, {profile = .Glsl, stage = .Compute})
+		if bok {
+			files := make(map[u32]bool, context.temp_allocator)
+			for in_ in bprog {
+				if Dx_Op(in_.op) == .Dcl_Input {
+					continue
+				}
+				ops, _ := dxbc_operands(in_.words)
+				for o in ops {
+					if o.file >= 32 && o.file <= 36 {
+						files[o.file] = true
+					}
+				}
+			}
+			testing.expectf(t, len(files) == 1 && files[b.file], "%s reads system values %v, want %d", b.name, files, b.file)
+		}
+		destroy(bm)
+	}
+
+	// Nine UAVs: u8 needs SFI0's D3D_SHADER_REQUIRES_64_UAVS; eight do not.
+	for n in 8 ..= 9 {
+		sb := strings.builder_make(context.temp_allocator)
+		fmt.sbprint(&sb, "#version 310 es\nlayout(local_size_x = 1) in;\n")
+		for k in 0 ..< n {
+			fmt.sbprintf(&sb, "buffer B%d {{ uint w[]; }} b%d;\n", k, k)
+		}
+		fmt.sbprint(&sb, "void main() {\n")
+		for k in 0 ..< n {
+			fmt.sbprintf(&sb, "    b%d.w[0] = %du;\n", k, k)
+		}
+		fmt.sbprint(&sb, "}\n")
+		um, _, uok := dxbc_compile(t, strings.to_string(sb), {profile = .Glsl, stage = .Compute})
+		if uok {
+			sfi0 := dxbc_chunk(um.dxbc, "SFI0")
+			if n == 8 {
+				testing.expect(t, sfi0 == nil)
+			} else {
+				testing.expectf(t, len(sfi0) == 8 && slice.reinterpret([]u32, sfi0)[0] == 0x8 && slice.reinterpret([]u32, sfi0)[1] == 0, "SFI0 %v", sfi0)
+			}
+		}
+		destroy(um)
+	}
+}
+
+// Each barrier's sync flags (_t 1, _g 2, _ugroup 4, _uglobal 8, the
+// controls' low bits): barrier() _g_t, memoryBarrier() _uglobal_g,
+// memoryBarrierShared() _g, memoryBarrierBuffer() and memoryBarrierImage()
+// _uglobal, groupMemoryBarrier() _ugroup_g; in a fragment shader nothing.
+@(test)
+test_dxbc_barriers :: proc(t: ^testing.T) {
+	body :: "barrier(); memoryBarrier(); memoryBarrierShared(); memoryBarrierBuffer(); memoryBarrierImage(); groupMemoryBarrier();"
+	m, prog, ok := dxbc_compile(t, "#version 310 es\nlayout(local_size_x = 4) in;\nbuffer B { uint w[]; } b;\nvoid main() { b.w[0] = 1u; " + body + " }", {profile = .Glsl, stage = .Compute})
+	defer destroy(m)
+	if ok {
+		flags := make([dynamic]u32, context.temp_allocator)
+		for in_ in prog {
+			if Dx_Op(in_.op) == .Sync {
+				append(&flags, in_.ctl)
+			}
+		}
+		want := []u32{0x3, 0xa, 0x2, 0x8, 0x8, 0x6}
+		testing.expectf(t, slice.equal(flags[:], want), "sync flags %x, want %x", flags, want)
+	}
+	fm, fprog, fok := dxbc_compile(t, "#version 310 es\nprecision highp float;\nout vec4 c;\nvoid main() { memoryBarrier(); memoryBarrierBuffer(); memoryBarrierImage(); c = vec4(1.0); }", {profile = .Glsl})
+	defer destroy(fm)
+	if fok {
+		for in_ in fprog {
+			testing.expect(t, Dx_Op(in_.op) != .Sync)
+		}
+	}
+}
+
+// Every atomic on int and uint, shared and buffer words, used and not: the
+// immediate form of the op by type (imin / imax for int, umin / umax for
+// uint), the word's byte address, the operands in GLSL's order
+// (atomicCompSwap's comparand, then its value); a buffer's old value is
+// masked by its size (bufinfo), a shared one is not.
+@(test)
+test_dxbc_atomics :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 4) in;
+buffer I { int w[]; } bi;
+buffer U { uint w[]; } bu;
+shared int si[4];
+shared uint su[4];
+uniform int uI;
+void main() {
+    si[1] = atomicAdd(si[0], 11) + atomicMin(si[1], 12) + atomicMax(si[2], 13) + atomicAnd(si[3], 14);
+    atomicOr(si[0], 15); atomicXor(si[1], 16); atomicExchange(si[2], 17); atomicCompSwap(si[3], 18, 19);
+    su[1] = atomicAdd(su[0], 21u) + atomicMin(su[1], 22u) + atomicMax(su[2], 23u) + atomicAnd(su[3], 24u);
+    atomicOr(su[0], 25u); atomicXor(su[1], 26u); atomicExchange(su[2], 27u); atomicCompSwap(su[3], 28u, 29u);
+    bi.w[0] = atomicMin(bi.w[uI], 31) + atomicMax(bi.w[uI], 32) + atomicCompSwap(bi.w[uI], 33, 34);
+    bu.w[0] = atomicMin(bu.w[uI], 41u) + atomicMax(bu.w[uI], 42u) + atomicCompSwap(bu.w[uI], 43u, 44u);
+    atomicAdd(bu.w[uI], 45u); atomicAnd(bu.w[uI], 46u); atomicOr(bu.w[uI], 47u); atomicXor(bu.w[uI], 48u); atomicExchange(bu.w[uI], 49u);
+}`
+	m, prog, ok := dxbc_compile(t, src, {profile = .Glsl, stage = .Compute})
+	defer destroy(m)
+	if !ok {
+		return
+	}
+	Seen :: struct {
+		op:     Dx_Op,
+		shared: bool,
+		// g0's immediate byte address (shared), the operands' immediates.
+		addr:   u32,
+		values: [2]u32,
+		masked: bool,
+	}
+	seen := make([dynamic]Seen, context.temp_allocator)
+	for in_, i in prog {
+		op := Dx_Op(in_.op)
+		if op < .Imm_Atomic_Iadd || op > .Imm_Atomic_Umin {
+			continue
+		}
+		ops, _ := dxbc_operands(in_.words)
+		s := Seen{op = op, shared = ops[1].file == 31, addr = ops[2].imm if ops[2].file == 4 else 0xffffffff}
+		for k in 3 ..< len(ops) {
+			s.values[k - 3] = ops[k].imm
+		}
+		s.masked = i + 3 < len(prog) && Dx_Op(prog[i + 1].op) == .Bufinfo && Dx_Op(prog[i + 2].op) == .Ult && Dx_Op(prog[i + 3].op) == .And
+		append(&seen, s)
+	}
+	A :: 0xffffffff
+	want := [?]Seen {
+		{.Imm_Atomic_Iadd, true, 0, {11, 0}, false},
+		{.Imm_Atomic_Imin, true, 4, {12, 0}, false},
+		{.Imm_Atomic_Imax, true, 8, {13, 0}, false},
+		{.Imm_Atomic_And, true, 12, {14, 0}, false},
+		{.Imm_Atomic_Or, true, 0, {15, 0}, false},
+		{.Imm_Atomic_Xor, true, 4, {16, 0}, false},
+		{.Imm_Atomic_Exch, true, 8, {17, 0}, false},
+		{.Imm_Atomic_Cmp_Exch, true, 12, {18, 19}, false},
+		{.Imm_Atomic_Iadd, true, 16, {21, 0}, false},
+		{.Imm_Atomic_Umin, true, 20, {22, 0}, false},
+		{.Imm_Atomic_Umax, true, 24, {23, 0}, false},
+		{.Imm_Atomic_And, true, 28, {24, 0}, false},
+		{.Imm_Atomic_Or, true, 16, {25, 0}, false},
+		{.Imm_Atomic_Xor, true, 20, {26, 0}, false},
+		{.Imm_Atomic_Exch, true, 24, {27, 0}, false},
+		{.Imm_Atomic_Cmp_Exch, true, 28, {28, 29}, false},
+		{.Imm_Atomic_Imin, false, A, {31, 0}, true},
+		{.Imm_Atomic_Imax, false, A, {32, 0}, true},
+		{.Imm_Atomic_Cmp_Exch, false, A, {33, 34}, true},
+		{.Imm_Atomic_Umin, false, A, {41, 0}, true},
+		{.Imm_Atomic_Umax, false, A, {42, 0}, true},
+		{.Imm_Atomic_Cmp_Exch, false, A, {43, 44}, true},
+		{.Imm_Atomic_Iadd, false, A, {45, 0}, true},
+		{.Imm_Atomic_And, false, A, {46, 0}, true},
+		{.Imm_Atomic_Or, false, A, {47, 0}, true},
+		{.Imm_Atomic_Xor, false, A, {48, 0}, true},
+		{.Imm_Atomic_Exch, false, A, {49, 0}, true},
+	}
+	testing.expectf(t, len(seen) == len(want), "%d atomics, want %d", len(seen), len(want))
+	for w, k in want {
+		if k < len(seen) {
+			testing.expectf(t, seen[k] == w, "atomic %d: %v, want %v", k, seen[k], w)
+		}
+	}
+}
+
+// Storage buffer writes store only the words written, each store_raw at
+// word element * stride + offset clamped to 0x3ffffffc and made a byte
+// address (as reads are): a vec4 element one store_raw of 4 words, a
+// struct one per field at its std430 offset, a swizzle one word per
+// component, a component chosen at run time one word, a compound
+// assignment one load and one store at the same address.
+@(test)
+test_dxbc_buffer_writes :: proc(t: ^testing.T) {
+	Case :: struct {
+		src:     string,
+		// Each store_raw's word offset added before the clamp (0: none) and
+		// its words.
+		stores:  [][2]u32,
+		ld_raws: int,
+		// The element index's scale, in words (S's std430 stride is 8).
+		stride:  u32,
+	}
+	decls :: "#version 310 es\nlayout(local_size_x = 1) in;\nstruct S { float a; vec2 b; uvec3 c; };\nbuffer B { S rows[]; };\nbuffer V { vec4 v[]; };\nuniform int uI;\n"
+	cases := [?]Case {
+		{decls + "void main() { v[uI] = vec4(1.0); }", {{0, 4}}, 0, 4},
+		{decls + "void main() { rows[uI] = S(1.0, vec2(2.0), uvec3(3u)); }", {{0, 1}, {2, 2}, {4, 3}}, 0, 8},
+		{decls + "void main() { v[uI].wy = vec2(1.0); rows[uI].c.z = 2u; }", {{3, 1}, {1, 1}, {6, 1}}, 0, 4},
+		{decls + "void main() { v[uI][uI + 1] = 1.0; }", {{0, 1}}, 0, 4},
+		{decls + "void main() { rows[uI].b += vec2(1.0); }", {{2, 2}}, 1, 8},
+	}
+	for cs in cases {
+		m, prog, ok := dxbc_compile(t, cs.src, {profile = .Glsl, stage = .Compute})
+		defer destroy(m)
+		if !ok {
+			continue
+		}
+		stores := make([dynamic][2]u32, context.temp_allocator)
+		ld_raws := 0
+		stride: u32 = 0
+		for in_, i in prog {
+			if Dx_Op(in_.op) == .Imul && stride == 0 {
+				ops, _ := dxbc_operands(in_.words)
+				if len(ops) == 4 && ops[3].file == 4 {
+					stride = ops[3].imm
+				}
+			}
+			if Dx_Op(in_.op) == .Ld_Raw {
+				ld_raws += 1
+			}
+			if Dx_Op(in_.op) != .Store_Raw {
+				continue
+			}
+			testing.expectf(t, i >= 2 && Dx_Op(prog[i - 2].op) == .Umin && Dx_Op(prog[i - 1].op) == .Ishl, "%s: store_raw not after umin, ishl", cs.src)
+			if i >= 2 {
+				ops, _ := dxbc_operands(prog[i - 2].words)
+				testing.expectf(t, len(ops) == 3 && ops[2].file == 4 && ops[2].imm == 0x3ffffffc, "%s: clamp %v", cs.src, ops)
+			}
+			off: u32
+			if i >= 3 && Dx_Op(prog[i - 3].op) == .Iadd {
+				ops, _ := dxbc_operands(prog[i - 3].words)
+				if len(ops) == 3 && ops[2].file == 4 {
+					off = ops[2].imm
+				}
+			}
+			ops, _ := dxbc_operands(in_.words)
+			mask := ops[0].sel & 0xf
+			append(&stores, [2]u32{off, 1 + (mask >> 1 & 1) + (mask >> 2 & 1) + (mask >> 3 & 1)})
+		}
+		testing.expectf(t, slice.equal(stores[:], cs.stores), "%s: stores %v, want %v", cs.src, stores, cs.stores)
+		testing.expectf(t, ld_raws == cs.ld_raws, "%s: %d ld_raws, want %d", cs.src, ld_raws, cs.ld_raws)
+		testing.expectf(t, stride == cs.stride, "%s: element index times %d, want %d", cs.src, stride, cs.stride)
+	}
+}
+
+// Shared variables are packed in g0 in declaration order as the CPU lays
+// them out (component_count words each: a struct's fields one after
+// another, a matrix column by column, an array element by element); an
+// index chosen at run time is clamped to the last element, then scaled by
+// the element's words.
+@(test)
+test_dxbc_shared :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 4) in;
+struct P { vec3 a; bool b; mat2 m; int ids[3]; };
+shared P parts[4];
+shared float x;
+shared vec4 sv[4];
+uniform int uI;
+buffer B { int w[]; } o;
+void main() {
+    x = 1.0;
+    parts[2].m[1].y = 2.0;
+    parts[uI].ids[2] = 3;
+    o.w[0] = parts[1].ids[uI];
+    parts[3] = parts[0];
+    sv[uI][uI + 1] = 5.0;
+}`
+	m, prog, ok := dxbc_compile(t, src, {profile = .Glsl, stage = .Compute})
+	defer destroy(m)
+	if !ok {
+		return
+	}
+	tgsm: u32
+	g0_stores := make([dynamic]u32, context.temp_allocator)
+	clamps := make([dynamic][2]u32, context.temp_allocator)
+	for in_, i in prog {
+		ops, _ := dxbc_operands(in_.words)
+		#partial switch Dx_Op(in_.op) {
+		case .Dcl_Tgsm_Raw:
+			tgsm = in_.words[2]
+		case .Store_Raw:
+			if ops[0].file == 31 && ops[1].file == 4 {
+				append(&g0_stores, ops[1].imm)
+			}
+		case .Imin:
+			// The clamp's last index and the scale after it.
+			if len(ops) == 3 && ops[2].file == 4 && i + 1 < len(prog) && Dx_Op(prog[i + 1].op) == .Imul {
+				mul, _ := dxbc_operands(prog[i + 1].words)
+				append(&clamps, [2]u32{ops[2].imm, mul[3].imm if len(mul) == 4 && mul[3].file == 4 else 0})
+			}
+		}
+	}
+	// P is 11 words: a 0-2, b 3, m 4-7, ids 8-10; x after 4 of them, sv
+	// after x. parts[3] = parts[0] stores each leaf at its packed word.
+	testing.expect_value(t, tgsm, (45 + 16) * 4)
+	want_stores := []u32{44 * 4, (22 + 4 + 3) * 4, 33 * 4, 36 * 4, 37 * 4, 39 * 4, 41 * 4, 42 * 4, 43 * 4}
+	testing.expectf(t, slice.equal(g0_stores[:], want_stores), "g0 stores at %v, want %v", g0_stores, want_stores)
+	// parts[uI] (last 3, 11 words); ids[uI] (last 2, 1 word: no imul);
+	// sv[uI] (last 3, 4 words).
+	want_clamps := [][2]u32{{3, 11}, {3, 4}}
+	testing.expectf(t, slice.equal(clamps[:], want_clamps), "clamps %v, want %v", clamps, want_clamps)
+	// sv[uI][uI + 1]: the component (mapped by movc) is added to the
+	// element's words, then sv's first word, before the byte address.
+	found := false
+	for i in 0 ..< len(prog) - 4 {
+		ops := [5]Dx_Op{Dx_Op(prog[i].op), Dx_Op(prog[i + 1].op), Dx_Op(prog[i + 2].op), Dx_Op(prog[i + 3].op), Dx_Op(prog[i + 4].op)}
+		found ||= ops == {.Movc, .Iadd, .Iadd, .Ishl, .Store_Raw}
+	}
+	testing.expect(t, found)
+}
+
+// Image accesses' operands: a read-only image's ld at (x, y, 0, 0) (the
+// mip, in w, 0), a writable one's ld_uav_typed and every store_uav_typed at
+// the coordinate's (x, y) as the first two address components.
+@(test)
+test_dxbc_images :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 1) in;
+layout(rgba8) readonly uniform highp image2D ro;
+layout(r32f) uniform highp image2D rw;
+layout(rgba16f) writeonly uniform highp image2D wo;
+uniform ivec2 uP;
+void main() {
+    vec4 a = imageLoad(ro, uP.yx) + imageLoad(rw, uP);
+    imageStore(wo, uP, a);
+    imageStore(rw, uP.yx, a);
+}`
+	m, prog, ok := dxbc_compile(t, src, {profile = .Glsl, stage = .Compute})
+	defer destroy(m)
+	if !ok {
+		return
+	}
+	// The address operand's first two swizzle components (2 bits each).
+	xy :: proc(o: Operand) -> u32 {return o.sel & 0xf if o.mode == 1 else 0xff}
+	lds, uav_lds, stores := 0, 0, 0
+	for in_, i in prog {
+		ops, _ := dxbc_operands(in_.words)
+		#partial switch Dx_Op(in_.op) {
+		case .Ld:
+			lds += 1
+			// mov at.xy, coord; mov at.zw, l(0); ld r, at.xyzw
+			ok_mip := i >= 2 && Dx_Op(prog[i - 1].op) == .Mov && Dx_Op(prog[i - 2].op) == .Mov
+			if ok_mip {
+				zw, _ := dxbc_operands(prog[i - 1].words)
+				c, _ := dxbc_operands(prog[i - 2].words)
+				ok_mip = zw[0].sel & 0xf == 0xc && zw[1].file == 4 && zw[1].imm == 0 && c[0].sel & 0xf == 0x3
+				// uP.yx: y then x.
+				ok_mip &&= c[1].mode == 1 && c[1].sel & 0xf == (1 | 0 << 2)
+			}
+			testing.expectf(t, ok_mip && xy(ops[1]) == (0 | 1 << 2), "ld's address %v", ops)
+		case .Ld_Uav_Typed:
+			uav_lds += 1
+			testing.expectf(t, xy(ops[1]) == (0 | 1 << 2), "ld_uav_typed's address %v", ops)
+		case .Store_Uav_Typed:
+			// The first store at uP (x, y), the second at uP.yx.
+			want: u32 = (0 | 1 << 2) if stores == 0 else (1 | 0 << 2)
+			testing.expectf(t, xy(ops[1]) == want, "store_uav_typed %d's address %v", stores, ops)
+			stores += 1
+		}
+	}
+	testing.expect(t, lds == 1 && uav_lds == 1 && stores == 2)
+}
+
+// A sampler or image parameter names the argument it was called with even
+// when a later argument calls the same function (its parameters are bound
+// once every argument is evaluated): tap(texA, tap(texB, uv).xy) samples
+// texB, then texA; tap(u_rw, tap(u_ro, 1.0)) loads t0 with ld, then u0 with
+// ld_uav_typed (a writable r32f image passed to a readonly image2D
+// parameter keeps its UAV).
+@(test)
+test_dxbc_resource_params :: proc(t: ^testing.T) {
+	fs := `#version 310 es
+precision highp float;
+uniform sampler2D texA;
+uniform sampler2D texB;
+in vec2 uv;
+out vec4 c;
+vec4 tap(sampler2D s, vec2 p) { return textureLod(s, p, 0.0); }
+void main() { c = tap(texA, tap(texB, uv).xy); }`
+	m, prog, ok := dxbc_compile(t, fs, {profile = .Glsl})
+	if ok {
+		ids := make([dynamic]u32, context.temp_allocator)
+		for in_ in prog {
+			if Dx_Op(in_.op) == .Sample_L {
+				ops, _ := dxbc_operands(in_.words)
+				append(&ids, ops[2].idx[1])
+			}
+		}
+		testing.expectf(t, slice.equal(ids[:], []u32{1, 0}), "sampled t%v, want t1 then t0", ids)
+	}
+	destroy(m)
+	cs := `#version 310 es
+layout(local_size_x = 1) in;
+layout(r32f) uniform highp image2D u_rw;
+layout(r32f) readonly uniform highp image2D u_ro;
+buffer Out { vec4 out_v[]; };
+float tap(readonly highp image2D im, float bias) {
+    return imageLoad(im, ivec2(0, 0)).x + bias;
+}
+void main() {
+    out_v[0] = vec4(tap(u_rw, tap(u_ro, 1.0)));
+}`
+	cm, cprog, cok := dxbc_compile(t, cs, {profile = .Glsl, stage = .Compute})
+	if cok {
+		loads := make([dynamic][2]u32, context.temp_allocator)
+		for in_ in cprog {
+			op := Dx_Op(in_.op)
+			if op == .Ld || op == .Ld_Uav_Typed {
+				ops, _ := dxbc_operands(in_.words)
+				append(&loads, [2]u32{ops[2].file, ops[2].idx[1]})
+			}
+		}
+		testing.expectf(t, slice.equal(loads[:], [][2]u32{{7, 0}, {30, 0}}), "loads %v, want t0 then u0", loads)
+	}
+	destroy(cm)
+}
+
+// UAVs that a device-scope barrier orders are declared _glc (globally
+// coherent): the raw ones under memoryBarrier() or memoryBarrierBuffer(),
+// the typed ones under memoryBarrier() or memoryBarrierImage(); none
+// otherwise (groupMemoryBarrier() and barrier() are the thread group's).
+@(test)
+test_dxbc_glc :: proc(t: ^testing.T) {
+	Case :: struct {
+		barrier:          string,
+		raw_glc, typ_glc: bool,
+	}
+	cases := [?]Case{{"", false, false}, {"barrier(); groupMemoryBarrier(); memoryBarrierShared();", false, false}, {"memoryBarrier();", true, true}, {"memoryBarrierBuffer();", true, false}, {"memoryBarrierImage();", false, true}, {"memoryBarrierBuffer(); memoryBarrierImage();", true, true}}
+	for cs in cases {
+		src := fmt.tprintf("#version 310 es\nlayout(local_size_x = 2) in;\nlayout(r32ui) uniform highp uimage2D im;\nbuffer B {{ uint w[]; }} b;\nvoid main() {{ b.w[0] = imageLoad(im, ivec2(0)).x; %s imageStore(im, ivec2(1), uvec4(b.w[1])); }}", cs.barrier)
+		m, prog, ok := dxbc_compile(t, src, {profile = .Glsl, stage = .Compute})
+		if ok {
+			raw, typ := false, false
+			for in_ in prog {
+				#partial switch Dx_Op(in_.op) {
+				case .Dcl_Uav_Raw:
+					raw = in_.ctl & (1 << 5) != 0
+				case .Dcl_Uav_Typed:
+					typ = in_.ctl & (1 << 5) != 0
+				}
+			}
+			testing.expectf(t, raw == cs.raw_glc && typ == cs.typ_glc, "%q: raw _glc %v, typed _glc %v", cs.barrier, raw, typ)
+		}
+		destroy(m)
+	}
+}
+
+// What Direct3D 12 lacks is an error with Options.dxbc only:
+// gl_NumWorkGroups (Dxbc_Num_Work_Groups, at its first use) unless
+// Options.num_work_groups_uniform makes it the block's uvec3
+// oksl_NumWorkGroups in every GPU backend (no NumWorkgroups built-in in
+// SPIR-V, no threadgroups_per_grid in MSL) while the CPU reads run_compute's
+// groups, whatever the block holds; more than 64 UAV or 128 SRV registers
+// (Dxbc_Too_Many_Uavs, Dxbc_Too_Many_Srvs, with the counts); a
+// local_size_z over 64 (Dxbc_Local_Size_Z, at the local_size_z).
+@(test)
+test_dxbc_compute_errors :: proc(t: ^testing.T) {
+	num := "#version 310 es\nlayout(local_size_x = 4) in;\nbuffer B { uint w[]; } b;\nvoid main() {\n    b.w[0] = gl_NumWorkGroups.x;\n}"
+	m, errs, ok := compile(num, {profile = .Glsl, stage = .Compute, dxbc = true})
+	testing.expectf(t, !ok && len(errs) == 1 && errs[0].code == .Dxbc_Num_Work_Groups && errs[0].pos.line == 5 && errs[0].pos.col == 14, "%v", errs)
+	destroy(m)
+	m, errs, ok = compile(num, {profile = .Glsl, stage = .Compute})
+	testing.expectf(t, ok, "without dxbc: %v", errs)
+	destroy(m)
+	// The option's uvec3 is not the shader's: one of its own named
+	// oksl_NumWorkGroups keeps its name, offset and field everywhere.
+	uni := "#version 310 es\nlayout(local_size_x = 4) in;\nuniform float uK;\nuniform uvec3 oksl_NumWorkGroups;\nbuffer B { uint w[]; } b;\nvoid main() {\n    uint i = gl_LocalInvocationIndex;\n    b.w[i] = gl_NumWorkGroups[i % 3u] + uint(uK) + oksl_NumWorkGroups[i % 3u] * 100u;\n}"
+	m, errs, ok = compile(uni, {profile = .Glsl, stage = .Compute, dxbc = true, num_work_groups_uniform = true})
+	testing.expectf(t, ok && len(m.dxbc) > 0, "with the uniform: %v", errs)
+	if ok {
+		dxbc_program(t, m, "num_work_groups_uniform")
+		if have_spirv_val() {
+			expect_valid_spirv(t, "num_work_groups_uniform", m.spirv)
+		}
+		// Reflection: the shader's two uniforms, and the option's offset
+		// after them.
+		testing.expectf(t, len(m.uniforms) == 2 && m.uniforms[1].name == "oksl_NumWorkGroups" && m.uniforms[1].offset == 16, "uniforms %v", m.uniforms)
+		uoff, ut, found := uniform_offset(m, "oksl_NumWorkGroups")
+		testing.expectf(t, found && ut == vec_type(.Uint, 3) && uoff == 16, "the shader's oksl_NumWorkGroups at %d, %v", uoff, ut)
+		off := m.num_work_groups_offset
+		testing.expectf(t, off == 32 && m.block_size >= off + 12, "num_work_groups_offset %d in %d bytes", off, m.block_size)
+		// MSL: one field each, the option's outside the ok_ prefix.
+		st := m.msl[strings.index(m.msl, "struct Oksl_Uniforms {"):]
+		st = st[:strings.index(st, "};")]
+		testing.expectf(t, strings.count(st, "ok_oksl_NumWorkGroups;") == 1 && strings.count(st, "oksl_num_work_groups;") == 1 && !strings.contains(m.msl, "$"), "MSL uniforms %s", st)
+		testing.expect(t, !strings.contains(m.msl, "threadgroups_per_grid"))
+		for w, i in m.spirv {
+			// OpDecorate ... BuiltIn NumWorkgroups.
+			testing.expect(t, !(w == 0x0004_0047 && i + 3 < len(m.spirv) && m.spirv[i + 2] == 11 && m.spirv[i + 3] == BUILTIN_NUM_WORKGROUPS))
+		}
+		// The CPU reads the groups, not the block's garbage there, and the
+		// shader's own uniform from the block.
+		block := make([]u8, m.block_size, context.temp_allocator)
+		set_uniform(m, block, "uK", {1})
+		set_uniform(m, block, "oksl_NumWorkGroups", {4, 5, 6})
+		bad := [3]u32{1000, 2000, 3000}
+		copy(block[off:], slice.to_bytes(bad[:]))
+		words := make([]u32, 4, context.temp_allocator)
+		bufs := [1][]u32{words}
+		scratch: Scratch
+		run_compute(&m.program, block, {1, 5, 7}, &scratch, {buffers = bufs[:]})
+		scratch_destroy(&scratch)
+		testing.expectf(t, slice.equal(words, []u32{402, 506, 608, 402}), "the CPU read %v", words)
+	}
+	destroy(m)
+	// The option off is the old interface (the built-in), and an unused
+	// one reflects -1.
+	m, errs, ok = compile(uni, {profile = .Glsl, stage = .Compute})
+	if testing.expectf(t, ok, "%v", errs) {
+		testing.expect(t, m.num_work_groups_offset == -1 && len(m.uniforms) == 2 && strings.contains(m.msl, "threadgroups_per_grid"))
+	}
+	destroy(m)
+	m, errs, ok = compile("#version 310 es\nlayout(local_size_x = 1) in;\nbuffer B { uint w[]; } b;\nvoid main() { b.w[0] = 1u; }", {profile = .Glsl, stage = .Compute, dxbc = true, num_work_groups_uniform = true})
+	testing.expectf(t, ok && m.num_work_groups_offset == -1 && m.block_size == 0, "unused: %v %d", errs, m.num_work_groups_offset)
+	destroy(m)
+	// 64 writable buffers fit, 65 do not (u0-u63); 128 read-only ones fit, 129 do not.
+	for lim in ([][3]int{{64, 0, 0}, {65, 0, int(Error_Code.Dxbc_Too_Many_Uavs)}, {128, 1, 0}, {129, 1, int(Error_Code.Dxbc_Too_Many_Srvs)}}) {
+		n, ro, want := lim[0], lim[1] == 1, Error_Code(lim[2])
+		sb := strings.builder_make(context.temp_allocator)
+		fmt.sbprint(&sb, "#version 310 es\nlayout(local_size_x = 1) in;\nbuffer O { uint o[]; };\n")
+		for k in 0 ..< n - (0 if ro else 1) {
+			fmt.sbprintf(&sb, "%sbuffer B%d {{ uint w%d[]; }};\n", "readonly " if ro else "", k, k)
+		}
+		fmt.sbprint(&sb, "void main() {\n    uint s = 0u;\n")
+		for k in 0 ..< n - (0 if ro else 1) {
+			if ro {
+				fmt.sbprintf(&sb, "    s += w%d[0];\n", k)
+			} else {
+				fmt.sbprintf(&sb, "    w%d[0] = %du;\n", k, k)
+			}
+		}
+		fmt.sbprint(&sb, "    o[0] = s;\n}\n")
+		lm, lerrs, lok := compile(strings.to_string(sb), {profile = .Glsl, stage = .Compute, dxbc = true})
+		if want == .None {
+			testing.expectf(t, lok, "%d %s buffers: %v", n, "read-only" if ro else "writable", lerrs)
+		} else {
+			testing.expectf(t, !lok && len(lerrs) == 1 && lerrs[0].code == want && lerrs[0].n == i64(n) && lerrs[0].m == (128 if ro else 64), "%d buffers: %v", n, lerrs)
+		}
+		destroy(lm)
+	}
+	for z in ([]int{64, 65}) {
+		src := fmt.tprintf("#version 310 es\nlayout(local_size_x = 1, local_size_z = %d) in;\nbuffer B {{ uint w[]; }} b;\nvoid main() {{ b.w[gl_LocalInvocationIndex] = 1u; }}", z)
+		zm, zerrs, zok := compile(src, {profile = .Glsl, stage = .Compute, dxbc = true})
+		if z == 64 {
+			testing.expectf(t, zok, "z 64: %v", zerrs)
+		} else {
+			testing.expectf(t, !zok && len(zerrs) == 1 && zerrs[0].code == .Dxbc_Local_Size_Z && zerrs[0].n == 65 && zerrs[0].m == 64 && zerrs[0].pos.line == 2 && zerrs[0].pos.col == 26, "z 65: %v", zerrs)
+		}
+		destroy(zm)
 	}
 }
 

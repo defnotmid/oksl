@@ -11,9 +11,9 @@
 // interpreter code, and a hash of the CPU result with the value folded into
 // the output colour. Per shader in testdata/ and demo/media/ it writes the
 // .spv, the .metal, a float CPU render (.f32) and the reflection the host
-// sees (.reflect), or the diagnostics (.errors), and for vertex and
-// fragment shaders the .dxbc (Options.dxbc; testdata/'s vertex shaders
-// have only it). corpus_dxbc.tsv has a hash of each valid case's DXBC,
+// sees (.reflect), or the diagnostics (.errors), and the .dxbc
+// (Options.dxbc; testdata/'s vertex shaders have only it; a compute shader's
+// compiled apart, with Options.num_work_groups_uniform). corpus_dxbc.tsv has a hash of each valid case's DXBC,
 // and for the cases where GLSL leaves the result open and D3D12 on vkd3d
 // (RADV) differs from the CPU, the reason (DXBC_OPEN).
 //
@@ -375,6 +375,17 @@ files :: proc(dir: string) {
 		if options.stage == .Compute {
 			snapshot_compute(base, m)
 			oksl.destroy(m)
+			// Its DXBC, compiled apart, gl_NumWorkGroups from the block
+			// (DXBC has none).
+			options.dxbc = true
+			options.num_work_groups_uniform = true
+			dm, derrs, dok := oksl.compile(string(data), options)
+			if dok {
+				_ = os.write_entire_file(fmt.tprintf("%s.dxbc", base), dm.dxbc)
+			} else {
+				_ = os.write_entire_file(fmt.tprintf("%s.dxbc.errors", base), transmute([]u8)oksl.format_errors(derrs))
+			}
+			oksl.destroy(dm)
 			continue
 		}
 		_ = os.write_entire_file(fmt.tprintf("%s.dxbc", base), m.dxbc)

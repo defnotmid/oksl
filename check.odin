@@ -34,6 +34,11 @@ Checked :: struct {
 	num_ro_buffers: int,
 	num_ro_images:  int,
 	local_size:     [3]u32,
+	// Where each local_size_* was first declared.
+	local_size_pos: [3]Pos,
+	// Options.num_work_groups_uniform: gl_NumWorkGroups' uniform (0 when
+	// unused or off).
+	num_groups_uniform: Sym_Id,
 	// (1 + taps) environments of block_stride bytes: `uniforms` holds the
 	// first's, then each tap's copies (stage.odin).
 	block_size:     int,
@@ -69,6 +74,7 @@ Checker :: struct {
 	num_ro_buffers:  int,
 	num_ro_images:   int,
 	local_size:      [3]u32,
+	local_size_pos:  [3]Pos,
 	local_size_seen: [3]bool,
 	has_workgroup:   bool,
 	workgroup_bad:   bool,
@@ -204,6 +210,10 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 	out.num_ro_buffers = c.num_ro_buffers
 	out.num_ro_images = c.num_ro_images
 	out.local_size = c.local_size
+	out.local_size_pos = c.local_size_pos
+	if c.u.num_groups_uniform {
+		out.num_groups_uniform = c.gl_num_groups
+	}
 	out.block_stride = round_up(c.next_offset, 16)
 	out.taps = len(u.taps)
 	out.block_size = out.block_stride * (1 + out.taps)
@@ -434,7 +444,14 @@ builtin_symbol :: proc(c: ^Checker, name: string) -> Sym_Id {
 			return 0
 		}
 		if c.gl_num_groups == 0 {
-			c.gl_num_groups = add_sym(c, Symbol{name = name, type = intern(c.u, vec_type(.Uint, 3)), storage = .Stage_In, is_const = true})
+			if c.u.num_groups_uniform {
+				// A uniform of the block on the GPU (laid out with the used
+				// ones); the CPU reads it from run_compute's groups.
+				c.gl_num_groups = add_sym(c, Symbol{name = NUM_GROUPS_SYM, type = intern(c.u, vec_type(.Uint, 3)), storage = .Uniform, is_const = true, index = -1})
+				append(&c.uniforms, c.gl_num_groups)
+			} else {
+				c.gl_num_groups = add_sym(c, Symbol{name = name, type = intern(c.u, vec_type(.Uint, 3)), storage = .Stage_In, is_const = true})
+			}
 		}
 		return c.gl_num_groups
 	case "gl_LocalInvocationIndex":
@@ -670,6 +687,9 @@ check_workgroup :: proc(c: ^Checker, wg: Range) {
 		}
 	}
 	if !c.workgroup_bad {
+		if !c.has_workgroup {
+			c.local_size_pos = decl_pos
+		}
 		c.local_size = {u32(decl_size[0]), u32(decl_size[1]), u32(decl_size[2])}
 		c.local_size_seen = seen
 		c.has_workgroup = true
@@ -3175,3 +3195,10 @@ builtin_args_ok :: proc(c: ^Checker, info: Builtin_Info, args: []Expr_Id) -> boo
 	}
 	return false
 }
+
+// Options.num_work_groups_uniform's uniform: a name no shader can declare
+// (as stage_entry's $uv and $color), so it never meets a user uniform in
+// lookups or in the backends' member names (MSL: oksl_num_work_groups,
+// outside the ok_ prefix of every user field).
+@(private)
+NUM_GROUPS_SYM :: "$num_work_groups"

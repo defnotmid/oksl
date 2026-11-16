@@ -118,6 +118,12 @@ create_graphics_pipeline_state :: proc(dev: rawptr, desc: ^d3d12.GRAPHICS_PIPELI
 	return
 }
 
+create_compute_pipeline_state :: proc(dev: rawptr, desc: ^d3d12.COMPUTE_PIPELINE_STATE_DESC) -> (out: rawptr, hr: dxgi.HRESULT) {
+	d := (^d3d12.IDevice)(dev)
+	hr = d->CreateComputePipelineState(desc, d3d12.IPipelineState_UUID, &out)
+	return
+}
+
 create_command_list :: proc(dev: rawptr, allocator: rawptr) -> (out: rawptr) {
 	d := (^d3d12.IDevice)(dev)
 	check(d->CreateCommandList(0, .DIRECT, (^d3d12.ICommandAllocator)(allocator), nil, d3d12.IGraphicsCommandList_UUID, &out), "CreateCommandList")
@@ -144,6 +150,11 @@ create_root_signature :: proc(dev: rawptr, data: rawptr, size: uint) -> (out: ra
 create_shader_resource_view :: proc(dev: rawptr, res: rawptr, desc: ^d3d12.SHADER_RESOURCE_VIEW_DESC, handle: d3d12.CPU_DESCRIPTOR_HANDLE) {
 	d := (^d3d12.IDevice)(dev)
 	d->CreateShaderResourceView((^d3d12.IResource)(res), desc, handle)
+}
+
+create_unordered_access_view :: proc(dev: rawptr, res: rawptr, desc: ^d3d12.UNORDERED_ACCESS_VIEW_DESC, handle: d3d12.CPU_DESCRIPTOR_HANDLE) {
+	d := (^d3d12.IDevice)(dev)
+	d->CreateUnorderedAccessView((^d3d12.IResource)(res), nil, desc, handle)
 }
 
 create_render_target_view :: proc(dev: rawptr, res: rawptr, handle: d3d12.CPU_DESCRIPTOR_HANDLE) {
@@ -250,6 +261,11 @@ draw_instanced :: proc(l: rawptr, vertices, first: u32) {
 	gl->DrawInstanced(vertices, 1, first, 0)
 }
 
+dispatch :: proc(l: rawptr, x, y, z: u32) {
+	gl := (^d3d12.IGraphicsCommandList)(l)
+	gl->Dispatch(x, y, z)
+}
+
 copy_buffer_region :: proc(l: rawptr, dst: rawptr, dst_offset: u64, src: rawptr, src_offset: u64, size: u64) {
 	gl := (^d3d12.IGraphicsCommandList)(l)
 	gl->CopyBufferRegion((^d3d12.IResource)(dst), dst_offset, (^d3d12.IResource)(src), src_offset, size)
@@ -293,6 +309,21 @@ transition :: proc(l: rawptr, res: rawptr, before, after: d3d12.RESOURCE_STATES)
 set_descriptor_heaps :: proc(l: rawptr, heaps: []rawptr) {
 	gl := (^d3d12.IGraphicsCommandList)(l)
 	gl->SetDescriptorHeaps(u32(len(heaps)), ([^]^d3d12.IDescriptorHeap)(raw_data(heaps)))
+}
+
+set_compute_root_signature :: proc(l: rawptr, rs: rawptr) {
+	gl := (^d3d12.IGraphicsCommandList)(l)
+	gl->SetComputeRootSignature((^d3d12.IRootSignature)(rs))
+}
+
+set_compute_root_table :: proc(l: rawptr, index: u32, h: d3d12.GPU_DESCRIPTOR_HANDLE) {
+	gl := (^d3d12.IGraphicsCommandList)(l)
+	gl->SetComputeRootDescriptorTable(index, h)
+}
+
+set_compute_root_cbv :: proc(l: rawptr, index: u32, address: u64) {
+	gl := (^d3d12.IGraphicsCommandList)(l)
+	gl->SetComputeRootConstantBufferView(index, address)
 }
 
 set_graphics_root_signature :: proc(l: rawptr, rs: rawptr) {

@@ -11,6 +11,7 @@ import "core:fmt"
 import "core:math"
 import "core:slice"
 import "core:strings"
+import "core:thread"
 import oksl "../.."
 import stbi "vendor:stb/image"
 
@@ -658,3 +659,349 @@ facing_compare :: proc(vm: ^oksl.Module, gpu_f: [][4]f32) -> (string, bool) {
 	}
 	return fmt.tprintf("%d pixels (%d front, %d back), z and w worst %.3g relative, mismatches %d", checked, fronts, backs, worst, bad), bad == 0 && fronts > 0 && backs > 0
 }
+
+// ---- compute ----------------------------------------------------------------------------
+
+// A compute check's shape: read-write images rw_w x rw_h (read-only ones
+// twice that, so non-multiples of 8 exercise partial edge workgroups),
+// `buf_words` words per storage buffer, and a grid of exactly the
+// read-write image (else 3 more invocations each way, and at least 2x2).
+Compute_Shape :: struct {
+	rw_w, rw_h, buf_words: int,
+	exact_groups:          bool,
+}
+
+// image_war.comp needs >= 128x128 to catch a missing fence (gpu_parity
+// on Metal).
+compute_shape :: proc(name: string) -> Compute_Shape {
+	if name == "image_war.comp" {
+		return {128, 128, 16384, true}
+	}
+	return {29, 17, 4096, false}
+}
+
+// A compute check's data, in the temporary allocator: the uniform block,
+// the grid, every storage buffer's and image's first contents (what the
+// GPU uploads, in Module.storage_buffers and .storage_images order) and the
+// CPU's copies (run_compute writes them).
+Compute_Data :: struct {
+	block:       []u8,
+	groups:      [3]int,
+	buf_words:   int,
+	// Which words of a buffer's element are floats (compared within 1e-4).
+	float_words: [][]bool,
+	init_bufs:   [][]u32,
+	cpu_bufs:    [][]u32,
+	init_imgs:   [][]u8,
+	cpu_imgs:    []oksl.Storage_Image,
+}
+
+compute_data :: proc(m: ^oksl.Module, shape: Compute_Shape) -> (cd: Compute_Data, err: string) {
+	rw_w, rw_h := shape.rw_w, shape.rw_h
+	ro_w, ro_h := rw_w * 2, rw_h * 2
+	y_stride := (ro_w + 7) &~ 7
+	tx, ty := int(m.threadcount.x), int(m.threadcount.y)
+	extra := 0 if shape.exact_groups else 3
+	cd.groups = {max((rw_w + extra + tx - 1) / tx, 2), max((rw_h + extra + ty - 1) / ty, 2), 3 if m.threadcount.z > 1 else 1}
+	cd.buf_words = shape.buf_words
+
+	cd.block = make([]u8, m.block_size, context.temp_allocator)
+	oksl.set_uniform(m, cd.block, "uScale", {1.25})
+	oksl.set_uniform(m, cd.block, "uDt", {0.25})
+	oksl.set_uniform(m, cd.block, "uCount", {500})
+	oksl.set_uniform(m, cd.block, "uMatArr", {1, 2, 3, 4}, 0)
+	oksl.set_uniform(m, cd.block, "uMatArr", {5, 6, 7, 8}, 1)
+	oksl.set_uniform(m, cd.block, "ky", {13933, 46871, 4732, 1081344})
+	oksl.set_uniform(m, cd.block, "ku", {-7509, -25259, 32768, 33685504})
+	oksl.set_uniform(m, cd.block, "kv", {32768, -29763, -3005, 255})
+	oksl.set_uniform(m, cd.block, "size", {f32(ro_w), f32(ro_h), f32(y_stride), f32(y_stride * ro_h)})
+	// Options.num_work_groups_uniform's group count (the GPU's; the CPU
+	// reads groups).
+	if m.num_work_groups_offset >= 0 {
+		counts := [3]u32{u32(cd.groups.x), u32(cd.groups.y), u32(cd.groups.z)}
+		copy(cd.block[m.num_work_groups_offset:], slice.to_bytes(counts[:]))
+	}
+
+	nb, ni := len(m.storage_buffers), len(m.storage_images)
+	cd.float_words = make([][]bool, nb, context.temp_allocator)
+	cd.init_bufs = make([][]u32, nb, context.temp_allocator)
+	cd.cpu_bufs = make([][]u32, nb, context.temp_allocator)
+	for sb, bi in m.storage_buffers {
+		stride_words := max(sb.stride / 4, 1)
+		fw := make([]bool, stride_words, context.temp_allocator)
+		if !mark_float_words(m, sb.element, 0, fw) {
+			return cd, fmt.tprintf("missing struct reflection for buffer %s", sb.name)
+		}
+		init_w := make([]u32, shape.buf_words, context.temp_allocator)
+		for &w, i in init_w {
+			if !fw[i % stride_words] {
+				w = 0xdead_0000 | u32((bi * 31 + i * 17) & 0xffff)
+			} else {
+				w = transmute(u32)(f32(((bi * 29 + i * 37 + 11) % 64) + 8) * 0.25)
+			}
+		}
+		cd.float_words[bi] = fw
+		cd.init_bufs[bi] = init_w
+		cd.cpu_bufs[bi] = slice.clone(init_w, context.temp_allocator)
+	}
+	cd.init_imgs = make([][]u8, ni, context.temp_allocator)
+	cd.cpu_imgs = make([]oksl.Storage_Image, ni, context.temp_allocator)
+	for im, ii in m.storage_images {
+		iw := ro_w if im.readonly else rw_w
+		ih := ro_h if im.readonly else rw_h
+		init_d := make([]u8, iw * ih * image_texel_bytes(im.format), context.temp_allocator)
+		switch im.format {
+		case .None:
+		case .Rgba8:
+			for &b, i in init_d {
+				b = u8((ii * 53 + i * 41 + 19) & 255)
+			}
+		case .Rgba16f:
+			for &h, i in slice.reinterpret([]u16, init_d) {
+				h = u16(0x3800 + ((ii * 31 + i * 19) & 0x07ff))
+			}
+		case .Rgba32f, .R32f:
+			for &f, i in slice.reinterpret([]f32, init_d) {
+				f = f32((ii * 23 + i * 43 + 7) % 128) / 64.0
+			}
+		case .R32ui:
+			for &v, i in slice.reinterpret([]u32, init_d) {
+				v = u32((ii * 13 + i * 17 + 5) & 1023)
+			}
+		case .R32i:
+			for &v, i in slice.reinterpret([]i32, init_d) {
+				v = i32((ii * 13 + i * 19) % 511) - 255
+			}
+		}
+		cd.init_imgs[ii] = init_d
+		cd.cpu_imgs[ii] = {data = slice.clone(init_d, context.temp_allocator), width = iw, height = ih, format = im.format}
+	}
+	return cd, ""
+}
+
+image_texel_bytes :: proc(f: oksl.Image_Format) -> int {
+	switch f {
+	case .None:
+		return 0
+	case .Rgba8, .R32f, .R32ui, .R32i:
+		return 4
+	case .Rgba16f:
+		return 8
+	case .Rgba32f:
+		return 16
+	}
+	return 0
+}
+
+mark_float_words :: proc(m: ^oksl.Module, t: oksl.Type, byte_off: int, float_words: []bool) -> bool {
+	if t.base == .Struct {
+		if t.strukt < 0 || int(t.strukt) >= len(m.structs) || len(m.structs[t.strukt].fields) == 0 {
+			return false
+		}
+		for f in m.structs[t.strukt].fields {
+			if !mark_float_words(m, f.type, byte_off + f.offset, float_words) {
+				return false
+			}
+		}
+		return true
+	}
+	if t.base == .Float {
+		words := int(t.rows) * max(int(t.cols), 1)
+		for k in 0 ..< words {
+			idx := byte_off / 4 + k
+			if idx >= 0 && idx < len(float_words) {
+				float_words[idx] = true
+			}
+		}
+	}
+	return true
+}
+
+@(private = "file")
+Range_Job :: struct {
+	program: ^oksl.Program,
+	block:   []u8,
+	groups:  [3]int,
+	opts:    oksl.Run_Options,
+	first:   int,
+	count:   int,
+}
+
+// Runs the check on the CPU, split across three concurrent OS threads (each
+// with its own Scratch), into cd.cpu_bufs and cd.cpu_imgs.
+compute_cpu :: proc(m: ^oksl.Module, cd: ^Compute_Data) {
+	sizes: [oksl.SAMPLER_COUNT][3]i32
+	for &s, ch in sizes {
+		s = {TEX, TEX, LAYERS if ch in m.channel_arrays else 1}
+	}
+	arrays := m.channel_arrays
+	opts := oksl.Run_Options{sampler = cpu_sampler, user = &arrays, channel_sizes = sizes[:], buffers = cd.cpu_bufs, images = cd.cpu_imgs}
+	total := cd.groups.x * cd.groups.y * cd.groups.z
+	third := total / 3
+	jobs := [3]Range_Job {
+		{program = &m.program, block = cd.block, groups = cd.groups, opts = opts, first = 0, count = third},
+		{program = &m.program, block = cd.block, groups = cd.groups, opts = opts, first = third, count = third},
+		{program = &m.program, block = cd.block, groups = cd.groups, opts = opts, first = third * 2, count = -1},
+	}
+	threads: [3]^thread.Thread
+	for &th, ti in threads {
+		th = thread.create_and_start_with_poly_data(&jobs[ti], proc(job: ^Range_Job) {
+			s: oksl.Scratch
+			defer oksl.scratch_destroy(&s)
+			oksl.run_compute(job.program, job.block, job.groups, &s, job.opts, job.first, job.count)
+		})
+	}
+	for th in threads {
+		thread.destroy(th)
+	}
+}
+
+parity_f16_to_f32 :: proc(h: u16) -> f32 {
+	sign := u32(h & 0x8000) << 16
+	exp := u32((h >> 10) & 0x1f)
+	mant := u32(h & 0x03ff)
+	if exp == 0 {
+		if mant == 0 {
+			return transmute(f32)sign
+		}
+		e := u32(113)
+		for (mant & 0x0400) == 0 {
+			mant <<= 1
+			e -= 1
+		}
+		return transmute(f32)(sign | (e << 23) | ((mant & 0x03ff) << 13))
+	}
+	if exp == 31 {
+		return transmute(f32)(sign | 0x7f80_0000 | (mant << 13))
+	}
+	return transmute(f32)(sign | ((exp + 112) << 23) | (mant << 13))
+}
+
+// Compares what the GPU wrote (`gpu_bufs`: the read-write storage buffers'
+// bytes, `gpu_imgs`: the read-write images' tightly packed rows, each in
+// binding order) with the CPU's: integer words, r32ui and r32i texels
+// exactly, float words and rgba32f / r32f texels within 1e-4 (0.02 when the
+// shader samples, whose filtering differs), rgba16f within 2e-3 or one ulp
+// and rgba8 within 1 of 255. Atomics' results the testdata shaders fold so they do
+// not depend on order (atomics.comp, histogram.comp).
+compute_compare :: proc(m: ^oksl.Module, cd: ^Compute_Data, gpu_bufs, gpu_imgs: [][]u8) -> (string, bool) {
+	ro_buf, ro_tex := m.num_readonly_storage_buffers, m.num_readonly_storage_textures
+	max_f_err: f32 = 0
+	mismatches := 0
+	// Prints the first 4 mismatches.
+	report :: proc(mismatches: ^int, what: string, i, k: int, gpu, cpu: u32) {
+		if mismatches^ < 4 {
+			fmt.printfln("  %s %d [%d]: gpu %x, cpu %x", what, i, k, gpu, cpu)
+		}
+		mismatches^ += 1
+	}
+	for gb, i in gpu_bufs {
+		bi := ro_buf + i
+		fw := cd.float_words[bi]
+		gpu_w := slice.reinterpret([]u32, gb)
+		cpu_w := cd.cpu_bufs[bi]
+		for w, k in cpu_w {
+			if gpu_w[k] == w {
+				continue
+			}
+			if !fw[k % len(fw)] {
+				report(&mismatches, "buffer", bi, k, gpu_w[k], w)
+				continue
+			}
+			if same_float(transmute(f32)gpu_w[k], transmute(f32)w) {
+				continue
+			}
+			d := abs(transmute(f32)gpu_w[k] - transmute(f32)w)
+			max_f_err = max(max_f_err, d)
+			if !(d <= 1e-4) {
+				report(&mismatches, "buffer", bi, k, gpu_w[k], w)
+			}
+		}
+	}
+	for gpu_b, i in gpu_imgs {
+		ii := ro_tex + i
+		cpu_b := cd.cpu_imgs[ii].data
+		switch m.storage_images[ii].format {
+		case .None:
+		case .R32ui, .R32i:
+			gw, cw := slice.reinterpret([]u32, gpu_b), slice.reinterpret([]u32, cpu_b)
+			for k in 0 ..< len(gw) {
+				if gw[k] != cw[k] {
+					report(&mismatches, "image", ii, k, gw[k], cw[k])
+				}
+			}
+		case .Rgba8:
+			for k in 0 ..< len(gpu_b) {
+				d := abs(int(gpu_b[k]) - int(cpu_b[k]))
+				max_f_err = max(max_f_err, f32(d) / 255.0)
+				if d > 1 {
+					report(&mismatches, "image", ii, k, u32(gpu_b[k]), u32(cpu_b[k]))
+				}
+			}
+		case .Rgba16f:
+			gh, ch := slice.reinterpret([]u16, gpu_b), slice.reinterpret([]u16, cpu_b)
+			for k in 0 ..< len(gh) {
+				gf, cf := parity_f16_to_f32(gh[k]), parity_f16_to_f32(ch[k])
+				if same_float(gf, cf) {
+					continue
+				}
+				d := abs(gf - cf)
+				max_f_err = max(max_f_err, d)
+				// One half-float ulp (2^-10 relative) either way: the CPU
+				// rounds to nearest, D3D's conversion toward zero.
+				if !(d <= 2e-3 || d <= abs(cf) / 1024) {
+					report(&mismatches, "image", ii, k, u32(gh[k]), u32(ch[k]))
+				}
+			}
+		case .Rgba32f, .R32f:
+			gf, cf := slice.reinterpret([]f32, gpu_b), slice.reinterpret([]f32, cpu_b)
+			tol: f32 = 0.02 if m.num_samplers > 0 else 1e-4
+			for k in 0 ..< len(gf) {
+				if same_float(gf[k], cf[k]) {
+					continue
+				}
+				d := abs(gf[k] - cf[k])
+				max_f_err = max(max_f_err, d)
+				if !(d <= tol) {
+					report(&mismatches, "image", ii, k, transmute(u32)gf[k], transmute(u32)cf[k])
+				}
+			}
+		}
+	}
+	return fmt.tprintf("max float err %.6f, mismatches %d", max_f_err, mismatches), mismatches == 0
+}
+
+// Equal (infinities of a sign, either zero) or both NaN: before any
+// difference, which inf - inf would make NaN.
+same_float :: proc(a, b: f32) -> bool {
+	return a == b || math.is_nan(a) && math.is_nan(b)
+}
+
+// Every storage image format, read-only and read-write, and a single
+// channel format's missing components ((0, 0, 1)).
+IMAGE_FORMATS_CS :: `#version 310 es
+layout(local_size_x = 8, local_size_y = 4) in;
+
+layout(r32f) readonly uniform image2D inF;
+layout(r32i) readonly uniform iimage2D inI;
+layout(r32f) uniform image2D rwF;
+layout(r32i) uniform iimage2D rwI;
+layout(rgba8) writeonly uniform image2D out8;
+writeonly buffer Checks { uint ok_bits[]; } checks;
+
+void main() {
+    ivec2 sz = imageSize(out8);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= sz.x || p.y >= sz.y) {
+        return;
+    }
+    vec4 vf = imageLoad(inF, p);
+    ivec4 vi = imageLoad(inI, p);
+    vec4 rf = imageLoad(rwF, p);
+    ivec4 ri = imageLoad(rwI, p);
+    imageStore(rwF, p, vec4(rf.r + vf.r * 0.5 + vf.a, 9.0, 9.0, 9.0));
+    imageStore(rwI, p, ivec4(ri.r - vi.r + vi.a * 7, 3, 4, 5));
+    uint sub_ok = (vf.g == 0.0 && vf.b == 0.0 && vf.a == 1.0 && vi.g == 0 && vi.b == 0 && vi.a == 1) ? 1u : 0u;
+    checks.ok_bits[p.y * sz.x + p.x] = sub_ok * 100u + uint(vi.a + ri.a);
+    imageStore(out8, p, vec4(clamp(vf.r * 0.25, 0.0, 1.0), vf.g, vf.b, vf.a * 0.5));
+}`

@@ -365,6 +365,11 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 			append(&inputs, stage_var(&l, row))
 		}
 	}
+	// Options.num_work_groups_uniform: the CPU knows the group count, and
+	// reads it from run_compute's groups as without the option.
+	if c.num_groups_uniform != 0 {
+		append(&inputs, stage_var(&l, Interface_Var{kind = .Num_Work_Groups, sym = c.num_groups_uniform}))
+	}
 	for sym, i in u.syms {
 		if i > 0 && sym.storage == .Work_Group_Size {
 			l.sym_slot[i] = const_vec(&l, {c.local_size[0], c.local_size[1], c.local_size[2]})
@@ -375,7 +380,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	// Uniform slots, filled from the block before each run.
 	for sym, i in u.syms {
 		// Uniforms left out of the block (unused, index -1) have no slots.
-		if i == 0 || (sym.storage != .Uniform && sym.storage != .Builtin_Uniform) || sym.index < 0 {
+		if i == 0 || (sym.storage != .Uniform && sym.storage != .Builtin_Uniform) || sym.index < 0 || Sym_Id(i) == c.num_groups_uniform {
 			continue
 		}
 		t := ty(u, sym.type)

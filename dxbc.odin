@@ -68,6 +68,7 @@ Dx_Op :: enum u32 {
 	Ishl                = 0x29,
 	Ishr                = 0x2a,
 	Itof                = 0x2b,
+	Ld                  = 0x2d,
 	Log                 = 0x2f,
 	Loop                = 0x30,
 	Lt                  = 0x31,
@@ -115,11 +116,30 @@ Dx_Op :: enum u32 {
 	Dcl_Temps           = 0x68,
 	Dcl_Indexable_Temp  = 0x69,
 	Dcl_Global_Flags    = 0x6a,
+	Bufinfo             = 0x79,
 	Deriv_Rtx_Fine      = 0x7b,
 	Deriv_Rty_Fine      = 0x7d,
 	Rcp                 = 0x81,
+	Dcl_Thread_Group    = 0x9b,
+	Dcl_Uav_Typed       = 0x9c,
+	Dcl_Uav_Raw         = 0x9d,
+	Dcl_Tgsm_Raw        = 0x9f,
 	Dcl_Resource_Raw    = 0xa1,
+	Ld_Uav_Typed        = 0xa3,
+	Store_Uav_Typed     = 0xa4,
 	Ld_Raw              = 0xa5,
+	Store_Raw           = 0xa6,
+	Imm_Atomic_Iadd     = 0xb4,
+	Imm_Atomic_And      = 0xb5,
+	Imm_Atomic_Or       = 0xb6,
+	Imm_Atomic_Xor      = 0xb7,
+	Imm_Atomic_Exch     = 0xb8,
+	Imm_Atomic_Cmp_Exch = 0xb9,
+	Imm_Atomic_Imax     = 0xba,
+	Imm_Atomic_Imin     = 0xbb,
+	Imm_Atomic_Umax     = 0xbc,
+	Imm_Atomic_Umin     = 0xbd,
+	Sync                = 0xbe,
 }
 
 // Opcode token controls (bits 11..23).
@@ -133,24 +153,49 @@ DX_NZ :: 1 << 18
 DX_RESINFO_UINT :: 2 << 11
 @(private)
 DX_CB_DYNAMIC :: 1 << 11
+// dcl_uav_*'s _glc: the UAV is globally coherent, so sync_uglobal orders
+// its accesses for the whole GPU (without it, only for the thread group).
+@(private)
+DX_UAV_GLC :: 1 << 16
+// sync's flags: _t (the thread group's invocations wait for each other),
+// _g (a fence on its shared memory), _ugroup and _uglobal (a fence on UAV
+// memory for the thread group, for the whole GPU).
+@(private)
+DX_SYNC_T :: 1 << 11
+@(private)
+DX_SYNC_G :: 1 << 12
+@(private)
+DX_SYNC_UGROUP :: 1 << 13
+@(private)
+DX_SYNC_UGLOBAL :: 1 << 14
 
 // Operand types (register files).
 @(private)
 Dx_File :: enum u8 {
-	Temp      = 0,
-	Input     = 1,
-	Output    = 2,
-	Indexable = 3,
-	Imm       = 4,
-	Sampler   = 6,
-	Resource  = 7,
-	Cbuffer   = 8,
-	Null      = 13,
-	Omask     = 15,
+	Temp            = 0,
+	Input           = 1,
+	Output          = 2,
+	Indexable       = 3,
+	Imm             = 4,
+	Sampler         = 6,
+	Resource        = 7,
+	Cbuffer         = 8,
+	Null            = 13,
+	Omask           = 15,
+	Uav             = 30,
+	// Thread group shared memory (g#).
+	Tgsm            = 31,
+	// The compute shader's system values: SV_DispatchThreadID,
+	// SV_GroupID, SV_GroupThreadID, SV_GroupIndex.
+	Thread_ID       = 32,
+	Group_ID        = 33,
+	Group_Thread_ID = 34,
+	Group_Index     = 36,
 }
 
 // Indices an operand of each file takes in an SM5.1 instruction: r/v/o
-// [reg], x [array][reg], cb [id][slot][element], t/s [id][register].
+// [reg], x [array][reg], cb [id][slot][element], t/s/u [id][register], g
+// [reg]; the compute system values none.
 @(private, rodata)
 DX_DIMS := #partial #sparse [Dx_File]u8 {
 	.Temp      = 1,
@@ -160,6 +205,8 @@ DX_DIMS := #partial #sparse [Dx_File]u8 {
 	.Sampler   = 2,
 	.Resource  = 2,
 	.Cbuffer   = 3,
+	.Uav       = 2,
+	.Tgsm      = 1,
 }
 
 // A source operand, or a value: a register (its last index steps through
@@ -191,7 +238,7 @@ dx_reg :: proc "contextless" (file: Dx_File, reg: u32) -> Dx_Src {
 @(private)
 dx_at :: proc "contextless" (s: Dx_Src, k: int) -> Dx_Src {
 	r := s
-	if s.file == .Imm {
+	if s.file == .Imm || DX_DIMS[s.file] == 0 {
 		return r
 	}
 	r.idx[DX_DIMS[s.file] - 1] += u32(k)
@@ -307,9 +354,16 @@ dx_put_dst :: proc(buf: ^[dynamic]u32, s: Dx_Src, mask: u8) {
 	case .Omask:
 		append(buf, dx_token(.Omask, 1, 0, 0, 0, {}))
 		return
-	case .Temp, .Input, .Output, .Indexable, .Imm, .Sampler, .Resource, .Cbuffer:
+	case .Temp, .Input, .Output, .Indexable, .Imm, .Sampler, .Resource, .Cbuffer, .Uav, .Tgsm, .Thread_ID, .Group_ID, .Group_Thread_ID, .Group_Index:
 	}
 	append(buf, dx_token(s.file, 2, 0, u32(mask), u32(DX_DIMS[s.file]), dx_reps(s)))
+	dx_put_indices(buf, s)
+}
+
+// A memory operand an atomic writes (u# or g#, no components).
+@(private)
+dx_put_mem :: proc(buf: ^[dynamic]u32, s: Dx_Src) {
+	append(buf, dx_token(s.file, 0, 0, 0, u32(DX_DIMS[s.file]), {}))
 	dx_put_indices(buf, s)
 }
 
@@ -675,10 +729,18 @@ Dx :: struct {
 	// Symbols kept in an indexable temp though their type has no array
 	// (matrices indexed dynamically).
 	sym_x:      []bool,
-	// SM5.1 range ids: per channel, per storage buffer.
+	// SM5.1 range ids: per channel; each storage buffer's and storage
+	// image's operand (t# or u#, by Module.storage_buffers and
+	// .storage_images index); the image each image symbol or parameter
+	// names; each shared variable's first word in g0 (packed, as the CPU
+	// lays them out).
 	tex_id:     [SAMPLER_COUNT]u32,
-	buf_id:     []u32,
-	buf_reg:    []u32,
+	buf_res:    []Dx_Src,
+	img_res:    []Dx_Src,
+	sym_img:    []i8,
+	sym_word:   []u32,
+	// UAV registers declared (u0 up to u<uavs - 1>).
+	uavs:       u32,
 	cb_dynamic: bool,
 	terminated: bool,
 	// Where the code ended after the last break (a switch case needs one
@@ -795,12 +857,11 @@ dx_alloc :: proc(d: ^Dx, t: Type, indexable := false) -> Dx_Src {
 
 // ---- module ------------------------------------------------------------------------------
 
-// The DXBC container of a vertex or fragment shader (module_front rejects
-// Options.dxbc for compute), in the context's allocator: it is the only
-// allocation there, sized exactly; the emitter's working tables live in the
-// temporary allocator and are released on return.
+// The DXBC container of a shader (dxbc_supported has rejected what D3D12
+// lacks), in the context's allocator: it is the only allocation there,
+// sized exactly; the emitter's working tables live in the temporary
+// allocator and are released on return.
 emit_dxbc :: proc(u: ^Unit, c: ^Checked) -> []u8 {
-	assert(u.stage != .Compute)
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	out_allocator := context.allocator
 	context.allocator = context.temp_allocator
@@ -821,12 +882,17 @@ emit_dxbc :: proc(u: ^Unit, c: ^Checked) -> []u8 {
 	d.lvs = make([dynamic]Dx_LV)
 	d.sym_loc = make([]Dx_Src, len(u.syms))
 	d.sym_chan = make([]i8, len(u.syms))
+	d.sym_img = make([]i8, len(u.syms))
 	d.sym_x = make([]bool, len(u.syms))
+	d.sym_word = make([]u32, len(u.syms))
 	for &ch in d.sym_chan {
 		ch = -1
 	}
-	d.buf_id = make([]u32, len(c.buffers))
-	d.buf_reg = make([]u32, len(c.buffers))
+	for &im in d.sym_img {
+		im = -1
+	}
+	d.buf_res = make([]Dx_Src, len(c.buffers))
+	d.img_res = make([]Dx_Src, len(c.images))
 	dx_find_indexed_matrices(&d)
 
 	resources := make([dynamic]u32)
@@ -848,8 +914,13 @@ emit_dxbc :: proc(u: ^Unit, c: ^Checked) -> []u8 {
 	// as SPIR-V's and MSL's do; without it a driver treats every
 	// instruction as precise), the declarations, then the code, written
 	// straight into the container.
-	is_vertex := u.stage == .Vertex
-	head := [3]u32{0x51 | (u32(1) if is_vertex else 0) << 16, 0, u32(Dx_Op.Dcl_Global_Flags) | 1 << 11 | 1 << 24}
+	// The program type: pixel 0, vertex 1, compute 5.
+	program_types := [Stage]u32 {
+		.Fragment = 0,
+		.Vertex   = 1,
+		.Compute  = 5,
+	}
+	head := [3]u32{0x51 | program_types[u.stage] << 16, 0, u32(Dx_Op.Dcl_Global_Flags) | 1 << 11 | 1 << 24}
 	if d.cb_dynamic && len(resources) > 0 && resources[0] & 0x7ff == u32(Dx_Op.Dcl_Constant_Buffer) {
 		resources[0] |= DX_CB_DYNAMIC
 	}
@@ -875,8 +946,12 @@ emit_dxbc :: proc(u: ^Unit, c: ^Checked) -> []u8 {
 	}
 	isgn := [1][]u8{dxbc_signature(d.sig_in[:], false)}
 	osgn := [1][]u8{dxbc_signature(d.sig_out[:], true)}
-	chunks := [?]Dx_Chunk{{{'I', 'S', 'G', 'N'}, isgn[:]}, {{'O', 'S', 'G', 'N'}, osgn[:]}, {{'S', 'H', 'E', 'X'}, shex_bytes[:]}}
-	return dxbc_container(chunks[:], out_allocator)
+	// SFI0, the features the shader needs, only when it needs one: UAV
+	// registers past u7 (D3D_SHADER_REQUIRES_64_UAVS).
+	sfi0 := [2]u32{0x8, 0}
+	sfi0_parts := [1][]u8{slice.to_bytes(sfi0[:])}
+	chunks := [?]Dx_Chunk{{{'I', 'S', 'G', 'N'}, isgn[:]}, {{'O', 'S', 'G', 'N'}, osgn[:]}, {{'S', 'H', 'E', 'X'}, shex_bytes[:]}, {{'S', 'F', 'I', '0'}, sfi0_parts[:]}}
+	return dxbc_container(chunks[:4 if d.uavs > 8 else 3], out_allocator)
 }
 
 // Marks symbols whose matrices an expression indexes dynamically: they
@@ -913,16 +988,21 @@ dx_declare_interface :: proc(d: ^Dx, res: ^[dynamic]u32) {
 	u := d.u
 	c := d.checked
 	fragment := u.stage == .Fragment
+	compute := u.stage == .Compute
+	// SDL_GPU's spaces: vertex t / s 0 and b 1, fragment t / s 2 and b 3,
+	// compute t / s 0, u 1 and b 2.
 	space_tex: u32 = 2 if fragment else 0
-	space_cb: u32 = 3 if fragment else 1
-	next_tex: u32 = 0
+	space_cb: u32 = 3 if fragment else (2 if compute else 1)
+	space_uav: u32 = 1
+	next_tex, next_uav: u32 = 0, 0
 	ins_decl :: proc(buf: ^[dynamic]u32, op: Dx_Op, ctl: u32, words: ..u32) {
 		start := len(buf)
 		append(buf, u32(op) | ctl)
 		append(buf, ..words)
 		dx_end(buf, start)
 	}
-	// The constant buffer first, then samplers, textures and buffers.
+	// The constant buffer first, then samplers, textures, storage images
+	// and storage buffers.
 	for row in c.interface {
 		if row.kind == .Uniform_Block {
 			size := u32(round_up(c.block_size, 16) / 16)
@@ -945,17 +1025,73 @@ dx_declare_interface :: proc(d: ^Dx, res: ^[dynamic]u32) {
 			ins_decl(res, .Dcl_Resource, dim << 11, dx_token(.Resource, 1, 0, 0, 3, {}), d.tex_id[ch], ch, ch, 0x5555, space_tex)
 		}
 	}
+	// UAVs a device-scope barrier orders are globally coherent:
+	// memoryBarrier() and memoryBarrierBuffer() the raw (buffer) ones,
+	// memoryBarrier() and memoryBarrierImage() the typed (image) ones.
+	glc_raw, glc_typed: u32
+	if compute {
+		for e in u.exprs {
+			if e.kind == .Call && e.call == .Builtin {
+				#partial switch e.builtin {
+				case .Memory_Barrier:
+					glc_raw, glc_typed = DX_UAV_GLC, DX_UAV_GLC
+				case .Memory_Barrier_Buffer:
+					glc_raw = DX_UAV_GLC
+				case .Memory_Barrier_Image:
+					glc_typed = DX_UAV_GLC
+				}
+			}
+		}
+	}
+	// Read-only images are typed SRVs (t#, ld), the others typed UAVs (u#),
+	// 2D with the format's return type (float 5, uint 4, sint 3).
+	for row in c.interface {
+		if row.kind == .Storage_Image {
+			i := u.syms[row.sym].index
+			reg := u32(row.binding)
+			ret: u32 = 0x5555
+			#partial switch image_format_of(sym_type(u, row.sym)) {
+			case .R32ui:
+				ret = 0x4444
+			case .R32i:
+				ret = 0x3333
+			}
+			if row.set == 0 {
+				ins_decl(res, .Dcl_Resource, 3 << 11, dx_token(.Resource, 1, 0, 0, 3, {}), next_tex, reg, reg, ret, space_tex)
+				d.img_res[i] = Dx_Src{file = .Resource, idx = {next_tex, reg, 0}, rel = -1, swz = DX_XYZW}
+				next_tex += 1
+			} else {
+				ins_decl(res, .Dcl_Uav_Typed, 3 << 11 | glc_typed, dx_token(.Uav, 1, 0, 0, 3, {}), next_uav, reg, reg, ret, space_uav)
+				d.img_res[i] = Dx_Src{file = .Uav, idx = {next_uav, reg, 0}, rel = -1, swz = DX_XYZW}
+				d.uavs = max(d.uavs, reg + 1)
+				next_uav += 1
+			}
+			d.sym_img[row.sym] = i8(i)
+		}
+	}
+	// Storage buffers are raw: SRVs (t#) when read-only (every graphics
+	// stage's), else UAVs (u#).
 	for row in c.interface {
 		if row.kind == .Buffer {
 			i := u.syms[row.sym].index
 			reg := u32(row.binding)
-			ins_decl(res, .Dcl_Resource_Raw, 0, dx_token(.Resource, 1, 0, 0, 3, {}), next_tex, reg, reg, space_tex)
-			d.buf_id[i] = next_tex
-			d.buf_reg[i] = reg
-			next_tex += 1
+			if compute && row.set == 1 {
+				ins_decl(res, .Dcl_Uav_Raw, glc_raw, dx_token(.Uav, 1, 0, 0, 3, {}), next_uav, reg, reg, space_uav)
+				d.buf_res[i] = Dx_Src{file = .Uav, idx = {next_uav, reg, 0}, rel = -1, swz = DX_XYZW}
+				d.uavs = max(d.uavs, reg + 1)
+				next_uav += 1
+			} else {
+				ins_decl(res, .Dcl_Resource_Raw, 0, dx_token(.Resource, 1, 0, 0, 3, {}), next_tex, reg, reg, space_tex)
+				d.buf_res[i] = Dx_Src{file = .Resource, idx = {next_tex, reg, 0}, rel = -1, swz = DX_XYZW}
+				next_tex += 1
+			}
 		}
 	}
 
+	if compute {
+		dx_declare_compute(d)
+		return
+	}
 	io := &d.io_decls
 	// The outputs are declared first (fxc's order), then the inputs.
 	for row in c.interface {
@@ -1023,6 +1159,106 @@ dx_declare_interface :: proc(d: ^Dx, res: ^[dynamic]u32) {
 		}
 	}
 }
+
+// A compute shader's thread group, its system values and its shared
+// memory: every shared variable packed into g0 from its first word, in
+// declaration order, as the CPU lays them out (run-time indexes are
+// clamped into their variable, so no access leaves it).
+@(private)
+dx_declare_compute :: proc(d: ^Dx) {
+	u := d.u
+	c := d.checked
+	io := &d.io_decls
+	ls := c.local_size
+	append(io, u32(Dx_Op.Dcl_Thread_Group) | 4 << 24, ls.x, ls.y, ls.z)
+	for row in c.interface {
+		file: Dx_File
+		mask: u32 = 0x7
+		#partial switch row.kind {
+		case .Global_Invocation_ID:
+			file = .Thread_ID
+		case .Work_Group_ID:
+			file = .Group_ID
+		case .Local_Invocation_ID:
+			file = .Group_Thread_ID
+		case .Local_Invocation_Index:
+			file, mask = .Group_Index, 0x1
+		case:
+			continue
+		}
+		append(io, u32(Dx_Op.Dcl_Input) | 2 << 24, dx_token(file, 2, 0, mask, 0, {}))
+		d.sym_loc[row.sym] = dx_reg(file, 0)
+	}
+	words: u32 = 0
+	for sh in c.shared_vars {
+		d.sym_word[sh] = words
+		words += u32(component_count(u, sym_type(u, sh)))
+	}
+	if words > 0 {
+		append(io, u32(Dx_Op.Dcl_Tgsm_Raw) | 4 << 24, dx_token(.Tgsm, 0, 0, 0, 1, {}), 0, 4 * words)
+	}
+}
+
+// What DXBC cannot express, as errors on `u`: gl_NumWorkGroups (Direct3D
+// has no system value for it and SDL_GPU passes none) unless
+// Options.num_work_groups_uniform makes it a uniform, and a local_size_z
+// over D3D12's 64.
+@(private)
+dxbc_supported :: proc(u: ^Unit, c: ^Checked) -> bool {
+	ok := true
+	for row in c.interface {
+		if row.kind != .Num_Work_Groups {
+			continue
+		}
+		pos := u.syms[row.sym].pos
+		for e in u.exprs {
+			if e.kind == .Ident && e.sym == row.sym {
+				pos = e.pos
+				break
+			}
+		}
+		append(&u.errors, Error{pos = pos, code = .Dxbc_Num_Work_Groups})
+		ok = false
+	}
+	// Registers by SDL_GPU's bindings: u for a compute shader's writable
+	// images and buffers, t for the rest; the first resource past the
+	// limit is named.
+	for row in c.interface {
+		if row.kind != .Channel && row.kind != .Storage_Image && row.kind != .Buffer {
+			continue
+		}
+		uav := u.stage == .Compute && row.kind != .Channel && row.set == 1
+		limit: i32 = DX_MAX_UAVS if uav else DX_MAX_SRVS
+		if row.binding < limit {
+			continue
+		}
+		n: i32 = 0
+		for r in c.interface {
+			if (r.kind == .Channel || r.kind == .Storage_Image || r.kind == .Buffer) && (u.stage == .Compute && r.kind != .Channel && r.set == 1) == uav {
+				n = max(n, r.binding + 1)
+			}
+		}
+		sym := u.syms[row.sym]
+		name := u.buffer_decls[c.buffer_decls[sym.index]].block if row.kind == .Buffer else sym.name
+		append(&u.errors, Error{pos = sym.pos, code = .Dxbc_Too_Many_Uavs if uav else .Dxbc_Too_Many_Srvs, name = name, n = i64(n), m = i64(limit)})
+		ok = false
+		break
+	}
+	if c.local_size.z > DX_MAX_LOCAL_SIZE_Z {
+		append(&u.errors, Error{pos = c.local_size_pos.z, code = .Dxbc_Local_Size_Z, n = i64(c.local_size.z), m = DX_MAX_LOCAL_SIZE_Z})
+		ok = false
+	}
+	return ok
+}
+
+// D3D12's largest thread group z (D3D12_CS_THREAD_GROUP_MAX_Z), and its
+// UAV and SRV registers (D3D12_UAV_SLOT_COUNT, the 128 t# of SM5).
+@(private)
+DX_MAX_LOCAL_SIZE_Z :: 64
+@(private)
+DX_MAX_UAVS :: 64
+@(private)
+DX_MAX_SRVS :: 128
 
 // A stage output lives in a temporary (outputs cannot be read), zero until
 // written and copied to `dst` at the end.

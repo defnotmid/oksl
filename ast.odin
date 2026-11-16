@@ -328,6 +328,8 @@ Unit :: struct {
 	features:     Features,
 	// A Shadertoy buffer pass: the entry adapter keeps mainImage's colour.
 	buffer_pass:  bool,
+	// Options.num_work_groups_uniform.
+	num_groups_uniform: bool,
 	// A vertex shader's taps (Options.taps): the entry runs a copy of main
 	// for each.
 	taps:         []Tap,
@@ -356,7 +358,7 @@ Unit :: struct {
 	calls:        [dynamic][2]Func_Id,
 }
 
-unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass := false, stage := Stage.Fragment, taps: []Tap = nil) {
+unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass := false, stage := Stage.Fragment, taps: []Tap = nil, num_groups_uniform := false) {
 	context.allocator = allocator
 	u.allocator = allocator
 	u.profile = profile
@@ -364,6 +366,7 @@ unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass 
 	u.stage = stage
 	u.features = profile_features(profile, stage)
 	u.buffer_pass = buffer_pass
+	u.num_groups_uniform = num_groups_uniform
 	u.taps = taps
 	u.errors = make([dynamic]Error)
 	u.exprs = make([dynamic]Expr)

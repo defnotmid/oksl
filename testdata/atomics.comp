@@ -77,7 +77,7 @@ void main() {
 
     int si = int(tid) - 64;
     uint ui = tid + 1u;
-    int dyn_c = int(tid & 3u);
+    int dyn_c = int(tid % 3u);
 
     // Shared atomics: swizzles, struct fields, arrays, dynamic vector indexing.
     atomicAdd(sh_pack.iv.x, si);

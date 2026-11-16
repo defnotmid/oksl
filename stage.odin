@@ -243,7 +243,7 @@ stage_var_rows :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 	if c.gl_group_id != 0 {
 		append(rows, Interface_Var{kind = .Work_Group_ID, sym = c.gl_group_id})
 	}
-	if c.gl_num_groups != 0 {
+	if c.gl_num_groups != 0 && !c.u.num_groups_uniform {
 		append(rows, Interface_Var{kind = .Num_Work_Groups, sym = c.gl_num_groups})
 	}
 	if c.gl_local_index != 0 {

@@ -219,8 +219,12 @@ Error_Code :: enum u8 {
 	Atomic_Target,
 	Unsupported_Atomic_Counter,
 	Unsupported_Image_Atomic,
-	// Options.dxbc on a compute shader (DXBC has vertex and fragment only).
-	Dxbc_Compute,
+	// Options.dxbc: what Direct3D 12 lacks (gl_NumWorkGroups, a thread group
+	// deeper than 64, more than 64 UAV or 128 SRV registers).
+	Dxbc_Num_Work_Groups,
+	Dxbc_Local_Size_Z,
+	Dxbc_Too_Many_Uavs,
+	Dxbc_Too_Many_Srvs,
 }
 
 // A diagnostic at `pos` (the user's line and column: macro expansions keep
@@ -430,7 +434,10 @@ ERROR_TEXT := [Error_Code]string {
 	.Atomic_Target         = "{name} requires a shared variable or read-write buffer element",
 	.Unsupported_Atomic_Counter = "atomic_uint counters are not supported; use atomic operations on a storage buffer or shared variable",
 	.Unsupported_Image_Atomic   = "{name} is not in GLSL ES 3.10 core; use atomic operations on a storage buffer or shared variable",
-	.Dxbc_Compute               = "DXBC is emitted for vertex and fragment shaders, not compute shaders",
+	.Dxbc_Num_Work_Groups       = "gl_NumWorkGroups has no Direct3D 12 equivalent (SDL_GPU passes no group count); for DXBC, compile with Options.num_work_groups_uniform and write the count at Module.num_work_groups_offset",
+	.Dxbc_Local_Size_Z          = "local_size_z = {n} is more than Direct3D 12's maximum of {m}",
+	.Dxbc_Too_Many_Uavs         = "{name} needs {n} UAV registers (writable storage images and buffers); Direct3D 12 has {m}",
+	.Dxbc_Too_Many_Srvs         = "{name} needs {n} SRV registers (samplers, read-only storage images and buffers); Direct3D 12 has {m}",
 }
 
 // The text of a diagnostic (without its position).

@@ -29,9 +29,18 @@ Options :: struct {
 	no_spirv: bool,
 	no_msl:   bool,
 	no_cpu:   bool,
-	// Also emit DXBC (Module.dxbc) for Direct3D 12: vertex and fragment
-	// shaders; a compute shader with it set is an error (Dxbc_Compute).
+	// Also emit DXBC (Module.dxbc) for Direct3D 12; what D3D12 lacks is an
+	// error (gl_NumWorkGroups without num_work_groups_uniform:
+	// Dxbc_Num_Work_Groups; local_size_z over 64: Dxbc_Local_Size_Z; more
+	// than 64 UAVs or 128 SRVs: Dxbc_Too_Many_Uavs, Dxbc_Too_Many_Srvs).
 	dxbc:     bool,
+	// Compute: gl_NumWorkGroups is a uvec3 the checker adds to the uniform
+	// block, read by SPIR-V, MSL and DXBC, for hosts that dispatch through
+	// APIs without a group count (Direct3D 12 has no system value for it and
+	// SDL_GPU passes none): write the dispatch's group count as three u32s
+	// at Module.num_work_groups_offset. The CPU reads run_compute's
+	// `groups`, which it knows, whatever the block holds.
+	num_work_groups_uniform: bool,
 	// Vertex shaders: runs of main for other environments, each giving the
 	// vertex's position there (a motion blur's shutter opening). In
 	// compile_pipeline, the vertex stage's.
@@ -122,11 +131,17 @@ Module :: struct {
 	spirv:         []u32,
 	// Metal source; entry point MSL_ENTRY.
 	msl:           string,
-	// A DXBC container (Shader Model 5.1, vs_5_1 or ps_5_1) for Direct3D
+	// A DXBC container (Shader Model 5.1: vs_5_1, ps_5_1 or cs_5_1) for Direct3D
 	// 12, when Options.dxbc asks for it; entry point DXBC_ENTRY.
 	dxbc:          []u8,
-	// The uniforms of the block's first environment.
+	// The uniforms of the block's first environment (the shader's own;
+	// not Options.num_work_groups_uniform's).
 	uniforms:      []Uniform_Info,
+	// Options.num_work_groups_uniform: the byte offset in the block of the
+	// uvec3 a GPU reads gl_NumWorkGroups from (write the dispatch's group
+	// count there as three u32s); -1 when the shader does not read it or
+	// the option is off.
+	num_work_groups_offset: int,
 	// Size of the uniform block in bytes (a multiple of 16): (1 + taps)
 	// environments of `block_stride` bytes, each laid out as `uniforms`.
 	block_size:    int,
@@ -200,13 +215,9 @@ compile :: proc(source: string, options := Options{}) -> (m: ^Module, errors: []
 @(private)
 module_front :: proc(source: string, options: Options, src, prelude_src: Source) -> (u: ^Unit, toks: []Token, ok: bool) {
 	u = new(Unit)
-	unit_init(u, options.profile, context.allocator, buffer_pass = options.unclamped, stage = options.stage, taps = options.taps)
+	unit_init(u, options.profile, context.allocator, buffer_pass = options.unclamped, stage = options.stage, taps = options.taps, num_groups_uniform = options.num_work_groups_uniform)
 	if options.stage not_in PROFILE_RULES[options.profile].stages {
 		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Stage_Unsupported, a = PROFILE_NAMES[options.profile], b = STAGE_NAMES[options.stage]})
-		return u, nil, false
-	}
-	if options.dxbc && options.stage == .Compute {
-		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Dxbc_Compute})
 		return u, nil, false
 	}
 	if len(options.taps) > 0 && options.stage != .Vertex {
@@ -261,6 +272,9 @@ tokens_valid :: proc(toks: []Token, errors: ^[dynamic]Error) -> bool {
 @(private)
 module_build :: proc(m: ^Module, u: ^Unit, toks: []Token, options: Options) -> bool {
 	checked := module_check(u, toks) or_return
+	if options.dxbc && !dxbc_supported(u, &checked) {
+		return false
+	}
 	module_emit(m, u, &checked, options)
 	return true
 }
@@ -287,10 +301,18 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 	m.inputs_used = c.inputs_used
 	// The taps' copies follow the first environment's uniforms.
 	uniforms := make([dynamic]Uniform_Info)
+	m.num_work_groups_offset = -1
+	if c.num_groups_uniform != 0 {
+		m.num_work_groups_offset = u.syms[c.num_groups_uniform].index
+	}
 	for sid in c.uniforms {
 		s := u.syms[sid]
 		if s.index >= c.block_stride {
 			break
+		}
+		if sid == c.num_groups_uniform {
+			// Not the shader's: it has its own field.
+			continue
 		}
 		t := ty(u, s.type)
 		_, size := std140(t)

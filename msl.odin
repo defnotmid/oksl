@@ -327,7 +327,7 @@ emit_uniform_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 	}
 	for s in m.c.uniforms {
 		sym := m.u.syms[s]
-		append(&members, Msl_Member{fmt.aprintf("ok_%s", sym.name), ty(m.u, sym.type), sym.index})
+		append(&members, Msl_Member{uniform_member_name(sym), ty(m.u, sym.type), sym.index})
 	}
 	strings.write_string(out, "struct Oksl_Uniforms {\n")
 	cur := 0
@@ -369,6 +369,9 @@ emit_uniform_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 uniform_member_name :: proc(sym: Symbol) -> string {
 	if sym.storage == .Builtin_Uniform {
 		return builtin_members()[builtin_member_index(sym.index)].name
+	}
+	if sym.name == NUM_GROUPS_SYM {
+		return "oksl_num_work_groups"
 	}
 	return fmt.aprintf("ok_%s", sym.name)
 }

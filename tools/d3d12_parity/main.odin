@@ -14,12 +14,16 @@
 // perspective and flat integers, and the DXBC emitter's own cases
 // (edge.odin: early returns, loops, indexing and bounds, integers,
 // evaluation order, bools, discard, channels through functions, built-ins
-// at their edges). The CPU side is tools/parity's, shared with gpu_parity.
+// at their edges); then every testdata compute shader, image_formats and
+// the emitter's compute cases (edge_compute.odin), dispatched with SDL_GPU's
+// compute root signature (compute.odin), every writable buffer word and
+// image texel compared with the CPU's run_compute. The CPU side is
+// tools/parity's, shared with gpu_parity.
 //
 // Bindings follow SDL_GPU's D3D12 rules: vertex t[n] / s[n] in space0 and
 // b0 in space1, pixel t[n] / s[n] in space2 and b0 in space3 (root CBVs and
 // descriptor tables, as SDL's root signature has them), vertex inputs
-// TEXCOORD<location>.
+// TEXCOORD<location>; compute t / s in space0, u in space1, b0 in space2.
 //
 // Writes <name>_d3d12.png, <name>_cpu.png and <name>_diff.png.
 //
@@ -116,13 +120,14 @@ submit :: proc(g: ^Gpu) {
 	list_reset(g.list, g.allocator)
 }
 
-// Uploads `data` into a new default-heap buffer in state SHADER_READ.
-upload_buffer :: proc(g: ^Gpu, data: []u8, state := SHADER_READ) -> rawptr {
+// Uploads `data` into a new default-heap buffer (`flags`) in `state`.
+upload_buffer :: proc(g: ^Gpu, data: []u8, state := SHADER_READ, flags := d3d12.RESOURCE_FLAGS{}) -> rawptr {
 	desc := buffer_desc(len(data))
 	// Created in COMMON (D3D12 ignores a buffer's initial state); the
 	// copy promotes it to COPY_DEST.
-	buf := create_committed_resource(g.device, .DEFAULT, &desc, {})
 	staging := create_committed_resource(g.device, .UPLOAD, &desc, d3d12.RESOURCE_STATE_GENERIC_READ)
+	desc.Flags = flags
+	buf := create_committed_resource(g.device, .DEFAULT, &desc, {})
 	defer release(staging)
 	copy(resource_map(staging)[:len(data)], data)
 	resource_unmap(staging)
@@ -133,9 +138,11 @@ upload_buffer :: proc(g: ^Gpu, data: []u8, state := SHADER_READ) -> rawptr {
 }
 
 // A texture from `levels` mips of `layers` layers: subresource
-// (level, layer)'s rows come from `rows` (at layer first_layer + layer).
-upload_texture :: proc(g: ^Gpu, format: dxgi.FORMAT, w, h, layers, levels, bpp: int, rows: proc(level, layer, y: int, out: []u8), first_layer := 0) -> rawptr {
+// (level, layer)'s rows come from `rows` (at layer first_layer + layer,
+// given `user`); created with `flags`, left in `state`.
+upload_texture :: proc(g: ^Gpu, format: dxgi.FORMAT, w, h, layers, levels, bpp: int, rows: proc(level, layer, y: int, out: []u8, user: rawptr), first_layer := 0, user: rawptr = nil, flags := d3d12.RESOURCE_FLAGS{}, state := SHADER_READ) -> rawptr {
 	desc := texture_desc(format, w, h, layers, levels)
+	desc.Flags = flags
 	tex := create_committed_resource(g.device, .DEFAULT, &desc, {.COPY_DEST})
 	n := layers * levels
 	footprints := make([]d3d12.PLACED_SUBRESOURCE_FOOTPRINT, n, context.temp_allocator)
@@ -149,7 +156,7 @@ upload_texture :: proc(g: ^Gpu, format: dxgi.FORMAT, w, h, layers, levels, bpp: 
 			fp := footprints[layer * levels + level]
 			lw, lh := max(w >> uint(level), 1), max(h >> uint(level), 1)
 			for y in 0 ..< lh {
-				rows(level, first_layer + layer, y, mapped[int(fp.Offset) + y * int(fp.Footprint.RowPitch):][:lw * bpp])
+				rows(level, first_layer + layer, y, mapped[int(fp.Offset) + y * int(fp.Footprint.RowPitch):][:lw * bpp], user)
 			}
 		}
 	}
@@ -161,7 +168,7 @@ upload_texture :: proc(g: ^Gpu, format: dxgi.FORMAT, w, h, layers, levels, bpp: 
 		src.PlacedFootprint = footprints[i]
 		copy_texture_region(g.list, &dst, &src)
 	}
-	transition(g.list, tex, {.COPY_DEST}, SHADER_READ)
+	transition(g.list, tex, {.COPY_DEST}, state)
 	submit(g)
 	return tex
 }
@@ -178,7 +185,7 @@ gpu_init :: proc(g: ^Gpu, hardware: bool) -> bool {
 	g.allocator = create_command_allocator(g.device)
 	g.list = create_command_list(g.device, g.allocator)
 	g.fence = create_fence(g.device)
-	srv := d3d12.DESCRIPTOR_HEAP_DESC{Type = .CBV_SRV_UAV, NumDescriptors = 64, Flags = {.SHADER_VISIBLE}}
+	srv := d3d12.DESCRIPTOR_HEAP_DESC{Type = .CBV_SRV_UAV, NumDescriptors = 256, Flags = {.SHADER_VISIBLE}}
 	smp := d3d12.DESCRIPTOR_HEAP_DESC{Type = .SAMPLER, NumDescriptors = 32, Flags = {.SHADER_VISIBLE}}
 	rtv := d3d12.DESCRIPTOR_HEAP_DESC{Type = .RTV, NumDescriptors = len(Target)}
 	g.srv_heap = create_descriptor_heap(g.device, &srv)
@@ -209,7 +216,7 @@ gpu_init :: proc(g: ^Gpu, hardware: bool) -> bool {
 	resource_unmap(g.quad)
 
 	g.resources[.Words] = upload_buffer(g, slice.to_bytes(parity.test_words[:]))
-	layer_rows :: proc(level, layer, y: int, out: []u8) {
+	layer_rows :: proc(level, layer, y: int, out: []u8, _: rawptr) {
 		n := TEX >> uint(level)
 		for i in 0 ..< len(out) {
 			out[i] = parity.layer_pixel(parity.level_offset(level) + y * n * 4 + i, layer)
@@ -219,13 +226,13 @@ gpu_init :: proc(g: ^Gpu, hardware: bool) -> bool {
 		g.resources[s] = upload_texture(g, .R8G8B8A8_UNORM, TEX, TEX, 1, LEVELS, 4, layer_rows, first_layer = l)
 	}
 	g.resources[.Layers] = upload_texture(g, .R8G8B8A8_UNORM, TEX, TEX, LAYERS, LEVELS, 4, layer_rows)
-	g.resources[.R32f] = upload_texture(g, .R32_FLOAT, parity.BOUND_R_W, parity.BOUND_R_H, 1, 1, 4, proc(level, layer, y: int, out: []u8) {
+	g.resources[.R32f] = upload_texture(g, .R32_FLOAT, parity.BOUND_R_W, parity.BOUND_R_H, 1, 1, 4, proc(level, layer, y: int, out: []u8, _: rawptr) {
 		copy(out, slice.to_bytes(parity.bound_r_texels[y * parity.BOUND_R_W:][:parity.BOUND_R_W]))
 	})
-	g.resources[.Rg32f] = upload_texture(g, .R32G32_FLOAT, parity.BOUND_RG_W, parity.BOUND_RG_H, 1, 1, 8, proc(level, layer, y: int, out: []u8) {
+	g.resources[.Rg32f] = upload_texture(g, .R32G32_FLOAT, parity.BOUND_RG_W, parity.BOUND_RG_H, 1, 1, 8, proc(level, layer, y: int, out: []u8, _: rawptr) {
 		copy(out, slice.to_bytes(parity.bound_rg_texels[y * parity.BOUND_RG_W:][:parity.BOUND_RG_W]))
 	})
-	g.resources[.Rgba32f] = upload_texture(g, .R32G32B32A32_FLOAT, parity.BOUND_RGBA_W, parity.BOUND_RGBA_H, 1, 1, 16, proc(level, layer, y: int, out: []u8) {
+	g.resources[.Rgba32f] = upload_texture(g, .R32G32B32A32_FLOAT, parity.BOUND_RGBA_W, parity.BOUND_RGBA_H, 1, 1, 16, proc(level, layer, y: int, out: []u8, _: rawptr) {
 		copy(out, slice.to_bytes(parity.bound_rgba_texels[y * parity.BOUND_RGBA_W:][:parity.BOUND_RGBA_W]))
 	})
 
@@ -470,12 +477,16 @@ main :: proc() {
 
 	infos, _ := os.read_all_directory_by_path(data_dir, context.allocator)
 	names := make([dynamic]string)
+	comp_names := make([dynamic]string)
 	for fi in infos {
 		if o, known := oksl.options_of_path(fi.name); known && o.stage == .Fragment {
 			append(&names, fi.fullpath)
+		} else if known && o.stage == .Compute {
+			append(&comp_names, fi.fullpath)
 		}
 	}
 	slice.sort(names[:])
+	slice.sort(comp_names[:])
 	failed := 0
 	scratch: oksl.Scratch
 	defer oksl.scratch_destroy(&scratch)
@@ -516,7 +527,30 @@ main :: proc() {
 	if debug_messages() > 0 || !face_ok {
 		failed += 1
 	}
-	checks := len(names) + len(EDGE_SHADERS) + 4
+	// Compute: every testdata compute shader, image_formats, the emitter's
+	// own cases (edge_compute.odin).
+	compute_report :: proc(name, detail: string, ok: bool, failed: ^int) {
+		fmt.printfln("%-20s %s  %s", name, detail, "ok" if ok else "MISMATCH")
+		if debug_messages() > 0 || !ok {
+			failed^ += 1
+		}
+		free_all(context.temp_allocator)
+	}
+	for path in comp_names {
+		src, _ := os.read_entire_file(path, context.allocator)
+		options, _ := oksl.options_of_path(path)
+		name := filepath.base(path)
+		detail, ok := compute_check(&g, name, string(src), options, parity.compute_shape(name))
+		compute_report(name, detail, ok, &failed)
+		delete(src)
+	}
+	fmt_detail, fmt_ok := compute_check(&g, "image_formats", parity.IMAGE_FORMATS_CS, {profile = .Glsl, stage = .Compute}, parity.compute_shape(""))
+	compute_report("image_formats", fmt_detail, fmt_ok, &failed)
+	for e in EDGE_COMPUTE {
+		detail, ok := compute_check(&g, e.name, e.source, {profile = .Glsl, stage = .Compute}, e.shape)
+		compute_report(e.name, detail, ok, &failed)
+	}
+	checks := len(names) + len(EDGE_SHADERS) + 4 + len(comp_names) + 1 + len(EDGE_COMPUTE)
 	fmt.printfln("%d/%d checks match (images in %s)", checks - failed, checks, out_dir)
 	if failed > 0 {
 		os.exit(1)

@@ -330,6 +330,17 @@ Dx_LV :: struct {
 	comp:    i32,
 	// Bools in the uniform block are 0 / 1 words.
 	as_uint: bool,
+	// Memory (dx_is_mem: shared memory, g0, packed as on the CPU; a storage
+	// buffer's t# or u#, std430): the value's word, `word` plus the run-time
+	// word offset in temp `dyn`'s x (-1 for none); a vector's swizzle is in
+	// `swz`, a component chosen at run time is folded into `dyn`.
+	word:    u32,
+	dyn:     i32,
+}
+
+@(private)
+dx_is_mem :: proc "contextless" (lv: Dx_LV) -> bool {
+	return lv.loc.file == .Tgsm || lv.loc.file == .Resource || lv.loc.file == .Uav
 }
 
 // The clamped index `i` (0 ..< n) times `size`, added to `rel` when set,
@@ -386,8 +397,18 @@ dx_lvalue :: proc(d: ^Dx, id: Expr_Id) -> Dx_LV {
 			}
 			return lv
 		}
-		return {loc = d.sym_loc[e.sym], type = t, comp = -1}
+		if sym.storage == .Shared {
+			return {loc = dx_reg(.Tgsm, 0), type = t, comp = -1, word = d.sym_word[e.sym], dyn = -1}
+		}
+		return {loc = d.sym_loc[e.sym], type = t, comp = -1, dyn = -1}
+	case .Buffer_Load:
+		p, _ := buf_path(u, id)
+		return dx_buf_lvalue(d, p)
 	case .Index:
+		if root, _ := target_buffer(u, id); root != 0 {
+			p, _ := buf_path(u, id)
+			return dx_buf_lvalue(d, p)
+		}
 		base := dx_lvalue(d, e.a)
 		rt := expr_type(u, id)
 		ix := u.exprs[e.b]
@@ -414,13 +435,37 @@ dx_lvalue :: proc(d: ^Dx, id: Expr_Id) -> Dx_LV {
 					dx_ins(&d.code, .Ieq, 0, c, 1, t, dx_imm(u32(k)))
 					dx_ins(&d.code, .Movc, 0, mapped, 1, c, dx_imm(u32(base.swz[k])), mapped)
 				}
-				base.comp = i32(mapped.idx[0])
+				if dx_is_mem(base) {
+					// The component's word.
+					if base.dyn >= 0 {
+						dx_ins(&d.code, .Iadd, 0, mapped, 1, mapped, dx_comp(dx_reg(.Temp, u32(base.dyn)), 0))
+					}
+					base.dyn = i32(mapped.idx[0])
+				} else {
+					base.comp = i32(mapped.idx[0])
+				}
+				base.swz_len = 0
+			}
+			if lit && dx_is_mem(base) {
+				// One component: its word.
+				base.word += u32(base.swz[0])
 				base.swz_len = 0
 			}
 			base.type = rt
 			return base
 		}
 		n := int(bt.array) if is_array(bt) else int(bt.cols)
+		if dx_is_mem(base) {
+			// Elements of component_count words (matrices' columns rows).
+			words := component_count(u, rt)
+			if lit {
+				base.word += u32(clamp(int(ix.value), 0, n - 1) * words)
+			} else {
+				base.dyn = i32(dx_index(d, e.b, n, words, base.dyn, 0))
+			}
+			base.type = rt
+			return base
+		}
 		size := dx_regs(u, rt)
 		if lit {
 			base.loc = dx_at(base.loc, clamp(int(ix.value), 0, n - 1) * size)
@@ -434,6 +479,10 @@ dx_lvalue :: proc(d: ^Dx, id: Expr_Id) -> Dx_LV {
 		base.type = rt
 		return base
 	case .Field:
+		if root, _ := target_buffer(u, id); root != 0 {
+			p, _ := buf_path(u, id)
+			return dx_buf_lvalue(d, p)
+		}
 		base := dx_lvalue(d, e.a)
 		if e.swizzle_len > 0 {
 			if is_scalar(base.type) {
@@ -452,16 +501,36 @@ dx_lvalue :: proc(d: ^Dx, id: Expr_Id) -> Dx_LV {
 			base.type = expr_type(u, id)
 			return base
 		}
-		base.loc = dx_at(base.loc, dx_field_reg(u, base.type.strukt, e.field))
+		if dx_is_mem(base) {
+			base.word += u32(dx_field_words(u, base.type.strukt, e.field))
+		} else {
+			base.loc = dx_at(base.loc, dx_field_reg(u, base.type.strukt, e.field))
+		}
 		base.type = expr_type(u, id)
 		return base
 	}
 	return {}
 }
 
+// The word offset of field `field` in struct `st` packed (shared memory).
+@(private)
+dx_field_words :: proc(u: ^Unit, st: i32, field: i32) -> int {
+	n := 0
+	for f, i in struct_fields(u, st) {
+		if i32(i) == field {
+			break
+		}
+		n += component_count(u, ty(u, f.type))
+	}
+	return n
+}
+
 @(private)
 dx_load :: proc(d: ^Dx, lv: Dx_LV) -> Dx_Src {
 	t := lv.type
+	if dx_is_mem(lv) {
+		return dx_mem_load(d, lv)
+	}
 	if lv.comp >= 0 {
 		// One component of a vector chosen at run time.
 		r := dx_scalar_temp(d)
@@ -505,6 +574,17 @@ dx_bool_word :: proc(d: ^Dx, v: Dx_Src, t: Type, as_uint: bool) -> Dx_Src {
 @(private)
 dx_store_lv :: proc(d: ^Dx, lv: Dx_LV, v: Dx_Src) {
 	t := lv.type
+	if dx_is_mem(lv) {
+		if lv.swz_len > 0 {
+			// A swizzle: each component to its word.
+			for k in 0 ..< lv.swz_len {
+				dx_mem_leaf(d, lv, lv.word + u32(lv.swz[k]), 1, dx_comp(v, 0 if is_scalar(t) else k), true)
+			}
+			return
+		}
+		dx_mem_walk(d, lv, lv.word, t, v, true)
+		return
+	}
 	if lv.comp >= 0 {
 		c := dx_scalar_temp(d)
 		for k in 0 ..< 4 {
@@ -552,6 +632,10 @@ dx_expr :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 	case .Bool_Lit:
 		return dx_imm(0xffffffff if e.value != 0 else 0)
 	case .Ident:
+		if u.syms[e.sym].storage == .Work_Group_Size {
+			ls := d.checked.local_size
+			return {file = .Imm, rel = -1, swz = DX_XYZW, imm = {ls.x, ls.y, ls.z, ls.z}}
+		}
 		return dx_load(d, dx_lvalue(d, id))
 	case .Convert:
 		return dx_convert(d, dx_expr(d, e.a), expr_type(u, e.a), t)
@@ -777,19 +861,16 @@ dx_ternary :: proc(d: ^Dx, e: Expr, t: Type) -> Dx_Src {
 	return dx_comp(r, 0) if is_scalar(t) else r
 }
 
-// A storage buffer read, of only the words `p` names (buf_path, as the
-// CPU reads them): word w = element * stride + offset in 32 bits, wrapping;
-// each ld_raw's w is clamped to 0x3ffffffc before it becomes a byte
-// address, so a w past the buffer stays past it (where ld_raw on a raw SRV
-// gives 0) and a 4-word read at the ceiling does not cross 2^32.
+// A storage buffer element `p` names (buf_path) as an lvalue: word w =
+// element * stride (+ a component chosen at run time, clamped and mapped
+// through the swizzle before it) in 32 bits, wrapping as on the CPU, then
+// the path's word offset per access (dx_mem_addr).
 @(private)
-dx_buffer_read :: proc(d: ^Dx, p: Buf_Path) -> Dx_Src {
+dx_buf_lvalue :: proc(d: ^Dx, p: Buf_Path) -> Dx_LV {
 	u := d.u
 	base := dx_scalar_temp(d)
 	dx_ins2(&d.code, .Imul, dx_null(), base, 1, dx_comp(dx_expr(d, p.elem_idx), 0), dx_imm(u32(p.stride_words)))
 	if p.dyn_comp != 0 {
-		// One component chosen at run time: clamp, map through the
-		// swizzle before it, add.
 		c := dx_scalar_temp(d)
 		dx_ins(&d.code, .Imax, 0, c, 1, dx_comp(dx_expr(d, p.dyn_comp), 0), dx_imm(0))
 		dx_ins(&d.code, .Imin, 0, c, 1, c, dx_imm_i(i32(p.dyn_rows - 1)))
@@ -805,65 +886,119 @@ dx_buffer_read :: proc(d: ^Dx, p: Buf_Path) -> Dx_Src {
 		}
 		dx_ins(&d.code, .Iadd, 0, base, 1, base, c)
 	}
-	buf := u.syms[p.sym].index
-	t := p.type
-	if t.base == .Struct {
+	res := d.buf_res[u.syms[p.sym].index]
+	return {loc = res, type = p.type, swz = p.swz, swz_len = p.swz_len, comp = -1, word = u32(p.word_off), dyn = i32(base.idx[0])}
+}
+
+// A storage buffer read, of only the words `p` names (as the CPU reads
+// them).
+@(private)
+dx_buffer_read :: proc(d: ^Dx, p: Buf_Path) -> Dx_Src {
+	return dx_load(d, dx_buf_lvalue(d, p))
+}
+
+// A value in memory (dx_is_mem) into fresh registers: only the words it
+// names, a vector's swizzle as the words up to the last one named.
+@(private)
+dx_mem_load :: proc(d: ^Dx, lv: Dx_LV) -> Dx_Src {
+	t := lv.type
+	if t.base == .Struct || is_array(t) || is_matrix(t) {
 		r := dx_alloc(d, t)
-		dx_buffer_struct(d, buf, base, p.word_off, t, r)
+		dx_mem_walk(d, lv, lv.word, t, r, false)
 		return r
 	}
 	r := dx_temp(d)
-	if p.swz_len > 0 {
-		// A swizzle of a vector: its words up to the last one named.
-		last := 0
-		for k in 0 ..< p.swz_len {
-			last = max(last, int(p.swz[k]))
-		}
-		dx_ld_raw(d, buf, base, p.word_off, last + 1, r)
-		return dx_swizzle(r, p.swz, p.swz_len)
+	if lv.swz_len == 1 {
+		dx_mem_leaf(d, lv, lv.word + u32(lv.swz[0]), 1, r, false)
+		return dx_comp(r, 0)
 	}
-	dx_ld_raw(d, buf, base, p.word_off, int(t.rows), r)
+	if lv.swz_len > 0 {
+		last := 0
+		for k in 0 ..< lv.swz_len {
+			last = max(last, int(lv.swz[k]))
+		}
+		dx_mem_leaf(d, lv, lv.word, last + 1, r, false)
+		return dx_swizzle(r, lv.swz, lv.swz_len)
+	}
+	dx_mem_leaf(d, lv, lv.word, int(t.rows), r, false)
 	return dx_scalar_view(r, int(t.rows))
 }
 
-// A struct of type `t` at word base.x + `word` of buffer `buf` into the
-// registers at `dst`: each scalar or vector field one ld_raw at its std430
-// word offset, a struct field recursively.
+// A value of type `t` at `word` of memory `lv` from (`store`) or into the
+// registers `regs`: each scalar, vector or matrix column one access, at its
+// offset (a buffer's std430 offsets, shared memory's packed words), arrays
+// by element and structs by field, recursively.
 @(private)
-dx_buffer_struct :: proc(d: ^Dx, buf: int, base: Dx_Src, word: int, t: Type, dst: Dx_Src) {
+dx_mem_walk :: proc(d: ^Dx, lv: Dx_LV, word: u32, t: Type, regs: Dx_Src, store: bool) {
 	u := d.u
-	reg := 0
-	for f, i in struct_fields(u, t.strukt) {
-		ft := ty(u, f.type)
-		at := word + std430_field_offset(u, t.strukt, i32(i)) / 4
-		if ft.base == .Struct {
-			dx_buffer_struct(d, buf, base, at, ft, dx_at(dst, reg))
-		} else {
-			dx_ld_raw(d, buf, base, at, int(ft.rows), dx_at(dst, reg))
+	switch {
+	case is_array(t):
+		et := elem_type(t)
+		words, n := u32(component_count(u, et)), dx_regs(u, et)
+		for i in 0 ..< int(t.array) {
+			dx_mem_walk(d, lv, word + u32(i) * words, et, dx_at(regs, i * n), store)
 		}
-		reg += dx_regs(u, ft)
+	case t.base == .Struct:
+		reg := 0
+		for f, i in struct_fields(u, t.strukt) {
+			ft := ty(u, f.type)
+			off := std430_field_offset(u, t.strukt, i32(i)) / 4 if lv.loc.file != .Tgsm else dx_field_words(u, t.strukt, i32(i))
+			dx_mem_walk(d, lv, word + u32(off), ft, dx_at(regs, reg), store)
+			reg += dx_regs(u, ft)
+		}
+	case is_matrix(t):
+		for c in 0 ..< int(t.cols) {
+			dx_mem_leaf(d, lv, word + u32(c) * u32(t.rows), int(t.rows), dx_at(regs, c), store)
+		}
+	case:
+		dx_mem_leaf(d, lv, word, int(t.rows), dx_n(regs, int(t.rows)) if store else regs, store)
 	}
 }
 
-// ld_raw of `n` words at word base.x + `word` of buffer `buf` into `dst`.
+// The byte address of `word` of memory `lv`: shared memory's directly (its
+// indexes are clamped into the variable); a buffer's clamped to word
+// 0x3ffffffc first, so a word past the buffer stays past it (where ld_raw
+// gives 0 and store_raw and the atomics write nothing) and a 4-word access
+// at the ceiling does not cross 2^32.
 @(private)
-dx_ld_raw :: proc(d: ^Dx, buf: int, base: Dx_Src, word: int, n: int, dst: Dx_Src) {
+dx_mem_addr :: proc(d: ^Dx, lv: Dx_LV, word: u32) -> Dx_Src {
+	if lv.loc.file == .Tgsm && lv.dyn < 0 {
+		return dx_imm(4 * word)
+	}
 	a := dx_scalar_temp(d)
-	w := base
+	w := dx_comp(dx_reg(.Temp, u32(lv.dyn)), 0)
 	if word != 0 {
-		dx_ins(&d.code, .Iadd, 0, a, 1, base, dx_imm(u32(word)))
+		dx_ins(&d.code, .Iadd, 0, a, 1, w, dx_imm(word))
 		w = a
 	}
-	dx_ins(&d.code, .Umin, 0, a, 1, w, dx_imm(0x3ffffffc))
-	dx_ins(&d.code, .Ishl, 0, a, 1, a, dx_imm(2))
-	res := Dx_Src{file = .Resource, idx = {d.buf_id[buf], d.buf_reg[buf], 0}, rel = -1, swz = DX_XYZW}
+	if lv.loc.file != .Tgsm {
+		dx_ins(&d.code, .Umin, 0, a, 1, w, dx_imm(0x3ffffffc))
+		w = a
+	}
+	dx_ins(&d.code, .Ishl, 0, a, 1, w, dx_imm(2))
+	return a
+}
+
+// ld_raw of `n` words at `word` of memory `lv` into `reg`, or store_raw of
+// `n` words from `reg` (store_raw writes the words inside the buffer of a
+// store that straddles its end, as the CPU does).
+@(private)
+dx_mem_leaf :: proc(d: ^Dx, lv: Dx_LV, word: u32, n: int, reg: Dx_Src, store: bool) {
 	assert(n >= 1 && n <= 4)
+	a := dx_mem_addr(d, lv, word)
 	mask := dx_mask(n)
 	start := len(d.code)
-	append(&d.code, u32(Dx_Op.Ld_Raw))
-	dx_put_dst(&d.code, dst, mask)
-	dx_put_src(&d.code, a, 1)
-	dx_put_src(&d.code, res, mask, vector = true)
+	if store {
+		append(&d.code, u32(Dx_Op.Store_Raw))
+		dx_put_dst(&d.code, lv.loc, mask)
+		dx_put_src(&d.code, a, 1)
+		dx_put_src(&d.code, reg, mask)
+	} else {
+		append(&d.code, u32(Dx_Op.Ld_Raw))
+		dx_put_dst(&d.code, reg, mask)
+		dx_put_src(&d.code, a, 1)
+		dx_put_src(&d.code, lv.loc, mask, vector = true)
+	}
 	dx_end(&d.code, start)
 }
 
@@ -1159,10 +1294,12 @@ dx_user_call :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 		pt := ty(u, p.type)
 		switch {
 		case pt.base == .Sampler:
-			if p.sym != 0 {
-				d.sym_chan[p.sym] = d.sym_chan[u.exprs[args[i]].sym]
-			}
-			continue
+			// The channel (or image) the argument names now, bound with the
+			// other parameters once every argument is evaluated (a call in a
+			// later one may bind this function's parameters too).
+			d.vals[vbase + i] = dx_imm(u32(u8(d.sym_chan[u.exprs[args[i]].sym])))
+		case pt.base == .Image:
+			d.vals[vbase + i] = dx_imm(u32(u8(d.sym_img[u.exprs[args[i]].sym])))
 		case p.qual == .In:
 			v := dx_expr(d, args[i])
 			loc := dx_alloc(d, pt, p.sym != 0 && d.sym_x[p.sym])
@@ -1181,7 +1318,15 @@ dx_user_call :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 		}
 	}
 	for p, i in ps {
-		if p.sym != 0 && ty(u, p.type).base != .Sampler {
+		if p.sym == 0 {
+			continue
+		}
+		#partial switch ty(u, p.type).base {
+		case .Sampler:
+			d.sym_chan[p.sym] = i8(d.vals[vbase + i].imm[0])
+		case .Image:
+			d.sym_img[p.sym] = i8(d.vals[vbase + i].imm[0])
+		case:
 			d.sym_loc[p.sym] = d.vals[vbase + i]
 		}
 	}
@@ -1223,7 +1368,7 @@ dx_user_call :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 	d.terminated = false
 	for p, i in ps {
 		pt := ty(u, p.type)
-		if p.qual != .In && pt.base != .Sampler {
+		if p.qual != .In && pt.base != .Sampler && pt.base != .Image {
 			dx_store_lv(d, d.lvs[lbase + i], d.vals[vbase + i])
 		}
 	}
@@ -1387,7 +1532,17 @@ dx_builtin :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 	}
 	if is_barrier_builtin(b) {
 		// Graphics stages read their buffers only: nothing to order.
+		if u.stage == .Compute {
+			dx_flow(&d.code, .Sync, DX_SYNC_FLAGS[b])
+		}
 		return dx_imm(0)
+	}
+	if is_atomic_builtin(b) {
+		return dx_atomic(d, id)
+	}
+	#partial switch b {
+	case .Image_Load, .Image_Store, .Image_Size:
+		return dx_image(d, id)
 	}
 	assert(len(argx) <= 4)
 	types_buf: [4]Type
@@ -1995,4 +2150,152 @@ dx_texture :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 		return dx_sample(d, .Sample_L, ch, uv2, {dx_comp(flod, 0)})
 	}
 	return dx_imm(0)
+}
+
+// ---- compute ---------------------------------------------------------------------------
+
+// Each barrier's sync, by the SPIR-V backend's scopes and semantics:
+// barrier() waits for the thread group and orders shared memory
+// (ControlBarrier Workgroup, WorkgroupMemory); memoryBarrier() orders UAVs
+// for the device and shared memory (Device, Uniform | Workgroup | Image);
+// memoryBarrierShared() shared memory; memoryBarrierBuffer() and
+// memoryBarrierImage() UAVs (buffers and images are both u#);
+// groupMemoryBarrier() UAVs for the thread group and shared memory
+// (Workgroup, Uniform | Workgroup | Image).
+@(private, rodata)
+DX_SYNC_FLAGS := #partial [Builtin]u32 {
+	.Barrier               = DX_SYNC_T | DX_SYNC_G,
+	.Memory_Barrier        = DX_SYNC_UGLOBAL | DX_SYNC_G,
+	.Memory_Barrier_Shared = DX_SYNC_G,
+	.Memory_Barrier_Buffer = DX_SYNC_UGLOBAL,
+	.Memory_Barrier_Image  = DX_SYNC_UGLOBAL,
+	.Group_Memory_Barrier  = DX_SYNC_UGROUP | DX_SYNC_G,
+}
+
+// An atomic on a shared or storage buffer word: the target's address, then
+// the operands left to right, then imm_atomic_<op> (the old word, whether
+// the shader uses it or not). Out of a buffer's bounds the atomic writes
+// nothing and its value is undefined on D3D, so it is masked to 0 by the
+// buffer's size (bufinfo), as on the CPU; shared memory's indexes are
+// clamped into the variable.
+@(private)
+dx_atomic :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
+	u := d.u
+	e := u.exprs[id]
+	argx := args_of(u, id)
+	lv := dx_lvalue(d, argx[0])
+	assert(dx_is_mem(lv))
+	word := lv.word + (u32(lv.swz[0]) if lv.swz_len == 1 else 0)
+	addr := dx_mem_addr(d, lv, word)
+	base := dx_operands(d, argx[1:])
+	defer dx_pop_operands(d, base)
+	signed := ty(u, e.type).base == .Int
+	op: Dx_Op
+	#partial switch e.builtin {
+	case .Atomic_Add:
+		op = .Imm_Atomic_Iadd
+	case .Atomic_Min:
+		op = .Imm_Atomic_Imin if signed else .Imm_Atomic_Umin
+	case .Atomic_Max:
+		op = .Imm_Atomic_Imax if signed else .Imm_Atomic_Umax
+	case .Atomic_And:
+		op = .Imm_Atomic_And
+	case .Atomic_Or:
+		op = .Imm_Atomic_Or
+	case .Atomic_Xor:
+		op = .Imm_Atomic_Xor
+	case .Atomic_Exchange:
+		op = .Imm_Atomic_Exch
+	case .Atomic_Comp_Swap:
+		// imm_atomic_cmp_exch's src0 is the comparand, src1 the value.
+		op = .Imm_Atomic_Cmp_Exch
+	}
+	r := dx_scalar_temp(d)
+	start := len(d.code)
+	append(&d.code, u32(op))
+	dx_put_dst(&d.code, r, 1)
+	dx_put_mem(&d.code, lv.loc)
+	dx_put_src(&d.code, addr, 1)
+	for k in 0 ..< len(argx) - 1 {
+		dx_put_src(&d.code, dx_comp(d.vals[base + k], 0), 1)
+	}
+	dx_end(&d.code, start)
+	if lv.loc.file != .Tgsm {
+		size := dx_scalar_temp(d)
+		bstart := len(d.code)
+		append(&d.code, u32(Dx_Op.Bufinfo))
+		dx_put_dst(&d.code, size, 1)
+		dx_put_src(&d.code, lv.loc, 1, vector = true)
+		dx_end(&d.code, bstart)
+		dx_ins(&d.code, .Ult, 0, size, 1, addr, size)
+		dx_ins(&d.code, .And, 0, r, 1, r, size)
+	}
+	return r
+}
+
+// imageLoad, imageStore and imageSize. A read-only image is an SRV read
+// with ld (at mip 0), a writable one a typed UAV (ld_uav_typed: only
+// read-write r32 formats, as check allows, which every D3D12 device loads);
+// both give 0 in every component of the format out of bounds, and the
+// format's defaults (0, 0, 1) in the others, so a single-channel format's
+// w is masked to the CPU's 0 out of bounds by the image's size.
+@(private)
+dx_image :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
+	u := d.u
+	e := u.exprs[id]
+	argx := args_of(u, id)
+	img := int(d.sym_img[u.exprs[argx[0]].sym])
+	res := d.img_res[img]
+	format := image_format_of(sym_type(u, d.checked.images[img]))
+	size_of_image :: proc(d: ^Dx, res: Dx_Src) -> Dx_Src {
+		r := dx_temp(d)
+		start := len(d.code)
+		append(&d.code, u32(Dx_Op.Resinfo) | DX_RESINFO_UINT)
+		dx_put_dst(&d.code, r, 0x3)
+		dx_put_src(&d.code, dx_imm(0), 1)
+		dx_put_src(&d.code, res, 0x3, vector = true)
+		dx_end(&d.code, start)
+		return r
+	}
+	if e.builtin == .Image_Size {
+		return size_of_image(d, res)
+	}
+	base := dx_operands(d, argx[1:])
+	defer dx_pop_operands(d, base)
+	coord := dx_n(d.vals[base], 2)
+	if e.builtin == .Image_Store {
+		start := len(d.code)
+		append(&d.code, u32(Dx_Op.Store_Uav_Typed))
+		dx_put_dst(&d.code, res, 0xf)
+		dx_put_src(&d.code, coord, 0xf, vector = true)
+		dx_put_src(&d.code, dx_n(d.vals[base + 1], 4), 0xf, vector = true)
+		dx_end(&d.code, start)
+		return dx_imm(0)
+	}
+	r := dx_temp(d)
+	start := len(d.code)
+	if res.file == .Uav {
+		append(&d.code, u32(Dx_Op.Ld_Uav_Typed))
+		dx_put_dst(&d.code, r, 0xf)
+		dx_put_src(&d.code, coord, 0xf, vector = true)
+	} else {
+		// ld's address: x, y, then the mip level in w.
+		at := dx_temp(d)
+		dx_ins(&d.code, .Mov, 0, at, 0x3, coord)
+		dx_ins(&d.code, .Mov, 0, at, 0xc, dx_imm(0))
+		start = len(d.code)
+		append(&d.code, u32(Dx_Op.Ld))
+		dx_put_dst(&d.code, r, 0xf)
+		dx_put_src(&d.code, at, 0xf, vector = true)
+	}
+	dx_put_src(&d.code, res, 0xf, vector = true)
+	dx_end(&d.code, start)
+	#partial switch format {
+	case .R32f, .R32ui, .R32i:
+		inside := size_of_image(d, res)
+		dx_ins(&d.code, .Ult, 0, inside, 0x3, coord, inside)
+		dx_ins(&d.code, .And, 0, inside, 0x1, dx_comp(inside, 0), dx_comp(inside, 1))
+		dx_ins(&d.code, .And, 0, r, 0x8, r, dx_comp(inside, 0))
+	}
+	return r
 }

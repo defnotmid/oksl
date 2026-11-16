@@ -9,7 +9,7 @@ plain GLSL ES 3.0 / 3.1 vertex, fragment and compute shaders, into:
 
 - **SPIR-V** for Vulkan,
 - **MSL** for Metal,
-- **DXBC** (Shader Model 5.1) for Direct3D 12, vertex and fragment shaders,
+- **DXBC** (Shader Model 5.1) for Direct3D 12,
 - a **CPU program** that renders or dispatches the same shader with no GPU at all.
 
 It's plain Odin with no external toolchain. Runtime shaders usually mean
@@ -55,7 +55,7 @@ if !ok {
 }
 // GPU: SDL_CreateGPUShader with m.spirv (entry oksl.SPIRV_ENTRY), m.msl
 // (entry oksl.MSL_ENTRY) or m.dxbc (format .DXBC, entry oksl.DXBC_ENTRY;
-// vertex and fragment shaders compiled with dxbc = true), num_samplers = m.num_samplers, num_uniform_buffers =
+// compiled with dxbc = true), num_samplers = m.num_samplers, num_uniform_buffers =
 // m.num_uniform_buffers, num_storage_buffers = len(m.storage_buffers);
 // Vertex shader: oksl.compile(oksl.LAYER_VERTEX_GLSL, {profile = .Glsl, stage = .Vertex}), once.
 // CPU:
@@ -299,7 +299,10 @@ Shadertoy profiles) compiles a GLSL ES 3.1 compute shader:
   `gl_WorkGroupID`, `gl_NumWorkGroups` (`uvec3`),
   `gl_LocalInvocationIndex` (`uint`), and the compile-time constant
   `gl_WorkGroupSize` (`const uvec3`, usable in constant expressions and
-  array sizes).
+  array sizes). With `Options.num_work_groups_uniform`, `gl_NumWorkGroups`
+  is a `uvec3` in the uniform block on the GPU, at
+  `Module.num_work_groups_offset` (for Direct3D 12, which has no group
+  count; see DXBC below), and still the dispatch's `groups` on the CPU.
 - **Storage buffers and binding order:** `std430` storage buffers may be
   `readonly`, read-write (unqualified) or `writeonly` (`readonly` and
   `writeonly` together is diagnosed; reads from `writeonly` and writes to
@@ -506,10 +509,10 @@ four channels (the rows above); GLSL shaders have 16 (`SAMPLER_COUNT`).
   device uint*`) followed by read-write / `writeonly` storage buffers
   (`device uint*`) starting at `[[buffer(num_uniform_buffers)]]`.
 - **DXBC** (`Module.dxbc`, SDL_GPU's `DXBC` format: a container with
-  ISGN, OSGN and an SM5.1 SHEX chunk, signed with the DXBC checksum; entry
-  `main`, profiles `vs_5_1` and `ps_5_1`; emitted only with
-  `Options.dxbc`, which is an error (`Dxbc_Compute`) on a compute shader
-  until compute is done): SDL_GPU's D3D12 registers. Vertex
+  ISGN, OSGN and an SM5.1 SHEX chunk, signed with the DXBC checksum, and
+  SFI0 when a compute shader uses UAV registers past `u7`; entry `main`,
+  profiles `vs_5_1`, `ps_5_1` and `cs_5_1`; emitted only with
+  `Options.dxbc`): SDL_GPU's D3D12 registers. Vertex
   shaders: channel n at `t[n]` and `s[n]` in space 0, storage buffer i at
   `t[num_samplers + i]` (a `ByteAddressBuffer`), the uniform block at
   `b0` in space 1. Fragment shaders: the same in space 2, the block in
@@ -535,6 +538,56 @@ four channels (the rows above); GLSL shaders have 16 (`SAMPLER_COUNT`).
   the buffer's end, as on the CPU). The emitter's tables live in the
   temporary allocator; the container is the only allocation on the
   module's.
+- **DXBC compute shaders** (`cs_5_1`, `dcl_thread_group` from
+  `local_size`): SDL_GPU's D3D12 compute registers (`SDL_gpu_d3d12.c`'s
+  compute root signature): channel n at `t[n]` and `s[n]` in space 0,
+  read-only storage images at `t[num_samplers + i]` and read-only storage
+  buffers after them, in space 0; read-write and `writeonly` storage images
+  at `u[i]`, read-write and `writeonly` storage buffers after them, in space
+  1; the uniform block at `b0` in space 2. `gl_GlobalInvocationID`,
+  `gl_WorkGroupID`, `gl_LocalInvocationID` and `gl_LocalInvocationIndex`
+  are `SV_DispatchThreadID`, `SV_GroupID`, `SV_GroupThreadID` and
+  `SV_GroupIndex`. Direct3D has no `gl_NumWorkGroups`, and SDL_GPU passes
+  no group count, so reading it is the error `Dxbc_Num_Work_Groups` unless
+  the shader is compiled with `Options.num_work_groups_uniform`: then in
+  every GPU backend (SPIR-V, MSL and DXBC, so one block layout serves them
+  all) `gl_NumWorkGroups` is a `uvec3` the checker adds to the block after
+  the shader's own uniforms, under an internal name no shader can declare
+  (so a uniform of the shader's never meets it; it is not in
+  `Module.uniforms`, which lists the shader's own); the host writes the
+  dispatch's group count there as three u32s, at
+  `Module.num_work_groups_offset` (-1 when the shader does not read it),
+  while the CPU (`run_compute`) keeps reading its `groups`, which it knows.
+  A `local_size_z` over Direct3D's 64 is
+  `Dxbc_Local_Size_Z`, more than 64 UAV registers (writable images and
+  buffers) `Dxbc_Too_Many_Uavs` and more than 128 SRV registers (samplers,
+  read-only images and buffers) `Dxbc_Too_Many_Srvs`, each with the count
+  and the limit. Storage buffers are raw views (read-only ones
+  SRVs, the others UAVs) with the CPU's rules: word element * stride +
+  offset in 32 bits, reads past the end 0, a write past it dropped word by
+  word (a vector or struct straddling the end keeps its words inside),
+  atomics past it dropped and returning 0 (D3D leaves their value
+  undefined, so it is masked by the buffer's size). Read-only images are
+  typed SRVs read with `ld`, read-write and `writeonly` ones typed UAVs
+  (`ld_uav_typed` only on the read-write `r32f`, `r32ui` and `r32i` that
+  GLSL ES 3.10 allows, which every D3D12 device loads, so no feature flag
+  is needed); out of bounds a load gives 0 in every component (a single
+  channel format's w too, as on the CPU; D3D would give 1) and a store
+  writes nothing. Shared variables are packed into one `g0` as the CPU lays
+  them out, their run-time indexes clamped as on the CPU. Barriers map to
+  `sync` as the SPIR-V backend's scopes and semantics say: `barrier()` is
+  `sync_g_t`, `memoryBarrier()` `sync_uglobal_g`, `memoryBarrierShared()`
+  `sync_g`, `memoryBarrierBuffer()` and `memoryBarrierImage()`
+  `sync_uglobal`, `groupMemoryBarrier()` `sync_ugroup_g`; a device-scope
+  fence orders only UAVs declared globally coherent, so the raw UAVs are
+  `_glc` when the shader calls `memoryBarrier()` or `memoryBarrierBuffer()`,
+  the typed ones when it calls `memoryBarrier()` or `memoryBarrierImage()`
+  (and only then, keeping the other shaders' caches). Every atomic is
+  the immediate form (`imm_atomic_*`, `imm_atomic_cmp_exch` for
+  `atomicCompSwap`), its operands evaluated left to right after its
+  target. `rgba16f` stores round toward zero on D3D (its rule for float
+  conversions) where the CPU rounds to nearest: they can differ by one
+  half-float ulp.
 - **Layer vertex shader** (`LAYER_VERTEX_GLSL`, the source of
   `testdata/layer.vert`, which a host compiles once like any vertex
   shader: `compile(LAYER_VERTEX_GLSL, {profile = .Glsl, stage =
@@ -827,7 +880,7 @@ odin test . -vet -strict-style                      # SkSL, GLSL/Shadertoy, the 
                                                     # (+ spirv-val, and vkd3d for DXBC, when installed)
 odin test . -vet -strict-style -define:OKSL_JIT=false # force the portable interpreter on x86-64
 odin run tools/gpu_parity -- out_dir                # SDL_GPU vs CPU interpreter on testdata/ through the layer vertex shader, and a tap of it
-odin run tools/d3d12_parity -- out_dir              # the same checks with the DXBC through Direct3D 12 on vkd3d (Linux)
+odin run tools/d3d12_parity -- out_dir              # the same checks (compute too) with the DXBC through Direct3D 12 on vkd3d (Linux)
                                                     # or on WARP under the debug layer and GPU-based validation (Windows;
                                                     # -hardware: the first hardware adapter), and the DXBC emitter's
                                                     # own cases (tools/parity: the shared CPU side)
@@ -866,9 +919,9 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 - **MSL is compiled only on macOS:** Metal has no Linux compiler, so on
   Linux the emitter is checked textually; on macOS `tools/gpu_parity` runs
   the MSL through SDL_GPU's Metal driver against the CPU interpreter.
-- **DXBC, not DXIL, and no compute yet:** Direct3D 12 takes the vertex
-  and fragment shaders as DXBC (SM5.1); for compute, run SDL_GPU's Vulkan
-  driver. The DXBC is checked with vkd3d (Wine's D3D12 over Vulkan:
+- **DXBC, not DXIL:** Direct3D 12 takes the shaders as DXBC (SM5.1); a
+  compute shader reading `gl_NumWorkGroups` needs the count in a uniform
+  (`Options.num_work_groups_uniform`). The DXBC is checked with vkd3d (Wine's D3D12 over Vulkan:
   `vkd3d-dxbc`, `vkd3d-compiler` and `tools/d3d12_parity`) and on
   Windows' own runtime with WARP, its software device, under the debug
   layer and GPU-based validation (`tools/d3d12_parity`), not yet on
