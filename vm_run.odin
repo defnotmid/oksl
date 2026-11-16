@@ -1230,6 +1230,28 @@ fval :: #force_inline proc "contextless" (v: u32) -> f32 {
 	return transmute(f32)v
 }
 
+// A float's bits with every NaN as 0x7fc00000 (`canonical`).
+@(private)
+canon_bits :: #force_inline proc "contextless" (b: u32) -> u32 {
+	return b if b & 0x7fff_ffff <= 0x7f80_0000 else 0x7fc0_0000
+}
+
+@(private)
+canon_f32 :: #force_inline proc "contextless" (x: f32) -> f32 {
+	return fval(canon_bits(fbits(x)))
+}
+
+@(private)
+canon8 :: #force_inline proc "contextless" (x: F8) -> F8 {
+	return intrinsics.simd_select(intrinsics.simd_lanes_ne(x, x), F8(fval(0x7fc0_0000)), x)
+}
+
+// canon8 in place, for the JIT's helpers (vectors by pointer: see math_8).
+@(private)
+canon_lanes8 :: #force_inline proc "contextless" (x: ^[8]f32) {
+	intrinsics.unaligned_store((^F8)(x), canon8(intrinsics.unaligned_load((^F8)(x))))
+}
+
 @(private)
 f_to_i :: proc "contextless" (f: f32) -> i32 {
 	if !(f == f) {
@@ -1423,6 +1445,8 @@ float_fn1 :: proc "contextless" (regs: []Reg, in_: Instr) {
 		fn1_lanes(regs, in_, .Isnan)
 	case .Isinf:
 		fn1_lanes(regs, in_, .Isinf)
+	case .Float_Bits_To_Int, .Float_Bits_To_Uint:
+		fn1_lanes(regs, in_, .Float_Bits_To_Uint)
 	}
 }
 
@@ -1430,9 +1454,56 @@ float_fn1 :: proc "contextless" (regs: []Reg, in_: Instr) {
 fn1_lanes :: #force_inline proc "contextless" (regs: []Reg, in_: Instr, $B: Builtin) {
 	for i in 0 ..< i32(in_.n) {
 		x, d := fl(&regs[in_.a + i]), &regs[in_.dst + i]
-		for l in 0 ..< LANES {
-			d[l] = fn1(x[l], B)
+		when B >= .Sin && B <= .Log2 {
+			for l := 0; l < LANES; l += 8 {
+				intrinsics.unaligned_store((^F8)(&d[l]), fn1_8(intrinsics.unaligned_load((^F8)(&x[l])), B))
+			}
+		} else {
+			for l in 0 ..< LANES {
+				d[l] = fn1(x[l], B)
+			}
 		}
+	}
+}
+
+// The float built-ins vm_math.odin computes, eight lanes at a time (the
+// interpreter and the JIT's helpers both).
+@(private)
+fn1_8 :: #force_inline proc "contextless" (x: F8, $B: Builtin) -> F8 {
+	when B == .Sin {
+		return fsin8(x)
+	} else when B == .Cos {
+		return fcos8(x)
+	} else when B == .Tan {
+		return ftan8(x)
+	} else when B == .Asin {
+		return fasin8(x)
+	} else when B == .Acos {
+		return facos8(x)
+	} else when B == .Atan {
+		return fatan8(x)
+	} else when B == .Sinh {
+		return fsinh8(x)
+	} else when B == .Cosh {
+		return fcosh8(x)
+	} else when B == .Tanh {
+		return ftanh8(x)
+	} else when B == .Asinh {
+		return fasinh8(x)
+	} else when B == .Acosh {
+		return facosh8(x)
+	} else when B == .Atanh {
+		return fatanh8(x)
+	} else when B == .Exp {
+		return fexp8(x)
+	} else when B == .Log {
+		return flog8(x)
+	} else when B == .Exp2 {
+		return fexp28(x)
+	} else when B == .Log2 {
+		return flog28(x)
+	} else {
+		#panic("not a vm_math.odin built-in")
 	}
 }
 
@@ -1444,38 +1515,6 @@ fn1 :: #force_inline proc "contextless" (x: f32, $B: Builtin) -> u32 {
 		return fbits(x * (math.PI / 180))
 	} else when B == .Degrees {
 		return fbits(x * (180 / math.PI))
-	} else when B == .Sin {
-		return fbits(math.sin(x))
-	} else when B == .Cos {
-		return fbits(math.cos(x))
-	} else when B == .Tan {
-		return fbits(math.tan(x))
-	} else when B == .Asin {
-		return fbits(math.asin(x))
-	} else when B == .Acos {
-		return fbits(math.acos(x))
-	} else when B == .Atan {
-		return fbits(math.atan(x))
-	} else when B == .Sinh {
-		return fbits(math.sinh(x))
-	} else when B == .Cosh {
-		return fbits(math.cosh(x))
-	} else when B == .Tanh {
-		return fbits(math.tanh(x))
-	} else when B == .Asinh {
-		return fbits(math.asinh(x))
-	} else when B == .Acosh {
-		return fbits(math.acosh(x))
-	} else when B == .Atanh {
-		return fbits(math.atanh(x))
-	} else when B == .Exp {
-		return fbits(math.exp(x))
-	} else when B == .Log {
-		return fbits(math.ln(x))
-	} else when B == .Exp2 {
-		return fbits(math.pow(f32(2), x))
-	} else when B == .Log2 {
-		return fbits(math.log2(x))
 	} else when B == .Sqrt {
 		return fbits(math.sqrt(x))
 	} else when B == .Inversesqrt {
@@ -1504,6 +1543,8 @@ fn1 :: #force_inline proc "contextless" (x: f32, $B: Builtin) -> u32 {
 		return u32(math.is_nan(x))
 	} else when B == .Isinf {
 		return u32(math.is_inf(x))
+	} else when B == .Float_Bits_To_Uint {
+		return canon_bits(fbits(x))
 	} else {
 		#panic("not a one-operand float built-in")
 	}
@@ -1531,19 +1572,32 @@ float_fn2 :: proc "contextless" (regs: []Reg, in_: Instr) {
 fn2_lanes :: #force_inline proc "contextless" (regs: []Reg, in_: Instr, $B: Builtin) {
 	for i in 0 ..< i32(in_.n) {
 		x, y, d := fl(&regs[in_.a + i]), fl(&regs[in_.b + i]), fl(&regs[in_.dst + i])
-		for l in 0 ..< LANES {
-			d[l] = fn2(x[l], y[l], B)
+		when B == .Atan2 || B == .Pow {
+			for l := 0; l < LANES; l += 8 {
+				intrinsics.unaligned_store((^F8)(&d[l]), fn2_8(intrinsics.unaligned_load((^F8)(&x[l])), intrinsics.unaligned_load((^F8)(&y[l])), B))
+			}
+		} else {
+			for l in 0 ..< LANES {
+				d[l] = fn2(x[l], y[l], B)
+			}
 		}
 	}
 }
 
 @(private)
-fn2 :: #force_inline proc "contextless" (x, y: f32, $B: Builtin) -> f32 {
+fn2_8 :: #force_inline proc "contextless" (x, y: F8, $B: Builtin) -> F8 {
 	when B == .Atan2 {
-		return math.atan2(x, y)
+		return fatan28(x, y)
 	} else when B == .Pow {
-		return math.pow(x, y)
-	} else when B == .Mod {
+		return fpow8(x, y)
+	} else {
+		#panic("not a vm_math.odin built-in")
+	}
+}
+
+@(private)
+fn2 :: #force_inline proc "contextless" (x, y: f32, $B: Builtin) -> f32 {
+	when B == .Mod {
 		return x - y * ffloor(x / y)
 	} else when B == .Min {
 		return y if y < x else x
@@ -2476,13 +2530,30 @@ bound_sample_filter :: proc "contextless" (im: ^Chan_Img, u, v: ^F_Lanes, lvl0, 
 	}
 }
 
-// The level the derivatives of quad `o` pick in `w x h` texels, as
-// texture() passes the sampler it.
+// The level the derivatives of each quad of eight lanes (two quads) pick
+// in `w x h` texels, in all four of its lanes: 0.5 * log2 of the larger
+// squared length of uv's differences along the quad's top row and left
+// column (max as maxnum), by quad_level8. texture() of a callback channel
+// (sampler_args8) and of a bound one alike.
 @(private)
-quad_level :: #force_inline proc "contextless" (u, v: [^]f32, o: int, w, h: f32) -> f32 {
-	dx := [2]f32{(u[o + 1] - u[o]) * w, (v[o + 1] - v[o]) * h}
-	dy := [2]f32{(u[o + 2] - u[o]) * w, (v[o + 2] - v[o]) * h}
-	return 0.5 * math.log2(max(dx.x * dx.x + dx.y * dx.y, dy.x * dy.x + dy.y * dy.y))
+quad_levels8 :: #force_inline proc "contextless" (u, v: F8, w, h: f32) -> F8 {
+	u0, v0 := intrinsics.simd_shuffle(u, u, 0, 0, 0, 0, 4, 4, 4, 4), intrinsics.simd_shuffle(v, v, 0, 0, 0, 0, 4, 4, 4, 4)
+	u1, v1 := intrinsics.simd_shuffle(u, u, 1, 1, 1, 1, 5, 5, 5, 5), intrinsics.simd_shuffle(v, v, 1, 1, 1, 1, 5, 5, 5, 5)
+	u2, v2 := intrinsics.simd_shuffle(u, u, 2, 2, 2, 2, 6, 6, 6, 6), intrinsics.simd_shuffle(v, v, 2, 2, 2, 2, 6, 6, 6, 6)
+	dxx, dxy := (u1 - u0) * w, (v1 - v0) * h
+	dyx, dyy := (u2 - u0) * w, (v2 - v0) * h
+	x2, y2 := dxx * dxx + dxy * dxy, dyx * dyx + dyy * dyy
+	// max (maxnum): y2 where x2 is NaN or smaller.
+	m := intrinsics.simd_select(intrinsics.simd_lanes_ne(x2, x2) | intrinsics.simd_lanes_gt(y2, x2), y2, x2)
+	return quad_level8(m)
+}
+
+// lod += quad_levels8 for eight lanes at u, v and lod (by pointer, for
+// the JIT's helpers too).
+@(private)
+add_quad_levels8 :: #force_inline proc "contextless" (u, v, lod: ^f32, w, h: f32) {
+	l := intrinsics.unaligned_load((^F8)(lod)) + quad_levels8(intrinsics.unaligned_load((^F8)(u)), intrinsics.unaligned_load((^F8)(v)), w, h)
+	intrinsics.unaligned_store((^F8)(lod), l)
 }
 
 // A lane's levels at lod `L` of a chain whose top level is `top`: level
@@ -2603,11 +2674,8 @@ sample_bound :: proc(r: ^Runner, im: ^Chan_Img, bias: bool, a, b, dst: i32) #no_
 		level := lod^
 		if bias {
 			w, h := f32(im.levels[0].size[0]), f32(im.levels[0].size[1])
-			for o := 0; o < LANES; o += 4 {
-				q := quad_level(raw_data(u), raw_data(v), o, w, h)
-				for l in o ..< o + 4 {
-					level[l] = lod[l] + q
-				}
+			for g := 0; g < LANES; g += 8 {
+				add_quad_levels8(&u[g], &v[g], &level[g], w, h)
 			}
 		}
 		for l in 0 ..< LANES {
@@ -2745,7 +2813,7 @@ texel_fetch_uv :: #force_inline proc "contextless" (px, py: i32, sx, sy: f32, fl
 	if (flags & 1) != 0 {
 		uy = uy * -1 + 1
 	}
-	return {ux, uy}
+	return {canon_f32(ux), canon_f32(uy)}
 }
 
 // A sample: dst = channel k at uv a, lod b (Texture_Bias: b plus the
@@ -2815,8 +2883,12 @@ sample_texture :: proc(r: ^Runner, in_: Instr, exec: Lane_Mask) #no_bounds_check
 		return
 	}
 	a, b := in_.a, in_.b
-	lod := fl(&regs[b])
-	u, v := fl(&regs[a]), fl(&regs[a + 1])
+	// What the callback receives: canonical, with texture()'s level.
+	u, v, lod: F_Lanes
+	implicit := in_.op == .Texture_Bias && size.xy != {} && r.p.stage != .Compute
+	for g := 0; g < LANES; g += 8 {
+		sampler_args8(&regs[a][g], &regs[a + 1][g], &regs[b][g], size, implicit, &u[g], &v[g], &lod[g])
+	}
 	if r.p.stage == .Compute {
 		if in_.n == 3 {
 			z := &regs[a + 2]
@@ -2850,10 +2922,6 @@ sample_texture :: proc(r: ^Runner, in_: Instr, exec: Lane_Mask) #no_bounds_check
 		if (running >> uint(o)) & 0xf == 0 {
 			continue
 		}
-		level: f32 = 0
-		if in_.op == .Texture_Bias && size.xy != {} {
-			level = quad_level(raw_data(u), raw_data(v), o, f32(size.x), f32(size.y))
-		}
 		for l in o ..< o + 4 {
 			if (have >> uint(l)) & 1 == 0 {
 				continue
@@ -2861,12 +2929,58 @@ sample_texture :: proc(r: ^Runner, in_: Instr, exec: Lane_Mask) #no_bounds_check
 			// The layer as GPUs take it, rounded to nearest even (NaN and
 			// out-of-range values as F_To_I takes them).
 			layer := int(f_to_i(fval(fn1(fval(regs[a + 2][l]), .Round_Even)))) if in_.n == 3 else 0
-			c := r.opts.sampler(r.opts.user, ch, {u[l], v[l]}, lod[l] + level, layer)
+			c := r.opts.sampler(r.opts.user, ch, {u[l], v[l]}, lod[l], layer)
 			for i in 0 ..< i32(4) {
 				regs[dst + i][l] = fbits(c[i])
 			}
 		}
 	}
+}
+
+// What a sampler callback receives for eight lanes (two quads) of uv and
+// lod: each lane's u, v and lod, plus, with `level` (texture() in a
+// fragment shader, of a sized channel), the level its quad picks: 0.5 *
+// log2 of the larger squared length, in texels, of the uv derivatives along
+// the quad's top row and left column. Every NaN is 0x7fc00000
+// (`canonical`). The interpreter and the JIT's helpers both.
+@(private)
+sampler_args8 :: #force_inline proc "contextless" (pu, pv, plod: ^u32, size: [3]i32, level: bool, cu, cv, cl: ^f32) {
+	u, v, lod := intrinsics.unaligned_load((^F8)(pu)), intrinsics.unaligned_load((^F8)(pv)), intrinsics.unaligned_load((^F8)(plod))
+	l := lod
+	if level {
+		l = lod + quad_levels8(u, v, f32(size.x), f32(size.y))
+	}
+	intrinsics.unaligned_store((^F8)(cu), canon8(u))
+	intrinsics.unaligned_store((^F8)(cv), canon8(v))
+	intrinsics.unaligned_store((^F8)(cl), canon8(l))
+}
+
+// 0.5 * log2(m), to within 2e-6 plus the result's own rounding to f32
+// (half an ulp, 3.8e-6 from |level| 64; checked for every m), exact where
+// m is a power of 4: m = 2^k * (1 + f) with 1 + f in [sqrt(2)/2, sqrt(2))
+// and log2(1 + f) as f times a degree-5 minimax polynomial q, in f32 (a
+// level needs neither f64 nor a correctly rounded log2, and is waited for
+// by every callback): 0.5 * f * q(f) on [sqrt(2)/2 - 1, sqrt(2) - 1],
+// minimax absolute error 1.85e-6.
+// log2(+-0) = -inf, of +inf +inf, of NaN or m < 0 NaN.
+@(private)
+quad_level8 :: #force_inline proc "contextless" (m: F8) -> F8 {
+	W :: #simd[8]u32
+	I :: #simd[8]i32
+	C0, C1, C2 :: f32(0h3FB8AA72), f32(0hBF38A0F9), f32(0h3EF5A9EC)
+	C3, C4, C5 :: f32(0hBEBBA56E), f32(0h3EA2EAB7), f32(0hBE531AE5)
+	sub := intrinsics.simd_lanes_lt(m, F8(1.1754943508222875e-38))
+	ms := intrinsics.simd_select(sub, m * 16777216, m)
+	b := transmute(W)ms
+	k := intrinsics.simd_shr(transmute(I)(b - W(0x3f35_04f3)), W(23))
+	f := transmute(F8)(b - transmute(W)intrinsics.simd_shl(k, W(23))) - 1
+	f2 := f * f
+	q := (C0 + f * C1) + f2 * ((C2 + f * C3) + f2 * (C4 + f * C5))
+	e := cast(F8)k - intrinsics.simd_select(sub, F8(24), F8(0))
+	l := 0.5 * (e + f * q)
+	l = intrinsics.simd_select(intrinsics.simd_lanes_eq(m, F8(0)), F8(fval(0xff80_0000)), l)
+	l = intrinsics.simd_select(intrinsics.simd_lanes_eq(m, F8(fval(0x7f80_0000))), m, l)
+	return intrinsics.simd_select(intrinsics.simd_lanes_ge(m, F8(0)), l, F8(fval(0x7fc0_0000)))
 }
 
 // Channel ch's size from the host (0x0 without one).

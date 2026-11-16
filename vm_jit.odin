@@ -119,6 +119,7 @@ Jit_Tables :: struct #align(32) {
 	neg_i32_max_f: [8]f32,
 	f255:       [8]f32,
 	byte_mask:  [8]u32,
+	canon_nan:  [8]u32,
 	two52_d:    [4]u64,
 	// Bound channels (sample_sub, decode_sub).
 	i256:       [8]u32,
@@ -201,6 +202,7 @@ init_jit :: proc "contextless" () {
 	jit_tables.d128 = 128
 	jit_tables.d_lo = -2147483648.0
 	jit_tables.d_hi = 2147483646.0
+	jit_tables.canon_nan = 0x7fc0_0000
 
 	max_id, _, _, _ := intrinsics.x86_cpuid(0, 0)
 	if max_id < 7 {
@@ -363,6 +365,8 @@ OFF_TAB_TWO52_D :: i32(offset_of(Jit_Tables, two52_d))
 OFF_TAB_F255 :: i32(offset_of(Jit_Tables, f255))
 @(private)
 OFF_TAB_BYTE :: i32(offset_of(Jit_Tables, byte_mask))
+@(private)
+OFF_TAB_CANON :: i32(offset_of(Jit_Tables, canon_nan))
 
 @(private)
 emit_b :: #force_inline proc(buf: ^[dynamic]u8, b0: u8) {
@@ -1973,18 +1977,9 @@ is_helper_instr :: proc(p: ^Program, in_: Instr) -> bool {
 		return int(in_.n) > 4
 	case .Load_Buf:
 		return int(in_.k) >= 4
-	case .F_Fn1:
-		#partial switch Builtin(in_.k) {
-		case .Radians, .Degrees, .Sqrt, .Inversesqrt,
-		     .Floor, .Ceil, .Fract, .Trunc, .Round, .Round_Even,
-		     .Abs, .Sign, .Isnan, .Isinf:
-			return false
-		}
-		return true
-	case .F_Fn2:
-		b := Builtin(in_.k)
-		return b == .Atan2 || b == .Pow
 	}
+	// F_Fn1 and F_Fn2's vm_math.odin built-ins call jit_help_math inside
+	// their basic block (emit_math_call).
 	return false
 }
 
@@ -2089,140 +2084,74 @@ jit_help_store_dyn :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bound
 	}
 }
 
+// Component i of a vm_math.odin built-in (F_Fn1, F_Fn2), through the
+// interpreter's math_8: the same procs, a register (eight lanes) at a time.
+// The operands are read from their slots; the result is returned in ymm0
+// (emit_math_call).
 @(private, enable_target_feature = "avx2")
-jit_help_sin :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
-	slots := ctx.slots
-	for i in 0 ..< i32(in_.n) {
-		x := (^Jit_Floats)(&slots[in_.a + i])
-		d := (^Jit_Floats)(&slots[in_.dst + i])
-		for l in 0 ..< JIT_LANES {d[l] = math.sin(x[l])}
-	}
+jit_help_math :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, i: i32) -> F8 #no_bounds_check {
+	r: [8]u32
+	math_8(in_.op, Builtin(in_.k), &ctx.slots[in_.a + i], &ctx.slots[in_.b + i], &r)
+	return transmute(F8)r
 }
 
-@(private, enable_target_feature = "avx2")
-jit_help_cos :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
-	slots := ctx.slots
-	for i in 0 ..< i32(in_.n) {
-		x := (^Jit_Floats)(&slots[in_.a + i])
-		d := (^Jit_Floats)(&slots[in_.dst + i])
-		for l in 0 ..< JIT_LANES {d[l] = math.cos(x[l])}
-	}
-}
-
-@(private, enable_target_feature = "avx2")
-jit_help_fn1 :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
-	slots := ctx.slots
-	b := Builtin(in_.k)
-	for i in 0 ..< i32(in_.n) {
-		x := (^Jit_Floats)(&slots[in_.a + i])
-		d := &slots[in_.dst + i]
-		#partial switch b {
-		case .Tan:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Tan)}
-		case .Asin:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Asin)}
-		case .Acos:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Acos)}
-		case .Atan:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Atan)}
-		case .Sinh:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Sinh)}
-		case .Cosh:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Cosh)}
-		case .Tanh:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Tanh)}
-		case .Asinh:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Asinh)}
-		case .Acosh:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Acosh)}
-		case .Atanh:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Atanh)}
-		case .Exp:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Exp)}
-		case .Log:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Log)}
-		case .Exp2:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Exp2)}
-		case .Log2:
-			for l in 0 ..< JIT_LANES {d[l] = fn1(x[l], .Log2)}
+// A jit_help_math call that doesn't end the basic block (as texture
+// callbacks): dirty cached operands are stored to their slots, the
+// ymm8..15 values still live after this instruction saved around the call
+// (the SysV ABI clobbers every YMM register), and the result taken from
+// ymm0 into the destination like any other op's.
+@(private)
+emit_math_call :: proc(e: ^Jit_Emitter, in_ptr: ^Instr, i: i32) {
+	in_ := in_ptr^
+	dst := in_.dst + i
+	n := i32(in_.n)
+	// Every operand register the helper reads, now or for a later i, to
+	// memory: an operand whose last use is this instruction leaves the cache
+	// below without a store.
+	for &cs, idx in e.cache {
+		if cs.slot >= 0 && cs.dirty && ((cs.slot >= in_.a && cs.slot < in_.a + n) || (in_.op == .F_Fn2 && cs.slot >= in_.b && cs.slot < in_.b + n)) {
+			vmovaps_store(&e.buf, cs.slot, u8(8 + idx))
+			cs.dirty = false
 		}
 	}
-}
-
-@(private, enable_target_feature = "avx2")
-jit_atan2_4 :: #force_inline proc "contextless" (y, x: #simd[4]f64) -> #simd[4]f64 {
-	// Exact SIMD evaluation of core:math.atan2_f64 (Stephen L. Moshier) for finite non-zero lanes.
-	PI        :: 0h4009_21fb_5444_2d18
-	MORE_BITS :: 6.123233995736765886130e-17
-	TAN3PI08  :: 2.41421356237309504880
-	P0        :: -8.750608600031904122785e-01
-	P1        :: -1.615753718733365076637e+01
-	P2        :: -7.500855792314704667340e+01
-	P3        :: -1.228866684490136173410e+02
-	P4        :: -6.485021904942025371773e+01
-	Q0        :: +2.485846490142306297962e+01
-	Q1        :: +1.650270098316988542046e+02
-	Q2        :: +4.328810604912902668951e+02
-	Q3        :: +4.853903996359136964868e+02
-	Q4        :: +1.945506571482613964425e+02
-
-	r := y / x
-	ax := intrinsics.simd_abs(r)
-	m_small := intrinsics.simd_lanes_le(ax, 0.66)
-	m_large := intrinsics.simd_lanes_gt(ax, TAN3PI08)
-	u := intrinsics.simd_select(m_small, ax, intrinsics.simd_select(m_large, 1.0 / ax, (ax - 1.0) / (ax + 1.0)))
-	z := u * u
-	num := z * ((((P0 * z + P1) * z + P2) * z + P3) * z + P4)
-	den := ((((z + Q0) * z + Q1) * z + Q2) * z + Q3) * z + Q4
-	xa := u * (num / den) + u
-	sa := intrinsics.simd_select(
-		m_small,
-		xa,
-		intrinsics.simd_select(m_large, (PI / 2 - xa) + MORE_BITS, (PI / 4 + xa) + 0.5 * MORE_BITS),
-	)
-	q := intrinsics.simd_select(intrinsics.simd_lanes_gt(r, 0), sa, -sa)
-	q_neg := intrinsics.simd_select(intrinsics.simd_lanes_le(q, 0), q + PI, q - PI)
-	return intrinsics.simd_select(intrinsics.simd_lanes_lt(x, 0), q_neg, q)
-}
-
-@(private, enable_target_feature = "avx2")
-jit_help_atan2 :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
-	slots := ctx.slots
-	for i in 0 ..< i32(in_.n) {
-		yf := (^Jit_Floats)(&slots[in_.a + i])
-		xf := (^Jit_Floats)(&slots[in_.b + i])
-		d := (^Jit_Floats)(&slots[in_.dst + i])
-		yb := transmute(#simd[8]i32)((^#simd[8]u32)(yf)^ & 0x7FFF_FFFF)
-		xb := transmute(#simd[8]i32)((^#simd[8]u32)(xf)^ & 0x7FFF_FFFF)
-		bad := intrinsics.simd_lanes_le(yb, 0) |
-			intrinsics.simd_lanes_ge(yb, 0x7F80_0000) |
-			intrinsics.simd_lanes_le(xb, 0) |
-			intrinsics.simd_lanes_ge(xb, 0x7F80_0000)
-		bad_mask := transmute(u8)intrinsics.simd_extract_msbs(bad)
-		if (bad_mask & 0x0F) == 0 {
-			ans := transmute([4]f64)jit_atan2_4(#simd[4]f64{f64(yf[0]), f64(yf[1]), f64(yf[2]), f64(yf[3])}, #simd[4]f64{f64(xf[0]), f64(xf[1]), f64(xf[2]), f64(xf[3])})
-			d[0], d[1], d[2], d[3] = f32(ans[0]), f32(ans[1]), f32(ans[2]), f32(ans[3])
+	save_regs: [8]u8
+	n_save := 0
+	for &cs, idx in e.cache {
+		if cs.slot < 0 {
+			continue
+		}
+		if cs.slot == dst || cs.last_use <= e.pc {
+			cs = {slot = -1, last_use = -1, dirty = false, stamp = 0}
 		} else {
-			for l in 0 ..< 4 {d[l] = math.atan2(yf[l], xf[l])}
-		}
-		if (bad_mask & 0xF0) == 0 {
-			ans := transmute([4]f64)jit_atan2_4(#simd[4]f64{f64(yf[4]), f64(yf[5]), f64(yf[6]), f64(yf[7])}, #simd[4]f64{f64(xf[4]), f64(xf[5]), f64(xf[6]), f64(xf[7])})
-			d[4], d[5], d[6], d[7] = f32(ans[0]), f32(ans[1]), f32(ans[2]), f32(ans[3])
-		} else {
-			for l in 4 ..< 8 {d[l] = math.atan2(yf[l], xf[l])}
+			save_regs[n_save] = u8(8 + idx)
+			n_save += 1
 		}
 	}
-}
-
-@(private, enable_target_feature = "avx2")
-jit_help_pow :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
-	slots := ctx.slots
-	for i in 0 ..< i32(in_.n) {
-		x := (^Jit_Floats)(&slots[in_.a + i])
-		y := (^Jit_Floats)(&slots[in_.b + i])
-		d := (^Jit_Floats)(&slots[in_.dst + i])
-		for l in 0 ..< JIT_LANES {d[l] = math.pow(x[l], y[l])}
+	frame := i32(n_save * 32)
+	if n_save > 0 {
+		emit_bytes(&e.buf, 0x48, 0x81, 0xEC) // sub rsp, frame
+		emit_u32(&e.buf, u32(frame))
+		for k in 0 ..< n_save {
+			emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x11, save_regs[k], 0, GPR_RSP, i32(k * 32))
+		}
 	}
+	emit_bytes(&e.buf, 0x48, 0x89, 0xEF) // mov rdi, rbp
+	emit_bytes(&e.buf, 0x48, 0xBE)       // movabs rsi, in_ptr
+	emit_u64(&e.buf, u64(uintptr(in_ptr)))
+	emit_b(&e.buf, 0xBA)                 // mov edx, i
+	emit_u32(&e.buf, u32(i))
+	emit_bytes(&e.buf, 0x48, 0xB8)       // movabs rax, jit_help_math
+	emit_u64(&e.buf, u64(uintptr(rawptr(jit_help_math))))
+	emit_bytes(&e.buf, 0xFF, 0xD0)       // call rax
+	if n_save > 0 {
+		for k in 0 ..< n_save {
+			emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x10, save_regs[k], 0, GPR_RSP, i32(k * 32))
+		}
+		emit_bytes(&e.buf, 0x48, 0x81, 0xC4) // add rsp, frame
+		emit_u32(&e.buf, u32(frame))
+	}
+	e.exec_ymask_valid = false
+	copy_to_dst(e, dst, 0)
 }
 
 @(private, enable_target_feature = "avx2")
@@ -2310,23 +2239,19 @@ jit_help_texture :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_
 	ch := int(in_.k)
 	context = ctx.host_ctx
 	size := opts.channel_sizes[ch] if ch < len(opts.channel_sizes) else [3]i32{}
-	lod := (^Jit_Floats)(&slots[b])
-	u, v := (^Jit_Floats)(&slots[a]), (^Jit_Floats)(&slots[a + 1])
+	u, v, lod: [8]f32
+	sampler_args8(&slots[a][0], &slots[a + 1][0], &slots[b][0], size, in_.op == .Texture_Bias && size.xy != {}, &u[0], &v[0], &lod[0])
 	have := u32(ctx.lanes)
 	for o := 0; o < JIT_LANES; o += 4 {
 		if (exec >> uint(o)) & 0xf == 0 {
 			continue
-		}
-		level: f32 = 0
-		if in_.op == .Texture_Bias && size.xy != {} {
-			level = quad_level(raw_data(u), raw_data(v), o, f32(size.x), f32(size.y))
 		}
 		for l in o ..< o + 4 {
 			if (have >> uint(l)) & 1 == 0 {
 				continue
 			}
 			layer := int(f_to_i(fval(fn1(fval(slots[a + 2][l]), .Round_Even)))) if in_.n == 3 else 0
-			c := opts.sampler(opts.user, ch, {u[l], v[l]}, lod[l] + level, layer)
+			c := opts.sampler(opts.user, ch, {u[l], v[l]}, lod[l], layer)
 			for i in 0 ..< i32(4) {
 				slots[dst + i][l] = fbits(c[i])
 			}
@@ -2370,6 +2295,8 @@ jit_help_texel_fetch :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bou
 		uy_v = uy_v * -1 + 1
 	}
 	uy := transmute([8]f32)uy_v
+	canon_lanes8(&ux)
+	canon_lanes8(&uy)
 	uint_lod := (in_.d & 4) != 0
 	have := u32(ctx.lanes)
 	for o := 0; o < JIT_LANES; o += 4 {
@@ -2397,12 +2324,7 @@ jit_help_bound_lod :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bound
 	im := &chan_imgs[in_.k]
 	w, h := f32(im.levels[0].size[0]), f32(im.levels[0].size[1])
 	t := &ctx.tex_tmp
-	for o := 0; o < JIT_LANES; o += 4 {
-		q := quad_level(raw_data(&t[0]), raw_data(&t[1]), o, w, h)
-		for l in o ..< o + 4 {
-			t[2][l] += q
-		}
-	}
+	add_quad_levels8(&t[0][0], &t[1][0], &t[2][0], w, h)
 }
 
 @(private)
@@ -3977,12 +3899,20 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					vop_d_tab(&e.buf, 0xDB, yd, yd, OFF_TAB_ONE_U)
 					commit_dst(e, dst + i, yd)
 				}
-			case .Sin:
-				emit_helper_call(&e.buf, jit_help_sin, &code[pc])
-			case .Cos:
-				emit_helper_call(&e.buf, jit_help_cos, &code[pc])
+			case .Float_Bits_To_Int, .Float_Bits_To_Uint:
+				// canon_bits: NaN lanes (unordered with themselves) to 0x7fc00000.
+				emit_vex_rm(&e.buf, 1, 0, 1, 0, 0x28, 3, 0, GPR_R14, OFF_TAB_CANON)
+				for i in 0 ..< n {
+					ya := read_slot(e, a + i, 1)
+					vcmpps(&e.buf, 2, ya, ya, 0x03) // UNORD_Q
+					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
+					vblendvps(&e.buf, yd, ya, 3, 2)
+					commit_dst(e, dst + i, yd)
+				}
 			case:
-				emit_helper_call(&e.buf, jit_help_fn1, &code[pc])
+				for i in 0 ..< n {
+					emit_math_call(e, &code[pc], i)
+				}
 			}
 
 		case .F_Fn2:
@@ -4027,10 +3957,10 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					vop_ps(&e.buf, 0x5C, yd, ya, 3)
 					commit_dst(e, dst + i, yd)
 				}
-			case .Atan2:
-				emit_helper_call(&e.buf, jit_help_atan2, &code[pc])
 			case:
-				emit_helper_call(&e.buf, jit_help_pow, &code[pc])
+				for i in 0 ..< n {
+					emit_math_call(e, &code[pc], i)
+				}
 			}
 
 		case .F_Fn3:

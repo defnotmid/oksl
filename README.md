@@ -718,7 +718,9 @@ stage has (see **JIT** below), the JIT matches the interpreter bit for bit.
 `texture` in a fragment shader passes the sampler the level a GPU picks:
 `0.5 * log2(max(|duv/dx|², |duv/dy|²))` in the channel's texels
 (`Run_Options.channel_sizes`), one per quad from its top row and left
-column, plus the bias. It is fractional and below 0 where magnified (-inf
+column, plus the bias (within 2e-6 levels and the level's own rounding to
+f32, exact where the squared length is a power of 4: a short f32
+polynomial for the log2, which every callback waits for). It is fractional and below 0 where magnified (-inf
 where uv is constant), so the sampler clamps it to the levels it has; a
 channel without a size samples at the bias. GPUs approximate the level
 differently (on a bent mapping radv and Apple pick up to 0.17 levels
@@ -742,7 +744,8 @@ oksl.Channel_Image{format = .Rgba8, pixels = rgba_bytes, width = w, height = h,
 
 - **Formats:** `.F32` (1, 2 or 4 floats a texel, in `data`), and in
   `pixels`: `.Rgba8` and `.Gray8` (`byte / 255`), `.Gray16` (little-endian
-  `u16 / 65535`), `.Rgba16f` (IEEE halves; NaN quieted). Missing
+  `u16 / 65535`), `.Rgba16f` (IEEE halves; a NaN, like any, is
+  0x7fc00000 wherever it reaches the host). Missing
   components read `(0, 0, 0, 1)`: the Gray formats are `(g, 0, 0, 1)`.
   Nothing is decoded from sRGB: the shader decodes what it filters, as a
   GPU does with a `_UNORM` texture (bind the GPU texture as `_UNORM`, not
@@ -833,9 +836,9 @@ unbound channels may mix in the same pass.
   atomics in workgroups of more than 8 invocations, other targets,
   machines without AVX2, environments that refuse executable memory
   (`PROT_EXEC`), and builds with `-define:OKSL_JIT=false` run on the
-  64-lane interpreter with the same results, apart from NaN bit patterns
-  and, in compute, the outcome of unsynchronized accesses (both undefined
-  on GPUs too). Lanes that aren't running compute their own values: a
+  64-lane interpreter with the same results, bit for bit and NaNs
+  included (see **Precision**), apart from, in compute, the outcome of
+  unsynchronized accesses (undefined on GPUs too). Lanes that aren't running compute their own values: a
   variable, parameter or return value takes its first value in every
   lane (its initializer; 0 for one without an initializer, a declaration
   directly in a `switch` body, a `?:` result, and the result of a function
@@ -863,6 +866,35 @@ unbound channels may mix in the same pass.
 - **Precision:** f32 throughout, matching GPU semantics: GLSL `mod`, C
   integer division and remainder, guarded division by zero and
   float-to-int conversion, and shift amounts masked to 31.
+- **The same bits everywhere:** the CPU's output is bit-identical on
+  x86-64 and arm64, on Linux, macOS and Windows, in the JIT and the
+  interpreter (in IEEE 754's default environment: round to nearest,
+  subnormals kept; a host that sets flush-to-zero changes results). No
+  float built-in calls the platform's libm: `sin`, `cos`, `tan`, `asin`,
+  `acos`, `atan` (both forms), `sinh`, `cosh`, `tanh`, `asinh`, `acosh`,
+  `atanh`, `exp`, `exp2`, `log`, `log2` and `pow` are oksl's own
+  (`vm_math.odin`; the `texture` level's `log2` too, above): eight lanes at
+  a time in f64 with
+  IEEE 754's basic operations only (no fused multiply-add, which Odin never
+  contracts into), rounded once to f32: within 0.5000003 ulp of the exact
+  value for every f32 argument (`pow` and `atan(y, x)` over a billion
+  pairs), the correctly rounded result but for at most 25 arguments in a
+  billion (and `pow`'s exact halfway cases from integer powers above 2,
+  such as `x * x * x` halfway between two subnormals; `pow(x, 2.0)` is
+  `x * x` in f64, exact before its rounding), with `sin`, `cos` and `tan`
+  reduced to full f64 precision at any argument and `pow` and `atan(y, x)` following C99's special cases. A NaN's sign and payload depend on the
+  CPU (x86 makes `0xffc00000`, arm64 `0x7fc00000`) and on the operand
+  order a compiler picks, so wherever a float's bits reach the host or an
+  integer they are canonical: every NaN in a target, a `run_vertex`
+  position or varying, a storage buffer or image store, a `sampler`
+  callback's `uv` or `lod`, and every NaN `floatBitsToInt` or
+  `floatBitsToUint` sees is `0x7fc00000` (an `rgba16f` texel's
+  `0x7e00`). Inside a shader NaNs propagate as the CPU makes them, which
+  nothing observes. A signaling NaN (from `uintBitsToFloat`, a uniform, a
+  buffer, an image or a callback) gives what the same NaN quiet gives,
+  everywhere: oksl's CPU code has no `min`/`max` (`fminnm`/`fmaxnm` on
+  arm64, which quiet a signaling NaN and return it, not the other operand)
+  that a signaling NaN can reach.
 
 ## Design
 

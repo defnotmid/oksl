@@ -5219,16 +5219,6 @@ void main() {
 // An independent statement of the rule, as a sampler callback, for the
 // bound images to match bit for bit in the JIT and the interpreter.
 
-// Two f32 words alike: the same bits, or both NaN. Which NaN a blend of
-// NaN texels gives (its sign and payload) depends on the order the
-// compiler gives the operands of an add, so the JIT, the interpreter and
-// builds of it differ there (the README's NaN bit patterns); every other
-// value is compared exactly.
-@(private = "file")
-bits_or_nan :: proc(a, b: u32) -> bool {
-	return a == b || (a & 0x7fff_ffff > 0x7f80_0000 && b & 0x7fff_ffff > 0x7f80_0000)
-}
-
 @(private = "file")
 ref_level :: proc(im: ^Channel_Image, l: int) -> (bytes: []u8, w, h, pitch: int) {
 	tb := channel_texel_bytes(im.format, im.components)
@@ -5572,7 +5562,7 @@ test_bound_channel_rule :: proc(t: ^testing.T) {
 							wc := slice.reinterpret([]u32, outs[2][target])
 							wcv := slice.reinterpret([]u32, outs[3][target])
 							for i in 0 ..< len(wj) {
-								if !bits_or_nan(wj[i], wv[i]) || !bits_or_nan(wj[i], wc[i]) || !bits_or_nan(wc[i], wcv[i]) {
+								if wj[i] != wv[i] || wj[i] != wc[i] || wc[i] != wcv[i] {
 									if mismatches < 12 {
 										testing.expectf(t, false, "%v/%d %v %v mips=%v xform %d target %d pixel (%d, %d) comp %d: jit %08x vm %08x callback %08x/%08x",
 											cfg.format, cfg.comps, filter, wrap, mips, xi, target, (i / 4) % W, i / 4 / W, i % 4, wj[i], wv[i], wc[i], wcv[i])
@@ -5688,8 +5678,8 @@ void main() {
 }
 
 // Every stored value of every byte format decodes as the rule says
-// (u8 / 255, u16 / 65535, every half as f16_to_f32 with NaN quieted),
-// through texelFetch and Nearest in both engines, with rows `stride` bytes
+// (u8 / 255, u16 / 65535, every half as f16_to_f32, a NaN leaving the
+// target canonical), through texelFetch and Nearest in both engines, with rows `stride` bytes
 // apart and Gray texels at every byte alignment.
 @(test)
 test_bound_channel_decode :: proc(t: ^testing.T) {
@@ -5774,9 +5764,11 @@ void main() {
 				g := slice.reinterpret([]u32, o)
 				w := slice.reinterpret([]u32, want)
 				for i in 0 ..< len(w) {
-					if g[i] != w[i] {
+					// A NaN leaves a target as 0x7fc00000 (`canonical`).
+					want_i := w[i] if want[i / 4][i % 4] == want[i / 4][i % 4] else 0x7fc0_0000
+					if g[i] != want_i {
 						if bad < 4 {
-							testing.expectf(t, false, "%v offset %d jit=%v texel %d comp %d: got %08x, want %08x", c.format, c.offset, jit, i / 4, i % 4, g[i], w[i])
+							testing.expectf(t, false, "%v offset %d jit=%v texel %d comp %d: got %08x, want %08x", c.format, c.offset, jit, i / 4, i % 4, g[i], want_i)
 						}
 						bad += 1
 					}
@@ -5825,7 +5817,7 @@ void main() {
 			run_f32_interp(&m.program, block, W, H, outs[2], temp_scratch(), {sampler = ref_bound_sampler, user = &im, channel_sizes = sizes[:]})
 			a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
 			for i in 0 ..< len(a) {
-				if !bits_or_nan(a[i], b[i]) || !bits_or_nan(b[i], c[i]) {
+				if a[i] != b[i] || b[i] != c[i] {
 					testing.expectf(t, false, "%v scale %v word %d: jit %08x vm %08x callback %08x", format, scale, i, a[i], b[i], c[i])
 					break
 				}
@@ -6071,7 +6063,7 @@ void main() {
 		run_f32_interp(&m.program, nil, 24, 24, outs[2], temp_scratch(), {sampler = ref_bound_sampler, user = &im})
 		a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
 		for i in 0 ..< len(a) {
-			if !bits_or_nan(a[i], b[i]) || !bits_or_nan(b[i], c[i]) {
+			if a[i] != b[i] || b[i] != c[i] {
 				testing.expectf(t, false, "n %d word %d: jit %08x vm %08x callback %08x", n, i, a[i], b[i], c[i])
 				break
 			}
@@ -6159,7 +6151,7 @@ void main() {
 			run_f32_interp(&m.program, nil, 64, 64, outs[2], temp_scratch(), {channel_images = {im}, buffers = {words}})
 			a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
 			for i in 0 ..< len(a) {
-				if !bits_or_nan(a[i], b[i]) || !bits_or_nan(b[i], c[i]) {
+				if a[i] != b[i] || b[i] != c[i] {
 					testing.expectf(t, false, "n %d axis %d word %d (coords %v): fma %08x f64 %08x vm %08x", n, ax, i, q[i / 4], a[i], b[i], c[i])
 					break
 				}
@@ -6170,7 +6162,7 @@ void main() {
 				run_f32_interp(&m.program, nil, 64, 64, outs[3], temp_scratch(), {sampler = ref_bound_sampler, user = &im, channel_sizes = {{i32(im.width), i32(im.height), 1}}, buffers = {words}})
 				r := slice.reinterpret([]u32, outs[3])
 				for i in 0 ..< len(c) {
-					if !bits_or_nan(c[i], r[i]) {
+					if c[i] != r[i] {
 						testing.expectf(t, false, "n %d axis %d word %d (coords %v): vm %08x callback %08x", n, ax, i, q[i / 4], c[i], r[i])
 						break
 					}
@@ -6288,7 +6280,7 @@ void main() {
 			run_f32_interp(&m.program, nil, 16, 16, outs[2], temp_scratch(), {sampler = ref_bound_sampler, user = &im, buffers = {words}})
 			a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
 			for i in 0 ..< len(a) {
-				if !bits_or_nan(a[i], b[i]) || !bits_or_nan(b[i], c[i]) {
+				if a[i] != b[i] || b[i] != c[i] {
 					testing.expectf(t, false, "fma %v n %d %v %v word %d: jit %08x vm %08x callback %08x", fma, n, format, filter, i, a[i], b[i], c[i])
 					break
 				}
@@ -9516,12 +9508,7 @@ void main() {{
 
 @(private = "file")
 jit_vec4_bits_eq :: proc(a, b: [4]f32) -> bool {
-	for c in 0 ..< 4 {
-		if !(math.is_nan(a[c]) && math.is_nan(b[c])) && transmute(u32)a[c] != transmute(u32)b[c] {
-			return false
-		}
-	}
-	return true
+	return transmute([4]u32)a == transmute([4]u32)b
 }
 
 @(test)
@@ -13269,22 +13256,14 @@ cjit_clone_run :: proc(r: Cjit_Run) -> Cjit_Run {
 	return c
 }
 
-@(private = "file")
-cjit_f32_same :: #force_inline proc(a, b: u32) -> bool {
-	nan_a := (a & 0x7fff_ffff) > 0x7f80_0000
-	nan_b := (b & 0x7fff_ffff) > 0x7f80_0000
-	return a == b || (nan_a && nan_b)
-}
-
 // Every word of every buffer and every byte of every image (sentinels
-// included) equal, any f32 NaN word equal to any other (and f16 NaNs in
-// rgba16f images); reports the first difference of each.
+// included) equal, NaNs too; reports the first difference of each.
 @(private = "file")
 cjit_expect_same :: proc(t: ^testing.T, what: string, a, b: Cjit_Run, loc := #caller_location) -> bool {
 	same := true
 	for _, i in a.bufs {
 		for w, j in a.bufs[i] {
-			if !cjit_f32_same(w, b.bufs[i][j]) {
+			if w != b.bufs[i][j] {
 				testing.expectf(t, false, "%s: buffer %d word %d (of %d): jit %08x interp %08x", what, i, j, len(a.opts.buffers[i]), w, b.bufs[i][j], loc = loc)
 				same = false
 				break
@@ -13294,26 +13273,12 @@ cjit_expect_same :: proc(t: ^testing.T, what: string, a, b: Cjit_Run, loc := #ca
 	for _, i in a.imgs {
 		f := a.opts.images[i].format
 		x, y := a.imgs[i], b.imgs[i]
-		for j := 0; j < len(x); {
-			ok := true
-			step := 1
-			if (f == .R32f || f == .Rgba32f) && j % 4 == 0 && j + 4 <= len(x) {
-				step = 4
-				ok = cjit_f32_same(intrinsics.unaligned_load((^u32)(&x[j])), intrinsics.unaligned_load((^u32)(&y[j])))
-			} else if f == .Rgba16f && j % 2 == 0 && j + 2 <= len(x) {
-				step = 2
-				hx := u16(x[j]) | u16(x[j + 1]) << 8
-				hy := u16(y[j]) | u16(y[j + 1]) << 8
-				ok = hx == hy || ((hx & 0x7fff) > 0x7c00 && (hy & 0x7fff) > 0x7c00)
-			} else {
-				ok = x[j] == y[j]
-			}
-			if !ok {
-				testing.expectf(t, false, "%s: image %d (%v) byte %d (of %d): jit %v interp %v", what, i, f, j, len(a.opts.images[i].data), x[j:j + step], y[j:j + step], loc = loc)
+		for j in 0 ..< len(x) {
+			if x[j] != y[j] {
+				testing.expectf(t, false, "%s: image %d (%v) byte %d (of %d): jit %v interp %v", what, i, f, j, len(a.opts.images[i].data), x[j], y[j], loc = loc)
 				same = false
 				break
 			}
-			j += step
 		}
 	}
 	return same
@@ -14267,12 +14232,11 @@ void zeros(float x, float lo, float hi, out vec4 a, out vec4 b, out vec4 c, out 
 
 @(private = "file")
 sz_same :: proc(a, b: u32) -> bool {
-	return a == b || ((a & 0x7fff_ffff) > 0x7f80_0000 && (b & 0x7fff_ffff) > 0x7f80_0000)
+	return a == b
 }
 
 // Signed zeros, NaNs and infinities through clamp and the functions odd at 0,
-// in the JIT and the interpreter alike, bit for bit (any NaN equal to any
-// other), in fragment shaders (per-pixel operands from a buffer, and uniform
+// in the JIT and the interpreter alike, bit for bit, in fragment shaders (per-pixel operands from a buffer, and uniform
 // ones, which run once per run) and in compute; and the results GLSL ES 3.10
 // and IEEE 754 define: clamp is min(max(x, lo), hi) with max(x, y) = x < y ? y
 // : x, so a bound equal to x leaves x (clamp(-0.0, 0.0, 1.0) = -0.0), and a
@@ -14379,9 +14343,9 @@ void main() {
 			}
 		}
 	}
-	// sinh(-1e-8) keeps its sign (core:math's (e^x - e^-x) / 2 gives -0.0).
+	// sinh(-1e-8) is -1e-8 (core:math's (e^x - e^-x) / 2 gave -0.0).
 	p_tiny := 7 * 7 * 7
-	testing.expectf(t, bits(&ti, p_tiny, 3) & 0x8000_0000 != 0, "sinh(-1e-8) = %08x", bits(&ti, p_tiny, 3))
+	testing.expectf(t, bits(&ti, p_tiny, 3) == transmute(u32)f32(-1e-8), "sinh(-1e-8) = %08x", bits(&ti, p_tiny, 3))
 
 	// Uniform operands: the work runs once per run, before the batches.
 	{
@@ -14616,6 +14580,958 @@ test_jit_sampler_lane_args :: proc(t: ^testing.T) {
 				}
 			}
 			compare(t, "run_fragment", c, rj[:], ri[:], oj[:], oi[:])
+		}
+	}
+}
+
+// ---- oksl's own f32 math, and canonical NaNs ---------------------------------------------
+
+@(private = "file")
+Math_Fn :: enum {Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Asinh, Acosh, Atanh, Exp, Exp2, Log, Log2}
+
+// The f64 references: libm's sin, cos, exp and pow, core:math's (FreeBSD's)
+// asin, acos, atan, atan2, tanh, the inverse hyperbolics and log, and sinh
+// by its series below 1, where (e^x - e^-x) / 2 cancels.
+@(private = "file")
+math_ref :: proc(f: Math_Fn, x: f64) -> f64 {
+	switch f {
+	case .Sin:   return math.sin(x)
+	case .Cos:   return math.cos(x)
+	case .Tan:   return math.sin(x) / math.cos(x)
+	case .Asin:  return math.asin(x)
+	case .Acos:  return math.acos(x)
+	case .Atan:  return math.atan(x)
+	case .Sinh:
+		if abs(x) < 1 {
+			z, term, sum := x * x, x, x
+			for k in 1 ..< 30 {
+				term *= z / f64(2 * k * (2 * k + 1))
+				sum += term
+			}
+			return sum
+		}
+		return (math.exp(x) - math.exp(-x)) * 0.5
+	case .Cosh:  return (math.exp(x) + math.exp(-x)) * 0.5
+	case .Tanh:  return math.tanh(x)
+	case .Asinh: return math.asinh(x)
+	case .Acosh: return math.acosh(x)
+	case .Atanh: return math.atanh(x)
+	case .Exp:   return math.exp(x)
+	case .Exp2:  return math.pow(2.0, x)
+	case .Log:   return math.ln(x)
+	case .Log2:  return math.ln(x) / math.LN2
+	}
+	return 0
+}
+
+@(private = "file")
+math_new8 :: proc(f: Math_Fn, x: F8) -> F8 {
+	switch f {
+	case .Sin:   return fsin8(x)
+	case .Cos:   return fcos8(x)
+	case .Tan:   return ftan8(x)
+	case .Asin:  return fasin8(x)
+	case .Acos:  return facos8(x)
+	case .Atan:  return fatan8(x)
+	case .Sinh:  return fsinh8(x)
+	case .Cosh:  return fcosh8(x)
+	case .Tanh:  return ftanh8(x)
+	case .Asinh: return fasinh8(x)
+	case .Acosh: return facosh8(x)
+	case .Atanh: return fatanh8(x)
+	case .Exp:   return fexp8(x)
+	case .Exp2:  return fexp28(x)
+	case .Log:   return flog8(x)
+	case .Log2:  return flog28(x)
+	}
+	return 0
+}
+
+// f at x, from lane 2 of eight whose others hold other values.
+@(private = "file")
+math_new :: proc(f: Math_Fn, x: f32) -> f32 {
+	return (transmute([8]f32)math_new8(f, F8{0.5, -3, x, 1e30, 2, -0.25, 1e-30, 7}))[2]
+}
+
+@(private = "file")
+math_lane :: proc(v: F8, i: int) -> f32 {
+	return (transmute([8]f32)v)[i]
+}
+
+// |got - ref| in f32 ulps at ref (2^-149 below 2^-126). A NaN, an infinity or
+// a zero where the reference has none (or the other sign): +inf.
+@(private = "file")
+math_ulps :: proc(got: f32, ref: f64) -> f64 {
+	if ref != ref || got != got {
+		return 0 if ref != ref && got != got else math.INF_F64
+	}
+	if rr := f32(ref); math.is_inf(rr) || math.is_inf(got) {
+		return 0 if got == rr else math.INF_F64
+	}
+	if ref == 0 {
+		return 0 if got == 0 && math.sign_bit(got) == math.sign_bit(ref) else math.INF_F64
+	}
+	ulp := 1.401298464324817e-45
+	if abs(ref) >= 1.1754943508222875e-38 {
+		_, e := math.frexp(ref)
+		ulp = math.ldexp(f64(1), e - 24)
+	}
+	return abs(f64(got) - ref) / ulp
+}
+
+// Values every sweep includes: zeros, subnormals, the ends, 1 and the
+// points the functions' reductions and special cases turn on; the f32s
+// nearest a multiple of pi/2 (below 2^20, where the third Cody-Waite part
+// matters most, and above, the closest of all), and the only three below
+// 2^20 whose sin or cos round the other way without that third part.
+@(private = "file")
+MATH_EDGES := [?]u32 {
+	0x437c_e5f1, 0x4096_cbe4, 0x474d_246f, 0x4116_cbe4, 0x4882_665e, 0x4902_665e, 0x4943_998d, 0x484d_246f,
+	0x6f79_be45, 0x50a3_e87f, 0x6ff9_be45, 0x5123_e87f, 0x6a19_76f1, 0x4955_bcba, 0x4979_5cac, 0x497d_25c7,
+	0x0000_0000, 0x0000_0001, 0x007f_ffff, 0x0080_0000, 0x3380_0000, 0x3f00_0000, 0x3f3f_ffff, 0x3f40_0000,
+	0x3f49_0fda, 0x3f49_0fdb, 0x3f49_0fdc, 0x3f80_0000, 0x3f7f_ffff, 0x3f80_0001, 0x3fc9_0fdb, 0x4049_0fdb,
+	0x3ed4_13cd, 0x401a_827a, 0x3ef2_d78c, 0x3f00_0001, 0x42b1_7218, 0x42b1_7217, 0x42b2_0000, 0xc2ce_8ed0,
+	0xc2cf_f1b5, 0xc2d0_0000, 0x4300_0000, 0x42fe_0000, 0xc315_0000, 0xc316_0000, 0x4b80_0000, 0x4b80_0001,
+	0x4c00_0000, 0x5f80_0000, 0x6dbd_bb21, 0x577f_dbf3, 0x7f7f_ffff, 0x7f80_0000, 0x7fc0_0000, 0x7fa0_0001,
+	0x4110_3ef2, 0x40c9_0fdb, 0x4ac9_0fdb, 0x5a00_0000, 0x48fe_178e,
+}
+
+// oksl's f32 math (vm_math.odin) against f64 references over every 4096th
+// f32 bit pattern of each sign (subnormals to infinity) and the edges, and
+// pow and atan(y, x) over a grid of every 2^22nd pattern of each sign by
+// itself: within 0.500001 ulp (0.5 being correctly rounded; no exhaustive
+// sweep finds over 0.50000023), and NaNs,
+// infinities and zeros' signs as the reference has them (libm's C99 rules
+// for pow and atan2 at zeros and infinities).
+@(test)
+test_math_ulp :: proc(t: ^testing.T) {
+	xs := make([dynamic]f32, context.temp_allocator)
+	for b: u32 = 0; b <= 0x7f80_0000; b += 4096 {
+		append(&xs, transmute(f32)b, transmute(f32)(b | 0x8000_0000))
+	}
+	for b in MATH_EDGES {
+		append(&xs, transmute(f32)b, transmute(f32)(b | 0x8000_0000))
+	}
+	for len(xs) % 8 != 0 {
+		append(&xs, 1)
+	}
+	for f in Math_Fn {
+		worst, worst_x := 0.0, f32(0)
+		for i := 0; i < len(xs); i += 8 {
+			got := transmute([8]f32)math_new8(f, intrinsics.unaligned_load((^F8)(&xs[i])))
+			for k in 0 ..< 8 {
+				x := xs[i + k]
+				if e := math_ulps(got[k], math_ref(f, f64(x))); e > worst {
+					worst, worst_x = e, x
+				}
+			}
+		}
+		testing.expectf(t, worst <= 0.500001, "%v: %.7f ulp at %v (0x%08x)", f, worst, worst_x, transmute(u32)worst_x)
+	}
+	grid := make([dynamic]f32, context.temp_allocator)
+	for b: u32 = 0; b <= 0x7f80_0000; b += 1 << 22 {
+		append(&grid, transmute(f32)b, transmute(f32)(b | 0x8000_0000))
+	}
+	for v in ([]f32{1, -1, 2, -2, 0.5, -0.5, 3, -3, 1e-45, 16777216, 16777218, 8388609, -8388609, 10, 0.1, 1.0000001, 0.99999994, math.nan_f32(), 7, -7}) {
+		append(&grid, v)
+	}
+	for len(grid) % 8 != 0 {
+		append(&grid, 1)
+	}
+	worst_pow, worst_atan2: f64
+	wp, wa: [2]f32
+	for x in grid {
+		for j := 0; j + 8 <= len(grid); j += 8 {
+			y8 := intrinsics.unaligned_load((^F8)(&grid[j]))
+			p, a := transmute([8]f32)fpow8(F8(x), y8), transmute([8]f32)fatan28(F8(x), y8)
+			for k in 0 ..< 8 {
+				y := grid[j + k]
+				if e := math_ulps(p[k], math.pow(f64(x), f64(y))); e > worst_pow {
+					worst_pow, wp = e, {x, y}
+				}
+				if e := math_ulps(a[k], math.atan2(f64(x), f64(y))); e > worst_atan2 {
+					worst_atan2, wa = e, {x, y}
+				}
+			}
+		}
+	}
+	testing.expectf(t, worst_pow <= 0.500001, "pow: %.7f ulp at %v", worst_pow, wp)
+	testing.expectf(t, worst_atan2 <= 0.500001, "atan2: %.7f ulp at %v", worst_atan2, wa)
+}
+
+// Results the functions define exactly, bit for bit: odd functions keep -0,
+// exp2 and log2 are exact at powers of two, and the special cases of C99's
+// pow and atan2 and of the domains (NaN as any NaN).
+@(test)
+test_math_edges :: proc(t: ^testing.T) {
+	NAN :: u32(0x7fc0_0000)
+	INF, NINF, NEG0 :: u32(0x7f80_0000), u32(0xff80_0000), u32(0x8000_0000)
+	PIO2_F, PI_F, PIO4_F :: u32(0x3fc9_0fdb), u32(0x4049_0fdb), u32(0x3f49_0fdb)
+	same :: proc(got: f32, want: u32) -> bool {
+		g := transmute(u32)got
+		return g == want || (want == NAN && got != got)
+	}
+	One :: struct {
+		f:       Math_Fn,
+		x, want: u32,
+	}
+	ones := [?]One {
+		{.Sin, NEG0, NEG0}, {.Sin, 0, 0}, {.Sin, INF, NAN}, {.Sin, NINF, NAN}, {.Sin, NAN, NAN},
+		{.Cos, NEG0, 0x3f80_0000}, {.Cos, INF, NAN}, {.Tan, NEG0, NEG0}, {.Tan, INF, NAN},
+		{.Asin, NEG0, NEG0}, {.Asin, 0x3f80_0000, PIO2_F}, {.Asin, 0xbf80_0000, PIO2_F | NEG0}, {.Asin, 0x3f80_0001, NAN},
+		{.Acos, 0x3f80_0000, 0}, {.Acos, 0xbf80_0000, PI_F}, {.Acos, 0, PIO2_F}, {.Acos, 0xbf80_0001, NAN},
+		{.Atan, NEG0, NEG0}, {.Atan, INF, PIO2_F}, {.Atan, NINF, PIO2_F | NEG0}, {.Atan, 0x3f80_0000, PIO4_F},
+		{.Sinh, NEG0, NEG0}, {.Sinh, INF, INF}, {.Sinh, NINF, NINF}, {.Sinh, 0x42b4_0000, INF},
+		{.Cosh, NEG0, 0x3f80_0000}, {.Cosh, NINF, INF},
+		{.Tanh, NEG0, NEG0}, {.Tanh, INF, 0x3f80_0000}, {.Tanh, NINF, 0xbf80_0000}, {.Tanh, 0x4120_0000, 0x3f80_0000},
+		{.Asinh, NEG0, NEG0}, {.Asinh, INF, INF}, {.Asinh, NINF, NINF},
+		{.Acosh, 0x3f80_0000, 0}, {.Acosh, 0x3f7f_ffff, NAN}, {.Acosh, INF, INF}, {.Acosh, NINF, NAN},
+		{.Atanh, NEG0, NEG0}, {.Atanh, 0x3f80_0000, INF}, {.Atanh, 0xbf80_0000, NINF}, {.Atanh, 0x3f80_0001, NAN},
+		{.Exp, 0, 0x3f80_0000}, {.Exp, NEG0, 0x3f80_0000}, {.Exp, INF, INF}, {.Exp, NINF, 0}, {.Exp, 0x42b2_0000, INF}, {.Exp, 0xc2d0_0000, 0},
+		{.Exp2, NINF, 0}, {.Exp2, INF, INF}, {.Exp2, 0x4300_0000, INF}, {.Exp2, 0xc316_0000, 0}, {.Exp2, 0xc315_0000, 1},
+		{.Log, 0x3f80_0000, 0}, {.Log, 0, NINF}, {.Log, NEG0, NINF}, {.Log, 0xbf80_0000, NAN}, {.Log, INF, INF}, {.Log, NINF, NAN},
+		{.Log2, 0, NINF}, {.Log2, NEG0, NINF}, {.Log2, 0xbf80_0000, NAN}, {.Log2, INF, INF}, {.Log2, 1, 0xc315_0000},
+	}
+	for c in ones {
+		got := math_new(c.f, transmute(f32)c.x)
+		testing.expectf(t, same(got, c.want), "%v(0x%08x) = 0x%08x, want 0x%08x", c.f, c.x, transmute(u32)got, c.want)
+	}
+	for k in -149 ..= 127 {
+		p := math.ldexp_f32(1, k)
+		testing.expectf(t, math_new(.Exp2, f32(k)) == p, "exp2(%d) = %v", k, math_new(.Exp2, f32(k)))
+		testing.expectf(t, math_new(.Log2, p) == f32(k), "log2(2^%d) = %v", k, math_new(.Log2, p))
+		testing.expectf(t, math_lane(fpow8(2, F8(f32(k))), 3) == p, "pow(2, %d) = %v", k, fpow8(2, F8(f32(k))))
+	}
+	Two :: struct {
+		x, y, want: u32,
+	}
+	ONE, NONE, TWO, HALF, THREE, NTHREE, NTWO :: u32(0x3f80_0000), u32(0xbf80_0000), u32(0x4000_0000), u32(0x3f00_0000), u32(0x4040_0000), u32(0xc040_0000), u32(0xc000_0000)
+	pows := [?]Two {
+		{NAN, 0, ONE}, {NAN, NEG0, ONE}, {ONE, NAN, ONE}, {ONE, INF, ONE}, {NONE, INF, ONE}, {NONE, NINF, ONE},
+		{NAN, ONE, NAN}, {TWO, NAN, NAN}, {NONE, NAN, NAN},
+		{NTWO, HALF, NAN}, {NINF, HALF, INF}, {NINF, NTHREE, NEG0}, {NINF, THREE, NINF}, {NINF, NTWO, 0},
+		{NTWO, THREE, 0xc100_0000}, {NTWO, TWO, 0x4080_0000}, {NTWO, NONE, 0xbf00_0000},
+		{0, NTHREE, INF}, {NEG0, NTHREE, NINF}, {NEG0, NTWO, INF}, {NEG0, NINF, INF}, {0, NHALF_U32, INF},
+		{0, THREE, 0}, {NEG0, THREE, NEG0}, {NEG0, TWO, 0}, {NEG0, HALF, 0}, {0, INF, 0},
+		{HALF, INF, 0}, {HALF, NINF, INF}, {TWO, INF, INF}, {TWO, NINF, 0}, {INF, NONE, 0}, {INF, HALF, INF},
+		{TWO, 0x4b7f_ffff, INF}, {NTWO, 0x4b7f_ffff, NINF}, {NTWO, 0x4b80_0001, INF}, {0x4120_0000, TWO, 0x42c8_0000},
+	}
+	for c in pows {
+		got := math_lane(fpow8(F8{2, transmute(f32)c.x, 0, -1, 1, 3, -2, 0.5}, F8{0.5, transmute(f32)c.y, -1, 3, 2, 0, 0.5, -7}), 1)
+		testing.expectf(t, same(got, c.want), "pow(0x%08x, 0x%08x) = 0x%08x, want 0x%08x", c.x, c.y, transmute(u32)got, c.want)
+	}
+	atan2s := [?]Two {
+		{0, ONE, 0}, {NEG0, ONE, NEG0}, {0, NEG0, PI_F}, {NEG0, NEG0, PI_F | NEG0}, {0, 0, 0}, {NEG0, 0, NEG0},
+		{0, NONE, PI_F}, {NEG0, NONE, PI_F | NEG0}, {ONE, 0, PIO2_F}, {ONE, NEG0, PIO2_F}, {NONE, 0, PIO2_F | NEG0},
+		{INF, INF, PIO4_F}, {NINF, INF, PIO4_F | NEG0}, {INF, NINF, 0x4016_cbe4}, {NINF, NINF, 0xc016_cbe4},
+		{ONE, INF, 0}, {NONE, INF, NEG0}, {ONE, NINF, PI_F}, {NONE, NINF, PI_F | NEG0}, {INF, ONE, PIO2_F}, {NINF, NONE, PIO2_F | NEG0},
+		{ONE, ONE, PIO4_F}, {NAN, ONE, NAN}, {0, NAN, NAN}, {NAN, 0, NAN},
+	}
+	for c in atan2s {
+		got := math_lane(fatan28(F8{2, 0, transmute(f32)c.x, -1, 1, 3, -2, 0.5}, F8{0.5, -1, transmute(f32)c.y, 3, 2, 0, 0.5, -7}), 2)
+		testing.expectf(t, same(got, c.want), "atan(0x%08x, 0x%08x) = 0x%08x, want 0x%08x", c.x, c.y, transmute(u32)got, c.want)
+	}
+}
+
+@(private = "file")
+NHALF_U32 :: u32(0xbf00_0000)
+
+// Every float built-in the math library computes, in a fragment shader on
+// per-pixel operands from a buffer, through the JIT and the interpreter: the
+// outputs equal bit for bit, and equal to the library's procs called here
+// (NaN canonical), so both engines call them; over the edges, everyday
+// operands where glibc's sin, cos, tan, sinh, cosh, exp, exp2, log2 and pow
+// round differently (so a path back to libm shows), and 4,096 patterns
+// spread over every magnitude, NaNs with payloads and both signs included.
+@(test)
+test_math_engines :: proc(t: ^testing.T) {
+	src := `#version 310 es
+precision highp float;
+layout(std430, binding = 0) readonly buffer In { float v[]; } inp;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
+layout(location = 4) out vec4 o4;
+void main() {
+    int p = int(gl_FragCoord.y) * 64 + int(gl_FragCoord.x);
+    float x = inp.v[p * 2];
+    float y = inp.v[p * 2 + 1];
+    o0 = vec4(sin(x), cos(x), tan(x), asin(x));
+    o1 = vec4(acos(x), atan(x), sinh(x), cosh(x));
+    o2 = vec4(tanh(x), asinh(x), acosh(x), atanh(x));
+    o3 = vec4(exp(x), exp2(x), log(x), log2(x));
+    o4 = vec4(pow(x, y), atan(x, y), pow(y, x), atan(y, x));
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	W, H :: 64, 64
+	N :: W * H
+	inputs := make([]u32, 2 * N, context.temp_allocator)
+	s: u32 = 0x9e37_79b9
+	next :: proc(s: ^u32) -> u32 {
+		s^ ~= s^ << 13
+		s^ ~= s^ >> 17
+		s^ ~= s^ << 5
+		return s^
+	}
+	for i in 0 ..< 2 * N {
+		inputs[i] = next(&s)
+	}
+	for b, i in MATH_EDGES {
+		inputs[4 * i], inputs[4 * i + 2] = b, b | 0x8000_0000
+		inputs[4 * i + 1], inputs[4 * i + 3] = MATH_EDGES[(i * 7 + 3) % len(MATH_EDGES)], MATH_EDGES[(i * 5 + 1) % len(MATH_EDGES)] | 0x8000_0000
+	}
+	LIBM_APART :: [?][2]u32 {
+		{0xc2c7_ffbe, 0}, {0xc2c7_fe42, 0}, {0xc2c7_e83e, 0}, {0xc2c7_7cb9, 0}, {0xc2c7_ffe6, 0}, {0xc2c7_ffcc, 0},
+		{0xc11f_fe67, 0}, {0xc11f_fd18, 0}, {0xc120_0000, 0}, {0xc11f_fdbf, 0}, {0xc29f_58c3, 0}, {0xc29f_180b, 0},
+		{0xc2ef_f4e1, 0}, {0xc2ef_b6b4, 0}, {0x3b44_9b9e, 0}, {0x3b83_1268, 0},
+		{0x4001_47ae, 0xc0ff_be77}, {0x4176_3d71, 0xc0ff_be77}, {0x418c_e148, 0xc0ff_be77},
+	}
+	for v, i in LIBM_APART {
+		j := 2 * (2 * len(MATH_EDGES) + i)
+		inputs[j], inputs[j + 1] = v[0], v[1]
+	}
+	inputs[2 * N - 2], inputs[2 * N - 1] = 0xffc0_1234, 0x7f80_0001
+	tj, ti := new([5][N][4]f32, context.temp_allocator), new([5][N][4]f32, context.temp_allocator)
+	tsj := [5][][4]f32{tj[0][:], tj[1][:], tj[2][:], tj[3][:], tj[4][:]}
+	tsi := [5][][4]f32{ti[0][:], ti[1][:], ti[2][:], ti[3][:], ti[4][:]}
+	bufs := [1][]u32{inputs}
+	run_targets(&m.program, nil, W, H, tsj[:], temp_scratch(), {buffers = bufs[:]})
+	sb, si := m.program.jit_body, m.program.jit_init
+	m.program.jit_body, m.program.jit_init = nil, nil
+	run_targets(&m.program, nil, W, H, tsi[:], temp_scratch(), {buffers = bufs[:]})
+	m.program.jit_body, m.program.jit_init = sb, si
+	bad := 0
+	for p in 0 ..< N {
+		x, y := transmute(f32)inputs[2 * p], transmute(f32)inputs[2 * p + 1]
+		want: [20]f32
+		for f, k in Math_Fn {
+			want[k] = math_new(f, x)
+		}
+		want[16], want[17] = math_lane(fpow8(F8(x), F8(y)), 0), math_lane(fatan28(F8(x), F8(y)), 0)
+		want[18], want[19] = math_lane(fpow8(F8(y), F8(x)), 0), math_lane(fatan28(F8(y), F8(x)), 0)
+		for k in 0 ..< 20 {
+			w := canon_bits(transmute(u32)want[k])
+			a, b := transmute(u32)tj[k / 4][p][k % 4], transmute(u32)ti[k / 4][p][k % 4]
+			if (a != w || b != w) && bad < 8 {
+				testing.expectf(t, false, "x 0x%08x y 0x%08x result %d: jit %08x interp %08x want %08x", inputs[2 * p], inputs[2 * p + 1], k, a, b, w)
+				bad += 1
+			}
+		}
+	}
+}
+
+@(private = "file")
+Nan_Rec :: struct {
+	u, v, l: u32,
+}
+
+@(private = "file")
+nan_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+	append((^[dynamic]Nan_Rec)(user), Nan_Rec{transmute(u32)uv.x, transmute(u32)uv.y, transmute(u32)lod})
+	return {uv.x, lod, 0, 1}
+}
+
+// Every NaN a host sees is 0x7fc00000 (an f16 one 0x7e00), in the JIT and
+// the interpreter alike, whatever sign and payload the NaN had: a NaN read
+// from a buffer (0xffc01234), 0 / 0 (0xffc00000 on x86) and its negation,
+// through run_f32, run_targets and run_fragment targets, run_vertex's
+// position and varyings, buffer stores (a float, a vec4, a swizzle and a
+// struct's float beside its int), r32f, rgba32f and rgba16f image stores,
+// floatBitsToInt and floatBitsToUint (into an int varying and a uint
+// buffer), and a sampler callback's uv and lod (textureLod and texture's
+// bias). Integers that look like NaNs, infinities, -0 and the largest
+// float are left alone.
+@(test)
+test_nan_canonical :: proc(t: ^testing.T) {
+	CANON :: u32(0x7fc0_0000)
+	inputs := []u32{0xffc0_1234, 0, 0x7f80_0001, 0x7f80_0000, 0xff80_0000, 0x8000_0000, 0x7f7f_ffff}
+	KEEP :: [4]u32{0x7f80_0000, 0xff80_0000, 0x8000_0000, 0x7f7f_ffff}
+	bufs := [1][]u32{inputs}
+	interp :: proc(p: ^Program) -> (rawptr, rawptr) {
+		sb, si := p.jit_body, p.jit_init
+		p.jit_body, p.jit_init = nil, nil
+		return sb, si
+	}
+	all_canon :: proc(t: ^testing.T, what: string, words: []u32, loc := #caller_location) {
+		for w, i in words {
+			testing.expectf(t, w == CANON, "%s: word %d is %08x", what, i, w, loc = loc)
+		}
+	}
+	frag := `#version 310 es
+precision highp float;
+uniform sampler2D s;
+layout(std430, binding = 0) readonly buffer In { uint w[]; } inp;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+void main() {
+    float a = uintBitsToFloat(inp.w[0]);
+    float z = uintBitsToFloat(inp.w[1]);
+    float n = z / z;
+    o0 = vec4(a, -n, n, -a);
+    o2 = vec4(uintBitsToFloat(inp.w[3]), uintBitsToFloat(inp.w[4]), uintBitsToFloat(inp.w[5]), uintBitsToFloat(inp.w[6]));
+    o1 = vec4(intBitsToFloat(floatBitsToInt(a)), uintBitsToFloat(floatBitsToUint(-n)), uintBitsToFloat(floatBitsToUint(a) ^ 0x7fc00000u), 1.0);
+    o1.w = textureLod(s, vec2(a, -n), n).x + texture(s, vec2(-a, n), -a).y;
+}
+`
+	fm, ferrs, fok := compile(frag, {profile = .Glsl, stage = .Fragment})
+	defer destroy(fm)
+	if !testing.expectf(t, fok, "%s", format_errors(ferrs, context.temp_allocator)) {
+		return
+	}
+	sizes := [1][3]i32{{4, 4, 1}}
+	for engine in 0 ..< 2 {
+		sb, si := fm.program.jit_body, fm.program.jit_init
+		if engine == 1 {
+			sb, si = interp(&fm.program)
+		}
+		name := "jit" if engine == 0 else "interp"
+		recs := make([dynamic]Nan_Rec, context.temp_allocator)
+		opts := Run_Options{buffers = bufs[:], sampler = nan_cb, user = &recs, channel_sizes = sizes[:]}
+		o: [4][4]f32
+		run_f32(&fm.program, nil, 2, 2, o[:], temp_scratch(), opts)
+		for px in o {
+			w := transmute([4]u32)px
+			all_canon(t, fmt.tprintf("%s run_f32", name), w[:])
+		}
+		t0, t1, t2: [4][4]f32
+		targets := [3][][4]f32{t0[:], t1[:], t2[:]}
+		run_targets(&fm.program, nil, 2, 2, targets[:], temp_scratch(), opts)
+		run_fragment(&fm.program, nil, {count = 1, origin = {{0, 0}}}, targets[:], make([]Quad_Lanes, 1, context.temp_allocator), temp_scratch(), opts)
+		for px in 0 ..< 4 {
+			w0, w1 := transmute([4]u32)t0[px], transmute([4]u32)t1[px]
+			testing.expectf(t, transmute([4]u32)t2[px] == KEEP, "%s: o2 %v", name, transmute([4]u32)t2[px])
+			all_canon(t, fmt.tprintf("%s o0", name), w0[:])
+			all_canon(t, fmt.tprintf("%s o1.xyw", name), {w1[0], w1[1], w1[3]})
+			testing.expectf(t, w1[2] == 0, "%s: floatBitsToUint(a) is %08x", name, w1[2] ~ CANON)
+		}
+		testing.expect(t, len(recs) > 0)
+		for r in recs {
+			all_canon(t, fmt.tprintf("%s sampler", name), {r.u, r.v, r.l})
+		}
+		fm.program.jit_body, fm.program.jit_init = sb, si
+	}
+
+	vert := `#version 310 es
+layout(std430, binding = 0) readonly buffer In { uint w[]; } inp;
+out vec4 v;
+flat out ivec2 iv;
+void main() {
+    float a = uintBitsToFloat(inp.w[0]);
+    float z = uintBitsToFloat(inp.w[1]);
+    float n = z / z;
+    gl_Position = vec4(a, -n, n, -a);
+    v = vec4(-n, a, uintBitsToFloat(inp.w[2]), n);
+    iv = ivec2(floatBitsToInt(-a), int(inp.w[0]));
+}
+`
+	vm, verrs, vok := compile(vert, {profile = .Glsl, stage = .Vertex})
+	defer destroy(vm)
+	if !testing.expectf(t, vok, "%s", format_errors(verrs, context.temp_allocator)) {
+		return
+	}
+	for engine in 0 ..< 2 {
+		sb, si := vm.program.jit_body, vm.program.jit_init
+		if engine == 1 {
+			sb, si = interp(&vm.program)
+		}
+		name := "jit" if engine == 0 else "interp"
+		pos: [3][4]f32
+		vary := make([]f32, 3 * vm.varying_floats, context.temp_allocator)
+		run_vertex(&vm.program, nil, nil, 3, pos[:], vary, temp_scratch(), {buffers = bufs[:]})
+		for p in pos {
+			w := transmute([4]u32)p
+			all_canon(t, fmt.tprintf("%s position", name), w[:])
+		}
+		for ov in vm.stage_outputs {
+			for i in 0 ..< 3 {
+				for k in 0 ..< int(ov.type.rows) {
+					w := transmute(u32)vary[i * vm.varying_floats + ov.offset + k]
+					if ov.name == "iv" && k == 1 {
+						testing.expectf(t, w == 0xffc0_1234, "%s: int varying %08x", name, w)
+					} else {
+						testing.expectf(t, w == CANON, "%s: varying %s.%d is %08x", name, ov.name, k, w)
+					}
+				}
+			}
+		}
+		vm.program.jit_body, vm.program.jit_init = sb, si
+	}
+
+	comp := `#version 310 es
+layout(local_size_x = 1) in;
+struct S { int i; float f; };
+struct R { float f; uint u; vec4 v; vec2 s; S st; };
+layout(std430, binding = 0) readonly buffer In { uint w[]; } inp;
+layout(std430, binding = 1) buffer Out { R r[]; } outp;
+layout(r32f) writeonly uniform highp image2D i32f;
+layout(rgba32f) writeonly uniform highp image2D i128f;
+layout(rgba16f) writeonly uniform highp image2D i64f;
+void main() {
+    float a = uintBitsToFloat(inp.w[0]);
+    float z = uintBitsToFloat(inp.w[1]);
+    float n = z / z;
+    outp.r[0].f = a;
+    outp.r[0].u = floatBitsToUint(-n);
+    outp.r[0].v = vec4(n, -n, a, -a);
+    outp.r[0].s.yx = vec2(-a, n);
+    outp.r[0].st = S(int(inp.w[0]), -n);
+    outp.r[1].v = vec4(uintBitsToFloat(inp.w[3]), uintBitsToFloat(inp.w[4]), uintBitsToFloat(inp.w[5]), uintBitsToFloat(inp.w[6]));
+    imageStore(i32f, ivec2(0, 0), vec4(-n));
+    imageStore(i128f, ivec2(0, 0), vec4(a, -a, n, -n));
+    imageStore(i64f, ivec2(0, 0), vec4(a, -a, n, -n));
+}
+`
+	cm, cerrs, cok := compile(comp, {profile = .Glsl, stage = .Compute})
+	defer destroy(cm)
+	if !testing.expectf(t, cok, "%s", format_errors(cerrs, context.temp_allocator)) {
+		return
+	}
+	for engine in 0 ..< 2 {
+		sb, si := cm.program.jit_body, cm.program.jit_init
+		if engine == 1 {
+			sb, si = interp(&cm.program)
+		}
+		name := "jit" if engine == 0 else "interp"
+		out := make([]u32, 24, context.temp_allocator)
+		r32: [1]u32
+		r128: [4]u32
+		r64: [4]u16
+		imgs := []Storage_Image {
+			{data = slice.to_bytes(r32[:]), width = 1, height = 1, format = .R32f},
+			{data = slice.to_bytes(r128[:]), width = 1, height = 1, format = .Rgba32f},
+			{data = slice.to_bytes(r64[:]), width = 1, height = 1, format = .Rgba16f},
+		}
+		cbufs := [2][]u32{inputs, out}
+		run_compute(&cm.program, nil, {1, 1, 1}, temp_scratch(), {buffers = cbufs[:], images = imgs})
+		// f, u, pad, pad, v (4), s (2), st.i, st.f
+		all_canon(t, fmt.tprintf("%s buffer", name), {out[0], out[1], out[4], out[5], out[6], out[7], out[8], out[9], out[11]})
+		testing.expectf(t, out[10] == 0xffc0_1234, "%s: struct int %08x", name, out[10])
+		testing.expectf(t, [4]u32{out[16], out[17], out[18], out[19]} == KEEP, "%s: kept floats %v", name, out[16:20])
+		all_canon(t, fmt.tprintf("%s r32f", name), r32[:])
+		all_canon(t, fmt.tprintf("%s rgba32f", name), r128[:])
+		testing.expectf(t, r64 == {0x7e00, 0x7e00, 0x7e00, 0x7e00}, "%s: rgba16f %v", name, r64)
+		cm.program.jit_body, cm.program.jit_init = sb, si
+	}
+}
+
+// pow(x, 2.0) is x * x in f64, rounded once: for every lane with y = 2,
+// whatever the other lanes of the call hold (the call takes a shortcut only
+// when all eight are 2), NaN, infinities and zeros included.
+@(test)
+test_math_pow_square :: proc(t: ^testing.T) {
+	xs := make([dynamic]f32, context.temp_allocator)
+	for b: u32 = 0; b <= 0x7f80_0000; b += 1 << 14 {
+		append(&xs, transmute(f32)b, transmute(f32)(b | 0x8000_0000))
+	}
+	for b in MATH_EDGES {
+		append(&xs, transmute(f32)b, transmute(f32)(b | 0x8000_0000))
+	}
+	MIXED :: F8{2, 3, 2, 0.5, 2, 2, -1, 2}
+	bad := 0
+	for x in xs {
+		want := f32(f64(x) * f64(x))
+		all2, mixed, all3 := transmute([8]f32)fpow8(F8(x), F8(2)), transmute([8]f32)fpow8(F8(x), MIXED), transmute([8]f32)fpow8(F8(x), F8(3))
+		half := transmute([8]f32)fpow8(F8(x), F8(0.5))
+		ok := (transmute(u32)all2[0] == transmute(u32)want || (x != x && all2[0] != all2[0])) &&
+			transmute(u32)mixed[0] == transmute(u32)all2[0] && transmute(u32)mixed[2] == transmute(u32)all2[0] &&
+			(transmute(u32)mixed[1] == transmute(u32)all3[0] || (x != x && mixed[1] != mixed[1])) &&
+			(transmute(u32)mixed[3] == transmute(u32)half[0] || (mixed[3] != mixed[3] && half[0] != half[0]))
+		if !ok && bad < 8 {
+			testing.expectf(t, false, "pow(0x%08x, 2): %v, mixed %v, want %v", transmute(u32)x, all2[0], mixed, want)
+			bad += 1
+		}
+	}
+}
+
+// texture()'s level: 0.5 * log2 of the squared length within 2e-6 (f64
+// reference), exact at powers of 4, -inf at 0, +inf at +inf, NaN for NaN
+// and negative lengths, subnormals included.
+@(test)
+test_texture_level :: proc(t: ^testing.T) {
+	worst, worst_m := 0.0, f32(0)
+	for b: u32 = 1; b < 0x7f80_0000; b += 4093 {
+		m := transmute(f32)b
+		got := transmute([8]f32)quad_level8(F8(m))
+		want := 0.5 * math.log2(f64(m))
+		// Less the rounding of the level itself to f32 (a 4e-6 step from 32).
+		w := abs(f32(want))
+		e := abs(f64(got[0]) - want) - 0.5 * f64(transmute(f32)(transmute(u32)w + 1) - w)
+		if e > worst {
+			worst, worst_m = e, m
+		}
+	}
+	testing.expectf(t, worst <= 2e-6, "level off by %v at %v", worst, worst_m)
+	for k in -74 ..= 63 {
+		m := math.ldexp_f32(1, 2 * k)
+		testing.expectf(t, (transmute([8]f32)quad_level8(F8(m)))[0] == f32(k), "level of 4^%d", k)
+	}
+	l := transmute([8]f32)quad_level8(F8{0, fval(0x8000_0000), fval(0x7f80_0000), math.nan_f32(), -1, 1, 2, 1e-45})
+	testing.expect(t, math.is_inf(l[0], -1) && math.is_inf(l[1], -1) && math.is_inf(l[2], 1) && l[3] != l[3] && l[4] != l[4])
+	testing.expect(t, l[5] == 0 && l[6] == 0.5 && abs(f64(l[7]) - 0.5 * math.log2(f64(f32(1e-45)))) <= 2e-6)
+}
+
+// A vm_math.odin built-in between many values the JIT keeps in registers
+// (its helper call stays inside the basic block, saving and restoring the
+// ones still live): the JIT equal to the interpreter bit for bit.
+@(test)
+test_math_live_across_call :: proc(t: ^testing.T) {
+	src := `#version 310 es
+precision highp float;
+layout(std430, binding = 0) readonly buffer In { float v[]; } inp;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+void main() {
+    int p = int(gl_FragCoord.y) * 16 + int(gl_FragCoord.x);
+    float x = inp.v[p], y = inp.v[p + 1];
+    float a = x * 1.5, b = y - 2.0, c = x * y, d = x + y, e = x - y, f = y * 3.0, g = x * x, h = y * y, i = a + b, j = c - d;
+    float s = sin(x) + cos(y) * exp(b) - atan(c, d) + pow(abs(e), 0.75) + log2(abs(f) + 1.0);
+    vec3 w = 0.5 + 0.5 * cos(x + vec3(y, c, d) + vec3(0, 2, 4));
+    vec4 z = pow(abs(vec4(e, f, g, h)) + 0.25, vec4(a, b, 1.5, 0.5)) + atan(vec4(i, j, a, b), vec4(c, d, e, f));
+    o0 = vec4(a + s * b, c - s * d, e * s + f, g + h * s) + vec4(w, 1.0) * z;
+    o1 = vec4(i * j + s, a * b * c, d * e * f, g * h * i * j) - z.wzyx;
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	W, H :: 16, 16
+	inputs := make([]u32, W * H + 1, context.temp_allocator)
+	s: u32 = 0x1234_5679
+	for i in 0 ..< len(inputs) {
+		s ~= s << 13; s ~= s >> 17; s ~= s << 5
+		inputs[i] = transmute(u32)(f32(i32(s % 2001) - 1000) * 0.013)
+	}
+	bufs := [1][]u32{inputs}
+	tj, ti: [2][W * H][4]f32
+	tsj := [2][][4]f32{tj[0][:], tj[1][:]}
+	tsi := [2][][4]f32{ti[0][:], ti[1][:]}
+	run_targets(&m.program, nil, W, H, tsj[:], temp_scratch(), {buffers = bufs[:]})
+	sb, si := m.program.jit_body, m.program.jit_init
+	m.program.jit_body, m.program.jit_init = nil, nil
+	run_targets(&m.program, nil, W, H, tsi[:], temp_scratch(), {buffers = bufs[:]})
+	m.program.jit_body, m.program.jit_init = sb, si
+	testing.expect(t, slice.equal(slice.reinterpret([]u32, tj[0][:]), slice.reinterpret([]u32, ti[0][:])))
+	testing.expect(t, slice.equal(slice.reinterpret([]u32, tj[1][:]), slice.reinterpret([]u32, ti[1][:])))
+}
+
+// What the sampler callback receives where its arguments are NaN: a
+// Shadertoy texelFetch whose iChannelResolution is NaN passes 0x7fc00000 as
+// uv in both engines; a quad whose x derivative is NaN picks its level from
+// the y derivative (max as maxnum).
+@(test)
+test_sampler_nan_args :: proc(t: ^testing.T) {
+	m, errs, ok := compile_shadertoy("void mainImage(out vec4 c, in vec2 p) { c = texelFetch(iChannel0, ivec2(p), 0); }")
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	block := make([]u8, m.block_size, context.temp_allocator)
+	nan := transmute(f32)u32(0xffc0_1234)
+	write_builtins(block, {resolution = {4, 2, 1}, channel_resolution = {{nan, nan, 1}, {}, {}, {}}})
+	// uv's 64 bits as three subnormals (colour is clamped, alpha is 1).
+	bits :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		u, v := transmute(u32)uv.x, transmute(u32)uv.y
+		return {fval(u & 0x7f_ffff), fval(u >> 23 | (v & 0x3fff) << 9), fval(v >> 14), 0}
+	}
+	for engine in 0 ..< 2 {
+		sb, si := m.program.jit_body, m.program.jit_init
+		if engine == 1 {
+			m.program.jit_body, m.program.jit_init = nil, nil
+		}
+		out: [8][4]f32
+		run_f32(&m.program, block, 4, 2, out[:], temp_scratch(), {sampler = bits})
+		for px in out {
+			w := transmute([4]u32)px
+			u, v := w[0] | w[1] << 23, w[1] >> 9 | w[2] << 14
+			testing.expectf(t, u == 0x7fc0_0000 && v == 0x7fc0_0000, "engine %d: uv %08x %08x", engine, u, v)
+		}
+		m.program.jit_body, m.program.jit_init = sb, si
+	}
+	// Lanes 0, 1, 2 of each quad: u NaN to the right, 1/16 down.
+	u := [8]u32{0, transmute(u32)nan, 0, 0, 0, transmute(u32)nan, 0, 0}
+	v := [8]u32{0, 0, transmute(u32)f32(0.0625), 0, 0, 0, transmute(u32)f32(0.0625), 0}
+	lod: [8]u32
+	cu, cv, cl: [8]f32
+	sampler_args8(&u[0], &v[0], &lod[0], {64, 64, 1}, true, &cu[0], &cv[0], &cl[0])
+	for l in 0 ..< 8 {
+		testing.expectf(t, cl[l] == 2, "lane %d: level %v, want 2 (|duv/dy| = 4 texels)", l, cl[l])
+	}
+	testing.expect(t, transmute(u32)cu[1] == 0x7fc0_0000)
+}
+
+// A NaN texel of a bound F32 image (texelFetch, Nearest and Linear) leaves
+// every target as 0x7fc00000 in both engines, whatever its sign and payload.
+@(test)
+test_bound_channel_nan_canonical :: proc(t: ^testing.T) {
+	src := `#version 310 es
+precision highp float;
+uniform sampler2D s;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+void main() {
+    o0 = texelFetch(s, ivec2(gl_FragCoord.xy), 0);
+    o1 = texture(s, gl_FragCoord.xy / 4.0);
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	texels: [16][4]f32
+	payloads := [4]u32{0xffc0_1234, 0x7f80_0001, 0xff80_0001, 0x7fff_ffff}
+	for &px, i in texels {
+		for k in 0 ..< 4 {
+			px[k] = transmute(f32)payloads[(i + k) % 4]
+		}
+	}
+	for filter in ([2]Channel_Filter{.Nearest, .Linear}) {
+		im := channel_image(texels[:], 4, 4, filter)
+		for engine in 0 ..< 2 {
+			t0, t1: [16][4]f32
+			outs := [2][][4]f32{t0[:], t1[:]}
+			opts := Run_Options{channel_images = {im}}
+			if engine == 0 {
+				run_targets(&m.program, nil, 4, 4, outs[:], temp_scratch(), opts)
+			} else {
+				run_targets_interp(&m.program, nil, 4, 4, outs[:], temp_scratch(), opts)
+			}
+			for o in outs {
+				for w in slice.reinterpret([]u32, o) {
+					testing.expectf(t, w == 0x7fc0_0000, "%v engine %d: %08x", filter, engine, w)
+				}
+			}
+		}
+	}
+}
+
+// A bound image's implicit level is the callback's, bit for bit: the bias
+// plus quad_levels8 (not core:math's log2), for random quads at random sizes.
+@(test)
+test_bound_level_is_callback_level :: proc(t: ^testing.T) {
+	s: u32 = 0x9e37_79b9
+	next :: proc(s: ^u32) -> f32 {
+		s^ ~= s^ << 13; s^ ~= s^ >> 17; s^ ~= s^ << 5
+		return f32(s^ % 100_000) / 100_000
+	}
+	bad := 0
+	for _ in 0 ..< 20_000 {
+		u, v, lod: [8]f32
+		for l in 0 ..< 8 {
+			u[l], v[l], lod[l] = next(&s), next(&s) * 0.03, next(&s) * 4 - 2
+		}
+		size := [3]i32{i32(1 + s % 4096), i32(1 + (s >> 12) % 4096), 1}
+		cu, cv, cl: [8]f32
+		sampler_args8((^u32)(&u[0]), (^u32)(&v[0]), (^u32)(&lod[0]), size, true, &cu[0], &cv[0], &cl[0])
+		bl := lod
+		add_quad_levels8(&u[0], &v[0], &bl[0], f32(size.x), f32(size.y))
+		for l in 0 ..< 8 {
+			if transmute(u32)bl[l] != transmute(u32)cl[l] && bad < 4 {
+				testing.expectf(t, false, "lane %d: bound %v, callback %v", l, bl[l], cl[l])
+				bad += 1
+			}
+		}
+	}
+}
+
+// A signaling NaN gives what the same NaN quieted gives (its quiet bit
+// set), in every built-in with a select or a clamp, in fragment, vertex and
+// compute, in both engines: the class of v0.0.22's arm64 bug, where LLVM
+// turned compare-and-select clamps into fmaxnm and fminnm, which quiet a
+// signaling NaN and then return the other operand. Operands come from a
+// storage buffer (both signs, several payloads, against ordinary values),
+// from uniforms, and from compile-time constants; mac.sh runs this at
+// -o:speed on arm64.
+@(test)
+test_signaling_nan_builtins :: proc(t: ^testing.T) {
+	EXPRS := []string{
+		"clamp(x, 0.0, 1.0)", "clamp(0.5, x, 1.0)", "clamp(0.5, 0.0, x)", "clamp(x, y, 1.0)",
+		"min(x, y)", "max(x, y)", "min(y, x)", "max(y, x)", "min(x, 0.5)", "max(x, 0.5)",
+		"step(x, y)", "step(y, x)", "smoothstep(0.0, 1.0, x)", "smoothstep(x, 1.0, 0.5)", "smoothstep(0.0, x, 0.5)", "smoothstep(x, y, 0.5)",
+		"mix(x, y, 0.5)", "mix(1.0, 2.0, x)", "mix(x, y, x < y)", "mix(x, 2.0, true)", "mix(0.5, x, false)",
+		"sign(x)", "abs(x)", "-x", "floor(x)", "ceil(x)", "fract(x)", "trunc(x)", "round(x)", "roundEven(x)",
+		"mod(x, y)", "mod(y, x)", "x < y ? x : y", "x > y ? x : y", "x >= 0.5 ? 1.0 : x", "isnan(x) ? 1.0 : 0.0", "isinf(x) ? 1.0 : 0.0",
+		"sqrt(x)", "inversesqrt(x)", "x * 1.0", "x + 0.0", "length(vec2(x, y))", "dot(vec2(x, 1.0), vec2(y, 2.0))",
+		"faceforward(vec2(x, 1.0), vec2(y, 1.0), vec2(1.0)).x", "faceforward(vec2(1.0), vec2(1.0), vec2(x, y)).y",
+		"clamp(vec4(x, y, 0.5, -x), 0.0, 1.0).x", "clamp(vec4(x, y, 0.5, -x), vec4(0.0), vec4(1.0)).w",
+		"min(vec4(x), vec4(y)).z", "max(vec3(y), vec3(x)).y", "step(vec2(x), vec2(0.5)).x", "smoothstep(vec2(0.0), vec2(1.0), vec2(x)).y",
+		"float(int(clamp(x, -4.0, 4.0)))", "float(x == x)", "float(x != y)", "float(floatBitsToUint(x) >> 31u)",
+		"clamp(x, u.x, u.y)", "min(x, u.z)", "max(u.z, x)", "smoothstep(u.x, u.y, x)", "clamp(u.z, 0.0, 1.0)", "step(u.z, x)",
+		"min(x, uintBitsToFloat(0x7f800001u))", "min(x, uintBitsToFloat(0x7fc00001u))",
+		"clamp(uintBitsToFloat(0xff800123u), 0.0, 1.0)", "clamp(uintBitsToFloat(0xffc00123u), 0.0, 1.0)",
+	}
+	N := len(EXPRS)
+	// Compute writes every result to a buffer; fragment and vertex shaders
+	// take 16 at a time, as four vec4 targets or varyings.
+	CHUNK :: 16
+	shader :: proc(stage: Stage, exprs: []string, first, count: int) -> string {
+		b := strings.builder_make(context.temp_allocator)
+		fmt.sbprintf(&b, "#version 310 es\nprecision highp float;\n")
+		if stage == .Compute {
+			fmt.sbprintf(&b, "layout(local_size_x = 8) in;\nlayout(std430, binding = 1) buffer Out {{ float r[]; }} outp;\n")
+		} else {
+			for i in 0 ..< 4 {
+				if stage == .Fragment {
+					fmt.sbprintf(&b, "layout(location = %d) out vec4 v%d;\n", i, i)
+				} else {
+					fmt.sbprintf(&b, "out vec4 v%d;\n", i)
+				}
+			}
+		}
+		fmt.sbprintf(&b, "layout(std430, binding = 0) readonly buffer In {{ uint w[]; }} inp;\nuniform vec4 u;\nvoid main() {{\n")
+		p := "gl_GlobalInvocationID.x" if stage == .Compute else ("uint(gl_VertexID)" if stage == .Vertex else "uint(gl_FragCoord.y) * 8u + uint(gl_FragCoord.x)")
+		fmt.sbprintf(&b, "    uint p = %s;\n    float x = uintBitsToFloat(inp.w[2u * p]);\n    float y = uintBitsToFloat(inp.w[2u * p + 1u]);\n    float r[%d];\n", p, CHUNK if stage != .Compute else count)
+		for k in 0 ..< count {
+			fmt.sbprintf(&b, "    r[%d] = %s;\n", k, exprs[first + k])
+		}
+		if stage == .Compute {
+			fmt.sbprintf(&b, "    for (int k = 0; k < %d; k++) {{ outp.r[int(p) * %d + k] = r[k]; }}\n", count, count)
+		} else {
+			for k in count ..< CHUNK {fmt.sbprintf(&b, "    r[%d] = 0.0;\n", k)}
+			for i in 0 ..< 4 {fmt.sbprintf(&b, "    v%d = vec4(r[%d], r[%d], r[%d], r[%d]);\n", i, 4 * i, 4 * i + 1, 4 * i + 2, 4 * i + 3)}
+			if stage == .Vertex {fmt.sbprintf(&b, "    gl_Position = vec4(0.0);\n")}
+		}
+		fmt.sbprintf(&b, "}}\n")
+		return strings.to_string(b)
+	}
+	stages := [3]Stage{.Fragment, .Vertex, .Compute}
+	// Pairs: each NaN against itself, the other NaNs and ordinary values.
+	snans := []u32{0x7f80_0001, 0xff80_0001, 0x7fa0_0000, 0xffbf_ffff, 0x7f80_1234, 0xffc0_1234, 0x7fc0_0000}
+	plain := []u32{0, 0x8000_0000, transmute(u32)f32(0.5), transmute(u32)f32(-2), transmute(u32)f32(3), 0x7f80_0000, 0xff80_0000, transmute(u32)f32(1e-40)}
+	words_s := make([dynamic]u32, context.temp_allocator)
+	for a in snans {
+		for b in snans {append(&words_s, a, b)}
+		for b in plain {append(&words_s, a, b, b, a)}
+	}
+	for len(words_s) % 16 != 0 {append(&words_s, 0)}
+	P := len(words_s) / 2
+	words_q := make([]u32, len(words_s), context.temp_allocator)
+	for w, i in words_s {
+		words_q[i] = w | 0x0040_0000 if w & 0x7fff_ffff > 0x7f80_0000 else w
+	}
+	// Uniforms (0.25, 0.75, NaN): the NaN signaling, then quiet.
+	for stage in stages {
+		results: [2][2][]u32 // [quiet][engine], [pair][expression]
+		for &r in results {
+			for &e in r {e = make([]u32, P * N, context.temp_allocator)}
+		}
+		step := N if stage == .Compute else CHUNK
+		for first := 0; first < N; first += step {
+			count := min(step, N - first)
+			m, errs, ok := compile(shader(stage, EXPRS, first, count), {profile = .Glsl, stage = stage})
+			defer destroy(m)
+			if !testing.expectf(t, ok, "%v: %s", stage, format_errors(errs, context.temp_allocator)) {
+				return
+			}
+			for quiet in 0 ..< 2 {
+				block := make([]u8, m.block_size, context.temp_allocator)
+				uv := [4]f32{0.25, 0.75, transmute(f32)u32(0x7fc0_0001 if quiet == 1 else 0x7f80_0001), 1}
+				set_uniform(m, block, "u", uv[:])
+				for engine in 0 ..< 2 {
+					out := make([]u32, P * count, context.temp_allocator)
+					bufs := [2][]u32{words_q if quiet == 1 else words_s[:], out}
+					opts := Run_Options{buffers = bufs[:]}
+					sb, si := m.program.jit_body, m.program.jit_init
+					if engine == 1 {
+						m.program.jit_body, m.program.jit_init = nil, nil
+					}
+					dst := results[quiet][engine]
+					switch stage {
+					case .Fragment:
+						tg: [4][][4]f32
+						for &x in tg {x = make([][4]f32, P, context.temp_allocator)}
+						run_targets(&m.program, block, 8, P / 8, tg[:], temp_scratch(), opts)
+						for p in 0 ..< P {
+							for k in 0 ..< count {dst[p * N + first + k] = transmute(u32)tg[k / 4][p][k % 4]}
+						}
+					case .Vertex:
+						pos := make([][4]f32, P, context.temp_allocator)
+						vary := make([]f32, P * m.varying_floats, context.temp_allocator)
+						run_vertex(&m.program, block, nil, P, pos, vary, temp_scratch(), opts)
+						for ov in m.stage_outputs {
+							vi := int(ov.name[1] - '0')
+							for p in 0 ..< P {
+								for c in 0 ..< 4 {
+									if k := vi * 4 + c; k < count {dst[p * N + first + k] = transmute(u32)vary[p * m.varying_floats + ov.offset + c]}
+								}
+							}
+						}
+					case .Compute:
+						run_compute(&m.program, block, {P / 8, 1, 1}, temp_scratch(), opts)
+						copy(dst, out)
+					}
+					m.program.jit_body, m.program.jit_init = sb, si
+				}
+			}
+		}
+		ref := results[1][1]
+		bad := 0
+		for quiet in 0 ..< 2 {
+			for engine in 0 ..< 2 {
+				for w, i in results[quiet][engine] {
+					if w != ref[i] && bad < 8 {
+						testing.expectf(t, false, "%v %s, %s: pair %08x %08x: %s = %08x, quiet interpreter %08x", stage, "signaling" if quiet == 0 else "quiet", "jit" if engine == 0 else "interp", words_s[2 * (i / N)], words_s[2 * (i / N) + 1], EXPRS[i % N], w, ref[i])
+						bad += 1
+					}
+				}
+			}
+		}
+		// Constant operands: a signaling NaN as its quiet twin.
+		for p in 0 ..< P {
+			for k := N - 4; k < N; k += 2 {
+				a, b := results[0][1][p * N + k], results[0][1][p * N + k + 1]
+				if a != b && bad < 8 {
+					testing.expectf(t, false, "%v: %s = %08x but %s = %08x", stage, EXPRS[k], a, EXPRS[k + 1], b)
+					bad += 1
+				}
+			}
+		}
+	}
+}
+
+// An rgba8 imageStore of a signaling NaN stores 0, as of a quiet one: the
+// stored value is canonical before image_store_fmt clamps it, so the
+// compare-and-select clamp LLVM makes fmaxnm and fminnm on arm64 never sees
+// a signaling NaN.
+@(test)
+test_signaling_nan_rgba8_store :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 4) in;
+layout(std430, binding = 0) readonly buffer In { uint w[]; } inp;
+layout(rgba8) writeonly uniform highp image2D o8;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    vec4 v = vec4(uintBitsToFloat(inp.w[i]), -uintBitsToFloat(inp.w[i]), min(uintBitsToFloat(inp.w[i]), 2.0), 0.5);
+    imageStore(o8, ivec2(int(i), 0), v);
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Compute})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	words := []u32{0x7f80_0001, 0xff80_0001, 0x7fa0_1234, 0x7fc0_0000}
+	for engine in 0 ..< 2 {
+		px: [4][4]u8
+		imgs := []Storage_Image{{data = slice.to_bytes(px[:]), width = 4, height = 1, format = .Rgba8}}
+		bufs := [1][]u32{words}
+		sb, si := m.program.jit_body, m.program.jit_init
+		if engine == 1 {
+			m.program.jit_body, m.program.jit_init = nil, nil
+		}
+		run_compute(&m.program, nil, {1, 1, 1}, temp_scratch(), {buffers = bufs[:], images = imgs})
+		m.program.jit_body, m.program.jit_init = sb, si
+		for p, i in px {
+			testing.expectf(t, p == {0, 0, 0, 128}, "engine %d, %08x: %v", engine, words[i], p)
 		}
 	}
 }

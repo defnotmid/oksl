@@ -1587,14 +1587,15 @@ dx_builtin :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 	case .Sinh, .Cosh:
 		// (e^|x| +- e^-|x|) / 2 from e = e^|x| >= 1 and 1 / e, with x's
 		// sign for sinh: e^-|x| itself would be a denormal, which D3D
-		// flushes to 0, where 1 / e is still fine (cosh(-88)).
+		// flushes to 0, where 1 / e is still fine (cosh(-88)); sinh is x
+		// itself near 0, where the difference cancels to 0.
 		ax := x
 		ax.abs = true
 		ex := dx_exp(d, n, ax)
 		inv := dx_op(d, .Rcp, n, ex)
 		inv.neg = b == .Sinh
 		h := dx_op(d, .Mul, n, dx_op(d, .Add, n, ex, inv), dx_imm_f(0.5))
-		return dx_copysign(d, n, h, x) if b == .Sinh else h
+		return dx_near_zero(d, n, x, dx_copysign(d, n, h, x)) if b == .Sinh else h
 	case .Tanh:
 		// 1 - 2 / (e^2x + 1), which saturates instead of inf / inf; x
 		// itself near 0.
@@ -1874,7 +1875,7 @@ dx_copysign :: proc(d: ^Dx, n: int, mag, x: Dx_Src) -> Dx_Src {
 	return dx_op(d, .Or, n, mag, s)
 }
 
-// x itself where |x| < 1e-4 (tanh, asinh, atanh: their cubic term is
+// x itself where |x| < 1e-4 (sinh, tanh, asinh, atanh: their cubic term is
 // below half an ulp there, and the formulas lose x to the 1 they add), else
 // `r`.
 @(private)

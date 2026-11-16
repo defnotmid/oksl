@@ -420,6 +420,12 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	}
 	l.globals[1] = l.next_slot
 	inline_call(&l, c.entry, nil, nil)
+	// The host reads the float outputs canonical (`canonical`).
+	for &v in p.outputs {
+		if v.base == .Float {
+			v.slot = canonical(&l, v.slot, int(v.n))
+		}
+	}
 
 	p.code = l.code[:]
 	p.has_barrier = l.has_barrier
@@ -467,6 +473,18 @@ written_syms :: proc(u: ^Unit) -> []bool {
 }
 
 // ---- helpers ----------------------------------------------------------------------------
+
+// n float slots from a in new temporaries, every NaN as 0x7fc00000: a NaN's
+// sign and payload depend on the CPU (x86 makes 0xffc00000, arm64
+// 0x7fc00000) and on the operand order the compiler picks, so wherever a
+// float's bits leave the program (outputs, buffer and image stores) or turn
+// into an integer (floatBitsToInt and floatBitsToUint) they are made one.
+@(private)
+canonical :: proc(l: ^Lower, a: i32, n: int) -> i32 {
+	s := alloc_slots(l, n)
+	emit(l, .F_Fn1, n = n, k = int(Builtin.Float_Bits_To_Uint), dst = s, a = a)
+	return s
+}
 
 @(private)
 emit :: proc(l: ^Lower, op: VM_Op, n := 1, k := 0, dst: i32 = 0, a: i32 = 0, b: i32 = 0, c: i32 = 0, d: i32 = 0) -> int {
@@ -839,7 +857,8 @@ buffer_loads :: proc(l: ^Lower, t: Type, dst, idx, stride: i32, word, buf: int, 
 @(private)
 buffer_stores :: proc(l: ^Lower, t: Type, src, idx, stride: i32, word, buf: int) -> i32 {
 	if t.base != .Struct {
-		emit(l, .Store_Buf, n = int(t.rows), k = buf, a = idx, b = src, c = stride, d = i32(word))
+		v := canonical(l, src, int(t.rows)) if t.base == .Float else src
+		emit(l, .Store_Buf, n = int(t.rows), k = buf, a = idx, b = v, c = stride, d = i32(word))
 		return src + i32(t.rows)
 	}
 	next := src
@@ -923,6 +942,9 @@ store_buf_lv :: proc(l: ^Lower, blv: VM_Buf_LV, v: Val) {
 		return
 	}
 	src := widen(l, v, p.swz_len)
+	if p.type.base == .Float {
+		src = canonical(l, src, p.swz_len)
+	}
 	for k in 0 ..< p.swz_len {
 		emit(l, .Store_Buf, n = 1, k = blv.buf_idx, a = blv.idx_slot, b = src + i32(k), c = blv.stride, d = i32(blv.word_off + int(p.swz[k])))
 	}
@@ -2677,7 +2699,8 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		}
 	}
 	if b == .Image_Store {
-		emit(l, .Image_Store, n = 4, k = int(vals[0].slot), a = vals[1].slot, b = vals[2].slot)
+		v := canonical(l, vals[2].slot, 4) if vals[2].t.base == .Float else vals[2].slot
+		emit(l, .Image_Store, n = 4, k = int(vals[0].slot), a = vals[1].slot, b = v)
 		return {}
 	}
 	at := vals[0].t
@@ -2705,7 +2728,7 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		emit(l, .Determinant, k = int(at.cols), dst = s, a = vals[0].slot)
 	case .Inverse:
 		emit(l, .Inverse, k = int(at.cols), dst = s, a = vals[0].slot)
-	case .Float_Bits_To_Int, .Float_Bits_To_Uint, .Int_Bits_To_Float, .Uint_Bits_To_Float:
+	case .Int_Bits_To_Float, .Uint_Bits_To_Float:
 		return {vals[0].slot, t}
 	case .Texture_Lod:
 		emit(l, .Texture, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
@@ -2837,6 +2860,9 @@ VM_BUILTINS := #partial [Builtin][Base]VM_Op {
 	.Round_Even         = #partial {.Float = .F_Fn1},
 	.Isnan              = #partial {.Float = .F_Fn1},
 	.Isinf              = #partial {.Float = .F_Fn1},
+	// The bits, every NaN as 0x7fc00000 (`canonical`).
+	.Float_Bits_To_Int  = #partial {.Float = .F_Fn1},
+	.Float_Bits_To_Uint = #partial {.Float = .F_Fn1},
 	.Dfdx               = #partial {.Float = .Deriv_X},
 	.Dfdy               = #partial {.Float = .Deriv_Y},
 	.Fwidth             = #partial {.Float = .Fwidth},
