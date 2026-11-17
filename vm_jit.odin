@@ -114,7 +114,7 @@ Jit_Tables :: struct #align(32) {
 	rad_to_deg: [8]f32,
 	f2i_hi:     [8]f32,
 	f2u_hi:     [8]f32,
-	half_f:     [8]f32,
+	half_below: [8]f32, // 0.49999997, the f32 below 0.5
 	i32_max_f:  [8]f32,
 	neg_i32_max_f: [8]f32,
 	f255:       [8]f32,
@@ -177,7 +177,7 @@ init_jit :: proc "contextless" () {
 	jit_tables.mask31_u = 31
 	jit_tables.all_ones = 0xffff_ffff
 	jit_tables.lane_iota = {0, 1, 2, 3, 4, 5, 6, 7}
-	jit_tables.half_f = 0.5
+	jit_tables.half_below = 0.49999997
 	jit_tables.one_f = 1.0
 	jit_tables.neg_one_f = -1.0
 	jit_tables.two_f = 2.0
@@ -352,7 +352,7 @@ OFF_TAB_ALL1 :: i32(offset_of(Jit_Tables, all_ones))
 @(private)
 OFF_TAB_IOTA :: i32(offset_of(Jit_Tables, lane_iota))
 @(private)
-OFF_TAB_HALF_F :: i32(offset_of(Jit_Tables, half_f))
+OFF_TAB_HALF_BELOW :: i32(offset_of(Jit_Tables, half_below))
 @(private)
 OFF_TAB_ONE_F :: i32(offset_of(Jit_Tables, one_f))
 @(private)
@@ -2824,12 +2824,8 @@ emit_image_store :: proc(e: ^Jit_Emitter, in_: Instr, fmt: Image_Format) {
 			vop_ps(&e.buf, 0x5F, 1, y, 5)                    // max(v, 0): NaN gives the second operand, 0
 			vop_ps_tab(&e.buf, 0x5D, 1, 1, OFF_TAB_ONE_F)
 			vop_ps_tab(&e.buf, 0x59, 1, 1, OFF_TAB_F255)
-			vroundps(&e.buf, 3, 1, 0x0B)                     // t = trunc(x), x >= 0
-			vop_ps(&e.buf, 0x5C, 1, 1, 3)                    // x - t
-			vcmpps_tab(&e.buf, 1, 1, OFF_TAB_HALF_F, 0x1D)   // >= 0.5
-			vop_ps_tab(&e.buf, 0x54, 1, 1, OFF_TAB_ONE_F)
-			vop_ps(&e.buf, 0x58, 3, 3, 1)                    // t + 1 where rounding up
-			emit_vex_rr(&e.buf, 1, 2, 1, 0, 0x5B, 3, 0, 3)   // vcvttps2dq
+			vop_ps_tab(&e.buf, 0x58, 3, 1, OFF_TAB_HALF_BELOW) // x >= 0: round's x + 0.49999997
+			emit_vex_rr(&e.buf, 1, 2, 1, 0, 0x5B, 3, 0, 3)   // vcvttps2dq truncates
 			if i == 0 {
 				vmovaps_rr(&e.buf, 0, 3)
 			} else {
@@ -4048,19 +4044,18 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 					commit_dst(e, dst + i, yd)
 				}
 			case .Round:
-				// Half away from zero, as math.round: t = trunc(x), and where
-				// |x - t| >= 0.5 (exact), t + copysign(1, x); NaN and inf keep t.
+				// Half away from zero, as math.round: trunc(x + copysign(0.49999997, x)),
+				// the f32 below 0.5, so that the sum's rounding to nearest even
+				// carries x to the next integer exactly when |fract(x)| >= 0.5
+				// (the same bits as trunc plus a compare and add, NaN payloads
+				// included, for all 2^32 inputs).
 				for i in 0 ..< n {
 					ya := read_slot(e, a + i, 1)
-					vroundps(&e.buf, 2, ya, 0x0B)
-					vop_ps(&e.buf, 0x5C, 3, ya, 2)                   // x - t
-					vop_ps_tab(&e.buf, 0x54, 3, 3, OFF_TAB_ABS)
-					vcmpps_tab(&e.buf, 3, 3, OFF_TAB_HALF_F, 0x1D)   // |x - t| >= 0.5 (GE_OQ)
-					vop_ps_tab(&e.buf, 0x54, 4, ya, OFF_TAB_SIGN)
-					vop_ps_tab(&e.buf, 0x56, 4, 4, OFF_TAB_ONE_F)    // copysign(1, x)
-					vop_ps(&e.buf, 0x58, 4, 2, 4)
+					vop_ps_tab(&e.buf, 0x54, 2, ya, OFF_TAB_SIGN)
+					vop_ps_tab(&e.buf, 0x56, 2, 2, OFF_TAB_HALF_BELOW) // copysign(0.49999997, x)
+					vop_ps(&e.buf, 0x58, 2, ya, 2)
 					yd := prep_dst(e, dst + i, 0, pin_bit(ya))
-					vblendvps(&e.buf, yd, 2, 4, 3)
+					vroundps(&e.buf, yd, 2, 0x0B)
 					commit_dst(e, dst + i, yd)
 				}
 			case .Fract:

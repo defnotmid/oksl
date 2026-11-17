@@ -15994,6 +15994,92 @@ void main() {
 	}
 }
 
+// round() and the rgba8 store's rounding, both half away from zero, at
+// every place where it decides: each half-integer tie up to 4096 and the
+// floats 3 ulps either side, the ties and integers around 2^22, 2^23 and
+// 2^24 where f32's spacing reaches 0.5, 1 and 2, every 65,537th pattern of
+// all 2^32 (NaNs, infinities and subnormals among them), and for the store
+// v = (k + 0.5) / 255 and 3 ulps either side for every k; both engines,
+// bit for bit, against math.round (a NaN reads back canonical).
+@(test)
+test_round_half_away :: proc(t: ^testing.T) {
+	src := `#version 310 es
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In { uint w[]; } inp;
+layout(std430, binding = 1) writeonly buffer Out { uint w[]; } o;
+layout(rgba8) writeonly uniform highp image2D o8;
+uniform uint uWidth;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    float x = uintBitsToFloat(inp.w[i]);
+    o.w[i] = floatBitsToUint(round(x));
+    imageStore(o8, ivec2(int(i % uWidth), int(i / uWidth)), vec4(x, x * 0.25, -x, 1.0));
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Compute})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	xs := make([dynamic]f32, context.temp_allocator)
+	around :: proc(xs: ^[dynamic]f32, c: f32, r: int) {
+		b := transmute(i32)c
+		for d in -r ..= r {
+			append(xs, transmute(f32)(b + i32(d)))
+			append(xs, -transmute(f32)(b + i32(d)))
+		}
+	}
+	for k in 0 ..< 8192 {
+		around(&xs, f32(k) * 0.5, 3)
+	}
+	for e in ([?]f32{4194304, 8388608, 16777216}) {
+		for k in -8 ..= 8 {
+			around(&xs, e + f32(k) * 0.5, 3)
+		}
+	}
+	for b: u64 = 0; b < 1 << 32; b += 65537 {
+		append(&xs, transmute(f32)u32(b))
+	}
+	for k in 0 ..< 255 {
+		around(&xs, (f32(k) + 0.5) / 255, 3)
+	}
+	for len(xs) % 64 != 0 {
+		append(&xs, 0.5)
+	}
+	n := len(xs)
+	W :: 1024
+	words := slice.reinterpret([]u32, xs[:])
+	ref_round :: proc(x: f32) -> u32 {
+		return 0x7fc0_0000 if x != x else transmute(u32)f32(math.round(f64(x)))
+	}
+	ref_unorm :: proc(v: f32) -> u8 {
+		c := min(max(v, 0), 1) if v == v else 0
+		return u8(math.round(f64(c * 255)))
+	}
+	block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+	cjit_set_u32(m, block, "uWidth", W)
+	for engine in 0 ..< 2 {
+		out := make([]u32, n, context.temp_allocator)
+		px := make([][4]u8, W * ((n + W - 1) / W), context.temp_allocator)
+		imgs := []Storage_Image{{data = slice.to_bytes(px), width = W, height = len(px) / W, format = .Rgba8}}
+		bufs := [2][]u32{words, out}
+		sb, si := m.program.jit_body, m.program.jit_init
+		if engine == 1 {
+			m.program.jit_body, m.program.jit_init = nil, nil
+		}
+		run_compute(&m.program, block, {n / 64, 1, 1}, temp_scratch(), {buffers = bufs[:], images = imgs})
+		m.program.jit_body, m.program.jit_init = sb, si
+		bad := 0
+		for x, i in xs {
+			want := [4]u8{ref_unorm(x), ref_unorm(x * 0.25), ref_unorm(-x), 255}
+			if (out[i] != ref_round(x) || px[i] != want) && bad < 8 {
+				testing.expectf(t, false, "engine %d, x %v (%08x): round %08x want %08x, rgba8 %v want %v", engine, x, transmute(u32)x, out[i], ref_round(x), px[i], want)
+				bad += 1
+			}
+		}
+	}
+}
+
 // ---- layered bound images and the mip builder ---------------------------------------------
 
 // A layered test image: `layers` images from make_test_image (one seed
