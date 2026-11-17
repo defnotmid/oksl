@@ -143,6 +143,113 @@ bound_formats_compare :: proc(m: ^oksl.Module, fi: int, filter: oksl.Channel_Fil
 	return bound_compare(m, bound_fmt_image(fi, filter, wrap), bound_fmt_queries[:], gpu_f, scratch, metal)
 }
 
+// ---- texelFetch out of range (bound_fetch_compare) ----------------------------------------
+//
+// A measurement, not oksl's rule against itself: what a GPU's texelFetch
+// returns outside the level or the texture, for the bound format images
+// bound as SDL binds a texture. oksl returns (0, 0, 0, 0) there.
+
+// texelFetch at each pixel's query: (x, y, level, 0).
+BOUND_FETCH_FRAG :: `#version 310 es
+precision highp float;
+precision highp int;
+readonly buffer Q { ivec4 q[]; };
+uniform sampler2D s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec4 c = q[p.y * 256 + p.x];
+    o = texelFetch(s, c.xy, c.z);
+}`
+
+// The queries, and each one's coordinates moved into the texture: the
+// level clamp(l, 0, top), then x and y clamped to its edges, or wrapped
+// (floored modulo).
+bound_fetch_queries: [W * H][4]i32
+bound_fetch_clamped: [W * H][4]i32
+bound_fetch_wrapped: [W * H][4]i32
+
+// Every pairing of x and y from -2^20, -2, -1, 0, the middle, n - 1, n and
+// n + 5 (n the level's size, the top level's past the top), at levels -1,
+// 0, 2, the top, the top + 1 and the top + 3, repeated over the target.
+make_bound_fetch_data :: proc() {
+	LEVELS :: [6]i32{-1, 0, 2, BOUND_FMT_LEVELS - 1, BOUND_FMT_LEVELS, BOUND_FMT_LEVELS + 3}
+	cases := make([dynamic][4]i32, context.temp_allocator)
+	for l in LEVELS {
+		w, h := bound_fmt_size(int(clamp(l, 0, BOUND_FMT_LEVELS - 1)))
+		coords :: proc(n: int) -> [8]i32 {
+			return {-1 << 20, -2, -1, 0, i32(n / 2), i32(n - 1), i32(n), i32(n + 5)}
+		}
+		for y in coords(h) {
+			for x in coords(w) {
+				append(&cases, [4]i32{x, y, l, 0})
+			}
+		}
+	}
+	for &q, i in bound_fetch_queries {
+		q = cases[i % len(cases)]
+		lc := clamp(q.z, 0, BOUND_FMT_LEVELS - 1)
+		w, h := bound_fmt_size(int(lc))
+		bound_fetch_clamped[i] = {clamp(q.x, 0, i32(w - 1)), clamp(q.y, 0, i32(h - 1)), lc, 0}
+		bound_fetch_wrapped[i] = {q.x %% i32(w), q.y %% i32(h), lc, 0}
+	}
+}
+
+// Sorts a GPU's texelFetch results at bound_fetch_queries: inside (level
+// and texel in range), and outside the texture or the level, each result
+// as zero (rgb 0, alpha 0 or 1), the clamped texel, the wrapped one, more
+// than one of those, or other. Within 1e-3 of the CPU's texels (decoded
+// exactly by both). The verdict: every inside result the CPU's texel.
+bound_fetch_compare :: proc(m: ^oksl.Module, fi: int, gpu_f: [][4]f32, scratch: ^oksl.Scratch) -> (string, bool) {
+	im := bound_fmt_image(fi, .Nearest, {.Clamp, .Clamp})
+	clamped := make([][4]f32, W * H, context.temp_allocator)
+	wrapped := make([][4]f32, W * H, context.temp_allocator)
+	oksl.run_f32(&m.program, nil, W, H, clamped, scratch, {channel_images = {im}, buffers = {slice.reinterpret([]u32, bound_fetch_clamped[:])}})
+	oksl.run_f32(&m.program, nil, W, H, wrapped, scratch, {channel_images = {im}, buffers = {slice.reinterpret([]u32, bound_fetch_wrapped[:])}})
+	near :: proc(a, b: [4]f32) -> bool {
+		for k in 0 ..< 4 {
+			if !(abs(a[k] - b[k]) <= 1e-3) {
+				return false
+			}
+		}
+		return true
+	}
+	Tally :: struct {
+		n, zero0, zero1, clamped, wrapped, several, other: int,
+		example:                                          string,
+	}
+	inside: Tally
+	coord, level: Tally
+	for i in 0 ..< W * H {
+		q := bound_fetch_queries[i]
+		g := gpu_f[i]
+		lw, lh := bound_fmt_size(int(clamp(q.z, 0, BOUND_FMT_LEVELS - 1)))
+		level_in := q.z >= 0 && q.z < BOUND_FMT_LEVELS
+		texel_in := q.x >= 0 && q.y >= 0 && int(q.x) < lw && int(q.y) < lh
+		t := &inside if level_in && texel_in else (&coord if level_in else &level)
+		t.n += 1
+		zero := g.xyz == {0, 0, 0} && (g.w == 0 || g.w == 1)
+		cl, wr := near(g, clamped[i]), near(g, wrapped[i])
+		switch {
+		case int(zero) + int(cl) + int(wr) > 1 && !(cl && wr && !zero && t == &inside): t.several += 1
+		case zero && g.w == 0: t.zero0 += 1
+		case zero:             t.zero1 += 1
+		case cl:               t.clamped += 1
+		case wr:               t.wrapped += 1
+		case:
+			t.other += 1
+			if t.example == "" {
+				t.example = fmt.tprintf(" (e.g. %v at %v; clamped %v)", g, q, clamped[i])
+			}
+		}
+	}
+	line :: proc(t: Tally) -> string {
+		return fmt.tprintf("%d: zero %d + %d (alpha 0 + 1), clamped %d, wrapped %d, several %d, other %d%s", t.n, t.zero0, t.zero1, t.clamped, t.wrapped, t.several, t.other, t.example)
+	}
+	inside_ok := inside.clamped + inside.several == inside.n && inside.zero0 + inside.zero1 + inside.wrapped + inside.other == 0
+	return fmt.tprintf("inside %s; texel out %s; level out %s", line(inside), line(coord), line(level)), inside_ok
+}
+
 // Metal's level of detail (Apple GPUs, measured on the M4 with
 // tools/gpu_parity's queries): the lod rounded to a half float, its
 // fraction truncated to 1/64 (oksl's rule and RADV round it to 1/256, to
@@ -208,6 +315,7 @@ bound_compare :: proc(m: ^oksl.Module, im: oksl.Channel_Image, queries: [][4]f32
 
 make_data :: proc() {
 	make_bound_fmt_data()
+	make_bound_fetch_data()
 	for &w, i in test_words {
 		w = transmute(u32)(f32((i * 37 + 11) % 256) / 255)
 	}

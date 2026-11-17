@@ -2529,7 +2529,18 @@ bound_clamped_f32 :: proc "contextless" (im: ^Chan_Img, u, v: ^F_Lanes, out: ^[4
 	} else {
 		nx, ny := lv.fs[0] * 256, lv.fs[1] * 256
 		axis :: #force_inline proc "contextless" (c: f32, n256: f64, mx: i32) -> (i0, i1: i32, tw: f32) {
-			cc := c if c > 0 else 0
+			// NaN as 0. x86's maxps does that for every NaN; elsewhere LLVM
+			// turns these compare-and-select clamps into maxnum and minnum
+			// (fmaxnm and fminnm on arm64), which give a signaling NaN back
+			// quiet and then 1 (v0.0.22 read the last texel there), so a
+			// signaling NaN is quieted first: + 0 (LLVM keeps it, for -0;
+			// -0 becomes +0, which the clamp makes 0 anyway). Not on x86,
+			// where it would cost 2.6% of a Linear tap for nothing.
+			cc := c
+			when ODIN_ARCH != .amd64 && ODIN_ARCH != .i386 {
+				cc = c + 0
+			}
+			cc = cc if cc > 0 else 0
 			cc = cc if cc < 1 else 1
 			T := f64(cc) * n256 - 128
 			// round_even(T) by 1.5 * 2^52 (|T| < 2^31), then floor(T) from it.

@@ -5219,6 +5219,16 @@ void main() {
 // An independent statement of the rule, as a sampler callback, for the
 // bound images to match bit for bit in the JIT and the interpreter.
 
+// Two f32 words alike: the same bits, or both NaN. Which NaN a blend of
+// NaN texels gives (its sign and payload) depends on the order the
+// compiler gives the operands of an add, so the JIT, the interpreter and
+// builds of it differ there (the README's NaN bit patterns); every other
+// value is compared exactly.
+@(private = "file")
+bits_or_nan :: proc(a, b: u32) -> bool {
+	return a == b || (a & 0x7fff_ffff > 0x7f80_0000 && b & 0x7fff_ffff > 0x7f80_0000)
+}
+
 @(private = "file")
 ref_level :: proc(im: ^Channel_Image, l: int) -> (bytes: []u8, w, h, pitch: int) {
 	tb := channel_texel_bytes(im.format, im.components)
@@ -5562,7 +5572,7 @@ test_bound_channel_rule :: proc(t: ^testing.T) {
 							wc := slice.reinterpret([]u32, outs[2][target])
 							wcv := slice.reinterpret([]u32, outs[3][target])
 							for i in 0 ..< len(wj) {
-								if wj[i] != wv[i] || wj[i] != wc[i] || wc[i] != wcv[i] {
+								if !bits_or_nan(wj[i], wv[i]) || !bits_or_nan(wj[i], wc[i]) || !bits_or_nan(wc[i], wcv[i]) {
 									if mismatches < 12 {
 										testing.expectf(t, false, "%v/%d %v %v mips=%v xform %d target %d pixel (%d, %d) comp %d: jit %08x vm %08x callback %08x/%08x",
 											cfg.format, cfg.comps, filter, wrap, mips, xi, target, (i / 4) % W, i / 4 / W, i % 4, wj[i], wv[i], wc[i], wcv[i])
@@ -5815,7 +5825,7 @@ void main() {
 			run_f32_interp(&m.program, block, W, H, outs[2], temp_scratch(), {sampler = ref_bound_sampler, user = &im, channel_sizes = sizes[:]})
 			a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
 			for i in 0 ..< len(a) {
-				if a[i] != b[i] || b[i] != c[i] {
+				if !bits_or_nan(a[i], b[i]) || !bits_or_nan(b[i], c[i]) {
 					testing.expectf(t, false, "%v scale %v word %d: jit %08x vm %08x callback %08x", format, scale, i, a[i], b[i], c[i])
 					break
 				}
@@ -6061,7 +6071,7 @@ void main() {
 		run_f32_interp(&m.program, nil, 24, 24, outs[2], temp_scratch(), {sampler = ref_bound_sampler, user = &im})
 		a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
 		for i in 0 ..< len(a) {
-			if a[i] != b[i] || b[i] != c[i] {
+			if !bits_or_nan(a[i], b[i]) || !bits_or_nan(b[i], c[i]) {
 				testing.expectf(t, false, "n %d word %d: jit %08x vm %08x callback %08x", n, i, a[i], b[i], c[i])
 				break
 			}
@@ -6149,7 +6159,7 @@ void main() {
 			run_f32_interp(&m.program, nil, 64, 64, outs[2], temp_scratch(), {channel_images = {im}, buffers = {words}})
 			a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
 			for i in 0 ..< len(a) {
-				if a[i] != b[i] || b[i] != c[i] {
+				if !bits_or_nan(a[i], b[i]) || !bits_or_nan(b[i], c[i]) {
 					testing.expectf(t, false, "n %d axis %d word %d (coords %v): fma %08x f64 %08x vm %08x", n, ax, i, q[i / 4], a[i], b[i], c[i])
 					break
 				}
@@ -6160,7 +6170,7 @@ void main() {
 				run_f32_interp(&m.program, nil, 64, 64, outs[3], temp_scratch(), {sampler = ref_bound_sampler, user = &im, channel_sizes = {{i32(im.width), i32(im.height), 1}}, buffers = {words}})
 				r := slice.reinterpret([]u32, outs[3])
 				for i in 0 ..< len(c) {
-					if c[i] != r[i] {
+					if !bits_or_nan(c[i], r[i]) {
 						testing.expectf(t, false, "n %d axis %d word %d (coords %v): vm %08x callback %08x", n, ax, i, q[i / 4], c[i], r[i])
 						break
 					}
@@ -6169,6 +6179,65 @@ void main() {
 		}
 	}
 	testing.expectf(t, found > 0, "no coordinate reaches the floor fix-up")
+}
+
+// A signaling NaN coordinate reads what a quiet one does (the rule: any
+// NaN is index -2^31), on every bound path, in both engines. v0.0.22's
+// interpreter clamped one to 1 for F32 Linear images on arm64 at
+// -o:speed (its clamp compiled to fmaxnm and fminnm), reading the last
+// texel where x86 and the quiet NaN read the first.
+@(test)
+test_bound_channel_signaling_nan :: proc(t: ^testing.T) {
+	SRC :: `#version 310 es
+precision highp float;
+readonly buffer Q { vec4 q[]; };
+uniform sampler2D s;
+layout(location = 0) out vec4 o;
+void main() {
+    vec4 c = q[int(gl_FragCoord.x)];
+    o = textureLod(s, c.xy, c.z);
+}`
+	m, errs, ok := compile(SRC, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	// Quiet first, then signaling ones of both signs, at lod 0 and 0.3.
+	NANS :: [5]u32{0x7fc00000, 0x7f800001, 0xff800001, 0x7fbfffff, 0xffc00001}
+	for format in ([2]Channel_Format{.F32, .Rgba8}) {
+		for filter in Channel_Filter {
+			for wrap in ([2]Channel_Wrap{.Clamp, .Repeat}) {
+				for mips in ([2]bool{false, true}) {
+					for n in ([3]int{3, 37, 1000}) {
+						im := make_test_image(format, 1 if format == .F32 else 4, n, 5, mips, u32(n))
+						im.filter, im.wrap = filter, {wrap, wrap}
+						for ax in 0 ..< 2 {
+							q: [10][4]f32
+							nans := NANS
+							for &e, i in q {
+								a := transmute(f32)nans[i % 5]
+								lod := f32(0.3) if i >= 5 else 0
+								e = {a, 0.43, lod, 0} if ax == 0 else {0.43, a, lod, 0}
+							}
+							for jit in ([2]bool{true, false}) {
+								out := make([][4]f32, 10, context.temp_allocator)
+								opts := Run_Options{channel_images = {im}, buffers = {slice.reinterpret([]u32, q[:])}}
+								if jit {
+									run_f32(&m.program, nil, 10, 1, out, temp_scratch(), opts)
+								} else {
+									run_f32_interp(&m.program, nil, 10, 1, out, temp_scratch(), opts)
+								}
+								for i in 0 ..< 10 {
+									ref := out[i / 5 * 5]
+									testing.expectf(t, transmute([4]u32)out[i] == transmute([4]u32)ref, "%v %v %v mips=%v n=%d axis %d jit=%v coord %08x: %v, a quiet NaN reads %v", format, filter, wrap, mips, n, ax, jit, nans[i % 5], out[i], ref)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 // Coordinates whose f32 product with the size rounds to a whole number
@@ -6219,7 +6288,7 @@ void main() {
 			run_f32_interp(&m.program, nil, 16, 16, outs[2], temp_scratch(), {sampler = ref_bound_sampler, user = &im, buffers = {words}})
 			a, b, c := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1]), slice.reinterpret([]u32, outs[2])
 			for i in 0 ..< len(a) {
-				if a[i] != b[i] || b[i] != c[i] {
+				if !bits_or_nan(a[i], b[i]) || !bits_or_nan(b[i], c[i]) {
 					testing.expectf(t, false, "fma %v n %d %v %v word %d: jit %08x vm %08x callback %08x", fma, n, format, filter, i, a[i], b[i], c[i])
 					break
 				}

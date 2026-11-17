@@ -60,12 +60,23 @@ Srv :: enum {
 	R32f,
 	Rg32f,
 	Rgba32f,
+	// parity.BOUND_FORMATS with their levels, and the texelFetch queries.
+	Fmt_Rgba8,
+	Fmt_R8,
+	Fmt_R16,
+	Fmt_Rgba16f,
+	Fetch_Q,
 }
 
 Smp :: enum {
 	Repeat,
 	Near_Clamp,
 	Linear_Clamp,
+	// SDL's default sampler (point, wrap, max_lod 0), it with max_lod 1000,
+	// and that clamped (bound_fetch_check).
+	Sdl_Default,
+	Point_Wrap,
+	Point_Clamp,
 }
 
 Target :: enum {
@@ -240,6 +251,17 @@ gpu_init :: proc(g: ^Gpu, hardware: bool) -> bool {
 		copy(out, slice.to_bytes(parity.bound_rgba_texels[y * parity.BOUND_RGBA_W:][:parity.BOUND_RGBA_W]))
 	})
 
+	fmt_rows :: proc(level, layer, y: int, out: []u8, user: rawptr) {
+		fi := (^int)(user)^
+		copy(out, parity.bound_fmt_texels[fi][level][y * len(out):][:len(out)])
+	}
+	@(static) fis := [4]int{0, 1, 2, 3}
+	tbs := [4]int{4, 1, 2, 8}
+	for fi in 0 ..< 4 {
+		g.resources[Srv(int(Srv.Fmt_Rgba8) + fi)] = upload_texture(g, FMT_DXGI[fi], parity.BOUND_FMT_W, parity.BOUND_FMT_H, 1, parity.BOUND_FMT_LEVELS, tbs[fi], fmt_rows, user = &fis[fi])
+	}
+	g.resources[.Fetch_Q] = upload_buffer(g, slice.to_bytes(parity.bound_fetch_queries[:]))
+
 	m, errors, ok := oksl.compile(oksl.LAYER_VERTEX_GLSL, {profile = .Glsl, stage = .Vertex, dxbc = true})
 	if !ok {
 		fmt.eprint(oksl.format_errors(errors))
@@ -281,9 +303,17 @@ write_srv :: proc(g: ^Gpu, s: Srv, slot: int) {
 		desc.Format = formats[int(s) - int(Srv.R32f)]
 		desc.ViewDimension = .TEXTURE2D
 		desc.Texture2D = {MipLevels = 1}
-	case .Words, .Corners:
+	case .Fmt_Rgba8, .Fmt_R8, .Fmt_R16, .Fmt_Rgba16f:
+		desc.Format = FMT_DXGI[int(s) - int(Srv.Fmt_Rgba8)]
+		desc.ViewDimension = .TEXTURE2D
+		desc.Texture2D = {MipLevels = parity.BOUND_FMT_LEVELS}
+	case .Words, .Corners, .Fetch_Q:
 		desc.Format, desc.ViewDimension = .R32_TYPELESS, .BUFFER
-		desc.Buffer = {NumElements = parity.WORDS if s == .Words else len(parity.QUAD) * size_of(parity.Corner) / 4, Flags = {.RAW}}
+		n := parity.WORDS if s == .Words else len(parity.QUAD) * size_of(parity.Corner) / 4
+		if s == .Fetch_Q {
+			n = len(parity.bound_fetch_queries) * 4
+		}
+		desc.Buffer = {NumElements = u32(n), Flags = {.RAW}}
 	}
 	h := heap_cpu_start(g.srv_heap)
 	h.ptr += uint(slot * int(g.srv_step))
@@ -299,6 +329,12 @@ write_sampler :: proc(g: ^Gpu, s: Smp, slot: int) {
 		desc = {Filter = .MIN_MAG_MIP_POINT, AddressU = .CLAMP, AddressV = .CLAMP, AddressW = .CLAMP}
 	case .Linear_Clamp:
 		desc = {Filter = .MIN_MAG_LINEAR_MIP_POINT, AddressU = .CLAMP, AddressV = .CLAMP, AddressW = .CLAMP}
+	case .Sdl_Default:
+		desc = {Filter = .MIN_MAG_MIP_POINT, AddressU = .WRAP, AddressV = .WRAP, AddressW = .WRAP}
+	case .Point_Wrap:
+		desc = {Filter = .MIN_MAG_MIP_POINT, AddressU = .WRAP, AddressV = .WRAP, AddressW = .WRAP, MaxLOD = 1000}
+	case .Point_Clamp:
+		desc = {Filter = .MIN_MAG_MIP_POINT, AddressU = .CLAMP, AddressV = .CLAMP, AddressW = .CLAMP, MaxLOD = 1000}
 	}
 	h := heap_cpu_start(g.sampler_heap)
 	h.ptr += uint(slot * int(g.sampler_step))
@@ -526,6 +562,7 @@ main :: proc() {
 	report("gl_VertexID", id_d, id_ok, &failed)
 	mask_d, mask_ok := sample_mask_check(&g)
 	report("gl_SampleMask", mask_d, mask_ok, &failed)
+	bound_fetch_check(&g, &scratch, &failed)
 	face_detail, face_ok := facing_check(&g)
 	fmt.printfln("%-20s %s  %s", "facing", face_detail, "ok" if face_ok else "MISMATCH")
 	if debug_messages() > 0 || !face_ok {
@@ -554,10 +591,52 @@ main :: proc() {
 		detail, ok := compute_check(&g, e.name, e.source, {profile = .Glsl, stage = .Compute}, e.shape)
 		compute_report(e.name, detail, ok, &failed)
 	}
-	checks := len(names) + len(EDGE_SHADERS) + 4 + len(comp_names) + 1 + len(EDGE_COMPUTE)
+	checks := len(names) + len(EDGE_SHADERS) + 4 + len(comp_names) + 1 + len(EDGE_COMPUTE) + 8
 	fmt.printfln("%d/%d checks match (images in %s)", checks - failed, checks, out_dir)
 	if failed > 0 {
 		os.exit(1)
+	}
+}
+
+// The DXGI formats of parity.BOUND_FORMATS.
+FMT_DXGI := [4]dxgi.FORMAT{.R8G8B8A8_UNORM, .R8_UNORM, .R16_UNORM, .R16G16B16A16_FLOAT}
+
+// texelFetch in and out of range (parity.bound_fetch_compare) on the
+// bound format textures, with SDL's default sampler (reported), and with
+// max_lod 1000 wrapping and clamped (the texels inside checked; 8 checks).
+bound_fetch_check :: proc(g: ^Gpu, scratch: ^oksl.Scratch, failed: ^int) {
+	m, errors, ok := oksl.compile(parity.BOUND_FETCH_FRAG, {profile = .Glsl, stage = .Fragment, dxbc = true})
+	defer oksl.destroy(m)
+	if !ok {
+		fmt.printfln("%-20s compile error:\n%s", "bound_fetch", oksl.format_errors(errors, context.temp_allocator))
+		failed^ += 8
+		return
+	}
+	view := [4]f32{W, H, 0, 0}
+	names := [3]string{"SDL default sampler", "max_lod 1000", "max_lod 1000, clamp to edge"}
+	smps := [3]Smp{.Sdl_Default, .Point_Wrap, .Point_Clamp}
+	formats := parity.BOUND_FORMATS
+	for si in 0 ..< 3 {
+		for fi in 0 ..< 4 {
+			px, err := draw(g, {vs = g.vs, ps = m.dxbc, vs_block = slice.to_bytes(view[:]), ps_srvs = {Srv(int(Srv.Fmt_Rgba8) + fi), .Fetch_Q}, ps_samplers = {smps[si]}, attributes = LAYER_ATTRIBUTES, vertices = 6, target = .Rgba32f})
+			if err != "" {
+				fmt.printfln("%-20s D3D12 draw failed: %s", "bound_fetch", err)
+				if si > 0 {
+					failed^ += 1
+				}
+				continue
+			}
+			detail, bf_ok := parity.bound_fetch_compare(m, fi, slice.reinterpret([][4]f32, px), scratch)
+			delete(px)
+			if si == 0 {
+				fmt.printfln("%-20s %v %s (reported): %s", "bound_fetch", formats[fi], names[si], detail)
+				continue
+			}
+			fmt.printfln("%-20s %v %s: %s  %s", "bound_fetch", formats[fi], names[si], detail, "ok" if bf_ok else "MISMATCH")
+			if debug_messages() > 0 || !bf_ok {
+				failed^ += 1
+			}
+		}
 	}
 }
 

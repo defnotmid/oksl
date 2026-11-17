@@ -1035,5 +1035,113 @@ bound_formats_check :: proc(g: ^Gpu, scratch: ^oksl.Scratch, failed: ^int) -> in
 			}
 		}
 	}
-	return checks
+	return checks + bound_fetch_check(g, texs, scratch, failed)
+}
+
+// texelFetch in and out of range (parity.bound_fetch_compare) on the
+// bound format textures: with SDL's default sampler and with that sampler
+// but max_lod 1000, what the GPU returns outside, reported; the texels
+// inside, with max_lod 1000, a check (the default's max_lod 0 may pin
+// texelFetch to level 0, as on RADV, which then reads the level-0 texel at
+// the level's texel centre).
+bound_fetch_check :: proc(g: ^Gpu, texs: [4]^sdl.GPUTexture, scratch: ^oksl.Scratch, failed: ^int) -> int {
+	m, errors, ok := oksl.compile(parity.BOUND_FETCH_FRAG, {profile = .Glsl, stage = .Fragment})
+	defer oksl.destroy(m)
+	if !ok {
+		fmt.println(oksl.format_errors(errors, context.temp_allocator))
+		failed^ += 1
+		return 1
+	}
+	info := sdl.GPUShaderCreateInfo {
+		code_size           = len(m.msl) if g.msl else len(m.spirv) * 4,
+		code                = raw_data(m.msl) if g.msl else ([^]u8)(raw_data(m.spirv)),
+		entrypoint          = oksl.MSL_ENTRY if g.msl else oksl.SPIRV_ENTRY,
+		format              = {.MSL} if g.msl else {.SPIRV},
+		stage               = .FRAGMENT,
+		num_samplers        = 1,
+		num_storage_buffers = 1,
+	}
+	frag := sdl.CreateGPUShader(g.device, info)
+	defer sdl.ReleaseGPUShader(g.device, frag)
+	buffer := sdl.GPUVertexBufferDescription{slot = 0, pitch = 16, input_rate = .VERTEX}
+	attrs := [2]sdl.GPUVertexAttribute{{location = 0, buffer_slot = 0, format = .FLOAT2, offset = 0}, {location = 1, buffer_slot = 0, format = .FLOAT2, offset = 8}}
+	color := sdl.GPUColorTargetDescription{format = .R32G32B32A32_FLOAT}
+	pipeline := sdl.CreateGPUGraphicsPipeline(g.device, {
+		vertex_shader      = g.vert,
+		fragment_shader    = frag,
+		vertex_input_state = {vertex_buffer_descriptions = &buffer, num_vertex_buffers = 1, vertex_attributes = &attrs[0], num_vertex_attributes = 2},
+		primitive_type     = .TRIANGLELIST,
+		rasterizer_state   = {fill_mode = .FILL, cull_mode = .NONE},
+		multisample_state  = {sample_count = ._1},
+		target_info        = {color_target_descriptions = &color, num_color_targets = 1},
+	})
+	defer sdl.ReleaseGPUGraphicsPipeline(g.device, pipeline)
+	if frag == nil || pipeline == nil {
+		fmt.println("bound_fetch: shader or pipeline failed:", sdl.GetError())
+		failed^ += 1
+		return 1
+	}
+	qbytes := size_of(parity.bound_fetch_queries)
+	qbuf := sdl.CreateGPUBuffer(g.device, {usage = {.GRAPHICS_STORAGE_READ}, size = u32(qbytes)})
+	defer sdl.ReleaseGPUBuffer(g.device, qbuf)
+	transfer := sdl.CreateGPUTransferBuffer(g.device, {usage = .UPLOAD, size = u32(qbytes)})
+	defer sdl.ReleaseGPUTransferBuffer(g.device, transfer)
+	mem.copy(sdl.MapGPUTransferBuffer(g.device, transfer, false), &parity.bound_fetch_queries, qbytes)
+	sdl.UnmapGPUTransferBuffer(g.device, transfer)
+	cmd := sdl.AcquireGPUCommandBuffer(g.device)
+	cp := sdl.BeginGPUCopyPass(cmd)
+	sdl.UploadToGPUBuffer(cp, {transfer_buffer = transfer}, {buffer = qbuf, size = u32(qbytes)}, false)
+	sdl.EndGPUCopyPass(cp)
+	fence := sdl.SubmitGPUCommandBufferAndAcquireFence(cmd)
+	_ = sdl.WaitForGPUFences(g.device, true, &fence, 1)
+	sdl.ReleaseGPUFence(g.device, fence)
+	formats := parity.BOUND_FORMATS
+	// SDL's defaults (repeat, max_lod 0), then max_lod 1000, then clamped to
+	// the edge as well.
+	samplers := [3]sdl.GPUSamplerCreateInfo{{}, {max_lod = 1000}, {max_lod = 1000, address_mode_u = .CLAMP_TO_EDGE, address_mode_v = .CLAMP_TO_EDGE, address_mode_w = .CLAMP_TO_EDGE}}
+	names := [3]string{"SDL default sampler", "max_lod 1000", "max_lod 1000, clamp to edge"}
+	for si in 0 ..< 3 {
+	lod_range := si > 0
+	smp := sdl.CreateGPUSampler(g.device, samplers[si])
+	defer sdl.ReleaseGPUSampler(g.device, smp)
+	for fi in 0 ..< 4 {
+		cmd = sdl.AcquireGPUCommandBuffer(g.device)
+		target := sdl.GPUColorTargetInfo{texture = g.target_f32, load_op = .CLEAR, store_op = .STORE}
+		pass := sdl.BeginGPURenderPass(cmd, &target, 1, nil)
+		sdl.BindGPUGraphicsPipeline(pass, pipeline)
+		binding := sdl.GPUBufferBinding{buffer = g.quad}
+		sdl.BindGPUVertexBuffers(pass, 0, &binding, 1)
+		sb := sdl.GPUTextureSamplerBinding{texture = texs[fi], sampler = smp}
+		sdl.BindGPUFragmentSamplers(pass, 0, &sb, 1)
+		qb := qbuf
+		sdl.BindGPUFragmentStorageBuffers(pass, 0, &qb, 1)
+		view := [4]f32{W, H, 0, 0}
+		sdl.PushGPUVertexUniformData(cmd, 0, &view, size_of(view))
+		sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+		sdl.EndGPURenderPass(pass)
+		nbytes :: W * H * size_of([4]f32)
+		dl := sdl.CreateGPUTransferBuffer(g.device, {usage = .DOWNLOAD, size = nbytes})
+		dp := sdl.BeginGPUCopyPass(cmd)
+		sdl.DownloadFromGPUTexture(dp, {texture = g.target_f32, w = W, h = H, d = 1}, {transfer_buffer = dl, pixels_per_row = W, rows_per_layer = H})
+		sdl.EndGPUCopyPass(dp)
+		fence = sdl.SubmitGPUCommandBufferAndAcquireFence(cmd)
+		_ = sdl.WaitForGPUFences(g.device, true, &fence, 1)
+		sdl.ReleaseGPUFence(g.device, fence)
+		gpu_f := make([][4]f32, W * H, context.temp_allocator)
+		mp := ([^][4]f32)(sdl.MapGPUTransferBuffer(g.device, dl, false))
+		copy(gpu_f, mp[:W * H])
+		sdl.UnmapGPUTransferBuffer(g.device, dl)
+		sdl.ReleaseGPUTransferBuffer(g.device, dl)
+		detail, bf_ok := parity.bound_fetch_compare(m, fi, gpu_f, scratch)
+		if lod_range {
+			if !bf_ok {
+				failed^ += 1
+			}
+			fmt.printfln("%-20s %v %s: %s  %s", "bound_fetch", formats[fi], names[si], detail, "ok" if bf_ok else "MISMATCH")
+		} else {
+			fmt.printfln("%-20s %v %s (reported): %s", "bound_fetch", formats[fi], names[si], detail)
+		}
+	}
+	}
+	return 8
 }
