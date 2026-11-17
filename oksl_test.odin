@@ -2871,13 +2871,18 @@ void main() {
 	p_vm.jit_init = nil
 	run_f32(&p_vm, block, 6, 3, out_vm, temp_scratch(), opts)
 
+	// The arm64 JIT's min and max are fminnm and fmaxnm (README): a NaN
+	// operand gives the other, so flags 1 and 2 stay clear there.
+	native := f32(3) if JIT_A64 && m.program.jit_body != nil else 0
 	for i in 0 ..< len(out_jit) {
 		x, y := i % 6, i / 6
 		lane := u32(x + y * 4)
 		want_bw := f32(words[lane]) if int(lane) < len(words) else 0
 		want_dyn := f32((lane & 3) + 1)
-		near(t, out_jit[i], {0.25, 3.0, 255.0 + want_bw + want_dyn, f32(u32(0xffff_ffff)) - f32(u32(0x8000_0001))})
-		testing.expect_value(t, transmute([4]u32)out_jit[i], transmute([4]u32)out_vm[i])
+		near(t, out_jit[i], {0.25, 3.0, 255.0 - native + want_bw + want_dyn, f32(u32(0xffff_ffff)) - f32(u32(0x8000_0001))})
+		want := out_vm[i]
+		want.z -= native
+		testing.expect_value(t, transmute([4]u32)out_jit[i], transmute([4]u32)want)
 	}
 
 	// Clamp with NaN bounds and sampler host context preservation.
@@ -2963,7 +2968,7 @@ test_compute_nv12 :: proc(t: ^testing.T) {
 	testing.expect_value(t, m.num_uniform_buffers, 1)
 	// Barrier-free compute runs in the JIT where there is one.
 	when JIT_ENABLED {
-		testing.expect_value(t, m.program.jit_body != nil, jit_avx2_ready)
+		testing.expect_value(t, m.program.jit_body != nil, jit_ready)
 	} else {
 		testing.expect(t, m.program.jit_body == nil)
 	}
@@ -5533,8 +5538,13 @@ test_bound_channel_rule :: proc(t: ^testing.T) {
 	for cfg, ci in configs {
 		for filter in Channel_Filter {
 			for wrap in ([4][2]Channel_Wrap{{.Clamp, .Clamp}, {.Repeat, .Repeat}, {.Repeat, .Clamp}, {.Clamp, .Repeat}}) {
-				for mips in ([2]bool{false, true}) {
+				// Levels: level 0 alone, the whole chain (4), and 2 and 3 of it.
+				for n_levels in ([4]int{1, 0, 2, 3}) {
+					mips := n_levels != 1
 					im := make_test_image(cfg.format, cfg.comps, TW, TH, mips, u32(ci * 31 + int(filter) * 7 + int(mips)))
+					if n_levels > 1 {
+						im.levels = im.levels[:n_levels - 1]
+					}
 					im.filter, im.wrap = filter, wrap
 					fetch_im := im
 					imgs := [2]Channel_Image{im, fetch_im}
@@ -5566,8 +5576,8 @@ test_bound_channel_rule :: proc(t: ^testing.T) {
 							for i in 0 ..< len(wj) {
 								if wj[i] != wv[i] || wj[i] != wc[i] || wc[i] != wcv[i] {
 									if mismatches < 12 {
-										testing.expectf(t, false, "%v/%d %v %v mips=%v xform %d target %d pixel (%d, %d) comp %d: jit %08x vm %08x callback %08x/%08x",
-											cfg.format, cfg.comps, filter, wrap, mips, xi, target, (i / 4) % W, i / 4 / W, i % 4, wj[i], wv[i], wc[i], wcv[i])
+										testing.expectf(t, false, "%v/%d %v %v levels=%d xform %d target %d pixel (%d, %d) comp %d: jit %08x vm %08x callback %08x/%08x",
+											cfg.format, cfg.comps, filter, wrap, 1 + len(im.levels), xi, target, (i / 4) % W, i / 4 / W, i % 4, wj[i], wv[i], wc[i], wcv[i])
 									}
 									mismatches += 1
 									break
@@ -5781,20 +5791,20 @@ void main() {
 }
 
 // texture() with levels: the bias plus the level the quad's derivatives
-// pick, as the sampler callback gets it, through jit_help_bound_lod with
-// live values in ymm8..15 around it; and a bound channel in compute.
+// pick, as the sampler callback gets it, through emit_chan_quad_levels /
+// a_emit_quad_levels with live values around it; and a bound channel in compute.
 @(test)
 test_bound_channel_implicit_lod :: proc(t: ^testing.T) {
 	SRC :: `#version 310 es
 precision highp float;
 uniform sampler2D s;
-uniform float uScale;
+uniform float uScale, uBias;
 layout(location = 0) out vec4 o;
 void main() {
     vec2 uv = gl_FragCoord.xy * gl_FragCoord.yx * uScale;
     float a = uv.x * 3.0, b = uv.y * 5.0, c = a * b, d = a - b, e = c + d, f = c * d;
     vec4 t0 = texture(s, uv);
-    vec4 t1 = texture(s, uv * 1.7, -0.4);
+    vec4 t1 = texture(s, uv * 1.7, uBias);
     o = t0 + t1 * 0.5 + vec4(a, b, c, d) * 1e-3 + vec4(e, f, 0.0, 0.0) * 1e-4;
 }`
 	m, errs, ok := compile(SRC, {profile = .Glsl, stage = .Fragment})
@@ -5808,8 +5818,11 @@ void main() {
 		im := make_test_image(format, 4, 64, 32, true, 11)
 		im.filter, im.wrap = .Linear, {.Repeat, .Clamp}
 		sizes := [1][3]i32{{64, 32, 1}}
-		for scale in ([3]f32{0.0007, 0.004, 0.02}) {
+		// The last scale's squared derivatives are subnormal (quad_level8's
+		// 2^24 rescale), its bias bringing their levels into the chain.
+		for scale, si in ([4]f32{0.0007, 0.004, 0.02, 1e-23}) {
 			set_uniform(m, block, "uScale", {scale})
+			set_uniform(m, block, "uBias", {70 if si == 3 else -0.4})
 			outs: [3][][4]f32
 			for &o in outs {
 				o = make([][4]f32, W * H, context.temp_allocator)
@@ -5823,6 +5836,54 @@ void main() {
 					testing.expectf(t, false, "%v scale %v word %d: jit %08x vm %08x callback %08x", format, scale, i, a[i], b[i], c[i])
 					break
 				}
+			}
+		}
+	}
+
+	// quad_level8 edge cases: NaN in x2 with larger finite y2, m == 0 with +100
+	// bias, m == +inf with -100 bias, and x2 = y2 = NaN.
+	{
+		EDGE_SRC :: `#version 310 es
+precision highp float;
+uniform sampler2D s;
+uniform sampler2D pts;
+layout(location = 0) out vec4 o;
+void main() {
+    vec4 p = texelFetch(pts, ivec2(gl_FragCoord.xy), 0);
+    o = texture(s, p.xy, p.z);
+}`
+		em, eerrs, eok := compile(EDGE_SRC, {profile = .Glsl, stage = .Fragment})
+		defer destroy(em)
+		if !testing.expectf(t, eok, "edge compile failed:\n%s", format_errors(eerrs, context.temp_allocator)) {
+			return
+		}
+		im := make_test_image(.Rgba8, 4, 64, 32, true, 13)
+		im.filter, im.wrap = .Linear, {.Clamp, .Clamp}
+		nan := math.nan_f32()
+		pts_data := [16][4]f32{}
+		set_quad :: proc(d: ^[16][4]f32, q: int, c00, c10, c01, c11: [2]f32, bias: f32) {
+			x := q * 2
+			d[x] = {c00.x, c00.y, bias, 0}
+			d[x + 1] = {c10.x, c10.y, bias, 0}
+			d[8 + x] = {c01.x, c01.y, bias, 0}
+			d[8 + x + 1] = {c11.x, c11.y, bias, 0}
+		}
+		set_quad(&pts_data, 0, {0.25, 0.25}, {nan, 0.25}, {0.25, 4.25}, {0.25, 4.25}, 0)
+		set_quad(&pts_data, 1, {0.25, 0.25}, {0.25, 0.25}, {0.25, 0.25}, {0.25, 0.25}, 100)
+		set_quad(&pts_data, 2, {0.25, 0.25}, {1e38, 0.25}, {0.25, 0.25}, {0.25, 0.25}, -100)
+		set_quad(&pts_data, 3, {nan, nan}, {0.25, 0.25}, {0.25, 0.25}, {0.25, 0.25}, 0)
+		pts := Channel_Image{data = slice.reinterpret([]f32, pts_data[:]), width = 8, height = 2, format = .F32, components = 4, filter = .Nearest, wrap = {.Clamp, .Clamp}}
+		outs: [2][][4]f32
+		for &o in outs {
+			o = make([][4]f32, 16, context.temp_allocator)
+		}
+		run_f32(&em.program, nil, 8, 2, outs[0], temp_scratch(), {channel_images = {im, pts}})
+		run_f32_interp(&em.program, nil, 8, 2, outs[1], temp_scratch(), {channel_images = {im, pts}})
+		a, b := slice.reinterpret([]u32, outs[0]), slice.reinterpret([]u32, outs[1])
+		for i in 0 ..< len(a) {
+			if a[i] != b[i] {
+				testing.expectf(t, false, "quad_level8 edge word %d: jit %08x vm %08x", i, a[i], b[i])
+				break
 			}
 		}
 	}
@@ -6260,8 +6321,8 @@ test_fetch_one_halves :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, bad8 == 0, "half8_bits: %d halves differ", bad8)
-	when JIT_ENABLED {
-		if !jit_avx2_ready {
+	when JIT_X64 {
+		if !jit_ready {
 			return
 		}
 		halves := make([]u16, 65536, context.temp_allocator)
@@ -8896,6 +8957,53 @@ void main() {
 	}
 }
 
+// An integer division between two masked stores in one block: its
+// operands read into scratch registers, the exec mask's lanes among them on
+// both JITs (ymm7; v14, v15), so the store after it reloads them. The JIT
+// against the interpreter, bit for bit.
+@(test)
+test_jit_div_between_stores :: proc(t: ^testing.T) {
+	src := `#version 310 es
+precision highp float;
+out vec4 o;
+void main() {
+    int i = int(gl_FragCoord.x);
+    int j = int(gl_FragCoord.y) * 3 + 1;
+    uint u = uint(gl_FragCoord.x) * 7u + 5u;
+    uint v = uint(gl_FragCoord.y) + 2u;
+    vec4 acc = vec4(-1.0);
+    if (((i + int(gl_FragCoord.y)) & 1) == 0) {
+        acc.x = 2.0;
+        int q = i / j;
+        acc.y = float(q) + 0.5;
+        uint r = u % v;
+        acc.z = float(r) + 0.25;
+        acc.w = float(i % j) + 0.125;
+    }
+    o = acc;
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	when JIT_ENABLED {
+		testing.expect_value(t, m.program.jit_body != nil, jit_ready)
+	}
+	W, H :: 16, 8
+	oj := make([][4]f32, W * H, context.temp_allocator)
+	oi := make([][4]f32, W * H, context.temp_allocator)
+	run_f32(&m.program, nil, W, H, oj, temp_scratch())
+	sb, si := m.program.jit_body, m.program.jit_init
+	m.program.jit_body, m.program.jit_init = nil, nil
+	run_f32(&m.program, nil, W, H, oi, temp_scratch())
+	m.program.jit_body, m.program.jit_init = sb, si
+	for i in 0 ..< W * H {
+		testing.expectf(t, transmute([4]u32)oj[i] == transmute([4]u32)oi[i], "pixel %d: jit %v interp %v", i, oj[i], oi[i])
+	}
+}
+
 @(test)
 test_jit_idiv_irem :: proc(t: ^testing.T) {
 	EDGES_N :: 33
@@ -9824,7 +9932,7 @@ void main() {{
 	testing.expect_value(t, dyn_total, i32(13))
 
 	when JIT_ENABLED {
-		if jit_avx2_ready {
+		if jit_ready {
 			// Reverting Item 1 marks all slots cross_bb and emits >600 B of extra [rbx] stores on t0..t15.
 			testing.expectf(
 				t,
@@ -9963,7 +10071,7 @@ test_jit_dst_reg_direct :: proc(t: ^testing.T) {
 	defer jit_destroy(&p_mov)
 
 	when JIT_ENABLED {
-		if jit_avx2_ready {
+		if jit_ready {
 			// Direct-dst vaddps/vmulps (5 B) matches reg-to-reg vmovaps (5 B);
 			// bouncing through ymm0 adds 128 vmovaps copies (+512 B).
 			testing.expectf(
@@ -10033,7 +10141,7 @@ test_jit_mask_restore_dead_kills :: proc(t: ^testing.T) {
 	defer jit_destroy(&p_live)
 
 	when JIT_ENABLED {
-		if jit_avx2_ready {
+		if jit_ready {
 			testing.expectf(
 				t,
 				len(p_zero.jit_mem) * 2 < len(p_live.jit_mem),
@@ -10193,7 +10301,7 @@ test_jit_cmp_mask_cond_fusion :: proc(t: ^testing.T) {
 	defer jit_destroy(&p_unfused)
 
 	when JIT_ENABLED {
-		if jit_avx2_ready {
+		if jit_ready {
 			// 16 extra Bit_Or + 1 I_To_F in p_unfused add ~85 B, while unfusing 16 cmp+Mask_Cond pairs adds ~350 B (>430 B diff).
 			// Reverting Item 3b collapses the difference to ~85 B.
 			testing.expectf(
@@ -10350,8 +10458,8 @@ test_jit_mask_eq_exec :: proc(t: ^testing.T) {
 	jit_compile(&p_noopt)
 	defer jit_destroy(&p_noopt)
 
-	when JIT_ENABLED {
-		if jit_avx2_ready {
+	when JIT_X64 { // x86's code shape
+		if jit_ready {
 			testing.expectf(
 				t,
 				len(p_opt.jit_mem) * 6 < len(p_noopt.jit_mem) * 5,
@@ -10533,7 +10641,7 @@ test_jit_store_exec_ymask_cache :: proc(t: ^testing.T) {
 	defer jit_destroy(&p_reexp)
 
 	when JIT_ENABLED {
-		if jit_avx2_ready {
+		if jit_ready {
 			// 24 Mask_Or(0,0,0) alone is 24 * 10 = 240 B; with 23 saved vpmovsxbd (23 * 6 = 138 B),
 			// p_reexp - p_cached is ~378 B. Reverting Item 4a shrinks the gap to 240 B (< 290 B).
 			testing.expectf(
@@ -10800,7 +10908,7 @@ test_jit_entry_unmasked_stores :: proc(t: ^testing.T) {
 		defer jit_destroy(&p_narrow)
 
 		when JIT_ENABLED {
-			if jit_avx2_ready {
+			if jit_ready {
 				// Mask_Cond itself is <= 24 B; the 8 masked stores (4 vpandn + 4 vpblendvb + 8 old loads + ensure_exec_ymask)
 				// add > 70 B on top of that. Fails if 4b is reverted!
 				testing.expectf(
@@ -10947,8 +11055,8 @@ void main() {
 	if !ok {
 		return
 	}
-	when JIT_ENABLED {
-		if jit_avx2_ready {
+	when JIT_X64 { // x86's code shape
+		if jit_ready {
 			// Verify non-entry Store / Store_Zero emitted the r13d == 0xFF fast-path check (41 81 FD FF 00 00 00).
 			sig := [7]u8{0x41, 0x81, 0xFD, 0xFF, 0x00, 0x00, 0x00}
 			hits := 0
@@ -11140,7 +11248,7 @@ test_jit_liveness_cross_bb :: proc(t: ^testing.T) {
 		jit_compile(&p_reused)
 		jit_compile(&p_distinct)
 		when JIT_ENABLED {
-			if jit_avx2_ready {
+			if jit_ready {
 				testing.expectf(
 					t,
 					len(p_reused.jit_mem) <= len(p_distinct.jit_mem) + 16,
@@ -11283,8 +11391,8 @@ test_jit_texture_same_bb :: proc(t: ^testing.T) {
 		jit_compile(&p_split)
 		defer jit_destroy(&p_split)
 
-		when JIT_ENABLED {
-			if jit_avx2_ready {
+		when JIT_X64 { // x86's code shape
+			if jit_ready {
 				testing.expectf(
 					t,
 					// Both programs carry the same bound-channel subroutines.
@@ -11452,8 +11560,8 @@ void main() {
 		if !ok_r || !ok_4 {
 			return
 		}
-		when JIT_ENABLED {
-			if jit_avx2_ready {
+		when JIT_X64 { // x86's code shape
+			if jit_ready {
 				testing.expectf(
 					t,
 					len(mr.program.jit_mem) + 250 < len(m4.program.jit_mem),
@@ -11632,7 +11740,7 @@ test_jit_load_buf_bounds_and_cold :: proc(t: ^testing.T) {
 		defer jit_destroy(&p_f1)
 
 		when JIT_ENABLED {
-			if jit_avx2_ready {
+			if jit_ready {
 				testing.expectf(
 					t,
 					len(p_v4.jit_mem) < len(p_f1.jit_mem),
@@ -13518,7 +13626,7 @@ test_dxbc_compute_errors :: proc(t: ^testing.T) {
 @(private = "file")
 cjit_available :: proc() -> bool {
 	when JIT_ENABLED {
-		return jit_avx2_ready
+		return jit_ready
 	} else {
 		return false
 	}
@@ -13606,11 +13714,11 @@ cjit_clone_run :: proc(r: Cjit_Run) -> Cjit_Run {
 // Every word of every buffer and every byte of every image (sentinels
 // included) equal, NaNs too; reports the first difference of each.
 @(private = "file")
-cjit_expect_same :: proc(t: ^testing.T, what: string, a, b: Cjit_Run, loc := #caller_location) -> bool {
+cjit_expect_same :: proc(t: ^testing.T, what: string, a, b: Cjit_Run, words_same: proc(buf, word: int, a, b: u32) -> bool = nil, loc := #caller_location) -> bool {
 	same := true
 	for _, i in a.bufs {
 		for w, j in a.bufs[i] {
-			if w != b.bufs[i][j] {
+			if w != b.bufs[i][j] && (words_same == nil || !words_same(i, j, w, b.bufs[i][j])) {
 				testing.expectf(t, false, "%s: buffer %d word %d (of %d): jit %08x interp %08x", what, i, j, len(a.opts.buffers[i]), w, b.bufs[i][j], loc = loc)
 				same = false
 				break
@@ -13643,7 +13751,7 @@ cjit_interp :: proc(p: ^Program, uniforms: []u8, groups: [3]int, opts: Run_Optio
 // expects identical memory; also that the JIT compiled it (`want_jit`) when
 // this machine has one.
 @(private = "file")
-cjit_compare :: proc(t: ^testing.T, what: string, m: ^Module, block: []u8, groups: [3]int, buf_words: []int, imgs: []Cjit_Image = nil, seed: u32 = 1, extra: Run_Options = {}, want_jit := true, first_group := 0, group_count := -1, init: proc(bi: int, words: []u32) = nil, loc := #caller_location) -> bool {
+cjit_compare :: proc(t: ^testing.T, what: string, m: ^Module, block: []u8, groups: [3]int, buf_words: []int, imgs: []Cjit_Image = nil, seed: u32 = 1, extra: Run_Options = {}, want_jit := true, first_group := 0, group_count := -1, init: proc(bi: int, words: []u32) = nil, words_same: proc(buf, word: int, a, b: u32) -> bool = nil, loc := #caller_location) -> bool {
 	if cjit_available() {
 		testing.expectf(t, (m.program.jit_body != nil) == want_jit, "%s: jit compiled %v, want %v", what, m.program.jit_body != nil, want_jit, loc = loc)
 	}
@@ -13655,7 +13763,7 @@ cjit_compare :: proc(t: ^testing.T, what: string, m: ^Module, block: []u8, group
 	rb := cjit_clone_run(ra)
 	run_compute(&m.program, block, groups, temp_scratch(), ra.opts, first_group, group_count)
 	cjit_interp(&m.program, block, groups, rb.opts, first_group, group_count)
-	return cjit_expect_same(t, what, ra, rb, loc)
+	return cjit_expect_same(t, what, ra, rb, words_same, loc)
 }
 
 @(private = "file")
@@ -14382,7 +14490,7 @@ void main() {
 	}
 	expect_store_dyn_sizes(t, "fragment", &m.program)
 	when JIT_ENABLED {
-		if jit_avx2_ready {
+		if jit_ready {
 			testing.expect(t, m.program.jit_body != nil)
 		}
 	}
@@ -14579,9 +14687,60 @@ void zeros(float x, float lo, float hi, out vec4 a, out vec4 b, out vec4 c, out 
 }
 `
 
+// Result k of zeros(), the JIT's a against the interpreter's b, for
+// operands (x, lo, hi). The arm64 JIT's clamp is fmaxnm then fminnm
+// (README), which order -0.0 below +0.0: there a clamp's result (0 and 8 to
+// 19) is a64_nm's, bit for bit, and a NaN one the interpreter's NaN.
 @(private = "file")
-sz_same :: proc(a, b: u32) -> bool {
+sz_same :: proc(k: int, x, lo, hi, a, b: u32) -> bool {
+	when JIT_A64 {
+		if k == 0 || k >= 8 {
+			want := transmute(u32)sz_clamp_a64(k, transmute(f32)x, transmute(f32)lo, transmute(f32)hi)
+			if want & 0x7fff_ffff > 0x7f80_0000 {
+				return a == b && a & 0x7fff_ffff > 0x7f80_0000
+			}
+			return a == want
+		}
+	}
 	return a == b
+}
+
+// zeros()'s clamp k as fmaxnm and fminnm compute it (a64_nm).
+@(private = "file")
+sz_clamp_a64 :: proc(k: int, x, lo, hi: f32) -> f32 {
+	cl :: proc(v, lo, hi: f32) -> f32 {return a64_nm(a64_nm(v, lo, true), hi, false)}
+	nan := transmute(f32)u32(0x7fc0_0000)
+	switch k {
+	case 0, 8, 11:
+		return cl(x, lo, hi)
+	case 9:
+		return cl(-x, lo, hi)
+	case 10:
+		return cl(lo, x, hi)
+	case 12, 16:
+		return cl(x, 0, 1)
+	case 13:
+		return cl(x, transmute(f32)u32(0x8000_0000), 0)
+	case 14, 19:
+		return cl(x, 0, hi)
+	case 15, 18:
+		return cl(x, nan, hi)
+	case 17:
+		return cl(x, nan, 1)
+	}
+	unreachable()
+}
+
+// Word j of compute's buffer 1 is zeros()'s result j % 20 for invocation
+// j / 20, whose operands lie past the input buffer (0) for j / 20 >= N.
+@(private = "file")
+sz_same_word :: proc(buf, word: int, a, b: u32) -> bool {
+	p := word / 20
+	x, lo, hi: u32
+	if p < SZ_W * SZ_H {
+		x, lo, hi = sz_inputs[p * 3], sz_inputs[p * 3 + 1], sz_inputs[p * 3 + 2]
+	}
+	return buf == 1 && sz_same(word % 20, x, lo, hi, a, b)
 }
 
 // Signed zeros, NaNs and infinities through clamp and the functions odd at 0,
@@ -14632,14 +14791,14 @@ void main() {
 	for p in 0 ..< SZ_CASES {
 		for k in 0 ..< 20 {
 			a, b := bits(&tj, p, k), bits(&ti, p, k)
-			if !sz_same(a, b) && bad < 8 {
+			if !sz_same(k, sz_inputs[p * 3], sz_inputs[p * 3 + 1], sz_inputs[p * 3 + 2], a, b) && bad < 8 {
 				testing.expectf(t, false, "fragment (x, lo, hi) = (%08x, %08x, %08x) result %d: jit %08x interp %08x", sz_inputs[p * 3], sz_inputs[p * 3 + 1], sz_inputs[p * 3 + 2], k, a, b)
 				bad += 1
 			}
 		}
 	}
 
-	// The defined results, from the interpreter (equal to the JIT above).
+	// The defined results, from the interpreter (the JIT's above, arm64's clamps aside).
 	Want :: struct {
 		x, lo, hi: u32,
 		k:         int,
@@ -14717,7 +14876,7 @@ void main() { zeros(ux, ulo, uhi, o0, o1, o2, o3, o4); }
 			return
 		}
 		when JIT_ENABLED {
-			if jit_avx2_ready {
+			if jit_ready {
 				testing.expect(t, um.program.jit_init != nil)
 			}
 		}
@@ -14739,7 +14898,7 @@ void main() { zeros(ux, ulo, uhi, o0, o1, o2, o3, o4); }
 					um.program.jit_body, um.program.jit_init = sb, si
 					for k in 0 ..< 20 {
 						a, b := transmute(u32)uj[k / 4][3][k % 4], transmute(u32)ui[k / 4][3][k % 4]
-						testing.expectf(t, sz_same(a, b), "uniform (%08x, %08x, %08x) result %d: jit %08x interp %08x", x, lo, hi, k, a, b)
+						testing.expectf(t, sz_same(k, x, lo, hi, a, b), "uniform (%08x, %08x, %08x) result %d: jit %08x interp %08x", x, lo, hi, k, a, b)
 					}
 					if x == NEG0 && lo == POS0 && hi == ONE {
 						testing.expectf(t, transmute(u32)ui[0][3][0] == NEG0, "uniform clamp(-0.0, 0.0, 1.0) = %08x", transmute(u32)ui[0][3][0])
@@ -14776,7 +14935,7 @@ void main() {{
 				copy(words, sz_inputs[:])
 			}
 		}
-		cjit_compare(t, fmt.tprintf("compute signed zeros, local size %d", size), cm, nil, {N / size + 1, 1, 1}, {N * 3, (N / size + 1) * size * 20}, init = init)
+		cjit_compare(t, fmt.tprintf("compute signed zeros, local size %d", size), cm, nil, {N / size + 1, 1, 1}, {N * 3, (N / size + 1) * size * 20}, init = init, words_same = sz_same_word)
 		destroy(cm)
 	}
 }
@@ -15806,6 +15965,39 @@ test_bound_level_is_callback_level :: proc(t: ^testing.T) {
 // storage buffer (both signs, several payloads, against ordinary values),
 // from uniforms, and from compile-time constants; mac.sh runs this at
 // -o:speed on arm64.
+// The arm64 JIT's value of a test_signaling_nan_builtins min, max or clamp
+// expression (fmaxnm and fminnm, a64_nm; README); ok false for the others,
+// which give the interpreter's bits there too.
+nan_native_ref :: proc(expr: string, x, y, uz: f32) -> (r: f32, ok: bool) {
+	mn :: proc(a, b: f32) -> f32 {return a64_nm(a, b, false)}
+	mx :: proc(a, b: f32) -> f32 {return a64_nm(a, b, true)}
+	cl :: proc(v, lo, hi: f32) -> f32 {return mn(mx(v, lo), hi)}
+	nx := transmute(f32)(transmute(u32)x ~ 0x8000_0000)
+	switch expr {
+	case "clamp(x, 0.0, 1.0)", "clamp(vec4(x, y, 0.5, -x), 0.0, 1.0).x": return cl(x, 0, 1), true
+	case "clamp(0.5, x, 1.0)":                       return cl(0.5, x, 1), true
+	case "clamp(0.5, 0.0, x)":                       return cl(0.5, 0, x), true
+	case "clamp(x, y, 1.0)":                         return cl(x, y, 1), true
+	case "min(x, y)", "min(vec4(x), vec4(y)).z":     return mn(x, y), true
+	case "max(x, y)":                                return mx(x, y), true
+	case "min(y, x)":                                return mn(y, x), true
+	case "max(y, x)", "max(vec3(y), vec3(x)).y":     return mx(y, x), true
+	case "min(x, 0.5)":                              return mn(x, 0.5), true
+	case "max(x, 0.5)":                              return mx(x, 0.5), true
+	case "clamp(vec4(x, y, 0.5, -x), vec4(0.0), vec4(1.0)).w": return cl(nx, 0, 1), true
+	case "float(int(clamp(x, -4.0, 4.0)))":          return f32(f_to_i(cl(x, -4, 4))), true
+	case "clamp(x, u.x, u.y)":                       return cl(x, 0.25, 0.75), true
+	case "min(x, u.z)":                              return mn(x, uz), true
+	case "max(u.z, x)":                              return mx(uz, x), true
+	case "clamp(u.z, 0.0, 1.0)":                     return cl(uz, 0, 1), true
+	case "min(x, uintBitsToFloat(0x7f800001u))":     return mn(x, transmute(f32)u32(0x7f80_0001)), true
+	case "min(x, uintBitsToFloat(0x7fc00001u))":     return mn(x, transmute(f32)u32(0x7fc0_0001)), true
+	case "clamp(uintBitsToFloat(0xff800123u), 0.0, 1.0)": return cl(transmute(f32)u32(0xff80_0123), 0, 1), true
+	case "clamp(uintBitsToFloat(0xffc00123u), 0.0, 1.0)": return cl(transmute(f32)u32(0xffc0_0123), 0, 1), true
+	}
+	return 0, false
+}
+
 @(test)
 test_signaling_nan_builtins :: proc(t: ^testing.T) {
 	EXPRS := []string{
@@ -15936,8 +16128,19 @@ test_signaling_nan_builtins :: proc(t: ^testing.T) {
 		for quiet in 0 ..< 2 {
 			for engine in 0 ..< 2 {
 				for w, i in results[quiet][engine] {
-					if w != ref[i] && bad < 8 {
-						testing.expectf(t, false, "%v %s, %s: pair %08x %08x: %s = %08x, quiet interpreter %08x", stage, "signaling" if quiet == 0 else "quiet", "jit" if engine == 0 else "interp", words_s[2 * (i / N)], words_s[2 * (i / N) + 1], EXPRS[i % N], w, ref[i])
+					want := ref[i]
+					when JIT_A64 {
+						// The arm64 JIT's min, max and clamp: a64_nm's.
+						if engine == 0 {
+							ws := words_q if quiet == 1 else words_s[:]
+							uz := transmute(f32)u32(0x7fc0_0001 if quiet == 1 else 0x7f80_0001)
+							if r, native := nan_native_ref(EXPRS[i % N], transmute(f32)ws[2 * (i / N)], transmute(f32)ws[2 * (i / N) + 1], uz); native {
+								want = 0x7fc0_0000 if r != r else transmute(u32)r
+							}
+						}
+					}
+					if w != want && bad < 8 {
+						testing.expectf(t, false, "%v %s, %s: pair %08x %08x: %s = %08x, want %08x (quiet interpreter %08x)", stage, "signaling" if quiet == 0 else "quiet", "jit" if engine == 0 else "interp", words_s[2 * (i / N)], words_s[2 * (i / N) + 1], EXPRS[i % N], w, want, ref[i])
 						bad += 1
 					}
 				}
@@ -15951,6 +16154,349 @@ test_signaling_nan_builtins :: proc(t: ^testing.T) {
 					testing.expectf(t, false, "%v: %s = %08x but %s = %08x", stage, EXPRS[k], a, EXPRS[k + 1], b)
 					bad += 1
 				}
+			}
+		}
+	}
+}
+
+// NEON's min and max (fminnm, fmaxnm) as the arm64 JIT takes them: a
+// signaling NaN operand gives NaN, a quiet one the other operand, and -0.0 is
+// below +0.0.
+a64_nm :: proc(a, b: f32, is_max: bool) -> f32 {
+	ab, bb := transmute(u32)a, transmute(u32)b
+	snan :: proc(w: u32) -> bool {return w & 0x7fff_ffff > 0x7f80_0000 && w & 0x40_0000 == 0}
+	if snan(ab) || snan(bb) {
+		return transmute(f32)u32(0x7fc0_0000)
+	}
+	if a != a {return b}
+	if b != b {return a}
+	if a == b {
+		// Zeros of either sign: max takes +0.0, min -0.0.
+		return transmute(f32)(ab & bb if is_max else ab | bb)
+	}
+	return max(a, b) if is_max else min(a, b)
+}
+
+// The arm64 hazards against the interpreter over NaNs (quiet and
+// signaling, both signs), infinities, signed zeros, subnormals, values at
+// and past the int and uint range, and ordinary ones, every pair, in a
+// fragment and a compute shader: the conversions, rounding, selects,
+// compares, division and the other float operations bit for bit (NEON and
+// the interpreter agree there), and min, max, clamp and smoothstep's clamp,
+// which the arm64 JIT takes from NEON (README), as a64_nm gives them there
+// (on x86 bit for bit with the interpreter too). The outputs are
+// canonical, so every NaN is 0x7fc00000.
+@(test)
+test_jit_native_edges :: proc(t: ^testing.T) {
+	EXACT := []string{
+		"float(int(x))", "float(uint(x))", "floor(x)", "ceil(x)", "trunc(x)", "round(x)", "roundEven(x)", "fract(x)",
+		"x / y", "mod(x, y)", "sqrt(x)", "inversesqrt(x)", "sign(x)", "x < y ? x : y", "step(x, y)", "float(isnan(x)) + 2.0 * float(isinf(y))",
+		"mix(x, y, 0.25)", "abs(x) - x", "float(floatBitsToUint(x) >> 16u)", "uintBitsToFloat(floatBitsToUint(y))",
+		"float(x == y) + 2.0 * float(x != y) + 4.0 * float(x <= y) + 8.0 * float(x > y)", "float(int(x) / int(y)) + float(int(x) % int(y))",
+		"float(uint(x) / uint(y)) + float(uint(x) % uint(y))", "float(int(x) >> (int(y) & 31)) + float(uint(x) << (uint(y) & 31u))",
+		"float(-int(x)) + float(abs(int(y)))", "float(x > 0.0 && y < 0.0) + 2.0 * float(x != 0.0 || y != 0.0)", "x * y + y", "x - y * 0.5",
+		"float(sign(int(x)))", "float(min(int(x), int(y))) + float(max(uint(x), uint(y)))", "float(clamp(int(x), -3, int(y)))", "float(uint(int(x)))",
+	}
+	NATIVE := []string{
+		"min(x, y)", "max(x, y)", "min(x, 0.5)", "max(-0.0, x)", "clamp(x, 0.0, 1.0)", "clamp(x, y, 2.0)", "clamp(0.5, x, y)", "smoothstep(x, y, 0.5)",
+		"smoothstep(0.0, 1.0, x)", "float(int(clamp(x, -4.0, 4.0)))", "min(y, x)", "max(y, x)", "clamp(y, -0.0, 0.0)", "clamp(x, 0.0, y)", "smoothstep(-1.0, 1.5, x)", "max(x, 0.0) + min(y, 1.0)",
+	}
+	_ :: native_ref
+	native_ref :: proc(k: int, x, y: f32) -> f32 {
+		mn :: proc(a, b: f32) -> f32 {return a64_nm(a, b, false)}
+		mx :: proc(a, b: f32) -> f32 {return a64_nm(a, b, true)}
+		ss :: proc(e0, e1, v: f32) -> f32 {
+			// The subtract and divide quiet a NaN (which LLVM may fold
+			// away here: (v - 0.0) / 1.0 is v).
+			t := (v - e0) / (e1 - e0)
+			if t != t {
+				t = transmute(f32)(transmute(u32)t | 0x40_0000)
+			}
+			s := mn(mx(t, 0), 1)
+			return s * s * (3 - 2 * s)
+		}
+		switch k {
+		case 0:  return mn(x, y)
+		case 1:  return mx(x, y)
+		case 2:  return mn(x, 0.5)
+		case 3:  return mx(transmute(f32)u32(0x8000_0000), x)
+		case 4:  return mn(mx(x, 0), 1)
+		case 5:  return mn(mx(x, y), 2)
+		case 6:  return mn(mx(0.5, x), y)
+		case 7:  return ss(x, y, 0.5)
+		case 8:  return ss(0, 1, x)
+		case 9:  return f32(f_to_i(mn(mx(x, -4), 4)))
+		case 10: return mn(y, x)
+		case 11: return mx(y, x)
+		case 12: return mn(mx(y, transmute(f32)u32(0x8000_0000)), 0)
+		case 13: return mn(mx(x, 0), y)
+		case 14: return ss(-1, 1.5, x)
+		case:    return mx(x, 0) + mn(y, 1)
+		}
+	}
+	edges := []u32{
+		0, 0x8000_0000, 0x7fc0_0000, 0xffc0_0000, 0x7f80_0001, 0xffa0_1234, 0x7f80_0000, 0xff80_0000,
+		1, 0x8000_0001, 0x007f_ffff, 0x0080_0000, 0x7f7f_ffff, 0xff7f_ffff,
+		transmute(u32)f32(0.5), transmute(u32)f32(-0.5), transmute(u32)f32(1), transmute(u32)f32(-1), transmute(u32)f32(2.5), transmute(u32)f32(-3.5),
+		transmute(u32)f32(2147483648), transmute(u32)f32(-2147483648), transmute(u32)f32(2147483520), transmute(u32)f32(-2147483904),
+		transmute(u32)f32(4294967296), transmute(u32)f32(4294967040), transmute(u32)f32(1e10), transmute(u32)f32(-1e10),
+		transmute(u32)f32(7), transmute(u32)f32(-7), transmute(u32)f32(0.3), transmute(u32)f32(1e-30),
+	}
+	E := len(edges)
+	P := E * E
+	words := make([]u32, 2 * P, context.temp_allocator)
+	for i in 0 ..< E {
+		for j in 0 ..< E {
+			words[2 * (i * E + j)] = edges[i]
+			words[2 * (i * E + j) + 1] = edges[j]
+		}
+	}
+	shader :: proc(compute: bool, exprs: []string) -> string {
+		b := strings.builder_make(context.temp_allocator)
+		fmt.sbprintf(&b, "#version 310 es\nprecision highp float;\n")
+		if compute {
+			fmt.sbprintf(&b, "layout(local_size_x = 8) in;\nlayout(std430, binding = 1) buffer Out {{ float r[]; }} outp;\n")
+		} else {
+			for i in 0 ..< 4 {fmt.sbprintf(&b, "layout(location = %d) out vec4 v%d;\n", i, i)}
+		}
+		fmt.sbprintf(&b, "layout(std430, binding = 0) readonly buffer In {{ uint w[]; }} inp;\nvoid main() {{\n")
+		fmt.sbprintf(&b, "    uint p = %s;\n", "gl_GlobalInvocationID.x" if compute else "uint(gl_FragCoord.y) * 32u + uint(gl_FragCoord.x)")
+		fmt.sbprintf(&b, "    float x = uintBitsToFloat(inp.w[2u * p]);\n    float y = uintBitsToFloat(inp.w[2u * p + 1u]);\n    float r[16];\n")
+		for e, k in exprs {fmt.sbprintf(&b, "    r[%d] = %s;\n", k, e)}
+		if compute {
+			fmt.sbprintf(&b, "    for (int k = 0; k < 16; k++) {{ outp.r[int(p) * 16 + k] = r[k]; }}\n")
+		} else {
+			for i in 0 ..< 4 {fmt.sbprintf(&b, "    v%d = vec4(r[%d], r[%d], r[%d], r[%d]);\n", i, 4 * i, 4 * i + 1, 4 * i + 2, 4 * i + 3)}
+		}
+		fmt.sbprintf(&b, "}}\n")
+		return strings.to_string(b)
+	}
+	groups := [3][]string{EXACT[:16], EXACT[16:], NATIVE}
+	for compute in ([2]bool{false, true}) {
+		for exprs, gi in groups {
+			src := shader(compute, exprs)
+			m, errs, ok := compile(src, {profile = .Glsl, stage = .Compute if compute else .Fragment})
+			defer destroy(m)
+			if !testing.expectf(t, ok, "%s\n%s", format_errors(errs, context.temp_allocator), src) {
+				continue
+			}
+			when JIT_ENABLED {
+				testing.expectf(t, (m.program.jit_body != nil) == jit_ready, "group %d compute=%v: jit compiled %v", gi, compute, m.program.jit_body != nil)
+			}
+			res: [2][]u32 // [engine]: [pair * 16 + expression]
+			for engine in 0 ..< 2 {
+				out := make([]u32, P * 16, context.temp_allocator)
+				sb, si := m.program.jit_body, m.program.jit_init
+				if engine == 1 {
+					m.program.jit_body, m.program.jit_init = nil, nil
+				}
+				in_bufs := [2][]u32{words, out}
+				opts := Run_Options{buffers = in_bufs[:]}
+				if compute {
+					run_compute(&m.program, nil, {P / 8, 1, 1}, temp_scratch(), opts)
+				} else {
+					tg: [4][][4]f32
+					for &x in tg {x = make([][4]f32, P, context.temp_allocator)}
+					run_targets(&m.program, nil, 32, P / 32, tg[:], temp_scratch(), opts)
+					for p in 0 ..< P {
+						for k in 0 ..< 16 {out[p * 16 + k] = transmute(u32)tg[k / 4][p][k % 4]}
+					}
+				}
+				m.program.jit_body, m.program.jit_init = sb, si
+				res[engine] = out
+			}
+			bad := 0
+			for p in 0 ..< P {
+				for k in 0 ..< 16 {
+					want := res[1][p * 16 + k]
+					when JIT_A64 {
+						if gi == 2 && m.program.jit_body != nil {
+							r := native_ref(k, transmute(f32)words[2 * p], transmute(f32)words[2 * p + 1])
+							want = 0x7fc0_0000 if r != r else transmute(u32)r
+						}
+					}
+					if got := res[0][p * 16 + k]; got != want && bad < 8 {
+						testing.expectf(t, false, "group %d compute=%v (x, y) = (%08x, %08x): %s = %08x, want %08x (interpreter %08x)", gi, compute, words[2 * p], words[2 * p + 1], exprs[k], got, want, res[1][p * 16 + k])
+						bad += 1
+					}
+				}
+			}
+		}
+	}
+}
+
+@(private = "file")
+Grad_Lods :: struct {
+	lods: [dynamic]u32,
+}
+
+@(private = "file")
+grad_lod_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+	append(&(^Grad_Lods)(user).lods, transmute(u32)lod)
+	return {lod, uv.x, uv.y, 1}
+}
+
+// The min, max and clamp the shader doesn't write: textureGrad's lod takes
+// max(|dx|^2, |dy|^2) (vm.odin's Texture_Grad), the Shadertoy wrapper clamps
+// its colour to [0, 1] (shadertoy.odin) and SkSL's saturate is a clamp. The
+// JIT against the interpreter, bit for bit on x86; on arm64 as fmaxnm and
+// fminnm give them (a64_nm, README): a NaN dx's lod is dy's, the wrapper's
+// clamp of -0.0 is +0.0 and of a signaling NaN 1.0.
+@(test)
+test_jit_implicit_min_max :: proc(t: ^testing.T) {
+	sizes := [1][3]i32{{16, 16, 0}}
+	W, H :: 4, 2
+	grad := `#version 310 es
+precision highp float;
+uniform sampler2D s;
+uniform float uZero;
+out vec4 o;
+void main() {
+    float nan_v = uZero / uZero;
+    o = textureGrad(s, gl_FragCoord.xy / 8.0, vec2(DX, 0.0), vec2(0.25, 0.0));
+}
+`
+	lods :: proc(t: ^testing.T, src: string, engine: int, sizes: [][3]i32) -> []u32 {
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+			return nil
+		}
+		when JIT_ENABLED {
+			testing.expect_value(t, m.program.jit_body != nil, jit_ready)
+		}
+		if engine == 1 {
+			m.program.jit_body, m.program.jit_init = nil, nil
+		}
+		block := make([]u8, max(m.block_size, 64), context.temp_allocator)
+		set_uniform(m, block, "uZero", {0.0})
+		o := make([][4]f32, W * H, context.temp_allocator)
+		st := Grad_Lods{lods = make([dynamic]u32, context.temp_allocator)}
+		run_f32(&m.program, block, W, H, o, temp_scratch(), {sampler = grad_lod_cb, user = &st, channel_sizes = sizes})
+		return st.lods[:]
+	}
+	g_nan, _ := strings.replace_all(grad, "DX", "nan_v", context.temp_allocator)
+	g_zero, _ := strings.replace_all(grad, "DX", "0.0", context.temp_allocator)
+	got := lods(t, g_nan, 0, sizes[:])
+	// fmaxnm(NaN, |dy|^2) is |dy|^2: the lod of a zero dx.
+	want := lods(t, g_zero if JIT_A64 else g_nan, 1, sizes[:])
+	if testing.expect_value(t, len(got), len(want)) {
+		for k in 0 ..< len(got) {
+			testing.expectf(t, got[k] == want[k], "textureGrad call %d: jit lod %08x, want %08x", k, got[k], want[k])
+		}
+	}
+
+	// The Shadertoy wrapper's clamp and SkSL's saturate of -0.0, a signaling
+	// NaN, a quiet one and 0.5.
+	srcs := [2]string{`
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    fragColor = vec4(-0.0, uintBitsToFloat(0x7f800001u + uint(fragCoord.x) * 0u), uintBitsToFloat(0x7fc00000u + uint(fragCoord.y) * 0u), 1.0);
+}
+`, `
+uniform float uZero;
+half4 main(float2 p) {
+    return half4(saturate(-uZero), saturate(uZero / uZero), saturate(p.x * 0.0 + 0.5), 1.0);
+}
+`}
+	profiles := [2]Profile{.Shadertoy, .Sksl}
+	for src, si in srcs {
+		m, errs, ok := compile(src, {profile = profiles[si], stage = .Fragment})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		block := make([]u8, max(m.block_size, 64), context.temp_allocator)
+		set_uniform(m, block, "uZero", {0.0})
+		oj := make([][4]f32, W * H, context.temp_allocator)
+		oi := make([][4]f32, W * H, context.temp_allocator)
+		run_f32(&m.program, block, W, H, oj, temp_scratch())
+		sb, sb_init := m.program.jit_body, m.program.jit_init
+		m.program.jit_body, m.program.jit_init = nil, nil
+		run_f32(&m.program, block, W, H, oi, temp_scratch())
+		m.program.jit_body, m.program.jit_init = sb, sb_init
+		want := transmute([4]u32)oi[0]
+		when JIT_A64 {
+			if sb != nil {
+				cl :: proc(v: u32) -> u32 {
+					r := a64_nm(a64_nm(transmute(f32)v, 0, true), 1, false)
+					return 0x7fc0_0000 if r != r else transmute(u32)r
+				}
+				// The interpreter's clamp gives -0.0, 0 and 0 for the
+				// first two and a quiet NaN; fmaxnm and fminnm +0.0, 1.0
+				// for the signaling NaN, 0 for the quiet one.
+				if si == 0 {
+					want = {cl(0x8000_0000), cl(0x7f80_0001), cl(0x7fc0_0000), want[3]}
+				} else {
+					want = {cl(0x8000_0000), cl(0x7fc0_0000), want[2], want[3]}
+				}
+			}
+		}
+		for px in 0 ..< W * H {
+			testing.expectf(t, transmute([4]u32)oj[px] == want, "%v pixel %d: jit %8x, want %8x (interpreter %8x)", profiles[si], px, transmute([4]u32)oj[px], want, transmute([4]u32)oi[px])
+		}
+	}
+}
+
+// Dynamic indexing and buffer reads whose index is the same within each
+// quad but not across the two of a batch: the JIT's every-lane-alike fast
+// paths (Load_Dyn, Load_Buf) must see both halves. Shift counts outside
+// [0, 31], negative ones included, masked to 31 as the interpreter does.
+// Both against the interpreter, bit for bit.
+@(test)
+test_jit_quad_uniform_and_shifts :: proc(t: ^testing.T) {
+	src := `#version 310 es
+precision highp float;
+layout(std430, binding = 0) readonly buffer In { uint w[]; } inp;
+uniform float uK;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+void main() {
+    int q = int(gl_FragCoord.x) / 2;
+    float arr[8];
+    for (int i = 0; i < 8; i++) { arr[i] = float(i * i) + uK; }
+    vec4 v4[4];
+    for (int i = 0; i < 4; i++) { v4[i] = vec4(float(i), float(i) * 2.0, uK, -float(i)); }
+    o0 = vec4(arr[q], float(inp.w[q]), float(inp.w[q * 3 + 1]), v4[q & 3].y);
+    // Counts from the buffer: 0, 1, 31, 32, 33, 63, 64, 255, -1, -31, -32, -33, min and max int.
+    uint a = inp.w[16 + (int(gl_FragCoord.y) & 3)];
+    int c = int(inp.w[20 + int(gl_FragCoord.x) % 14]);
+    o1 = vec4(uintBitsToFloat(a << uint(c)), uintBitsToFloat(a >> uint(c)), intBitsToFloat(int(a) >> c), intBitsToFloat(int(a) << c));
+}
+`
+	m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	when JIT_ENABLED {
+		testing.expect_value(t, m.program.jit_body != nil, jit_ready)
+	}
+	words := make([]u32, 64, context.temp_allocator)
+	for &w, i in words {
+		w = u32(i * 7 + 3)
+	}
+	words[16], words[17], words[18], words[19] = 0x8000_0001, 0xffff_ffff, 1, 0x1234_5678
+	counts := []i32{0, 1, 31, 32, 33, 63, 64, 255, -1, -31, -32, -33, min(i32), max(i32)}
+	for c, i in counts {
+		words[20 + i] = u32(c)
+	}
+	block := make([]u8, max(m.block_size, 64), context.temp_allocator)
+	set_uniform(m, block, "uK", {0.5})
+	bufs := [1][]u32{words}
+	W, H :: 28, 4
+	tj := [2][][4]f32{make([][4]f32, W * H, context.temp_allocator), make([][4]f32, W * H, context.temp_allocator)}
+	ti := [2][][4]f32{make([][4]f32, W * H, context.temp_allocator), make([][4]f32, W * H, context.temp_allocator)}
+	run_targets(&m.program, block, W, H, tj[:], temp_scratch(), {buffers = bufs[:]})
+	sb, si := m.program.jit_body, m.program.jit_init
+	m.program.jit_body, m.program.jit_init = nil, nil
+	run_targets(&m.program, block, W, H, ti[:], temp_scratch(), {buffers = bufs[:]})
+	m.program.jit_body, m.program.jit_init = sb, si
+	bad := 0
+	for k in 0 ..< 2 {
+		for p in 0 ..< W * H {
+			if transmute([4]u32)tj[k][p] != transmute([4]u32)ti[k][p] && bad < 8 {
+				testing.expectf(t, false, "target %d pixel %d: jit %8x interp %8x", k, p, transmute([4]u32)tj[k][p], transmute([4]u32)ti[k][p])
+				bad += 1
 			}
 		}
 	}
@@ -15989,7 +16535,15 @@ void main() {
 		run_compute(&m.program, nil, {1, 1, 1}, temp_scratch(), {buffers = bufs[:], images = imgs})
 		m.program.jit_body, m.program.jit_init = sb, si
 		for p, i in px {
-			testing.expectf(t, p == {0, 0, 0, 128}, "engine %d, %08x: %v", engine, words[i], p)
+			want := [4]u8{0, 0, 0, 128}
+			when JIT_A64 {
+				// min(NaN, 2.0) is fminnm's 2.0 in the arm64 JIT for a
+				// quiet NaN (a signaling one gives NaN; README).
+				if engine == 0 && sb != nil && words[i] & 0x40_0000 != 0 {
+					want[2] = 255
+				}
+			}
+			testing.expectf(t, p == want, "engine %d, %08x: %v", engine, words[i], p)
 		}
 	}
 }
@@ -17515,6 +18069,543 @@ test_texel_fetch_lowering :: proc(t: ^testing.T) {
 		defer destroy(m)
 		if ok {
 			testing.expectf(t, strings.count(m.msl, helpers[k]) == 1 && strings.contains(m.msl, calls[k]), "%s: MSL:\n%s", c.src, m.msl)
+		}
+	}
+}
+
+when JIT_ENABLED {
+
+@(private = "file")
+Abi_Check_State :: struct #align(16) {
+	v_sentinel: [8][2]u64, // v8..v15 on arm64 (low 64 checked, high 64 dirtied)
+	expected:   [20]u64,
+	got:        [20]u64,
+	bad_got:    [20]u64,
+	bad_mask:   u64,
+	calls:      u64,
+	count:      int,
+}
+
+@(private = "file")
+ABI_REG_NAMES :: [20]string {
+	"x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+	"x29", "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15", "sp",
+} when JIT_A64 else [20]string {
+	"rbx", "rbp", "r12", "r13", "r14", "r15", "rsp", "", "", "",
+	"", "", "", "", "", "", "", "", "", "",
+}
+
+@(private = "file")
+abi_record_check :: proc "c" (st: ^Abi_Check_State) {
+	st.calls += 1
+	for i in 0 ..< st.count {
+		if st.got[i] != st.expected[i] {
+			st.bad_mask |= u64(1) << uint(i)
+			st.bad_got[i] = st.got[i]
+		}
+	}
+}
+
+@(private = "file")
+abi_wrap_fn :: proc(orig_fn: rawptr, st: ^Abi_Check_State) -> (fn_ptr: rawptr, mem_slice: []u8) {
+	when JIT_A64 {
+		st.count = 20
+		for i in 0 ..< 19 {
+			st.expected[i] = 0x1122_3344_5566_7701 + u64(i) * 0x0101_0203_0405_0607
+		}
+		for i in 0 ..< 8 {
+			st.v_sentinel[i] = {st.expected[11 + i], 0xdead_beef_cafe_0000 ~ (u64(i) * 0x1111_2222_3333_4444)}
+		}
+		e: Jit_Emitter
+		e.buf = make([dynamic]u8, context.temp_allocator)
+		// Save caller's callee-saved GPRs and d8..d15 (176-byte 16-aligned frame).
+		ai(&e, 0xa9b57bfd) // stp x29, x30, [sp, #-176]!
+		for p in 0 ..< 5 {
+			r0 := u32(19 + p * 2)
+			ai(&e, 0xa9000000 | u32((p + 1) * 2) << 15 | (r0 + 1) << 10 | (31 << 5) | r0)
+		}
+		for p in 0 ..< 4 {
+			r0 := u32(8 + p * 2)
+			ai(&e, 0x6d000000 | u32(12 + p * 2) << 15 | (r0 + 1) << 10 | (31 << 5) | r0)
+		}
+		exp_off := i32(offset_of(Abi_Check_State, expected))
+		got_off := i32(offset_of(Abi_Check_State, got))
+		v_off := i32(offset_of(Abi_Check_State, v_sentinel))
+		a_mov_imm(&e, 9, u64(uintptr(st)))
+		ai(&e, 0x910003ea) // add x10, sp, #0
+		a_str_x(&e, 10, 9, exp_off + 19 * 8)
+		for i in 0 ..< 10 {
+			a_ldr_x(&e, u8(19 + i), 9, exp_off + i32(i) * 8)
+		}
+		a_ldr_x(&e, 29, 9, exp_off + 10 * 8)
+		for i in 0 ..< 8 {
+			a_ldr_q(&e, u8(8 + i), 9, v_off + i32(i) * 16)
+		}
+		a_mov_imm(&e, 16, u64(uintptr(orig_fn)))
+		ai(&e, 0xd63f0000 | (16 << 5)) // blr x16
+
+		// Capture returned sp, restore thunk sp at once, record all registers, verify.
+		ai(&e, 0x910003ea) // add x10, sp, #0
+		a_mov_imm(&e, 9, u64(uintptr(st)))
+		a_ldr_x(&e, 11, 9, exp_off + 19 * 8)
+		ai(&e, 0x91000000 | (11 << 5) | 31) // add sp, x11, #0
+		for i in 0 ..< 10 {
+			a_str_x(&e, u8(19 + i), 9, got_off + i32(i) * 8)
+		}
+		a_str_x(&e, 29, 9, got_off + 10 * 8)
+		for i in 0 ..< 8 {
+			ai(&e, 0xfd000000 | u32((got_off + i32(11 + i) * 8) / 8) << 10 | (9 << 5) | u32(8 + i))
+		}
+		a_str_x(&e, 10, 9, got_off + 19 * 8)
+		a_mov_xx(&e, A_X0, 9)
+		a_mov_imm(&e, 16, u64(uintptr(rawptr(abi_record_check))))
+		ai(&e, 0xd63f0000 | (16 << 5)) // blr x16
+
+		for p := 3; p >= 0; p -= 1 {
+			r0 := u32(8 + p * 2)
+			ai(&e, 0x6d400000 | u32(12 + p * 2) << 15 | (r0 + 1) << 10 | (31 << 5) | r0)
+		}
+		for p := 4; p >= 0; p -= 1 {
+			r0 := u32(19 + p * 2)
+			ai(&e, 0xa9400000 | u32((p + 1) * 2) << 15 | (r0 + 1) << 10 | (31 << 5) | r0)
+		}
+		ai(&e, 0xa8cb7bfd) // ldp x29, x30, [sp], #176
+		ai(&e, 0xd65f03c0) // ret
+		mem_slice = jit_map_code(e.buf[:])
+		fn_ptr = raw_data(mem_slice)
+	} else {
+		st.count = 7
+		for i in 0 ..< 6 {
+			st.expected[i] = 0x1122_3344_5566_7701 + u64(i) * 0x0101_0203_0405_0607
+		}
+		xregs := [6]u8{GPR_RBX, GPR_RBP, GPR_R12, GPR_R13, GPR_R14, 15}
+		buf := make([dynamic]u8, context.temp_allocator)
+		emit_bytes(&buf, 0x55, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57) // push rbp, rbx, r12..r15
+		emit_bytes(&buf, 0x48, 0x83, 0xEC, 0x08) // sub rsp, 8 -> rsp % 16 == 0
+		emit_bytes(&buf, 0x48, 0x89, 0x3C, 0x24) // mov [rsp], rdi
+		exp_off := i32(offset_of(Abi_Check_State, expected))
+		got_off := i32(offset_of(Abi_Check_State, got))
+		emit_bytes(&buf, 0x48, 0xB8)
+		emit_u64(&buf, u64(uintptr(st)))
+		emit_bytes(&buf, 0x48, 0x89)
+		emit_modrm_mem(&buf, GPR_RSP, GPR_RAX, exp_off + 6 * 8)
+		for reg, i in xregs {
+			emit_bytes(&buf, 0x48 | ((reg & 8) >> 1), 0x8B)
+			emit_modrm_mem(&buf, reg, GPR_RAX, exp_off + i32(i) * 8)
+		}
+		emit_bytes(&buf, 0x48, 0x8B, 0x3C, 0x24) // mov rdi, [rsp]
+		emit_bytes(&buf, 0x48, 0xB8)
+		emit_u64(&buf, u64(uintptr(orig_fn)))
+		emit_bytes(&buf, 0xFF, 0xD0) // call rax
+
+		emit_bytes(&buf, 0x49, 0x89, 0xE2) // mov r10, rsp
+		emit_bytes(&buf, 0x48, 0xB8)
+		emit_u64(&buf, u64(uintptr(st)))
+		emit_bytes(&buf, 0x48, 0x8B)
+		emit_modrm_mem(&buf, GPR_RSP, GPR_RAX, exp_off + 6 * 8)
+		for reg, i in xregs {
+			emit_bytes(&buf, 0x48 | ((reg & 8) >> 1), 0x89)
+			emit_modrm_mem(&buf, reg, GPR_RAX, got_off + i32(i) * 8)
+		}
+		emit_bytes(&buf, 0x4C, 0x89)
+		emit_modrm_mem(&buf, 10, GPR_RAX, got_off + 6 * 8)
+		emit_bytes(&buf, 0x48, 0x89, 0xC7) // mov rdi, rax
+		emit_bytes(&buf, 0x48, 0xB8)
+		emit_u64(&buf, u64(uintptr(rawptr(abi_record_check))))
+		emit_bytes(&buf, 0xFF, 0xD0) // call rax
+
+		emit_bytes(&buf, 0x48, 0x83, 0xC4, 0x08)
+		emit_bytes(&buf, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5B, 0x5D, 0xC3)
+		mem_slice = jit_map_code(buf[:])
+		fn_ptr = raw_data(mem_slice)
+	}
+	return
+}
+
+@(private = "file")
+abi_expect_ok :: proc(t: ^testing.T, label: string, st: ^Abi_Check_State, loc := #caller_location) {
+	testing.expectf(t, st.calls > 0, "%s: expected JIT calls > 0", label, loc = loc)
+	names := ABI_REG_NAMES
+	for i in 0 ..< st.count {
+		if (st.bad_mask & (u64(1) << uint(i))) != 0 {
+			testing.expectf(t, false, "%s: callee-saved %s clobbered: got %016x, want %016x", label, names[i], st.bad_got[i], st.expected[i], loc = loc)
+		}
+	}
+}
+
+@(private = "file")
+abi_run_wrapped :: proc(t: ^testing.T, label: string, p: ^Program, invoke: proc(p: ^Program, user: rawptr), user: rawptr, expect_init: bool, loc := #caller_location) {
+	testing.expectf(t, p.jit_body != nil, "%s: expected JIT compilation to succeed", label, loc = loc)
+	if p.jit_body == nil {
+		return
+	}
+	st: Abi_Check_State
+	orig_init, orig_body := p.jit_init, p.jit_body
+	wrap_body, mem_body := abi_wrap_fn(orig_body, &st)
+	defer virtual.release(raw_data(mem_body), len(mem_body))
+	wrap_init: rawptr
+	mem_init: []u8
+	if orig_init != nil {
+		wrap_init, mem_init = abi_wrap_fn(orig_init, &st)
+	}
+	defer if mem_init != nil {
+		virtual.release(raw_data(mem_init), len(mem_init))
+	}
+	testing.expectf(t, !expect_init || orig_init != nil, "%s: expected jit_init != nil", label, loc = loc)
+	p.jit_body = wrap_body
+	p.jit_init = wrap_init
+	invoke(p, user)
+	p.jit_body, p.jit_init = orig_body, orig_init
+	abi_expect_ok(t, label, &st, loc = loc)
+}
+
+} // when JIT_ENABLED
+
+@(test)
+test_jit_abi_callee_saved :: proc(t: ^testing.T) {
+	when JIT_ENABLED {
+		sampler_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+			return {uv.x * 0.25 + f32(channel) * 0.1, uv.y * 0.5, lod * 0.125, 1.0}
+		}
+
+		// 1. Fragment: uniform init math, in-block math, matrix determinant/inverse,
+		// dynamic array load/store, bound texture/textureLod/texelFetch, unbound callback.
+		FRAG_SRC :: `#version 310 es
+precision highp float;
+uniform vec4 u;
+uniform sampler2D s_mip;
+uniform sampler2D s_lin;
+uniform sampler2D s_gray;
+uniform sampler2D s_cb;
+float g_init = sin(0.7);
+layout(location = 0) out vec4 o;
+void main() {
+    vec2 fc = gl_FragCoord.xy;
+    float a[4];
+    int idx = int(fc.x) & 3;
+    a[0] = sin(fc.x * 0.25 + u.x + g_init);
+    a[1] = pow(abs(fc.y) + 1.1, 0.35);
+    a[2] = atan(fc.y + 0.5, fc.x + 1.0);
+    a[3] = a[0] * 0.5 + a[1];
+    a[idx] += 0.25;
+    mat2 m = mat2(a[0] + 2.0, 0.3, -0.2, a[1] + 2.0);
+    float d = determinant(inverse(m));
+    vec4 t0 = texture(s_mip, fc * 0.125);
+    vec4 t1 = textureLod(s_lin, fc * 0.0625, 0.0);
+    vec4 t2 = texelFetch(s_gray, ivec2(fc), 0);
+    vec4 t3 = texture(s_cb, fc * 0.125);
+    o = t0 + t1 + t2 + t3 + vec4(a[idx & 3], d, u.y, 1.0);
+}`
+		fm, ferrs, fok := compile(FRAG_SRC, {profile = .Glsl, stage = .Fragment})
+		defer destroy(fm)
+		if !testing.expectf(t, fok, "frag compile: %s", format_errors(ferrs, context.temp_allocator)) {
+			return
+		}
+		fblock := make([]u8, max(fm.block_size, 16), context.temp_allocator)
+		uval := [4]f32{0.35, -0.5, 1.25, 0.5}
+		set_uniform(fm, fblock, "u", uval[:])
+		im_mip := make_test_image(.Rgba8, 4, 16, 16, true, 17)
+		im_mip.filter, im_mip.wrap = .Linear, {.Repeat, .Repeat}
+		im_lin := make_test_image(.F32, 4, 8, 8, false, 23)
+		im_lin.filter = .Linear
+		im_gray := make_test_image(.Gray16, 1, 8, 8, false, 29)
+		csizes := [4][3]i32{{16, 16, 1}, {8, 8, 1}, {8, 8, 1}, {8, 8, 1}}
+		fopts := Run_Options{
+			channel_images = {im_mip, im_lin, im_gray},
+			sampler        = sampler_cb,
+			channel_sizes  = csizes[:],
+		}
+
+		W :: 8
+		H :: 4
+		fout_jit := make([][4]f32, W * H, context.temp_allocator)
+		fout_ref := make([][4]f32, W * H, context.temp_allocator)
+		Frag_Ctx :: struct {block: []u8, out: [][4]f32, opts: Run_Options}
+		fc_ctx := Frag_Ctx{fblock, fout_jit, fopts}
+		abi_run_wrapped(t, "fragment_run_f32", &fm.program, proc(p: ^Program, user: rawptr) {
+			c := (^Frag_Ctx)(user)
+			run_f32(p, c.block, W, H, c.out, temp_scratch(), c.opts)
+		}, &fc_ctx, true)
+		orig_init, orig_body := fm.program.jit_init, fm.program.jit_body
+		fm.program.jit_init, fm.program.jit_body = nil, nil
+		run_f32(&fm.program, fblock, W, H, fout_ref, temp_scratch(), fopts)
+		fm.program.jit_init, fm.program.jit_body = orig_init, orig_body
+		testing.expectf(t, slice.equal(slice.reinterpret([]u32, fout_jit), slice.reinterpret([]u32, fout_ref)), "fragment_run_f32 mismatch vs interp")
+
+		Q :: 6
+		origin := [Q][2]i32{{0, 0}, {2, 0}, {0, 2}, {2, 2}, {4, 0}, {4, 2}}
+		facing := [Q]bool{true, false, true, true, false, true}
+		helpers := [Q]Quad_Lanes{{}, {2}, {}, {3}, {}, {}}
+		shaded_jit := make([]Quad_Lanes, Q, context.temp_allocator)
+		shaded_ref := make([]Quad_Lanes, Q, context.temp_allocator)
+		ftarg_jit := make([][4]f32, Q * 4, context.temp_allocator)
+		ftarg_ref := make([][4]f32, Q * 4, context.temp_allocator)
+		RQ_Ctx :: struct {
+			block:  []u8,
+			quads:  Fragment_Quads,
+			targs:  [1][][4]f32,
+			shaded: []Quad_Lanes,
+			opts:   Run_Options,
+		}
+		rq_ctx := RQ_Ctx{
+			block  = fblock,
+			quads  = {count = Q, origin = origin[:], front_facing = facing[:], helpers = helpers[:]},
+			targs  = {ftarg_jit},
+			shaded = shaded_jit,
+			opts   = fopts,
+		}
+		abi_run_wrapped(t, "fragment_run_fragment", &fm.program, proc(p: ^Program, user: rawptr) {
+			c := (^RQ_Ctx)(user)
+			run_fragment(p, c.block, c.quads, c.targs[:], c.shaded, temp_scratch(), c.opts)
+		}, &rq_ctx, true)
+		fm.program.jit_init, fm.program.jit_body = nil, nil
+		ref_targs := [1][][4]f32{ftarg_ref}
+		run_fragment(&fm.program, fblock, rq_ctx.quads, ref_targs[:], shaded_ref, temp_scratch(), fopts)
+		fm.program.jit_init, fm.program.jit_body = orig_init, orig_body
+		testing.expectf(t, slice.equal(shaded_jit, shaded_ref) && slice.equal(slice.reinterpret([]u32, ftarg_jit), slice.reinterpret([]u32, ftarg_ref)), "fragment_run_fragment mismatch vs interp")
+
+		// 2. Fragment early exit (Mask_Kill with all lanes discarded).
+		KILL_SRC :: `#version 310 es
+precision highp float;
+uniform vec4 u;
+uniform sampler2D s_lin;
+layout(location = 0) out vec4 o;
+void main() {
+    float s = sin(gl_FragCoord.x + u.x);
+    vec4 t = textureLod(s_lin, gl_FragCoord.xy * 0.125, 0.0);
+    if (u.x > -1000.0) { discard; }
+    o = t + vec4(s);
+}`
+		km, kerrs, kok := compile(KILL_SRC, {profile = .Glsl, stage = .Fragment})
+		defer destroy(km)
+		if !testing.expectf(t, kok, "kill compile: %s", format_errors(kerrs, context.temp_allocator)) {
+			return
+		}
+		kblock := make([]u8, max(km.block_size, 16), context.temp_allocator)
+		set_uniform(km, kblock, "u", uval[:])
+		kout := make([][4]f32, W * H, context.temp_allocator)
+		kopts := Run_Options{channel_images = {im_lin}}
+		kfc := Frag_Ctx{kblock, kout, kopts}
+		abi_run_wrapped(t, "fragment_kill_run_f32", &km.program, proc(p: ^Program, user: rawptr) {
+			c := (^Frag_Ctx)(user)
+			run_f32(p, c.block, W, H, c.out, temp_scratch(), c.opts)
+		}, &kfc, false)
+		k_shaded := make([]Quad_Lanes, Q, context.temp_allocator)
+		k_targ := make([][4]f32, Q * 4, context.temp_allocator)
+		krq := RQ_Ctx{block = kblock, quads = {count = Q, origin = origin[:]}, targs = {k_targ}, shaded = k_shaded, opts = kopts}
+		abi_run_wrapped(t, "fragment_kill_run_fragment", &km.program, proc(p: ^Program, user: rawptr) {
+			c := (^RQ_Ctx)(user)
+			run_fragment(p, c.block, c.quads, c.targs[:], c.shaded, temp_scratch(), c.opts)
+		}, &krq, false)
+
+		// 3. Vertex (16 vertices = 2 batches): uniform init, math builtins, bound textureLod + texelFetch.
+		VERT_SRC :: `#version 310 es
+uniform vec4 u;
+uniform sampler2D s_mip;
+uniform sampler2D s_lin;
+float g_v = pow(1.5, 2.5);
+layout(location = 0) in vec4 a_pos;
+layout(location = 1) in vec2 a_uv;
+layout(location = 0) out vec4 v_out;
+void main() {
+    float x = sin(a_pos.x + u.x + g_v);
+    float y = atan(a_pos.y + 1.0, a_pos.z + 2.0);
+    vec4 t0 = textureLod(s_lin, a_uv, 0.0);
+    vec4 t1 = texelFetch(s_mip, ivec2(gl_VertexID & 15, (gl_VertexID >> 1) & 7), gl_VertexID & 1);
+    gl_Position = vec4(x, y, a_pos.z, 1.0);
+    v_out = t0 + t1 + vec4(x, y, float(gl_VertexID), g_v);
+}`
+		vm, verrs, vok := compile(VERT_SRC, {profile = .Glsl, stage = .Vertex})
+		defer destroy(vm)
+		if !testing.expectf(t, vok, "vert compile: %s", format_errors(verrs, context.temp_allocator)) {
+			return
+		}
+		VCOUNT :: 16
+		vblock := make([]u8, max(vm.block_size, 16), context.temp_allocator)
+		set_uniform(vm, vblock, "u", uval[:])
+		vpos_in := make([][4]f32, VCOUNT, context.temp_allocator)
+		vuv_in := make([][2]f32, VCOUNT, context.temp_allocator)
+		for i in 0 ..< VCOUNT {
+			vpos_in[i] = {f32(i) * 0.25, f32(i) * 0.5 + 1.0, f32(i % 5) + 0.5, 1.0}
+			vuv_in[i] = {f32(i) / 16.0, f32((i * 3) % 16) / 16.0}
+		}
+		attrs := [2]Attribute{
+			{format = .Float4, data = raw_data(vpos_in), stride = size_of([4]f32)},
+			{format = .Float2, data = raw_data(vuv_in), stride = size_of([2]f32)},
+		}
+		vpos_jit := make([][4]f32, VCOUNT, context.temp_allocator)
+		vpos_ref := make([][4]f32, VCOUNT, context.temp_allocator)
+		vary_jit := make([]f32, VCOUNT * vm.varying_floats, context.temp_allocator)
+		vary_ref := make([]f32, VCOUNT * vm.varying_floats, context.temp_allocator)
+		vopts := Run_Options{channel_images = {im_mip, im_lin}}
+		Vert_Ctx :: struct {
+			block: []u8,
+			attrs: []Attribute,
+			pos:   [][4]f32,
+			vary:  []f32,
+			opts:  Run_Options,
+		}
+		vc := Vert_Ctx{vblock, attrs[:], vpos_jit, vary_jit, vopts}
+		abi_run_wrapped(t, "vertex", &vm.program, proc(p: ^Program, user: rawptr) {
+			c := (^Vert_Ctx)(user)
+			run_vertex(p, c.block, c.attrs, VCOUNT, c.pos, c.vary, temp_scratch(), c.opts)
+		}, &vc, true)
+		v_init, v_body := vm.program.jit_init, vm.program.jit_body
+		vm.program.jit_init, vm.program.jit_body = nil, nil
+		run_vertex(&vm.program, vblock, attrs[:], VCOUNT, vpos_ref, vary_ref, temp_scratch(), vopts)
+		vm.program.jit_init, vm.program.jit_body = v_init, v_body
+		testing.expectf(t, slice.equal(slice.reinterpret([]u32, vpos_jit), slice.reinterpret([]u32, vpos_ref)) && slice.equal(slice.reinterpret([]u32, vary_jit), slice.reinterpret([]u32, vary_ref)), "vertex mismatch vs interp")
+
+		// 4. Compute: storage buffers, atomics, shared memory, storage image load/store/size,
+		// math helper, bound + unbound texture ops.
+		COMP_SRC :: `#version 310 es
+layout(local_size_x = 8) in;
+uniform vec4 u;
+uniform sampler2D s_mip;
+uniform sampler2D s_cb;
+layout(std430, binding = 0) buffer Data { uint d[]; };
+layout(rgba8, binding = 0) readonly uniform highp image2D img_in;
+layout(rgba32f, binding = 1) writeonly uniform highp image2D img_out;
+shared float sh[16];
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationIndex;
+    float s = sin(float(gid) * 0.3 + u.x) + pow(float(lid) + 1.5, 0.25);
+    sh[lid] = s;
+    float loaded = sh[lid ^ 1u] + uintBitsToFloat(d[gid]);
+    ivec2 sz = imageSize(img_in);
+    vec4 px = imageLoad(img_in, ivec2(int(gid) % sz.x, 0));
+    vec4 btex = textureLod(s_mip, vec2(float(gid) * 0.0625, 0.25), 0.0);
+    vec4 ctex = textureLod(s_cb, vec2(float(gid) * 0.125, 0.5), 1.0) + texelFetch(s_cb, ivec2(int(gid) & 7, 0), 0);
+    vec4 res = px + btex + ctex + vec4(loaded, s, float(sz.x), 1.0);
+    imageStore(img_out, ivec2(int(gid), 0), res);
+    uint old = atomicAdd(d[gid], 1u);
+    d[16u + gid] = old + floatBitsToUint(res.x);
+}`
+		cm, cerrs, cok := compile(COMP_SRC, {profile = .Glsl, stage = .Compute})
+		defer destroy(cm)
+		if !testing.expectf(t, cok, "compute compile: %s", format_errors(cerrs, context.temp_allocator)) {
+			return
+		}
+		cblock := make([]u8, max(cm.block_size, 16), context.temp_allocator)
+		set_uniform(cm, cblock, "u", uval[:])
+		img_in_px := make([]u8, 8 * 4, context.temp_allocator)
+		for i in 0 ..< len(img_in_px) {
+			img_in_px[i] = u8((i * 29 + 7) & 255)
+		}
+		img_in := Storage_Image{width = 8, height = 1, format = .Rgba8, data = img_in_px}
+		run_comp_case :: proc(t: ^testing.T, p: ^Program, block: []u8, im_mip: Channel_Image, img_in: Storage_Image, sampler: proc(rawptr, int, [2]f32, f32, int) -> [4]f32, jit: bool) -> ([]u32, []u8) {
+			buf := make([]u32, 32, context.temp_allocator)
+			for i in 0 ..< 16 {
+				buf[i] = transmute(u32)(f32(i) * 0.25 + 0.5)
+			}
+			out_px := make([]u8, 16 * 16, context.temp_allocator)
+			img_out := Storage_Image{width = 16, height = 1, format = .Rgba32f, data = out_px}
+			imgs := [2]Storage_Image{img_in, img_out}
+			csizes := [2][3]i32{{16, 16, 1}, {16, 16, 1}}
+			copts := Run_Options{
+				buffers        = {buf},
+				images         = imgs[:],
+				channel_images = {im_mip},
+				sampler        = sampler,
+				channel_sizes  = csizes[:],
+			}
+			Comp_Ctx :: struct {block: []u8, opts: Run_Options}
+			cc := Comp_Ctx{block, copts}
+			if jit {
+				abi_run_wrapped(t, "compute", p, proc(pr: ^Program, user: rawptr) {
+					c := (^Comp_Ctx)(user)
+					run_compute(pr, c.block, {2, 1, 1}, temp_scratch(), c.opts)
+				}, &cc, false)
+			} else {
+				o_init, o_body := p.jit_init, p.jit_body
+				p.jit_init, p.jit_body = nil, nil
+				run_compute(p, block, {2, 1, 1}, temp_scratch(), copts)
+				p.jit_init, p.jit_body = o_init, o_body
+			}
+			return buf, out_px
+		}
+		db_jit, px_jit := run_comp_case(t, &cm.program, cblock, im_mip, img_in, sampler_cb, true)
+		db_ref, px_ref := run_comp_case(t, &cm.program, cblock, im_mip, img_in, sampler_cb, false)
+		testing.expectf(t, slice.equal(db_jit, db_ref) && slice.equal(px_jit, px_ref), "compute mismatch vs interp")
+	}
+}
+
+// A fragment shader whose 2,400 values are all live at its end, so its
+// slots reach past what an arm64 ldp's or ldr's offset does (2047 * 32
+// bytes on, a_pair_mem adds the offset in x17), each through sin, whose
+// helper reads the slots at the addresses the JIT should use, and each
+// taking its pixel's x again (sin's chain alone forgets it, making every
+// lane of a row alike): the JIT against the interpreter bit for bit.
+@(test)
+test_jit_far_slots :: proc(t: ^testing.T) {
+	N :: 2400
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_string(&b, "#version 310 es\nprecision highp float;\nlayout(location = 0) out vec4 o;\nvoid main() {\n    float v0 = gl_FragCoord.x * 0.001;\n")
+	for i in 1 ..< N {
+		fmt.sbprintf(&b, "    float v%d = sin(v%d) + gl_FragCoord.x * %d.0 + gl_FragCoord.y;\n", i, i - 1, i % 7 + 1)
+	}
+	strings.write_string(&b, "    float s = 0.0;\n")
+	for i in 0 ..< N {
+		fmt.sbprintf(&b, "    s = s * 0.5 + v%d;\n", i)
+	}
+	fmt.sbprintf(&b, "    o = vec4(s, v0, v%d, v%d);\n}}\n", N / 2, N - 1)
+	m, errs, ok := compile(strings.to_string(b), {profile = .Glsl, stage = .Fragment})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	testing.expectf(t, m.program.num_slots > 2048, "%d slots, want more than 2048", m.program.num_slots)
+	when JIT_ENABLED {
+		if jit_ready {
+			testing.expect(t, m.program.jit_body != nil)
+		}
+	}
+	W, H :: 16, 8
+	oj := make([][4]f32, W * H, context.temp_allocator)
+	oi := make([][4]f32, W * H, context.temp_allocator)
+	run_f32(&m.program, nil, W, H, oj, temp_scratch())
+	run_f32_interp(&m.program, nil, W, H, oi, temp_scratch(), {})
+	for i in 0 ..< W * H {
+		testing.expectf(t, transmute([4]u32)oj[i] == transmute([4]u32)oi[i], "pixel %d: jit %v, interp %v", i, oj[i], oi[i])
+	}
+}
+
+// a_patch at each arm64 branch form's range ends: within it the distance is
+// encoded and the other bits kept, one word past it marks the program
+// unsupported.
+@(test)
+test_jit_a64_patch_range :: proc(t: ^testing.T) {
+	when JIT_A64 {
+		Form :: struct {
+			name:  string,
+			emit:  proc(e: ^Jit_Emitter) -> int,
+			bits:  uint,
+			shift: uint,
+		}
+		forms := [4]Form {
+			{"b", proc(e: ^Jit_Emitter) -> int {return a_branch(e, -1)}, 26, 0},
+			{"b.ne", proc(e: ^Jit_Emitter) -> int {return a_branch(e, 1)}, 19, 5},
+			{"cbnz", proc(e: ^Jit_Emitter) -> int {return a_cbz(e, 11, true)}, 19, 5},
+			{"tbz", proc(e: ^Jit_Emitter) -> int {return a_tbz(e, 3, 5, false)}, 14, 5},
+		}
+		for f in forms {
+			half := 1 << (f.bits - 1)
+			for d in ([4]int{-half - 1, -half, half - 1, half}) {
+				e: Jit_Emitter
+				defer delete(e.buf)
+				pos := f.emit(&e)
+				before := transmute(u32)[4]u8{e.buf[0], e.buf[1], e.buf[2], e.buf[3]}
+				a_patch(&e, pos, pos + 4 * d)
+				w := transmute(u32)[4]u8{e.buf[0], e.buf[1], e.buf[2], e.buf[3]}
+				in_range := d >= -half && d < half
+				testing.expectf(t, e.unsupported == !in_range, "%s by %d words: unsupported %v", f.name, d, e.unsupported)
+				if in_range {
+					field := u32(1 << f.bits - 1) << f.shift
+					imm := int(i32((w & field) >> f.shift << (32 - f.bits)) >> (32 - f.bits))
+					testing.expectf(t, imm == d && w &~ field == before &~ field, "%s by %d words: %08x (from %08x)", f.name, d, w, before)
+				}
+			}
 		}
 	}
 }

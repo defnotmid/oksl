@@ -707,8 +707,8 @@ oksl.run_compute(&m.program, block, {groups_x, groups_y, 1}, &scratch, {images =
 ```
 
 `run_compute` executes one workgroup at a time (`group_count = -1` runs to
-the end of `groups.x * groups.y * groups.z`). On x86-64 with AVX2 the JIT
-runs a workgroup in batches of 8 consecutive `gl_LocalInvocationIndex`
+the end of `groups.x * groups.y * groups.z`). The JIT (x86-64 with AVX2,
+and arm64) runs a workgroup in batches of 8 consecutive `gl_LocalInvocationIndex`
 values, each batch through the whole program before the next; the
 interpreter runs it in `ceil(local_size / 64)` 64-lane chunks, each
 instruction across a chunk. A workgroup whose size isn't a multiple of the
@@ -740,8 +740,8 @@ chunk keeps its own register and mask slice in `Scratch` (sized once from
 workgroup size and slot count, with no per-barrier allocation) while chunks
 advance in lockstep across every barrier, including inside loops and across
 early returns. A dispatch with an image whose texels reach past its first
-2^31 bytes runs on the interpreter (the JIT's gathers take signed 32-bit
-offsets).
+2^31 bytes runs on the interpreter (the x86-64 JIT's gathers take signed
+32-bit offsets; arm64 keeps the same rule).
 
 Within one `run_compute` call, on one thread, lanes execute in a fixed
 order, `(batch, then lane)` in the JIT and `(chunk, then lane)` in the
@@ -756,7 +756,8 @@ results. In the JIT, as on GPUs, an invocation that reads a word, texel or
 `shared` element another invocation of its workgroup writes without
 synchronization may see the value from before or after that write, and of
 two such writes either may stay; apart from that and the differences every
-stage has (see **JIT** below), the JIT matches the interpreter bit for bit.
+stage has (see **JIT** below, and there the arm64 JIT's `min`, `max` and
+`clamp`), the JIT matches the interpreter bit for bit.
 
 `texture` in a fragment shader passes the sampler the level a GPU picks:
 `0.5 * log2(max(|duv/dx|², |duv/dy|²))` in the channel's texels
@@ -796,8 +797,8 @@ uv came from `iChannelResolution`, level 0's size, at every lod.)
 
 For images the caller owns, `Run_Options.channel_images` (`[]Channel_Image`,
 indexed by channel) binds a channel's texels directly to any `run*` entry
-point, sampled in the JIT (AVX2 gathers on x86-64) and the interpreter
-without calling `sampler` per lane:
+point, sampled in the JIT (AVX2 gathers on x86-64, a load per lane on
+arm64) and the interpreter without calling `sampler` per lane:
 
 ```odin
 // f32 maps, one level, clamped (as before): []f32, [][2]f32 or [][4]f32
@@ -979,25 +980,42 @@ it makes the others, and `built_levels` lists and skips them.
   branches on the operation. Execution masks are
   `bit_set`s of lanes. Masked stores and selects are branchless, and
   `floor` avoids `core:math`'s modf.
-- **JIT:** on x86-64 Linux and macOS when the CPU has AVX2, `compile` also
-  translates vertex and fragment programs into 8-lane (two 2x2 quads per
-  256-bit YMM register) native AVX2 code in W^X pages (allocated
-  read-write, switched read-execute, and released by `destroy`), and
-  compute programs into 8 consecutive invocations per batch (see
-  `run_compute` above for which ones). Compute shaders with `barrier()` or
-  atomics in workgroups of more than 8 invocations, other targets,
-  machines without AVX2, environments that refuse executable memory
-  (`PROT_EXEC`), and builds with `-define:OKSL_JIT=false` run on the
-  64-lane interpreter with the same results, bit for bit and NaNs
-  included (see **Precision**), apart from, in compute, the outcome of
-  unsynchronized accesses (undefined on GPUs too). Lanes that aren't running compute their own values: a
+- **JIT:** on x86-64 Linux and macOS when the CPU has AVX2, and on arm64
+  Linux and macOS, `compile` also translates vertex and fragment programs
+  into 8-lane native code (two 2x2 quads per 256-bit YMM register of
+  AVX2, or per pair of 128-bit NEON registers) in W^X pages (on x86-64 and
+  Linux allocated read-write, switched read-execute; on macOS arm64 a
+  `MAP_JIT` mapping written with the thread's JIT write protection off;
+  released by `destroy`), and compute programs into 8 consecutive
+  invocations per batch (see `run_compute` above for which ones). Compute
+  shaders with `barrier()` or atomics in workgroups of more than 8
+  invocations, other targets (Windows among them), machines without AVX2,
+  environments that refuse executable memory (`PROT_EXEC`), and builds
+  with `-define:OKSL_JIT=false` run on the 64-lane interpreter. The x86-64 JIT
+  gives the interpreter's results bit for bit, NaNs included (see
+  **Precision**). The arm64 JIT takes NEON's own float `min`, `max` and
+  `clamp` (`fminnm` and `fmaxnm`) wherever they occur, the implicit ones
+  included (the Shadertoy wrapper's clamp of its colour to [0, 1], SkSL's
+  `saturate`, and the `max` of the squared derivatives that picks
+  `textureGrad`'s level): a quiet NaN operand gives the other one (the
+  interpreter's `min(NaN, y)` is NaN), a signaling NaN gives NaN, so
+  `clamp(sNaN, lo, hi)` is `hi`, and `-0.0` counts below `+0.0`
+  (`clamp(-0.0, 0.0, 1.0)` is `+0.0`); a NaN derivative passes
+  `textureGrad`'s level from the other one to the `sampler`. Every
+  other operation rounds as the interpreter's (no fused multiply-add) and
+  gives its bits, and NaNs reaching the host or an integer are canonical
+  as everywhere; `-define:OKSL_JIT=false` gives the interpreter, identical
+  on every platform. In compute both JITs can also differ from the
+  interpreter in the outcome of unsynchronized accesses (undefined on GPUs
+  too). Lanes that aren't running compute their own values: a
   variable, parameter or return value takes its first value in every
   lane (its initializer; 0 for one without an initializer, a declaration
   directly in a `switch` body, a `?:` result, and the result of a function
   that can return early) and later writes only in the lanes that run them,
   so what the lanes of a sampled quad that aren't running pass a `sampler`
   callback, and the derivatives and `texture` level that read them, are
-  the same in both. Signed zeros agree: `clamp` is GLSL's
+  the same in both. Signed zeros agree (in the x86-64 JIT; arm64's are
+  above): `clamp` is GLSL's
   `min(max(x, lo), hi)` with `max(x, y)` = `x < y ? y : x`, so
   `clamp(-0.0, 0.0, 1.0)` is `-0.0`, and a NaN operand gives the other
   one. CI runs the tests and goldens both ways and requires identical
@@ -1019,8 +1037,9 @@ it makes the others, and `built_levels` lists and skips them.
   integer division and remainder, guarded division by zero and
   float-to-int conversion, and shift amounts masked to 31.
 - **The same bits everywhere:** the CPU's output is bit-identical on
-  x86-64 and arm64, on Linux, macOS and Windows, in the JIT and the
-  interpreter (in IEEE 754's default environment: round to nearest,
+  x86-64 and arm64, on Linux, macOS and Windows, in the interpreter and
+  the x86-64 JIT (and in the arm64 JIT but for its `min`, `max` and
+  `clamp` of NaNs and signed zeros, under **JIT**; in IEEE 754's default environment: round to nearest,
   subnormals kept; a host that sets flush-to-zero changes results). No
   float built-in calls the platform's libm: `sin`, `cos`, `tan`, `asin`,
   `acos`, `atan` (both forms), `sinh`, `cosh`, `tanh`, `asinh`, `acosh`,
@@ -1046,8 +1065,9 @@ it makes the others, and `built_levels` lists and skips them.
   `0x7e00`). Inside a shader NaNs propagate as the CPU makes them, which
   nothing observes. A signaling NaN (from `uintBitsToFloat`, a uniform, a
   buffer, an image or a callback) gives what the same NaN quiet gives,
-  everywhere: the `fmaxnm` and `fminnm` LLVM makes of some of oksl's
-  clamps and selects on arm64 (which quiet a signaling NaN and return it,
+  everywhere but in the arm64 JIT's `min`, `max` and `clamp` (**JIT**):
+  the `fmaxnm` and `fminnm` LLVM makes of some of oksl's clamps and
+  selects on arm64 (which quiet a signaling NaN and return it,
   not the other operand) each take values arithmetic, a canonicalization
   or a `+ 0` has already quieted, but for `atan`'s, whose NaN lanes the
   result overrides, so none changes a result.
@@ -1130,7 +1150,7 @@ odin test . -vet -strict-style                      # SkSL, GLSL/Shadertoy, the 
                                                     # built-ins on the CPU, control flow and switch, discard,
                                                     # uniforms, children and channels, programs, corpus
                                                     # (+ spirv-val, and vkd3d for DXBC, when installed)
-odin test . -vet -strict-style -define:OKSL_JIT=false # force the portable interpreter on x86-64
+odin test . -vet -strict-style -define:OKSL_JIT=false # force the portable interpreter
 odin run tools/gpu_parity -- out_dir                # SDL_GPU vs CPU interpreter on testdata/ through the layer vertex shader, and a tap of it
 odin run tools/d3d12_parity -- out_dir              # the same checks (compute too) with the DXBC through Direct3D 12 on vkd3d (Linux)
                                                     # or on WARP under the debug layer and GPU-based validation (Windows;
@@ -1159,7 +1179,7 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
 - **Stages:** fragment, GLSL vertex and GLSL compute shaders, on the GPU
   and the CPU (`run_vertex`, `run_fragment`, `run_compute`). Compute shaders
   with `barrier()` or atomics in workgroups of more than 8 invocations run on
-  the 64-lane interpreter rather than the AVX2 JIT. Compute caps `shared`
+  the 64-lane interpreter rather than the JIT. Compute caps `shared`
   workgroup memory at 16,384 bytes (the GLSL ES 3.10 minimum), and omits
   `atomic_uint` counters (Vulkan disallows SPIR-V's `AtomicStorage`
   capability) and `imageAtomic*` (outside GLSL ES 3.10 core). Storage images and

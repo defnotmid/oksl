@@ -111,20 +111,29 @@ jit_dump_program :: proc(p: ^Program, e: ^Jit_Emitter, mem_slice: []u8, init_byt
 	}
 
 	ep_off := e.epilogue_off - body_off
-	ep_end := ep_off + 12
+	ep_end := ep_off + (12 when JIT_X64 else 36)
 	fmt.sbprintfln(&sb, "SECTION EPILOGUE 0x%x 0x%x", ep_off, ep_end)
 
-	for stub, si in e.bound_tex {
-		s0 := stub.stub_off - body_off
-		s1 := stub.stub_end - body_off
-		in_ := code[stub.pc]
-		fmt.sbprintfln(&sb, "STUB idx=%d pc=%d op=%v k=%d off=0x%x..0x%x bytes=%d", si, stub.pc, in_.op, in_.k, s0, s1, s1 - s0)
-	}
-	for stub, si in e.load_bufs {
-		s0 := stub.stub_off - body_off
-		s1 := stub.stub_end - body_off
-		in_ := code[stub.pc]
-		fmt.sbprintfln(&sb, "STUB idx=%d pc=%d op=%v k=%d off=0x%x..0x%x bytes=%d", len(e.bound_tex) + si, stub.pc, in_.op, in_.k, s0, s1, s1 - s0)
+	when JIT_X64 {
+		for stub, si in e.bound_tex {
+			s0 := stub.stub_off - body_off
+			s1 := stub.stub_end - body_off
+			in_ := code[stub.pc]
+			fmt.sbprintfln(&sb, "STUB idx=%d pc=%d op=%v k=%d off=0x%x..0x%x bytes=%d", si, stub.pc, in_.op, in_.k, s0, s1, s1 - s0)
+		}
+		for stub, si in e.load_bufs {
+			s0 := stub.stub_off - body_off
+			s1 := stub.stub_end - body_off
+			in_ := code[stub.pc]
+			fmt.sbprintfln(&sb, "STUB idx=%d pc=%d op=%v k=%d off=0x%x..0x%x bytes=%d", len(e.bound_tex) + si, stub.pc, in_.op, in_.k, s0, s1, s1 - s0)
+		}
+	} else {
+		for stub, si in e.unbound_tex {
+			s0 := stub.stub_off - body_off
+			s1 := stub.stub_end - body_off
+			in_ := code[stub.pc]
+			fmt.sbprintfln(&sb, "STUB idx=%d pc=%d op=%v k=%d off=0x%x..0x%x bytes=%d", si, stub.pc, in_.op, in_.k, s0, s1, s1 - s0)
+		}
 	}
 
 	subs: [8]struct {
@@ -148,17 +157,19 @@ jit_dump_program :: proc(p: ^Program, e: ^Jit_Emitter, mem_slice: []u8, init_byt
 		subs[n_subs] = {"CHAN_DECODE_SUB", e.chan_decode_off - body_off}
 		n_subs += 1
 	}
-	if e.helper_ymm_off > 0 {
-		subs[n_subs] = {"HELPER_YMM_SUB", e.helper_ymm_off - body_off}
-		n_subs += 1
-	}
-	if e.unif_oob_off > 0 {
-		subs[n_subs] = {"UNIF_OOB_SUB", e.unif_oob_off - body_off}
-		n_subs += 1
-	}
-	if e.big_buf_off > 0 {
-		subs[n_subs] = {"BIG_BUF_SUB", e.big_buf_off - body_off}
-		n_subs += 1
+	when JIT_X64 {
+		if e.helper_ymm_off > 0 {
+			subs[n_subs] = {"HELPER_YMM_SUB", e.helper_ymm_off - body_off}
+			n_subs += 1
+		}
+		if e.unif_oob_off > 0 {
+			subs[n_subs] = {"UNIF_OOB_SUB", e.unif_oob_off - body_off}
+			n_subs += 1
+		}
+		if e.big_buf_off > 0 {
+			subs[n_subs] = {"BIG_BUF_SUB", e.big_buf_off - body_off}
+			n_subs += 1
+		}
 	}
 	for si in 0 ..< n_subs {
 		s0 := subs[si].off
