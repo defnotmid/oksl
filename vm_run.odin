@@ -413,6 +413,10 @@ build_level :: proc "contextless" (src, dst: Build_Level, $F: Channel_Format, $C
 	}
 }
 
+// Chan_Img.fetch_route past the formats.
+@(private)
+FETCH_GENERAL :: u8(len(Channel_Format))
+
 // A bound channel as the samplers read it: its levels' addresses and
 // sizes, made once per run.
 @(private)
@@ -444,7 +448,9 @@ Chan_Img :: struct {
 	n_levels: i32,
 	top:      f32, // f32(n_levels - 1)
 	unorm:    f32, // 255, 65535; 0 for halves and floats
-	// 0: F32 with one level (the JIT stubs' inline texelFetch); 1: the rest.
+	// texelFetch: one level of a 2D image, its format (the interpreter's
+	// fetch_bound_one, the JIT stubs' inline fetch_one); FETCH_GENERAL: the
+	// rest.
 	fetch_route: u8,
 	// 0: F32, one level, Nearest, both axes Clamp (the stubs' inline read);
 	// 1: another format so with sides below 2^24 (sample_sub's FMA floor).
@@ -631,7 +637,7 @@ fill_chan_imgs :: proc "contextless" (dst: []Chan_Img, images: []Channel_Image) 
 		layers := max(im.layers, 1)
 		one := layers == 1
 		d.route = 0 if one && n == 1 && im.filter == .Nearest && im.wrap == {.Clamp, .Clamp} else 1
-		d.fetch_route = 0 if one && n == 1 && im.format == .F32 else 1
+		d.fetch_route = u8(im.format) if one && n == 1 else FETCH_GENERAL
 		d.near_route = 2
 		if d.route == 0 && im.width < 1 << 24 && im.height < 1 << 24 {
 			d.near_route = 0 if im.format == .F32 else 1
@@ -3056,55 +3062,125 @@ fetch_bound_lanes :: proc "contextless" (im: ^Chan_Img, regs: []Reg, a, b, dst: 
 	}
 }
 
-// texelFetch of a bound channel: its level's texel, 0 out of range.
-// texelFetch of F32 with one level: level 0's texel where the lod is 0.
+// Eight halves (each a u32's low word) as f16_to_f32 converts them, in
+// integers but for a subnormal's exact em * 2^-24: x_half's steps.
 @(private)
-fetch_bound_f32 :: proc "contextless" (im: ^Chan_Img, regs: []Reg, a, b, dst: i32, flip: bool, $C: int) #no_bounds_check {
-	px, py, lb := &regs[a], &regs[a + 1], &regs[b]
-	d0, d1, d2, d3 := fl(&regs[dst]), fl(&regs[dst + 1]), fl(&regs[dst + 2]), fl(&regs[dst + 3])
+half8_bits :: #force_inline proc "contextless" (h: Simd_U8) -> Simd_U8 {
+	W :: Simd_U8
+	I :: #simd[8]i32
+	em := h & 0x7fff
+	r := intrinsics.simd_shl(em, W(13)) + (127 - 15) << 23
+	sub := transmute(W)(cast(F8)transmute(I)em * (1.0 / 16777216))
+	r = intrinsics.simd_select(intrinsics.simd_lanes_lt(em, 0x400), sub, r)
+	quiet := intrinsics.simd_select(intrinsics.simd_lanes_ne(em & 0x3ff, 0), W(0x40_0000), W(0))
+	r = intrinsics.simd_select(intrinsics.simd_lanes_gt(em, 0x7bff), intrinsics.simd_shl(em, W(13)) | 0x7f80_0000 | quiet, r)
+	return r | intrinsics.simd_shl(h & 0x8000, W(16))
+}
+
+// texelFetch of one level of a 2D image (fetch_route its format), eight
+// lanes at a time: level 0's texel where the lod is 0 and the texel in
+// range, else 0. Each lane's texel (texel 0 out of range) is loaded as it
+// is stored, then the eight decode together, in integers (but for the
+// unsigned normalized formats' exact quotients), with no branch. Out of
+// line: inlined into execute, its seven bodies cost every shader 0.6% to
+// 2.6% more instructions in the default target's interpreter.
+@(private)
+fetch_bound_one :: #force_no_inline proc "contextless" (im: ^Chan_Img, regs: []Reg, a, b, dst: i32, flip: bool, $F: Channel_Format, $C: int) #no_bounds_check {
+	W :: Simd_U8
+	I :: #simd[8]i32
 	lv := &im.levels[0]
-	t := ([^]f32)(lv.ptr)
-	pitch, mx, my := lv.pitch, lv.max[0], lv.max[1]
-	for l in 0 ..< LANES {
-		x := i32(px[l])
-		y := i32(u32(my) - py[l]) if flip else i32(py[l])
-		if lb[l] != 0 || u32(x) > u32(mx) || u32(y) > u32(my) {
-			d0[l], d1[l], d2[l], d3[l] = 0, 0, 0, 0
-			continue
+	mx, my, pitch := W(u32(lv.max[0])), W(u32(lv.max[1])), W(u32(lv.pitch))
+	ld :: #force_inline proc "contextless" (r: ^Reg, g: int) -> W {return intrinsics.unaligned_load((^W)(&r[g]))}
+	unorm :: #force_inline proc "contextless" (v: W, m: f32) -> W {return transmute(W)(cast(F8)transmute(I)v / m)}
+	for g := 0; g < LANES; g += 8 {
+		x, y := ld(&regs[a], g), ld(&regs[a + 1], g)
+		if flip {
+			y = my - y
 		}
-		off := int(y * pitch + x) * C
-		when C == 1 {
-			d0[l], d1[l], d2[l], d3[l] = t[off], 0, 0, 1
-		} else when C == 2 {
-			d0[l], d1[l], d2[l], d3[l] = t[off], t[off + 1], 0, 1
+		ok := intrinsics.simd_lanes_le(x, mx) & intrinsics.simd_lanes_le(y, my) & intrinsics.simd_lanes_eq(ld(&regs[b], g), 0)
+		idx := transmute([8]u32)intrinsics.simd_select(ok, y * pitch + x, 0)
+		c: [4]W
+		c[3] = transmute(W)F8(1)
+		when F == .F32 {
+			t := ([^]u32)(lv.ptr)
+			w: [C][8]u32 = ---
+			for l in 0 ..< 8 {
+				for k in 0 ..< C {
+					w[k][l] = t[int(idx[l]) * C + k]
+				}
+			}
+			for k in 0 ..< C {
+				c[k] = transmute(W)w[k]
+			}
+		} else when F == .Rgba8 {
+			raw: [8]u32 = ---
+			for l in 0 ..< 8 {
+				raw[l] = intrinsics.unaligned_load((^u32)(&lv.ptr[int(idx[l]) * 4]))
+			}
+			v := transmute(W)raw
+			for k in 0 ..< 4 {
+				c[k] = unorm(intrinsics.simd_shr(v, W(u32(8 * k))) & 0xff, 255)
+			}
+		} else when F == .Gray8 {
+			raw: [8]u32 = ---
+			p := lv.ptr[lv.mis:]
+			for l in 0 ..< 8 {
+				raw[l] = u32(p[idx[l]])
+			}
+			c[0] = unorm(transmute(W)raw, 255)
+		} else when F == .Gray16 {
+			raw: [8]u32 = ---
+			p := lv.ptr[lv.mis:]
+			for l in 0 ..< 8 {
+				raw[l] = u32(intrinsics.unaligned_load((^u16)(&p[int(idx[l]) * 2])))
+			}
+			c[0] = unorm(transmute(W)raw, 65535)
 		} else {
-			c := ((^[4]f32)(&t[off]))^
-			d0[l], d1[l], d2[l], d3[l] = c[0], c[1], c[2], c[3]
+			raw: [2][8]u32 = ---
+			for l in 0 ..< 8 {
+				t := ([^]u32)(&lv.ptr[int(idx[l]) * 8])
+				raw[0][l], raw[1][l] = intrinsics.unaligned_load(&t[0]), intrinsics.unaligned_load(&t[1])
+			}
+			for k in 0 ..< 4 {
+				v := transmute(W)raw[k >> 1]
+				c[k] = half8_bits(intrinsics.simd_shr(v, W(16)) if k & 1 == 1 else v & 0xffff)
+			}
+		}
+		for k in 0 ..< 4 {
+			intrinsics.unaligned_store((^W)(&regs[dst + i32(k)][g]), intrinsics.simd_select(ok, c[k], 0))
 		}
 	}
 }
 
+// A sampler2DArray's (`arr`) checks its layer p.z on the general path,
+// whatever it binds.
 @(private)
 fetch_bound :: proc "contextless" (im: ^Chan_Img, regs: []Reg, a, b, dst: i32, flip, arr: bool) {
 	if arr {
 		fetch_bound_format(im, regs, a, b, dst, flip, true)
-	} else {
+		return
+	}
+	switch im.fetch_route {
+	case u8(Channel_Format.F32):
+		switch im.comps {
+		case 1: fetch_bound_one(im, regs, a, b, dst, flip, .F32, 1)
+		case 2: fetch_bound_one(im, regs, a, b, dst, flip, .F32, 2)
+		case:   fetch_bound_one(im, regs, a, b, dst, flip, .F32, 4)
+		}
+	case u8(Channel_Format.Rgba8):   fetch_bound_one(im, regs, a, b, dst, flip, .Rgba8, 4)
+	case u8(Channel_Format.Gray8):   fetch_bound_one(im, regs, a, b, dst, flip, .Gray8, 1)
+	case u8(Channel_Format.Gray16):  fetch_bound_one(im, regs, a, b, dst, flip, .Gray16, 1)
+	case u8(Channel_Format.Rgba16f): fetch_bound_one(im, regs, a, b, dst, flip, .Rgba16f, 4)
+	case:
 		fetch_bound_format(im, regs, a, b, dst, flip, false)
 	}
 }
 
+// The rest: levels, or layers.
 @(private)
 fetch_bound_format :: proc "contextless" (im: ^Chan_Img, regs: []Reg, a, b, dst: i32, flip: bool, $ARR: bool) {
 	switch im.format {
 	case .F32:
-		if im.n_levels == 1 && !ARR {
-			switch im.comps {
-			case 1: fetch_bound_f32(im, regs, a, b, dst, flip, 1)
-			case 2: fetch_bound_f32(im, regs, a, b, dst, flip, 2)
-			case:   fetch_bound_f32(im, regs, a, b, dst, flip, 4)
-			}
-			return
-		}
 		switch im.comps {
 		case 1: fetch_bound_lanes(im, regs, a, b, dst, flip, .F32, 1, ARR)
 		case 2: fetch_bound_lanes(im, regs, a, b, dst, flip, .F32, 2, ARR)

@@ -26,7 +26,7 @@ _ :: virtual
 jit_destroy :: proc(p: ^Program) {}
 
 @(private)
-jit_compile :: proc(p: ^Program, fma := true) {}
+jit_compile :: proc(p: ^Program, fma := true, f16c := true) {}
 
 @(private)
 jit_runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) {}
@@ -140,6 +140,9 @@ Jit_Tables :: struct #align(32) {
 	d128:       [4]f64,
 	d_lo:       [4]f64,
 	d_hi:       [4]f64,
+	// vpshufb: in each 128-bit lane, the four dwords' low words, then
+	// their high words (fetch_one's F16C path).
+	h_pack:     [32]u8,
 }
 
 #assert(offset_of(Jit_Tables, sign_mask) % 32 == 0)
@@ -151,6 +154,10 @@ jit_avx2_ready: bool
 // FMA3, for the bound channels' exact products in f32 (else f64).
 @(private)
 jit_fma_ready: bool
+
+// F16C, for fetch_one's half decode (else x_half's).
+@(private)
+jit_f16c_ready: bool
 
 @(private)
 jit_tables: Jit_Tables
@@ -203,6 +210,12 @@ init_jit :: proc "contextless" () {
 	jit_tables.d_lo = -2147483648.0
 	jit_tables.d_hi = 2147483646.0
 	jit_tables.canon_nan = 0x7fc0_0000
+	for i in 0 ..< 32 {
+		// Byte j of a lane: of dword (j & 7) / 2, its low word's (j < 8)
+		// or its high word's.
+		j := i & 15
+		jit_tables.h_pack[i] = u8(((j & 7) / 2) * 4 + (2 if j >= 8 else 0) + (j & 1))
+	}
 
 	max_id, _, _, _ := intrinsics.x86_cpuid(0, 0)
 	if max_id < 7 {
@@ -220,6 +233,7 @@ init_jit :: proc "contextless" () {
 	_, ebx7, _, _ := intrinsics.x86_cpuid(7, 0)
 	jit_avx2_ready = (ebx7 & (1 << 5)) != 0
 	jit_fma_ready = (ecx1 & (1 << 12)) != 0
+	jit_f16c_ready = (ecx1 & (1 << 29)) != 0
 }
 
 @(private)
@@ -367,6 +381,8 @@ OFF_TAB_F255 :: i32(offset_of(Jit_Tables, f255))
 OFF_TAB_BYTE :: i32(offset_of(Jit_Tables, byte_mask))
 @(private)
 OFF_TAB_CANON :: i32(offset_of(Jit_Tables, canon_nan))
+@(private)
+OFF_TAB_H_PACK :: i32(offset_of(Jit_Tables, h_pack))
 
 @(private)
 emit_b :: #force_inline proc(buf: ^[dynamic]u8, b0: u8) {
@@ -763,6 +779,23 @@ x_half :: proc(buf: ^[dynamic]u8, h, ta, tb, tc, td: u8) {
 	vop_d(buf, 0xEB, h, h, tb)
 }
 
+// Half k of an Rgba16f texel (ymm6: halves 0 and 1, ymm5: 2 and 3) into
+// ymm(k), as f16_to_f32 gives it. Called for halves 3 and 2 first, then 1
+// and 0: each takes as temporaries the registers that hold nothing needed
+// after it.
+@(private)
+x_half_comp :: proc(buf: ^[dynamic]u8, k: int) {
+	temps := [4][4]u8{{4, 5, 6, 7}, {0, 4, 5, 7}, {0, 1, 4, 7}, {0, 1, 4, 7}}
+	src := u8(5 if k >= 2 else 6)
+	if k & 1 == 1 {
+		vshift_imm(buf, 2, u8(k), src, 16)
+	} else {
+		vop_d_tab(buf, 0xDB, u8(k), src, OFF_TAB_U16)
+	}
+	t := temps[k]
+	x_half(buf, u8(k), t[0], t[1], t[2], t[3])
+}
+
 // decode_sub: the texels at in-range texel indexes ymm4 of level rsi of image
 // rdi, as stored values in f32 (the unsigned normalized formats' integers,
 // halves decoded), into ymm0..3 for the components dl has live and the image
@@ -804,27 +837,17 @@ emit_chan_decode_sub :: proc(buf: ^[dynamic]u8) {
 	x_land(buf, not_rgba8)
 	emit_bytes(buf, 0x83, 0xF9, u8(Channel_Format.Rgba16f))
 	not_half := x_jump(buf, JCC_JNE)
-	// Rgba16f: the texel's two words, ymm6 (halves 0, 1) and ymm5 (2, 3);
-	// halves 3 and 2 decode first, then 1 and 0, each with the registers
-	// that hold nothing needed after it.
+	// Rgba16f: the texel's two words, ymm6 (halves 0, 1) and ymm5 (2, 3).
 	x_gather(buf, 6, GPR_RAX, 4, 7, 3, 0)
 	x_gather(buf, 5, GPR_RAX, 4, 7, 3, 4)
-	half_temps := [4][4]u8{{4, 5, 6, 7}, {0, 4, 5, 7}, {0, 1, 4, 7}, {0, 1, 4, 7}}
 	for k := 3; k >= 0; k -= 1 {
-		src := u8(5 if k >= 2 else 6)
 		s0, s1 := x_if_comp(buf, k, false)
-		if k & 1 == 1 {
-			vshift_imm(buf, 2, u8(k), src, 16)
-		} else {
-			vop_d_tab(buf, 0xDB, u8(k), src, OFF_TAB_U16)
-		}
-		t := half_temps[k]
-		x_half(buf, u8(k), t[0], t[1], t[2], t[3])
+		x_half_comp(buf, k)
 		x_end_if(buf, s0, s1)
 	}
 	emit_b(buf, 0xC3)
 
-	// Gray8 and Gray16: the aligned word around byte offset o = index *
+	// Gray8 and Gray16: the aligned dword around byte offset o = index *
 	// bytes + mis, shifted right by (o & 3) * 8 and masked.
 	x_land(buf, not_half)
 	emit_bytes(buf, 0x83, 0xF9, u8(Channel_Format.Gray16))
@@ -1616,6 +1639,188 @@ emit_chan_fetch_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int) {
 	emit_b(buf, 0xC3)
 }
 
+// fetch_one: a 2D image's texelFetch, the stub's whole body. One level
+// (fetch_route its format) inline, with fetch_sub's rule: the texel at
+// level 0, (0, 0, 0, 0) out of range (the gathers' masks leave those lanes
+// 0, which every format decodes to 0), the components the format lacks
+// (0, 0, 0, 1); the rest (FETCH_GENERAL) through fetch_sub. F32 is tested
+// first and the general route before the bounds, so neither pays for the
+// other formats; each route ends where the caller stores the result.
+//   in:  ymm0 = x, ymm1 = y, ymm2 = lod, rdi = ^Chan_Img, rsi = its texels
+//   out: ymm0..3's live components (`comp_mask`); clobbers rax, rcx, rdx
+//        and ymm4..7.
+@(private)
+emit_chan_fetch_one :: proc(buf: ^[dynamic]u8, fetch_calls: ^[dynamic]int, comp_mask: u8, flip, f16c: bool) {
+	live :: #force_inline proc(m: u8, k: int) -> bool {return (m & (u8(1) << uint(k))) != 0}
+	if comp_mask == 0 {
+		return
+	}
+	// In range (unsigned: min_u(p, max) == p; and the lod 0) into ymm5,
+	// y * pitch + x into ymm4; clobbers ymm1, ymm3 and ymm6.
+	bounds :: proc(buf: ^[dynamic]u8, flip: bool) {
+		lv0 := OFF_CI_LEVELS
+		if flip {
+			vpbroadcastd_mem(buf, 6, GPR_RDI, lv0 + OFF_LV_MAX + 4)
+			vop_d(buf, 0xFA, 1, 6, 1) // max_y - py
+		}
+		vpbroadcastd_mem(buf, 6, GPR_RDI, lv0 + OFF_LV_MAX)
+		vop38_d(buf, 0x3B, 3, 0, 6)
+		vop_d(buf, 0x76, 3, 3, 0)
+		vpbroadcastd_mem(buf, 6, GPR_RDI, lv0 + OFF_LV_MAX + 4)
+		vop38_d(buf, 0x3B, 4, 1, 6)
+		vop_d(buf, 0x76, 4, 4, 1)
+		vop_d(buf, 0xDB, 5, 3, 4)
+		vzero(buf, 6)
+		vop_d(buf, 0x76, 6, 6, 2)
+		vop_d(buf, 0xDB, 5, 5, 6)
+		vpbroadcastd_mem(buf, 6, GPR_RDI, lv0 + OFF_LV_PITCH)
+		vop38_d(buf, 0x40, 1, 1, 6)
+		vop_d(buf, 0xFE, 4, 1, 0)
+	}
+	// A dword per lane in range at [base + ymm(idx) << scale + disp] into
+	// ymm(dst), 0 elsewhere (ymm7: the mask's copy).
+	gather :: proc(buf: ^[dynamic]u8, dst, base, idx, scale: u8, disp: i32) {
+		vmovaps_rr(buf, 7, 5)
+		vzero(buf, dst)
+		emit_vex_sib(buf, 2, 1, 1, 0, 0x90, dst, 7, base, idx, scale, disp)
+	}
+	done: [4]int
+	n_done := 0
+
+	// F32: element index << shift, its components (missing: 0, 0, 0, 1).
+	x_cmp_b(buf, GPR_RDI, OFF_CI_FETCH_ROUTE, u8(Channel_Format.F32))
+	not_f32 := x_jump(buf, JCC_JNE)
+	bounds(buf, flip)
+	emit_bytes(buf, 0x0F, 0xB6) // movzx ecx, byte [rdi + shift]
+	emit_modrm_mem(buf, GPR_RCX, GPR_RDI, OFF_CI_SHIFT)
+	x_bcast_gpr(buf, 6, GPR_RCX)
+	vop38_d(buf, 0x47, 4, 4, 6)
+	emit_chan_gather_rgba(buf, GPR_RDI, 0, 4, 5, comp_mask)
+	done[n_done] = x_jump(buf, 0)
+	n_done += 1
+
+	x_land(buf, not_f32)
+	x_cmp_b(buf, GPR_RDI, OFF_CI_FETCH_ROUTE, FETCH_GENERAL)
+	general := x_jump(buf, JCC_JE)
+	emit_bytes(buf, 0x0F, 0xB6) // movzx ecx, byte [rdi + fetch_route]
+	emit_modrm_mem(buf, GPR_RCX, GPR_RDI, OFF_CI_FETCH_ROUTE)
+	bounds(buf, flip)
+
+	// Rgba8: byte k of the texel's dword, / 255.
+	emit_bytes(buf, 0x83, 0xF9, u8(Channel_Format.Rgba8)) // cmp ecx, Rgba8
+	not_rgba8 := x_jump(buf, JCC_JNE)
+	gather(buf, 6, GPR_RSI, 4, 2, 0)
+	for k in 0 ..< 4 {
+		if !live(comp_mask, k) {
+			continue
+		}
+		r := u8(k)
+		if k == 0 {
+			vop_d_tab(buf, 0xDB, r, 6, OFF_TAB_BYTE)
+		} else {
+			vshift_imm(buf, 2, r, 6, u8(8 * k))
+			if k < 3 {
+				vop_d_tab(buf, 0xDB, r, r, OFF_TAB_BYTE)
+			}
+		}
+		x_dq2ps(buf, r, r)
+		vop_ps_tab(buf, 0x5E, r, r, OFF_TAB_F255)
+	}
+	done[n_done] = x_jump(buf, 0)
+	n_done += 1
+
+	// Gray8 and Gray16: the aligned dword around byte offset o = index *
+	// bytes + mis of level 0's aligned texels, shifted right (o & 3) * 8
+	// and masked, / 255 or / 65535; then (r, 0, 0, 1).
+	x_land(buf, not_rgba8)
+	emit_bytes(buf, 0x83, 0xF9, u8(Channel_Format.Rgba16f))
+	is_half := x_jump(buf, JCC_JE)
+	if live(comp_mask, 0) {
+		emit_bytes(buf, 0x83, 0xF9, u8(Channel_Format.Gray16))
+		gray8 := x_jump(buf, JCC_JNE)
+		vop_d(buf, 0xFE, 4, 4, 4) // Gray16: 2 bytes a texel
+		x_land(buf, gray8)
+		emit_bytes(buf, 0x48, 0x8B) // mov rax, [rdi + levels[0].ptr]
+		emit_modrm_mem(buf, GPR_RAX, GPR_RDI, OFF_CI_LEVELS + OFF_LV_PTR)
+		vpbroadcastd_mem(buf, 6, GPR_RDI, OFF_CI_LEVELS + OFF_LV_MIS)
+		vop_d(buf, 0xFE, 4, 4, 6)
+		vop_d_tab(buf, 0xDB, 6, 4, OFF_TAB_THREE_U)
+		vshift_imm(buf, 6, 6, 6, 3)
+		vop_d_tab(buf, 0xDB, 4, 4, OFF_TAB_NOT3)
+		gather(buf, 0, GPR_RAX, 4, 0, 0)
+		vop38_d(buf, 0x45, 0, 0, 6) // vpsrlvd
+		emit_bytes(buf, 0x83, 0xF9, u8(Channel_Format.Gray16))
+		m8 := x_jump(buf, JCC_JNE)
+		vop_d_tab(buf, 0xDB, 0, 0, OFF_TAB_U16)
+		m16 := x_jump(buf, 0)
+		x_land(buf, m8)
+		vop_d_tab(buf, 0xDB, 0, 0, OFF_TAB_BYTE)
+		x_land(buf, m16)
+		x_dq2ps(buf, 0, 0)
+		vbroadcastss_mem(buf, 6, GPR_RDI, OFF_CI_UNORM)
+		vop_ps(buf, 0x5E, 0, 0, 6)
+	}
+	if live(comp_mask, 1) {
+		vzero(buf, 1)
+	}
+	if live(comp_mask, 2) {
+		vzero(buf, 2)
+	}
+	if live(comp_mask, 3) {
+		vop_ps_tab(buf, 0x54, 3, 5, OFF_TAB_ONE_F)
+	}
+	done[n_done] = x_jump(buf, 0)
+	n_done += 1
+
+	// Rgba16f: the texel's two dwords, ymm6 (halves 0, 1) and ymm5 (2, 3).
+	x_land(buf, is_half)
+	if live(comp_mask, 0) || live(comp_mask, 1) {
+		gather(buf, 6, GPR_RSI, 4, 3, 0)
+	}
+	if live(comp_mask, 2) || live(comp_mask, 3) {
+		gather(buf, 5, GPR_RSI, 4, 3, 4)
+	}
+	if f16c {
+		// Each pair's eight words in order (vpshufb, then vpermq 0xd8:
+		// the first's in the low 128 bits, the second's in the high),
+		// then vcvtph2ps, which gives f16_to_f32's bits for every half.
+		for k0 in ([2]int{0, 2}) {
+			lo, hi := live(comp_mask, k0), live(comp_mask, k0 + 1)
+			if !lo && !hi {
+				continue
+			}
+			src := u8(6 if k0 == 0 else 5)
+			x_d38_m(buf, 0x00, 7, src, GPR_R14, OFF_TAB_H_PACK)
+			emit_vex_rr(buf, 3, 1, 1, 1, 0x00, 7, 0, 7) // vpermq ymm7, ymm7, 0xd8
+			append(buf, 0xD8)
+			if lo {
+				emit_vex_rr(buf, 2, 1, 1, 0, 0x13, u8(k0), 0, 7) // vcvtph2ps
+			}
+			if hi {
+				emit_vex_rr(buf, 3, 1, 1, 0, 0x39, 7, 0, 4) // vextracti128 xmm4, ymm7, 1
+				append(buf, 1)
+				emit_vex_rr(buf, 2, 1, 1, 0, 0x13, u8(k0 + 1), 0, 4)
+			}
+		}
+	} else {
+		for k := 3; k >= 0; k -= 1 {
+			if live(comp_mask, k) {
+				x_half_comp(buf, k)
+			}
+		}
+	}
+	done[n_done] = x_jump(buf, 0)
+	n_done += 1
+
+	x_land(buf, general)
+	emit_b(buf, 0xBA) // mov edx, live components | flip y << 8
+	emit_u32(buf, u32(comp_mask) | u32(flip) << 8)
+	x_call(buf, fetch_calls)
+	for i in 0 ..< n_done {
+		x_land(buf, done[i])
+	}
+}
+
 @(private)
 emit_store_mask_al :: proc(buf: ^[dynamic]u8, m: i32) {
 	if m == MASK_EXEC {
@@ -1797,6 +2002,7 @@ Jit_Emitter :: struct {
 	big_buf_off:      int,
 	cache:            [8]Cache_Slot,
 	fma:              bool, // FMA3 for the bound channels' exact products
+	f16c:             bool, // F16C for fetch_one's halves
 	stamp:            u32,
 	exec_gen:         u32,
 	pc:               i32,
@@ -4740,38 +4946,8 @@ jit_emit_fn :: proc(e: ^Jit_Emitter, p: ^Program, code: []Instr, is_init: bool) 
 			emit_u32(&e.buf, u32(stub.comp_mask) | u32(in_.d & 1) << 8)
 			x_call(&e.buf, &e.fetch_calls)
 		} else if in_.op == .Texel_Fetch {
-			// F32 with one level: inline, the texel at level 0 or 0 (rsi = its texels).
-			x_cmp_b(&e.buf, GPR_RDI, OFF_CI_FETCH_ROUTE, 0)
-			general := x_jump(&e.buf, JCC_JNE)
-			l0 := chan_disp + OFF_CI_LEVELS
-			if (in_.d & 1) != 0 {
-				vpbroadcastd_mem(&e.buf, 6, GPR_RBX, l0 + OFF_LV_MAX + 4)
-				vop_d(&e.buf, 0xFA, 1, 6, 1) // max_y - py
-			}
-			vpbroadcastd_mem(&e.buf, 6, GPR_RBX, l0 + OFF_LV_MAX)
-			vop38_d(&e.buf, 0x3B, 3, 0, 6) // min_u(px, max_x) == px iff u32(px) <= u32(max_x)
-			vop_d(&e.buf, 0x76, 3, 3, 0)
-			vpbroadcastd_mem(&e.buf, 6, GPR_RBX, l0 + OFF_LV_MAX + 4)
-			vop38_d(&e.buf, 0x3B, 4, 1, 6)
-			vop_d(&e.buf, 0x76, 4, 4, 1)
-			vop_d(&e.buf, 0xDB, 5, 3, 4)
-			vzero(&e.buf, 6)
-			vop_d(&e.buf, 0x76, 6, 6, 2) // level 0
-			vop_d(&e.buf, 0xDB, 5, 5, 6) // ymm5 = in range
-			vpbroadcastd_mem(&e.buf, 6, GPR_RBX, l0 + OFF_LV_PITCH)
-			vop38_d(&e.buf, 0x40, 1, 1, 6)
-			vop_d(&e.buf, 0xFE, 4, 1, 0)
-			emit_bytes(&e.buf, 0x0F, 0xB6) // movzx ecx, byte [rbx + shift]
-			emit_modrm_mem(&e.buf, GPR_RCX, GPR_RBX, chan_disp + OFF_CI_SHIFT)
-			x_bcast_gpr(&e.buf, 6, GPR_RCX)
-			vop38_d(&e.buf, 0x47, 4, 4, 6)
-			emit_chan_gather_rgba(&e.buf, GPR_RBX, chan_disp, 4, 5, stub.comp_mask)
-			fetched := x_jump(&e.buf, 0)
-			x_land(&e.buf, general)
-			emit_b(&e.buf, 0xBA) // mov edx, live components | flip y << 8
-			emit_u32(&e.buf, u32(stub.comp_mask) | u32(in_.d & 1) << 8)
-			x_call(&e.buf, &e.fetch_calls)
-			x_land(&e.buf, fetched)
+			// A 2D image's: one level inline (rsi = its texels).
+			emit_chan_fetch_one(&e.buf, &e.fetch_calls, stub.comp_mask, (in_.d & 1) != 0, e.f16c)
 		} else {
 			// F32, one level, Nearest, both axes clamped: inline (rsi = its texels).
 			x_cmp_b(&e.buf, GPR_RDI, OFF_CI_NEAR_ROUTE, 0)
@@ -4978,7 +5154,7 @@ jit_compute_eligible :: proc(p: ^Program) -> bool {
 // fma: false compiles without FMA3 where the CPU has it (the tests' other
 // path).
 @(private)
-jit_compile :: proc(p: ^Program, fma := true) {
+jit_compile :: proc(p: ^Program, fma := true, f16c := true) {
 	if !jit_avx2_ready || len(p.code) == 0 || (p.stage == .Compute && !jit_compute_eligible(p)) {
 		return
 	}
@@ -5011,6 +5187,7 @@ jit_compile :: proc(p: ^Program, fma := true) {
 		bound_tex        = make([dynamic]Bound_Tex_Stub, 0, 8, heap),
 		load_bufs        = make([dynamic]Load_Buf_Stub, 0, 8, heap),
 		fma              = fma && jit_fma_ready,
+		f16c             = f16c && jit_f16c_ready,
 	}
 	defer delete(e.buf)
 	defer delete(e.mem_mask, heap)

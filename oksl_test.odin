@@ -5982,6 +5982,371 @@ test_bound_channel_shadertoy_fetch :: proc(t: ^testing.T) {
 	}
 }
 
+// A copy of `im` (one level) with its texels `off` bytes into a 4-byte
+// aligned buffer whose other bytes are a sentinel pattern: guards before
+// and after the rows and in a stride's padding, read by nothing in range.
+@(private = "file")
+guarded_image :: proc(im: Channel_Image, off: int) -> Channel_Image {
+	out := im
+	GUARD :: 64
+	src := slice.to_bytes(im.data) if im.format == .F32 else im.pixels
+	n := GUARD + off + len(src) + GUARD
+	buf := slice.to_bytes(make([]u32, (n + 3) / 4, context.temp_allocator))[:n]
+	for &b, i in buf {
+		b = u8(0xA5 ~ i * 37)
+	}
+	tb := channel_texel_bytes(im.format, im.components if im.format == .F32 else (4 if im.format == .Rgba8 || im.format == .Rgba16f else 1))
+	pitch := im.stride if im.stride != 0 else im.width * tb
+	dst := buf[GUARD + off:][:len(src)]
+	for y in 0 ..< im.height {
+		copy(dst[y * pitch:][:im.width * tb], src[y * pitch:][:im.width * tb])
+	}
+	if im.format == .F32 {
+		out.data = slice.reinterpret([]f32, dst)
+	} else {
+		out.pixels = dst
+	}
+	return out
+}
+
+// texelFetch of one level of a 2D image (fetch_route its format: the
+// interpreter's fetch_bound_one, the JIT's inline fetch_one) against the
+// image's bytes, bit for bit (NaN canonical, as every output): every
+// format and F32's component counts, each subset of components the
+// shader keeps, coordinates in range, at the edges and out of range on
+// either axis (signed and unsigned extremes), lods 0, out of range and
+// negative, 1 x 1, odd, wide and tall images with tight and padded rows,
+// texels 0 to 3 bytes off a dword (Gray8; Rgba8 1 and 3, Gray16 and
+// Rgba16f 2), sentinels around and between the rows, every half (NaN and infinities included), the JIT with F16C and
+// without (per compile) and the interpreter; and the Shadertoy flip, a
+// 1-layer sampler2DArray's layer out of range, and which images take the
+// route.
+@(test)
+test_bound_fetch_one :: proc(t: ^testing.T) {
+	FRAG :: `#version 310 es
+precision highp float;
+readonly buffer Q { ivec4 q[]; };
+uniform sampler2D s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec4 c = q[int(gl_FragCoord.y) * 32 + int(gl_FragCoord.x)];
+    vec4 t = texelFetch(s, c.xy, c.z);
+    o = `
+	KEEP :: [7]string{"t", "vec4(t.x, 0.0, 0.0, 0.0)", "vec4(0.0, t.y, 0.0, 0.0)", "vec4(0.0, 0.0, t.z, 0.0)", "vec4(0.0, 0.0, 0.0, t.w)", "vec4(t.x, 0.0, 0.0, t.w)", "vec4(0.0, t.y, t.z, 0.0)"}
+	MASKS :: [7]u8{0xF, 1, 2, 4, 8, 9, 6}
+	progs: [len(KEEP)]^Module
+	defer for m in progs {
+		if m != nil {
+			destroy(m)
+		}
+	}
+	for e, i in KEEP {
+		m, errs, ok := compile(strings.concatenate({FRAG, e, ";\n}"}, context.temp_allocator), {profile = .Glsl, stage = .Fragment})
+		progs[i] = m
+		if !testing.expectf(t, ok, "compile failed:\n%s", format_errors(errs, context.temp_allocator)) {
+			return
+		}
+	}
+	canon :: proc(v: [4]f32) -> [4]u32 {
+		w := transmute([4]u32)v
+		for &x in w {
+			if (x & 0x7fff_ffff) > 0x7f80_0000 {
+				x = 0x7fc0_0000
+			}
+		}
+		return w
+	}
+	// Each image's queries: x and y at and around 0 and the edges and at
+	// the signed and unsigned extremes, a third of them at lods out of
+	// range, then every texel (at most 16,384) at lod 0.
+	queries :: proc(w, h: int) -> [][4]i32 {
+		q := make([dynamic][4]i32, context.temp_allocator)
+		xs := [?]i32{min(i32), -1, 0, 1, i32(w / 2), i32(w - 1), i32(w), i32(w + 1), max(i32)}
+		ys := [?]i32{min(i32), -1, 0, 1, i32(h / 2), i32(h - 1), i32(h), i32(h + 1), max(i32)}
+		lods := [?]i32{0, 1, -1, max(i32), min(i32)}
+		for x in xs {
+			for y in ys {
+				for l in lods {
+					append(&q, [4]i32{x, y, l, 0})
+				}
+			}
+		}
+		n := min(w * h, 16384)
+		for i in 0 ..< n {
+			k := i * (w * h) / n
+			append(&q, [4]i32{i32(k % w), i32(k / w), 0, 0})
+		}
+		for len(q) % 32 != 0 {
+			append(&q, [4]i32{0, 0, 0, 0})
+		}
+		return q[:]
+	}
+	Case :: struct {
+		format:       Channel_Format,
+		comps, w, h:  int,
+		seed:         u32, // odd: rows padded
+		off:          int, // texels this many bytes into their buffer
+	}
+	cases := [?]Case{
+		{.F32, 1, 7, 5, 1, 0}, {.F32, 2, 7, 5, 2, 0}, {.F32, 4, 7, 5, 3, 0}, {.F32, 4, 1, 1, 4, 0}, {.F32, 2, 1000, 2, 5, 4},
+		{.Rgba8, 4, 7, 5, 1, 0}, {.Rgba8, 4, 1, 1, 2, 1}, {.Rgba8, 4, 1000, 2, 3, 3}, {.Rgba8, 4, 2, 600, 4, 0},
+		{.Gray8, 1, 7, 5, 1, 1}, {.Gray8, 1, 1, 1, 2, 3}, {.Gray8, 1, 1001, 3, 3, 2}, {.Gray8, 1, 5, 9, 4, 0},
+		{.Gray16, 1, 7, 5, 1, 2}, {.Gray16, 1, 1, 1, 2, 0}, {.Gray16, 1, 999, 2, 3, 2}, {.Gray16, 1, 3, 7, 4, 0},
+		{.Rgba16f, 4, 7, 5, 1, 2}, {.Rgba16f, 4, 1, 1, 2, 0}, {.Rgba16f, 4, 1000, 2, 3, 6}, {.Rgba16f, 4, 128, 128, 4, 0},
+	}
+	for c in cases {
+		im := guarded_image(make_test_image(c.format, c.comps, c.w, c.h, false, c.seed), c.off)
+		// The texels exactly c.off & 3 bytes off a dword.
+		texels := uintptr(raw_data(im.data)) if c.format == .F32 else uintptr(raw_data(im.pixels))
+		testing.expectf(t, int(texels & 3) == c.off & 3, "%v %d x %d: texels %d bytes off a dword, want %d", c.format, c.w, c.h, texels & 3, c.off & 3)
+		if c.format == .Rgba16f && c.w * c.h == 16384 {
+			// Every half once.
+			h := slice.reinterpret([]u16, im.pixels)
+			for &v, i in h {
+				v = u16(i)
+			}
+		}
+		q := queries(c.w, c.h)
+		words := slice.reinterpret([]u32, q)
+		rows := len(q) / 32
+		want := make([][4]u32, len(q), context.temp_allocator)
+		for e, i in q {
+			if e.z == 0 {
+				want[i] = canon(ref_bound_fetch_texel(&im, int(e.x), int(e.y), 0))
+			}
+		}
+		for m, mi in progs {
+			masks := MASKS
+			keep := masks[mi]
+			// The JIT with F16C (where the CPU has it) and without, then
+			// the interpreter.
+			for engine in 0 ..< 3 {
+				out := make([][4]f32, len(q), context.temp_allocator)
+				opts := Run_Options{channel_images = {im}, buffers = {words}}
+				if engine < 2 {
+					jit_destroy(&m.program)
+					jit_compile(&m.program, true, engine == 0)
+					run_f32(&m.program, nil, 32, rows, out, temp_scratch(), opts)
+				} else {
+					run_f32_interp(&m.program, nil, 32, rows, out, temp_scratch(), opts)
+				}
+				bad := 0
+				for i in 0 ..< len(q) {
+					wv := want[i]
+					for k in 0 ..< 4 {
+						if (keep & (1 << uint(k))) == 0 {
+							wv[k] = 0
+						}
+					}
+					if canon(out[i]) != wv {
+						if bad < 4 {
+							testing.expectf(t, false, "%v x%d %d x %d (off %d) keep %x engine %d query %v: got %v (%8x), want %8x", c.format, c.comps, c.w, c.h, c.off, keep, engine, q[i], out[i], transmute([4]u32)out[i], wv)
+						}
+						bad += 1
+					}
+				}
+			}
+		}
+	}
+
+	// Which images take the route: one level and one layer, any format.
+	px := make([]u8, 64 * 8, context.temp_allocator)
+	lv := [1]Channel_Level{{texels = px[:32], width = 2, height = 2}}
+	chans: [4]Chan_Img
+	fill_chan_imgs(chans[:], {
+		{format = .Rgba16f, pixels = px[:4 * 4 * 8], width = 4, height = 4},
+		{format = .Rgba8, pixels = px[:4 * 4 * 4], width = 4, height = 4, levels = lv[:1]},
+		{format = .Gray8, pixels = px[:4 * 4 * 2], width = 4, height = 4, layers = 2},
+		{format = .Gray16, pixels = px[:4 * 4 * 2], width = 4, height = 4, layers = 1},
+	})
+	testing.expect_value(t, chans[0].fetch_route, u8(Channel_Format.Rgba16f))
+	testing.expect_value(t, chans[1].fetch_route, FETCH_GENERAL)
+	testing.expect_value(t, chans[2].fetch_route, FETCH_GENERAL)
+	testing.expect_value(t, chans[3].fetch_route, u8(Channel_Format.Gray16))
+
+	// A sampler2DArray with one layer: layer p.z out of range reads 0.
+	ARR :: `#version 310 es
+precision highp float;
+readonly buffer Q { ivec4 q[]; };
+uniform sampler2DArray s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec4 c = q[int(gl_FragCoord.x)];
+    o = texelFetch(s, c.xyw, c.z);
+}`
+	ma, aerrs, aok := compile(ARR, {profile = .Glsl, stage = .Fragment})
+	defer destroy(ma)
+	if testing.expectf(t, aok, "compile failed:\n%s", format_errors(aerrs, context.temp_allocator)) {
+		for format in ([3]Channel_Format{.Rgba8, .Gray8, .Rgba16f}) {
+			im := make_test_image(format, 4 if format != .Gray8 else 1, 3, 2, false, 7)
+			im.layers = 1
+			q: [32][4]i32
+			for &e, i in q {
+				e = {i32(i % 4) - 1, i32(i / 4 % 3), 0, i32(i / 12) - 1}
+			}
+			for jit in ([2]bool{true, false}) {
+				out := make([][4]f32, 32, context.temp_allocator)
+				opts := Run_Options{channel_images = {im}, buffers = {slice.reinterpret([]u32, q[:])}}
+				if jit {
+					run_f32(&ma.program, nil, 32, 1, out, temp_scratch(), opts)
+				} else {
+					run_f32_interp(&ma.program, nil, 32, 1, out, temp_scratch(), opts)
+				}
+				for e, i in q {
+					want := ref_bound_fetch_texel(&im, int(e.x), int(e.y), 0) if e.w == 0 else {}
+					testing.expectf(t, canon(out[i]) == canon(want), "array %v jit=%v %v: got %v, want %v", format, jit, e, out[i], want)
+				}
+			}
+		}
+	}
+
+	// The Shadertoy flip on the route: row max_y - y.
+	SRC :: `void mainImage(out vec4 c, in vec2 fc) {
+    int i = int(fc.x);
+    c = texelFetch(iChannel0, ivec2(i % 9 - 1, (i / 9) % 7 - 1), (i / 63) % 2);
+}`
+	g, gerrs, gok := compile_program({
+		sources = #partial {.Buffer_A = SRC, .Image = "void mainImage(out vec4 c, in vec2 fc) { c = texelFetch(iChannel0, ivec2(fc), 0); }"},
+		channels = #partial {.Buffer_A = {0 = {.External, 0}}, .Image = {0 = {.Buffer, u8(Pass_Kind.Buffer_A)}}},
+	})
+	defer destroy_program(g)
+	if !testing.expectf(t, gok, "graph compile failed:\n%s", format_errors(gerrs, context.temp_allocator)) {
+		return
+	}
+	p := &g.passes[0].module.program
+	N :: 126
+	block := make([]u8, max(g.passes[0].module.block_size, 16), context.temp_allocator)
+	write_builtins(block, {resolution = {N, 1, 1}})
+	for format in Channel_Format {
+		im := make_test_image(format, 4 if format == .F32 || format == .Rgba8 || format == .Rgba16f else 1, 7, 5, false, 13)
+		for engine in 0 ..< 3 {
+			out := make([][4]f32, N, context.temp_allocator)
+			if engine < 2 {
+				jit_destroy(p)
+				jit_compile(p, true, engine == 0)
+				run_f32(p, block, N, 1, out, temp_scratch(), {channel_images = {im}})
+			} else {
+				run_f32_interp(p, block, N, 1, out, temp_scratch(), {channel_images = {im}})
+			}
+			for i in 0 ..< N {
+				x, y, l := i % 9 - 1, (i / 9) % 7 - 1, (i / 63) % 2
+				want := ref_bound_fetch_texel(&im, x, 4 - y, l)
+				testing.expectf(t, canon(out[i]) == canon(want), "%v engine %d texel (%d, %d) level %d: got %v, want %v", format, engine, x, y, l, out[i], want)
+			}
+		}
+	}
+}
+
+// The one-level fetches' decode of every half against f16_to_f32 bit for
+// bit, NaN payloads included (no output shows them: every NaN reaching the
+// host is canonical): the interpreter's half8_bits, and the JIT's
+// fetch_one, F16C's (where the CPU has it) and x_half's, through the
+// emitted code itself; and jit_compile's f16c choosing between them.
+@(test)
+test_fetch_one_halves :: proc(t: ^testing.T) {
+	bad8 := 0
+	for base := 0; base < 65536; base += 8 {
+		h := Simd_U8{0, 1, 2, 3, 4, 5, 6, 7} + Simd_U8(u32(base))
+		got := transmute([8]u32)half8_bits(h)
+		for l in 0 ..< 8 {
+			want := transmute(u32)f16_to_f32(u16(base + l))
+			if got[l] != want {
+				if bad8 < 4 {
+					testing.expectf(t, false, "half8_bits(%04x): %08x, f16_to_f32 %08x", base + l, got[l], want)
+				}
+				bad8 += 1
+			}
+		}
+	}
+	testing.expectf(t, bad8 == 0, "half8_bits: %d halves differ", bad8)
+	when JIT_ENABLED {
+		if !jit_avx2_ready {
+			return
+		}
+		halves := make([]u16, 65536, context.temp_allocator)
+		for &h, i in halves {
+			h = u16(i)
+		}
+		im := Channel_Image{format = .Rgba16f, pixels = slice.to_bytes(halves), width = 128, height = 128}
+		chans: [1]Chan_Img
+		fill_chan_imgs(chans[:], {im})
+		for f16c in ([2]bool{true, false}) {
+			if f16c && !jit_f16c_ready {
+				continue
+			}
+			// fetch(img, in = [x, y, lod] lanes, out = [4] lanes) through
+			// emit_chan_fetch_one.
+			buf := make([dynamic]u8, context.temp_allocator)
+			emit_bytes(&buf, 0x41, 0x56)       // push r14
+			emit_bytes(&buf, 0x49, 0xBE)       // movabs r14, &jit_tables
+			emit_u64(&buf, u64(uintptr(&jit_tables)))
+			for r in u8(0) ..< 3 {
+				x_ld(&buf, r, GPR_RSI, i32(r) * 32)
+			}
+			emit_bytes(&buf, 0x48, 0x8B) // mov rsi, [rdi + ptr]
+			emit_modrm_mem(&buf, GPR_RSI, GPR_RDI, OFF_CHAN_PTR)
+			calls := make([dynamic]int, context.temp_allocator) // the general route's, not taken
+			emit_chan_fetch_one(&buf, &calls, 0xF, false, f16c)
+			for r in u8(0) ..< 4 {
+				x_st(&buf, GPR_RDX, i32(r) * 32, r)
+			}
+			emit_bytes(&buf, 0xC5, 0xF8, 0x77) // vzeroupper
+			emit_bytes(&buf, 0x41, 0x5E, 0xC3) // pop r14; ret
+			mem, err := virtual.reserve_and_commit(uint(len(buf)))
+			if !testing.expect(t, err == .None) {
+				return
+			}
+			defer virtual.release(raw_data(mem), len(mem))
+			copy(mem, buf[:])
+			testing.expect(t, virtual.protect(raw_data(mem), len(mem), {.Read, .Execute}))
+			fetch := (proc "c" (img: ^Chan_Img, in_: ^[3][8]u32, out: ^[4][8]u32))(rawptr(raw_data(mem)))
+			bad := 0
+			for base := 0; base < 16384; base += 8 {
+				in_: [3][8]u32
+				for l in 0 ..< 8 {
+					in_[0][l], in_[1][l] = u32((base + l) % 128), u32((base + l) / 128)
+				}
+				out: [4][8]u32
+				fetch(&chans[0], &in_, &out)
+				for l in 0 ..< 8 {
+					for k in 0 ..< 4 {
+						h := halves[(base + l) * 4 + k]
+						if out[k][l] != transmute(u32)f16_to_f32(h) {
+							if bad < 4 {
+								testing.expectf(t, false, "f16c=%v half %04x: %08x, f16_to_f32 %08x", f16c, h, out[k][l], transmute(u32)f16_to_f32(h))
+							}
+							bad += 1
+						}
+					}
+				}
+			}
+			testing.expectf(t, bad == 0, "f16c=%v: %d halves differ", f16c, bad)
+		}
+		// vcvtph2ps ymm (c4 e2 7d 13) in a compile with f16c, where the CPU
+		// has it, and in none without.
+		m, errs, ok := compile("#version 310 es\nprecision highp float;\nuniform sampler2D s;\nout vec4 o;\nvoid main() { o = texelFetch(s, ivec2(gl_FragCoord.xy), 0); }", {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+			return
+		}
+		count :: proc(code: []u8) -> (n: int) {
+			for i in 0 ..< len(code) - 3 {
+				if code[i] == 0xC4 && code[i + 1] == 0xE2 && code[i + 2] == 0x7D && code[i + 3] == 0x13 {
+					n += 1
+				}
+			}
+			return
+		}
+		jit_destroy(&m.program)
+		jit_compile(&m.program, true, true)
+		with := count(m.program.jit_mem)
+		jit_destroy(&m.program)
+		jit_compile(&m.program, true, false)
+		without := count(m.program.jit_mem)
+		testing.expectf(t, without == 0 && (with == 4) == jit_f16c_ready, "vcvtph2ps: %d with f16c, %d without (F16C %v)", with, without, jit_f16c_ready)
+	}
+}
+
 @(test)
 test_channel_image_ensure_gray16_align :: proc(t: ^testing.T) {
 	m := compile_simple_frag_for_ensure(t)
