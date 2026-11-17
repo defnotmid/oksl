@@ -2,6 +2,7 @@ package oksl
 
 import "base:intrinsics"
 import "core:fmt"
+import "core:log"
 import "core:math"
 import "core:mem"
 import "core:mem/virtual"
@@ -15007,14 +15008,22 @@ math_lane :: proc(v: F8, i: int) -> f32 {
 }
 
 // |got - ref| in f32 ulps at ref (2^-149 below 2^-126). A NaN, an infinity or
-// a zero where the reference has none (or the other sign): +inf.
+// a zero where the reference has none (or the other sign): +inf, but for an
+// overflow to inf, taken as 2^128, an ulp past f32's largest.
 @(private = "file")
 math_ulps :: proc(got: f32, ref: f64) -> f64 {
 	if ref != ref || got != got {
 		return 0 if ref != ref && got != got else math.INF_F64
 	}
 	if rr := f32(ref); math.is_inf(rr) || math.is_inf(got) {
-		return 0 if got == rr else math.INF_F64
+		if got == rr {
+			return 0
+		}
+		g := math.is_inf(got) ? math.copy_sign(math.ldexp(f64(1), 128), f64(got)) : f64(got)
+		if math.is_inf(ref) || (g < 0) != (ref < 0) {
+			return math.INF_F64
+		}
+		return abs(g - ref) / math.ldexp(f64(1), 104)
 	}
 	if ref == 0 {
 		return 0 if got == 0 && math.sign_bit(got) == math.sign_bit(ref) else math.INF_F64
@@ -15028,10 +15037,11 @@ math_ulps :: proc(got: f32, ref: f64) -> f64 {
 }
 
 // Values every sweep includes: zeros, subnormals, the ends, 1 and the
-// points the functions' reductions and special cases turn on; the f32s
-// nearest a multiple of pi/2 (below 2^20, where the third Cody-Waite part
-// matters most, and above, the closest of all), and the only three below
-// 2^20 whose sin or cos round the other way without that third part.
+// points the functions' reductions and special cases turn on; f32s near a
+// multiple of pi/2, below the Cody-Waite reduction's exact range and above;
+// and, last, each function's worst argument over every f32 (sin, cos and
+// tan on [-pi, pi], then sin and cos out to 6434 and their largest
+// absolute error out to 10^5).
 @(private = "file")
 MATH_EDGES := [?]u32 {
 	0x437c_e5f1, 0x4096_cbe4, 0x474d_246f, 0x4116_cbe4, 0x4882_665e, 0x4902_665e, 0x4943_998d, 0x484d_246f,
@@ -15042,21 +15052,47 @@ MATH_EDGES := [?]u32 {
 	0xc2cf_f1b5, 0xc2d0_0000, 0x4300_0000, 0x42fe_0000, 0xc315_0000, 0xc316_0000, 0x4b80_0000, 0x4b80_0001,
 	0x4c00_0000, 0x5f80_0000, 0x6dbd_bb21, 0x577f_dbf3, 0x7f7f_ffff, 0x7f80_0000, 0x7fc0_0000, 0x7fa0_0001,
 	0x4110_3ef2, 0x40c9_0fdb, 0x4ac9_0fdb, 0x5a00_0000, 0x48fe_178e,
+	0x4016_1d7d, 0x4017_7a4b, 0x4017_0095, 0x3dfe_4f65, 0x3f64_151f, 0x3f88_439e, 0x3dfd_ef32, 0x4076_ff6d,
+	0x3d7f_b0d7, 0x3eb5_1d75, 0x3f80_3f39, 0x3e4c_3066, 0x41d5_decd, 0x3f0c_b2fa, 0x3fa1_a758, 0x3fb4_5525,
+	0x445a_4f36, 0x41d3_9e9d, 0x47b8_4c70, 0x47c0_5a1c,
 }
 
-// oksl's f32 math (vm_math.odin) against f64 references over every 4096th
-// f32 bit pattern of each sign (subnormals to infinity) and the edges, and
-// pow and atan(y, x) over a grid of every 2^22nd pattern of each sign by
-// itself: within 0.500001 ulp (0.5 being correctly rounded; no exhaustive
-// sweep finds over 0.50000023), and NaNs,
-// infinities and zeros' signs as the reference has them (libm's C99 rules
-// for pow and atan2 at zeros and infinities).
+// Every pattern of the narrow regions where a function is steepest, its
+// reduction cancels or its polynomial errs most, which a strided sweep
+// steps over: [1 - 2^-10, 1 + 2^-10] (asin and acos at 1, log, log2 and
+// acosh just above it, atanh), pi/2 +- 2^-10 (tan's pole), and 2^15
+// patterns either side of sqrt(2)/2 and sqrt(2), the ends of log's reduced
+// interval, where log cancels on one side.
+@(private = "file")
+MATH_DENSE := [?][2]u32{{0x3f7f_c000, 0x3f80_2000}, {0x3fc8_ffdb, 0x3fc9_1fdb}, {0x3f34_84f3, 0x3f35_84f3}, {0x3fb4_84f3, 0x3fb5_84f3}}
+
+// oksl's f32 math (vm_math.odin) against f64 references, over a sample
+// (every 4096th f32 bit pattern of each sign, subnormals to infinity, and
+// every pattern of MATH_DENSE's regions) and MATH_EDGES: within MATH_ULP
+// (sin, cos and tan on [-pi, pi]), sin and cos within MATH_TRIG_FAR out to
+// 6434 and MATH_TRIG_ABS absolute out to 10^5, and NaNs, infinities and
+// zeros' signs as the reference has them everywhere (overflow within half
+// an ulp of f32's largest either way); pow and atan(y, x) over a grid of
+// every 2^22nd pattern of each sign by itself, and MATH_POW_PAIRS and
+// MATH_ATAN2_PAIRS, atan2 within MATH_ATAN2_ULP and pow within 1.5 +
+// MATH_POW_T * |y log2 x| ulp (its error is log2's, times y), and C99's
+// rules for both at zeros and infinities. The kernels give the same bits
+// on every target, so the sample's and the grid's own largest errors are
+// bounded too, by MATH_SAMPLE_ULP and MATH_GRID within MATH_DRIFT of what
+// they are: a change to a kernel shows even where it stays within its
+// bound. Logs each function's largest errors.
 @(test)
 test_math_ulp :: proc(t: ^testing.T) {
 	xs := make([dynamic]f32, context.temp_allocator)
 	for b: u32 = 0; b <= 0x7f80_0000; b += 4096 {
 		append(&xs, transmute(f32)b, transmute(f32)(b | 0x8000_0000))
 	}
+	for r in MATH_DENSE {
+		for b := r[0]; b <= r[1]; b += 1 {
+			append(&xs, transmute(f32)b, transmute(f32)(b | 0x8000_0000))
+		}
+	}
+	n_sample := len(xs)
 	for b in MATH_EDGES {
 		append(&xs, transmute(f32)b, transmute(f32)(b | 0x8000_0000))
 	}
@@ -15064,27 +15100,53 @@ test_math_ulp :: proc(t: ^testing.T) {
 		append(&xs, 1)
 	}
 	for f in Math_Fn {
-		worst, worst_x := 0.0, f32(0)
+		trig := f == .Sin || f == .Cos || f == .Tan
+		worst, worst_x, sample, far, far_x, worst_abs, worst_abs_x := 0.0, f32(0), 0.0, 0.0, f32(0), 0.0, f32(0)
 		for i := 0; i < len(xs); i += 8 {
 			got := transmute([8]f32)math_new8(f, intrinsics.unaligned_load((^F8)(&xs[i])))
 			for k in 0 ..< 8 {
 				x := xs[i + k]
-				if e := math_ulps(got[k], math_ref(f, f64(x))); e > worst {
-					worst, worst_x = e, x
+				ref := math_ref(f, f64(x))
+				e := math_ulps(got[k], ref)
+				if !trig || abs(x) <= math.PI || math.is_inf(e) {
+					if e > worst {
+						worst, worst_x = e, x
+					}
+					if i + k < n_sample {
+						sample = max(sample, e)
+					}
+				}
+				if (f == .Sin || f == .Cos) && abs(x) <= 6434 && e > far {
+					far, far_x = e, x
+				}
+				if (f == .Sin || f == .Cos) && abs(x) <= 1e5 && abs(f64(got[k]) - ref) > worst_abs {
+					worst_abs, worst_abs_x = abs(f64(got[k]) - ref), x
 				}
 			}
 		}
-		testing.expectf(t, worst <= 0.500001, "%v: %.7f ulp at %v (0x%08x)", f, worst, worst_x, transmute(u32)worst_x)
+		log.infof("%v: %.4f ulp at %v (0x%08x); the sample %.4f", f, worst, worst_x, transmute(u32)worst_x, sample)
+		testing.expectf(t, worst <= MATH_ULP[f], "%v: %.4f ulp at %v (0x%08x)", f, worst, worst_x, transmute(u32)worst_x)
+		testing.expectf(t, sample <= MATH_SAMPLE_ULP[f] + MATH_DRIFT, "%v: the sample's largest error %.4f ulp, was %.4f", f, sample, MATH_SAMPLE_ULP[f])
+		if f == .Sin || f == .Cos {
+			log.infof("%v: %.4f ulp out to 6434, at %v; %.3g absolute out to 1e5, at %v", f, far, far_x, worst_abs, worst_abs_x)
+			testing.expectf(t, far <= MATH_TRIG_FAR, "%v: %.4f ulp at %v", f, far, far_x)
+			testing.expectf(t, worst_abs <= MATH_TRIG_ABS, "%v: %.3g absolute at %v", f, worst_abs, worst_abs_x)
+		}
 	}
 	grid := make([dynamic]f32, context.temp_allocator)
 	for b: u32 = 0; b <= 0x7f80_0000; b += 1 << 22 {
 		append(&grid, transmute(f32)b, transmute(f32)(b | 0x8000_0000))
 	}
-	for v in ([]f32{1, -1, 2, -2, 0.5, -0.5, 3, -3, 1e-45, 16777216, 16777218, 8388609, -8388609, 10, 0.1, 1.0000001, 0.99999994, math.nan_f32(), 7, -7}) {
+	for v in ([]f32{1, -1, 2, -2, 0.5, -0.5, 3, -3, 1e-45, 16777216, 16777218, 8388609, -8388609, 10, 0.1, 1.0000001, 0.99999994, math.nan_f32(), 7, -7, 2.2, 0.45454547, 32}) {
 		append(&grid, v)
 	}
 	for len(grid) % 8 != 0 {
 		append(&grid, 1)
+	}
+	// pow's error over 1.5 ulp per unit of |y log2 x|, and atan2's in ulp.
+	pow_ratio :: proc(got, x, y: f32) -> f64 {
+		lt := abs(f64(y) * math.log2(abs(f64(x))))
+		return (math_ulps(got, math.pow(f64(x), f64(y))) - 1.5) / max(lt, 1)
 	}
 	worst_pow, worst_atan2: f64
 	wp, wa: [2]f32
@@ -15094,7 +15156,7 @@ test_math_ulp :: proc(t: ^testing.T) {
 			p, a := transmute([8]f32)fpow8(F8(x), y8), transmute([8]f32)fatan28(F8(x), y8)
 			for k in 0 ..< 8 {
 				y := grid[j + k]
-				if e := math_ulps(p[k], math.pow(f64(x), f64(y))); e > worst_pow {
+				if e := pow_ratio(p[k], x, y); e > worst_pow {
 					worst_pow, wp = e, {x, y}
 				}
 				if e := math_ulps(a[k], math.atan2(f64(x), f64(y))); e > worst_atan2 {
@@ -15103,8 +15165,80 @@ test_math_ulp :: proc(t: ^testing.T) {
 			}
 		}
 	}
-	testing.expectf(t, worst_pow <= 0.500001, "pow: %.7f ulp at %v", worst_pow, wp)
-	testing.expectf(t, worst_atan2 <= 0.500001, "atan2: %.7f ulp at %v", worst_atan2, wa)
+	log.infof("the grid: pow 1.5 + %.4f |y log2 x| ulp at %v; atan2 %.4f ulp at %v", worst_pow, wp, worst_atan2, wa)
+	testing.expectf(t, worst_pow <= MATH_GRID[0] + MATH_DRIFT, "pow: the grid's largest 1.5 + %.4f |y log2 x| ulp at %v, was %.4f", worst_pow, wp, MATH_GRID[0])
+	testing.expectf(t, worst_atan2 <= MATH_GRID[1] + MATH_DRIFT, "atan2: the grid's largest %.4f ulp at %v, was %.4f", worst_atan2, wa, MATH_GRID[1])
+	for c in MATH_POW_PAIRS {
+		e := pow_ratio(math_lane(fpow8(F8(c.x), F8(c.y)), 0), c.x, c.y)
+		worst_pow = max(worst_pow, e)
+		testing.expectf(t, e <= MATH_POW_T, "pow(%v, %v): 1.5 + %.4f |y log2 x| ulp", c.x, c.y, e)
+	}
+	for c in MATH_ATAN2_PAIRS {
+		e := math_ulps(math_lane(fatan28(F8(c.x), F8(c.y)), 0), math.atan2(f64(c.x), f64(c.y)))
+		worst_atan2 = max(worst_atan2, e)
+		testing.expectf(t, e <= MATH_ATAN2_ULP, "atan(%v, %v): %.4f ulp", c.x, c.y, e)
+	}
+	log.infof("with the pairs: pow 1.5 + %.4f |y log2 x| ulp; atan2 %.4f ulp", worst_pow, worst_atan2)
+}
+
+// Each function's bound in ulp over the range shaders use (sin, cos and tan
+// on [-pi, pi], the rest wherever the result is finite): the largest an
+// exhaustive sweep of every f32 finds, rounded up. Within Vulkan's bounds:
+// 2^-11 absolute for sin and cos on [-pi, pi], 3 + 2|x| ulp for exp and
+// exp2, 3 ulp for log and log2 outside [0.5, 2] and 2^-21 absolute inside,
+// 4096 ulp for atan (asin, acos, tan and the hyperbolics inherit theirs from
+// atan2, sin / cos and exp and log).
+@(private = "file")
+MATH_ULP := [Math_Fn]f64 {
+	.Sin = 1.5, .Cos = 1.6, .Tan = 3.7, .Asin = 2.9, .Acos = 2.5, .Atan = 1.8,
+	.Sinh = 2.4, .Cosh = 1.5, .Tanh = 2.7, .Asinh = 2.3, .Acosh = 2.9, .Atanh = 2.6,
+	.Exp = 1.1, .Exp2 = 1.1, .Log = 1.3, .Log2 = 2.4,
+}
+// sin and cos out to 6434, where the Cody-Waite reduction is exact (every
+// f32: 2.47 and 2.40).
+@(private = "file")
+MATH_TRIG_FAR :: 2.5
+// About half |x|'s ulp at 10^5.
+@(private = "file")
+MATH_TRIG_ABS :: 0.004
+// pow: the sup over every y of (e - 1.5) / |y log2 x| is ln 2 (1 + K) for
+// K the largest relative error of fpow8's log2|x|, in 2^-24: 3.28 over
+// every f32 x, so 2.97 (2.94 found, at the first pair). Vulkan's bound,
+// inherited from exp2(y * log2(x)), is at least twice that.
+@(private = "file")
+MATH_POW_T :: 3.0
+// atan2: its result depends only on u = fl(min / max), the octant and y's
+// sign, so the error's sup is at an end of u's rounding interval: 1.879
+// over every u (and found, at the first pair).
+@(private = "file")
+MATH_ATAN2_ULP :: 1.9
+// The sample's largest error for each function, and the grid's for pow and
+// atan2, as the kernels make them on every target (MATH_DRIFT more than
+// that fails: the references' own last-bit differences are far smaller).
+@(private = "file")
+MATH_SAMPLE_ULP := [Math_Fn]f64 {
+	.Sin = 1.3403, .Cos = 1.4272, .Tan = 2.6910, .Asin = 1.8855, .Acos = 1.9306, .Atan = 1.5017,
+	.Sinh = 2.0558, .Cosh = 1.3276, .Tanh = 2.1562, .Asinh = 1.7449, .Acosh = 2.3290, .Atanh = 1.8501,
+	.Exp = 0.9928, .Exp2 = 1.0100, .Log = 1.2509, .Log2 = 2.2901,
+}
+@(private = "file")
+MATH_GRID :: [2]f64{0.9444, 1.3333}
+@(private = "file")
+MATH_DRIFT :: 0.001
+// pow's and atan2's worst pairs found (x, y; atan2 as atan(x, y)).
+@(private = "file")
+MATH_POW_PAIRS := [?]struct {
+	x, y: f32,
+} {
+	{0.70675033, 127.8165}, {0.70481265, -130.76071}, {1.1346468, -351.19315}, {-1.4466956, -62},
+	{1.1370442, -393.99432}, {-0.7043096, 89}, {0.7068369, 100}, {0.70621204, 100},
+}
+@(private = "file")
+MATH_ATAN2_PAIRS := [?]struct {
+	x, y: f32,
+} {
+	{1.0299995, 1.9921367}, {2.244307e-39, 4.340746e-39}, {2.8449971e-09, 5.5025495e-09}, {0.5091876, 1.0090053},
+	{-0.00014448827, 0.0002757993}, {1.0645635, 1},
 }
 
 // Results the functions define exactly, bit for bit: odd functions keep -0,
@@ -15469,7 +15603,7 @@ void main() {
 	}
 }
 
-// pow(x, 2.0) is x * x in f64, rounded once: for every lane with y = 2,
+// pow(x, 2.0) is x * x, rounded once: for every lane with y = 2,
 // whatever the other lanes of the call hold (the call takes a shortcut only
 // when all eight are 2), NaN, infinities and zeros included.
 @(test)
@@ -15665,8 +15799,8 @@ test_bound_level_is_callback_level :: proc(t: ^testing.T) {
 }
 
 // A signaling NaN gives what the same NaN quieted gives (its quiet bit
-// set), in every built-in with a select or a clamp, in fragment, vertex and
-// compute, in both engines: the class of v0.0.22's arm64 bug, where LLVM
+// set), in every built-in with a select or a clamp and every vm_math.odin
+// built-in, in fragment, vertex and compute, in both engines: the class of v0.0.22's arm64 bug, where LLVM
 // turned compare-and-select clamps into fmaxnm and fminnm, which quiet a
 // signaling NaN and then return the other operand. Operands come from a
 // storage buffer (both signs, several payloads, against ordinary values),
@@ -15687,6 +15821,9 @@ test_signaling_nan_builtins :: proc(t: ^testing.T) {
 		"min(vec4(x), vec4(y)).z", "max(vec3(y), vec3(x)).y", "step(vec2(x), vec2(0.5)).x", "smoothstep(vec2(0.0), vec2(1.0), vec2(x)).y",
 		"float(int(clamp(x, -4.0, 4.0)))", "float(x == x)", "float(x != y)", "float(floatBitsToUint(x) >> 31u)",
 		"clamp(x, u.x, u.y)", "min(x, u.z)", "max(u.z, x)", "smoothstep(u.x, u.y, x)", "clamp(u.z, 0.0, 1.0)", "step(u.z, x)",
+		"sin(x)", "cos(x)", "tan(x)", "asin(x)", "acos(x)", "atan(x)", "atan(x, y)", "atan(y, x)", "atan(x, 1.0)", "atan(1.0, x)",
+		"sinh(x)", "cosh(x)", "tanh(x)", "asinh(x)", "acosh(x)", "atanh(x)", "exp(x)", "exp2(x)", "log(x)", "log2(x)",
+		"pow(x, y)", "pow(y, x)", "pow(x, 2.0)", "pow(1.0, x)", "pow(x, 0.0)", "pow(x, u.z)",
 		"min(x, uintBitsToFloat(0x7f800001u))", "min(x, uintBitsToFloat(0x7fc00001u))",
 		"clamp(uintBitsToFloat(0xff800123u), 0.0, 1.0)", "clamp(uintBitsToFloat(0xffc00123u), 0.0, 1.0)",
 	}

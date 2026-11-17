@@ -1026,15 +1026,17 @@ it makes the others, and `built_levels` lists and skips them.
   `acos`, `atan` (both forms), `sinh`, `cosh`, `tanh`, `asinh`, `acosh`,
   `atanh`, `exp`, `exp2`, `log`, `log2` and `pow` are oksl's own
   (`vm_math.odin`; the `texture` level's `log2` too, above): eight lanes at
-  a time in f64 with
-  IEEE 754's basic operations only (no fused multiply-add, which Odin never
-  contracts into), rounded once to f32: within 0.5000003 ulp of the exact
-  value for every f32 argument (`pow` and `atan(y, x)` over a billion
-  pairs), the correctly rounded result but for at most 25 arguments in a
-  billion (and `pow`'s exact halfway cases from integer powers above 2,
-  such as `x * x * x` halfway between two subnormals; `pow(x, 2.0)` is
-  `x * x` in f64, exact before its rounding), with `sin`, `cos` and `tan`
-  reduced to full f64 precision at any argument and `pow` and `atan(y, x)` following C99's special cases. A NaN's sign and payload depend on the
+  a time in f32 with IEEE 754's basic operations only (no fused
+  multiply-add, which Odin never contracts into), at a GPU's accuracy and
+  within the Vulkan spec's bounds for GLSL.std.450: over every f32
+  argument, `exp`, `exp2` and `log` within 1.3 ulp, `sin` and `cos` within
+  1.6 ulp on [-pi, pi] and 2.5 ulp out to 6434 (then within about half the
+  argument's own ulp to 10^5; Cody-Waite reduction, no 2/pi table), `tan`
+  3.7 ulp on [-pi, pi], `atan` 1.8 ulp and `atan(y, x)` 1.9, `asin`,
+  `acos`, `log2` and the hyperbolic functions 3 ulp, and `pow` within
+  1.5 + 3 * |y * log2(x)| ulp, as `exp2(y * log2(x))` on a GPU (`pow(x,
+  2.0)` is `x * x`), with `pow` and `atan(y, x)` following C99's special
+  cases. A NaN's sign and payload depend on the
   CPU (x86 makes `0xffc00000`, arm64 `0x7fc00000`) and on the operand
   order a compiler picks, so wherever a float's bits reach the host or an
   integer they are canonical: every NaN in a target, a `run_vertex`
@@ -1044,9 +1046,11 @@ it makes the others, and `built_levels` lists and skips them.
   `0x7e00`). Inside a shader NaNs propagate as the CPU makes them, which
   nothing observes. A signaling NaN (from `uintBitsToFloat`, a uniform, a
   buffer, an image or a callback) gives what the same NaN quiet gives,
-  everywhere: oksl's CPU code has no `min`/`max` (`fminnm`/`fmaxnm` on
-  arm64, which quiet a signaling NaN and return it, not the other operand)
-  that a signaling NaN can reach.
+  everywhere: the `fmaxnm` and `fminnm` LLVM makes of some of oksl's
+  clamps and selects on arm64 (which quiet a signaling NaN and return it,
+  not the other operand) each take values arithmetic, a canonicalization
+  or a `+ 0` has already quieted, but for `atan`'s, whose NaN lanes the
+  result overrides, so none changes a result.
 
 ## Design
 
