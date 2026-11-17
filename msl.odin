@@ -29,6 +29,8 @@ Msl :: struct {
 	args:    string,
 	// The sampler2DArray helpers written to `helpers`.
 	array_helpers: bit_set[Builtin],
+	// texelFetch's helpers written to `helpers` (msl_fetch_helper).
+	fetch_helpers: bit_set[Msl_Fetch],
 	sh_words:      int,
 	sh_off:        []int,
 	has_cas:       bool,
@@ -45,6 +47,39 @@ msl_texture_type :: proc "contextless" (t: Type) -> string {
 msl_image_type :: proc(t: Type) -> string {
 	acc := "access::read" if image_readonly(t) else ("access::write" if image_writeonly(t) else "access::read_write")
 	return fmt.aprintf("texture2d<%s, %s>", msl_scalar(image_texel_base(t)), acc)
+}
+
+// texelFetch's helpers: a sampler2D's, one counting p.y from the level's
+// bottom row (Shadertoy's), a sampler2DArray's.
+@(private)
+Msl_Fetch :: enum u8 {
+	Plain,
+	Flip,
+	Array,
+}
+
+// texelFetch as a helper taking the texture, p and the lod as a uint (a
+// negative int one out of range as a huge uint): read() of texel p (its
+// layer p.z) at level l, (0, 0, 0, 0) outside the level, the levels or the
+// layers, whatever the sampler. Metal leaves read() and the size queries
+// undefined out of range, so the level is checked before its size is
+// queried, and the texel before it is read.
+@(private)
+msl_fetch_helper :: proc(m: ^Msl, k: Msl_Fetch) -> string {
+	@(rodata, static)
+	names := [Msl_Fetch]string{.Plain = "oksl_fetch", .Flip = "oksl_fetch_flip", .Array = "oksl_fetch_array"}
+	if k not_in m.fetch_helpers {
+		m.fetch_helpers += {k}
+		switch k {
+		case .Plain:
+			strings.write_string(&m.helpers, "inline float4 oksl_fetch(texture2d<float> t, int2 p, uint l) {\n\tif (l >= t.get_num_mip_levels()) return float4(0.0f);\n\tuint2 q = uint2(p);\n\treturn q.x < t.get_width(l) && q.y < t.get_height(l) ? t.read(q, l) : float4(0.0f);\n}\n")
+		case .Flip:
+			strings.write_string(&m.helpers, "inline float4 oksl_fetch_flip(texture2d<float> t, int2 p, uint l) {\n\tif (l >= t.get_num_mip_levels()) return float4(0.0f);\n\tuint h = t.get_height(l);\n\tuint2 q = uint2(uint(p.x), h - 1u - uint(p.y));\n\treturn q.x < t.get_width(l) && q.y < h ? t.read(q, l) : float4(0.0f);\n}\n")
+		case .Array:
+			strings.write_string(&m.helpers, "inline float4 oksl_fetch_array(texture2d_array<float> t, int3 p, uint l) {\n\tif (l >= t.get_num_mip_levels()) return float4(0.0f);\n\tuint3 q = uint3(p);\n\treturn q.x < t.get_width(l) && q.y < t.get_height(l) && q.z < t.get_array_size() ? t.read(q.xy, q.z, l) : float4(0.0f);\n}\n")
+		}
+	}
+	return names[k]
 }
 
 // A sampler2DArray sample (b: Texture_Lod, Texture or Texture_Grad) as a
@@ -1953,21 +1988,9 @@ msl_builtin :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 		}
 		return wrap_pre(pre[:], fmt.aprintf("%s.sample(%s, %s, gradient2d(%s, %s))", tex, smp, a[1], a[2], a[3]))
 	case .Texel_Fetch:
-		rules := PROFILE_RULES[u.profile]
-		tex, smp := msl_sampler(m, args[0])
-		sz := a[3] if rules.header else fmt.aprintf("float2(int2(%s.get_width(uint(%s)), %s.get_height(uint(%s))))", tex, a[2], tex, a[2])
-		arr := expr_type(u, args[0]) == T_SAMPLER_ARRAY
-		// A sampler2DArray's: (x, y) as a sampler2D's, its layer p.z
-		// (a[1] is a temporary if anything has side effects).
-		p := fmt.aprintf("(%s).xy", a[1]) if arr else a[1]
-		uv := fmt.aprintf("((float2(%s) + float2(0.5f)) / %s)", p, sz)
-		if rules.flip_y {
-			uv = fmt.aprintf("((%s * float2(1.0f, -1.0f)) + float2(0.0f, 1.0f))", uv)
-		}
-		if arr {
-			return wrap_pre(pre[:], fmt.aprintf("%s(%s, %s, float3(%s, float((%s).z)), float(%s))", msl_array_helper(m, .Texture_Lod), tex, smp, uv, a[1], a[2]))
-		}
-		return wrap_pre(pre[:], fmt.aprintf("%s.sample(%s, %s, level(float(%s)))", tex, smp, uv, a[2]))
+		tex, _ := msl_sampler(m, args[0])
+		k := Msl_Fetch.Array if expr_type(u, args[0]) == T_SAMPLER_ARRAY else (.Flip if PROFILE_RULES[u.profile].flip_y else .Plain)
+		return wrap_pre(pre[:], fmt.aprintf("%s(%s, %s, uint(%s))", msl_fetch_helper(m, k), tex, a[1], a[2]))
 	case .Texture_Size:
 		tex, _ := msl_sampler(m, args[0])
 		if expr_type(u, args[0]) == T_SAMPLER_ARRAY {

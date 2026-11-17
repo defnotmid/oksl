@@ -159,7 +159,7 @@ test_preprocessor_conditionals :: proc(t: ^testing.T) {
 // Compiles `src` as Shadertoy code and runs it on a 4x2 layer; the sampler
 // reports the uv it was given (and the channel in alpha).
 @(private = "file")
-run_shadertoy :: proc(t: ^testing.T, src: string, b: Builtins = {resolution = {4, 2, 1}}, loc := #caller_location) -> (out: [][4]f32, m: ^Module) {
+run_shadertoy :: proc(t: ^testing.T, src: string, b: Builtins = {resolution = {4, 2, 1}}, sizes: [][3]i32 = nil, loc := #caller_location) -> (out: [][4]f32, m: ^Module) {
 	errs: []Error
 	ok: bool
 	m, errs, ok = compile_shadertoy(src)
@@ -177,7 +177,7 @@ run_shadertoy :: proc(t: ^testing.T, src: string, b: Builtins = {resolution = {4
 	for &px in out {
 		px = {-1, -1, -1, -1}
 	}
-	run_f32(&m.program, block, 4, 2, out, temp_scratch(), {sampler = sampler})
+	run_f32(&m.program, block, 4, 2, out, temp_scratch(), {sampler = sampler, channel_sizes = sizes})
 	return out, m
 }
 
@@ -226,7 +226,8 @@ void mainImage(out vec4 c, in vec2 p) {
     if (p.x > 3.0) c = vec4(d.xy, float(size.x * 100 + size.y), 1.0);
     if (p.x < 1.0 && p.y < 1.0) c = vec4(f.xy, 0.0, 1.0);
 }`
-	out, m := run_shadertoy(t, src, {resolution = {4, 2, 1}, channel_resolution = {{}, {8, 4, 1}, {}, {}}})
+	sizes := [][3]i32{{}, {8, 4, 1}}
+	out, m := run_shadertoy(t, src, {resolution = {4, 2, 1}, channel_resolution = {{}, {8, 4, 1}, {}, {}}}, sizes)
 	if m != nil {
 		testing.expect_value(t, m.num_samplers, 2)
 		testing.expect_value(t, m.channel_names[1], "iChannel1")
@@ -467,7 +468,7 @@ test_dialect_errors :: proc(t: ^testing.T) {
 		{"vec4 main(vec2 p) { return vec4(1); }\nvoid mainImage(out vec4 c, in vec2 p) { c = vec4(1); }", "1:6: main is reserved in Shadertoy code"},
 		{"uniform float iResolution;\nvoid mainImage(out vec4 c, in vec2 p) { c = vec4(1); }", "1:15: iResolution is a Shadertoy input of type vec3"},
 		{"void mainImage(out vec4 c, in vec2 p) { vec4 x = textureSize(iChannel0, 0); }", "can not initialize vec4 x with ivec2"},
-		{"vec4 f(sampler2D s) { return texelFetch(s, ivec2(0), 0); }\nvoid mainImage(out vec4 c, in vec2 p) { c = f(iChannel0); }", "1:41: texelFetch needs iChannel0..3 or a uniform sampler2D itself"},
+		{"ivec2 f(sampler2D s) { return textureSize(s, 0); }\nvoid mainImage(out vec4 c, in vec2 p) { c = vec4(f(iChannel0), 0, 1); }", "1:43: textureSize needs iChannel0..3 or a uniform sampler2D itself"},
 	}
 	for c in glsl {
 		got := shadertoy_errors(c[0])
@@ -6899,74 +6900,74 @@ void main() {
 			if have_spirv_val() {
 				expect_valid_spirv(t, "fs_buf_texel_fetch", fm.spirv)
 			}
-			// b.w[0].xy = (1, 2), ub.w[0].x = 0xffffffffu (4294967296.0), b.w[1].x = -1 (-1.0).
-			b_words := [8]u32{1, 2, 99, 99, transmute(u32)i32(-1), 99, 99, 99}
-			u_words := [4]u32{0xffffffff, 99, 99, 99}
+			// b.w[0].xy = (1, 1), ub.w[0].x = 1u, b.w[1].x = 0: texel (1, 1) of
+			// the 4x2 level 1 and of the 8x4 level 0.
+			b_words := [8]u32{1, 1, 99, 99, 0, 99, 99, 99}
+			u_words := [4]u32{1, 99, 99, 99}
 			sizes := [1][3]i32{{8, 4, 1}}
 			for interp in ([2]bool{false, true}) {
+				run_rec :: proc(fm: ^Module, interp: bool, w, h: int, out: [][4]f32, opts: Run_Options) {
+					if interp {
+						run_f32_interp(&fm.program, nil, w, h, out, temp_scratch(), opts)
+					} else {
+						run_f32(&fm.program, nil, w, h, out, temp_scratch(), opts)
+					}
+				}
 				rec: Rec
 				out := make([][4]f32, 4 * 4, context.temp_allocator)
-				opts := Run_Options{sampler = rec_cb, user = &rec, channel_sizes = sizes[:], buffers = {b_words[:], u_words[:]}}
-				if interp {
-					run_f32_interp(&fm.program, nil, 4, 4, out, temp_scratch(), opts)
-				} else {
-					run_f32(&fm.program, nil, 4, 4, out, temp_scratch(), opts)
-				}
+				run_rec(fm, interp, 4, 4, out, {sampler = rec_cb, user = &rec, channel_sizes = sizes[:], buffers = {b_words[:], u_words[:]}})
 				// 4x4 target with x < 2 && y < 2: only top-left quad active (4 lanes * 2 fetches = 8 calls),
 				// top-right quad idle within the same 8-lane batch (0 calls), bottom quads idle, and `?:` skipped.
 				testing.expect_value(t, rec.calls, 8)
-				testing.expect_value(t, rec.lods[0], f32(u32(0xffffffff)))
-				testing.expect_value(t, rec.lods[1], f32(-1))
-				testing.expect_value(t, rec.uv, [2]f32{1.5, 2.5})
+				testing.expect_value(t, rec.lods, [2]f32{1, 0})
+				testing.expect_value(t, rec.uv, [2]f32{1.5 / 8, 1.5 / 4})
+				testing.expect_value(t, out[0], [4]f32{1.5 / 4 + 1.5 / 8 + 7, 1.5 / 2 + 1.5 / 4 + 7, 7, 9})
 				testing.expect_value(t, out[2], [4]f32{7, 7, 7, 7})
 
 				// Nil sampler writes 0 on fetched lanes.
 				out_nil := make([][4]f32, 4, context.temp_allocator)
-				opts_nil := Run_Options{buffers = {b_words[:], u_words[:]}}
-				if interp {
-					run_f32_interp(&fm.program, nil, 2, 1, out_nil, temp_scratch(), opts_nil)
-				} else {
-					run_f32(&fm.program, nil, 2, 1, out_nil, temp_scratch(), opts_nil)
-				}
+				run_rec(fm, interp, 2, 1, out_nil, {buffers = {b_words[:], u_words[:]}})
 				testing.expect_value(t, out_nil[0], [4]f32{7, 7, 7, 7})
 
-				// Mip size shift (lod = 1 on 8x4 -> 4x2 -> uv = (1.5/4, 2.5/2) = (0.375, 1.25)),
-				// mip floor of 1 on each axis past the last level (lod = 3 on 8x4 and 4x8 -> 1x1 -> uv = (1.5, 2.5)),
-				// and nil channel_sizes (+Inf).
-				mip_b := [8]u32{1, 2, 0, 0, 1, 0, 0, 0}
-				mip_u := [4]u32{1, 0, 0, 0}
-				rec_mip: Rec
-				out_mip := make([][4]f32, 1, context.temp_allocator)
-				opts_mip := Run_Options{sampler = rec_cb, user = &rec_mip, channel_sizes = sizes[:], buffers = {mip_b[:], mip_u[:]}}
-				if interp {
-					run_f32_interp(&fm.program, nil, 1, 1, out_mip, temp_scratch(), opts_mip)
-				} else {
-					run_f32(&fm.program, nil, 1, 1, out_mip, temp_scratch(), opts_mip)
+				// Out of range, no call and 0: a uint lod of 2^32 - 1 and an
+				// int one of -1 (the same bits), 4 and 2^31 past the 8x4
+				// chain's 4 levels; texel (1, 2) at the 4x2 level 1, (1, 0)
+				// at the 1x1 level 3 (the chain's last), texel (8, 0) and
+				// (-1, 0) at level 0; any texel without channel_sizes.
+				Range_Case :: struct {
+					x, y, lod: u32,
+					sizes:     [][3]i32,
 				}
-				testing.expect_value(t, rec_mip.uv, [2]f32{0.375, 1.25})
+				none := [1][3]i32{}
+				cases := [?]Range_Case {
+					{1, 1, 0xffffffff, sizes[:]}, {1, 1, 4, sizes[:]}, {1, 1, 1 << 31, sizes[:]}, {1, 2, 1, sizes[:]},
+					{1, 0, 3, sizes[:]}, {8, 0, 0, sizes[:]}, {0xffffffff, 0, 0, sizes[:]}, {0, 0, 0, nil}, {0, 0, 0, none[:]},
+				}
+				for c in cases {
+					rb := [8]u32{c.x, c.y, 0, 0, c.lod, 0, 0, 0}
+					ru := [4]u32{c.lod, 0, 0, 0}
+					rec_out: Rec
+					out_r := make([][4]f32, 1, context.temp_allocator)
+					run_rec(fm, interp, 1, 1, out_r, {sampler = rec_cb, user = &rec_out, channel_sizes = c.sizes, buffers = {rb[:], ru[:]}})
+					testing.expectf(t, rec_out.calls == 0 && out_r[0] == {7, 7, 7, 7}, "interp=%v %v: %d calls, %v", interp, c, rec_out.calls, out_r[0])
+				}
 
-				floor_b := [8]u32{1, 2, 0, 0, 3, 0, 0, 0}
-				floor_u := [4]u32{3, 0, 0, 0}
-				for fsz in ([2][1][3]i32{{{8, 4, 1}}, {{4, 8, 1}}}) {
-					sz_slice := fsz
-					rec_fl: Rec
-					opts_fl := Run_Options{sampler = rec_cb, user = &rec_fl, channel_sizes = sz_slice[:], buffers = {floor_b[:], floor_u[:]}}
-					if interp {
-						run_f32_interp(&fm.program, nil, 1, 1, out_mip, temp_scratch(), opts_fl)
-					} else {
-						run_f32(&fm.program, nil, 1, 1, out_mip, temp_scratch(), opts_fl)
+				// In range at each level of the 8x4 chain (8x4, 4x2, 2x1, 1x1)
+				// and of 4x8's, the centre of its last texel (the quad's
+				// four lanes, twice).
+				for fsz in ([2][3]i32{{8, 4, 1}, {4, 8, 1}}) {
+					for l in u32(0) ..< 4 {
+						lw, lh := max(u32(fsz.x) >> l, 1), max(u32(fsz.y) >> l, 1)
+						rb := [8]u32{lw - 1, lh - 1, 0, 0, l, 0, 0, 0}
+						ru := [4]u32{l, 0, 0, 0}
+						sz := [1][3]i32{fsz}
+						rec_in: Rec
+						out_i := make([][4]f32, 1, context.temp_allocator)
+						run_rec(fm, interp, 1, 1, out_i, {sampler = rec_cb, user = &rec_in, channel_sizes = sz[:], buffers = {rb[:], ru[:]}})
+						want := [2]f32{(f32(lw) - 0.5) / f32(lw), (f32(lh) - 0.5) / f32(lh)}
+						testing.expectf(t, rec_in.calls == 8 && rec_in.uv == want && rec_in.lods == {f32(l), f32(l)}, "interp=%v %v level %d: %v", interp, fsz, l, rec_in)
 					}
-					testing.expect_value(t, rec_fl.uv, [2]f32{1.5, 2.5})
 				}
-
-				rec_nosz: Rec
-				opts_nosz := Run_Options{sampler = rec_cb, user = &rec_nosz, buffers = {mip_b[:], mip_u[:]}}
-				if interp {
-					run_f32_interp(&fm.program, nil, 1, 1, out_mip, temp_scratch(), opts_nosz)
-				} else {
-					run_f32(&fm.program, nil, 1, 1, out_mip, temp_scratch(), opts_nosz)
-				}
-				testing.expect(t, math.is_inf(rec_nosz.uv.x, 1) && math.is_inf(rec_nosz.uv.y, 1))
 			}
 		}
 
@@ -6986,21 +6987,34 @@ void main() {
 		cm, cerrs, cok := compile(CS_BUF, {profile = .Glsl, stage = .Compute})
 		defer destroy(cm)
 		if testing.expectf(t, cok, "cs_buf failed:\n%s", format_errors(cerrs, context.temp_allocator)) {
+			// Texel (1, 2) at the uint lod 0, and at the int lod -1, out of range.
 			b_words := [8]u32{1, 2, 0, 0, transmute(u32)i32(-1), 0, 0, 0}
-			u_words := [4]u32{0xffffffff, 0, 0, 0}
+			u_words := [4]u32{0, 0, 0, 0}
 			out_w := make([]u32, 8 * 4, context.temp_allocator)
 			sizes := [1][3]i32{{8, 4, 1}}
-			rec: Rec
-			run_compute(&cm.program, nil, {1, 1, 1}, temp_scratch(), {
-				sampler       = rec_cb,
-				user          = &rec,
-				channel_sizes = sizes[:],
-				buffers       = {b_words[:], u_words[:], out_w},
-			})
-			testing.expect_value(t, rec.calls, 6)
-			testing.expect_value(t, rec.lods[0], f32(u32(0xffffffff)))
-			testing.expect_value(t, rec.lods[1], f32(-1))
-			testing.expect_value(t, rec.uv, [2]f32{1.5, 2.5})
+			for interp in ([2]bool{false, true}) {
+				rec: Rec
+				opts := Run_Options {
+					sampler       = rec_cb,
+					user          = &rec,
+					channel_sizes = sizes[:],
+					buffers       = {b_words[:], u_words[:], out_w},
+				}
+				if interp {
+					cjit_interp(&cm.program, nil, {1, 1, 1}, opts)
+				} else {
+					run_compute(&cm.program, nil, {1, 1, 1}, temp_scratch(), opts)
+				}
+				testing.expect_value(t, rec.calls, 3)
+				testing.expect_value(t, rec.lods[0], 0)
+				testing.expect_value(t, rec.uv, [2]f32{1.5 / 8, 2.5 / 4})
+				for i in 0 ..< 8 {
+					v := slice.reinterpret([]f32, out_w[i * 4:][:4])
+					want := [4]f32{1.5 / 8, 2.5 / 4, 0, 1} if i < 3 else {}
+					testing.expectf(t, v[0] == want[0] && v[1] == want[1] && v[2] == want[2] && v[3] == want[3], "interp=%v lane %d: %v", interp, i, v)
+				}
+				slice.zero(out_w)
+			}
 		}
 
 		// Channel 15 (SAMPLER_COUNT - 1) boundary check.
@@ -7028,7 +7042,7 @@ void main() {
 		}
 	}
 
-	// 3. Shadertoy header texelFetch: dynamic lod, side-effecting p and lod, header size & flip_y.
+	// 3. Shadertoy texelFetch: dynamic lod, side-effecting p and lod, flip_y from the level's height (channel_sizes', not iChannelResolution).
 	{
 		ST :: `void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     int idx_p = 1;
@@ -7042,28 +7056,33 @@ void main() {
 			if have_spirv_val() {
 				expect_valid_spirv(t, "st_texel_fetch", sm.spirv)
 			}
+			call := sm.msl[strings.index(sm.msl, "oksl_fetch_flip(ok_"):]
 			testing.expect(
 				t,
-				strings.contains(sm.msl, "u.iChannelResolution") &&
-				!strings.contains(sm.msl, ".get_width(") &&
-				strings.contains(sm.msl, "float2(1.0f, -1.0f)") &&
+				!strings.contains(call[:strings.index_byte(call, '\n')], "iChannelResolution") &&
+				!strings.contains(sm.msl, "float2(1.0f, -1.0f)") &&
 				strings.count(sm.msl, "idx_p++") == 1 &&
 				strings.count(sm.msl, "idx_l++") == 1,
 			)
+			// iChannelResolution has no part in texelFetch (the channel's
+			// size is channel_sizes').
 			blk := make([]u8, sm.block_size, context.temp_allocator)
-			write_builtins(blk, {resolution = {2, 1, 1}, channel_resolution = {0 = {5, 4, 1}}})
+			write_builtins(blk, {resolution = {2, 1, 1}, channel_resolution = {0 = {7, 9, 1}}})
 
-			// Unbound callback receives uv = ((1 + 0.5)/5, ((1 + 0.5)/4)*-1 + 1) = (0.3, 0.625) and lod = 0, 1.
+			// The unbound callback receives texel (1, 1)'s centre, flipped, at
+			// its level: lod 0 of 5x4, ((1 + 0.5) / 5, 1 - (1 + 0.5) / 4) =
+			// (0.3, 0.625), and lod 1 of 2x2, (0.75, 0.25).
 			st_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 				return {uv.x, uv.y + lod * 10.0, 0, 1}
 			}
+			st_sizes := [1][3]i32{{5, 4, 1}}
 			oj := make([][4]f32, 2, context.temp_allocator)
 			ov := make([][4]f32, 2, context.temp_allocator)
-			run_f32(&sm.program, blk, 2, 1, oj, temp_scratch(), {sampler = st_cb})
-			run_f32_interp(&sm.program, blk, 2, 1, ov, temp_scratch(), {sampler = st_cb})
+			run_f32(&sm.program, blk, 2, 1, oj, temp_scratch(), {sampler = st_cb, channel_sizes = st_sizes[:]})
+			run_f32_interp(&sm.program, blk, 2, 1, ov, temp_scratch(), {sampler = st_cb, channel_sizes = st_sizes[:]})
 			testing.expect(t, slice.equal(slice.reinterpret([]u32, oj), slice.reinterpret([]u32, ov)))
 			near(t, oj[0], {0.3, 0.625, 0.5, 0.25})
-			near(t, oj[1], {0.3, 10.625, 0.5, 0.5})
+			near(t, oj[1], {0.75, 10.25, 0.5, 0.5})
 
 			// Bound 5x4 image: Shadertoy flip_y maps p=(1, 1) to row (4 - 1 - 1) = 2, col 1 -> index 11.
 			st_img: [20]f32
@@ -7140,59 +7159,6 @@ test_scratch_reuse_clears_channel_images :: proc(t: ^testing.T) {
 			}
 		}
 	}
-}
-
-@(test)
-test_texel_fetch_header_size_reads :: proc(t: ^testing.T) {
-	// 1. trim_buffer_loads keeps 2 components of c when d & 2 != 0, and drops c when d & 2 == 0.
-	for hdr in ([2]bool{true, false}) {
-		blocks := [5]Slots{{0, 1}, {1, 2}, {3, 1}, {4, 4}, {8, 4}}
-		code := [2]Instr {
-			{op = .Load_Buf, n = 4, dst = 4, a = 0, b = 4},
-			{op = .Texel_Fetch, n = 2, dst = 8, a = 1, b = 3, c = 4, d = 2 if hdr else 0},
-		}
-		p := Program{code = code[:], num_slots = 12}
-		trim_buffer_loads(&p, blocks[:])
-		if hdr {
-			testing.expect(t, len(p.code) == 2 && p.code[0].op == .Load_Buf && p.code[0].n == 2)
-		} else {
-			testing.expect(t, len(p.code) == 1 && p.code[0].op == .Texel_Fetch)
-		}
-	}
-
-	// 2. instr_read_write marks {c, 2} across basic blocks so a computed size in BB 1 flushes to memory before Texel_Fetch in BB 2.
-	consts := [4][2]u32 {
-		{0, transmute(u32)f32(4.0)},
-		{1, transmute(u32)f32(2.0)},
-		{2, 1},
-		{3, 1},
-	}
-	outputs := [1]Program_Var{{kind = .Stage_Out, location = 0, slot = 6, n = 4, base = .Float}}
-	code := [3]Instr {
-		{op = .Mov, n = 2, dst = 4, a = 0},
-		{op = .Texel_Fetch, n = 2, k = 0, d = 2, dst = 10, a = 2, b = 2, c = 4},
-		{op = .Store, n = 4, dst = 6, a = 10},
-	}
-	p := Program {
-		code      = code[:],
-		consts    = consts[:],
-		outputs   = outputs[:],
-		num_slots = 14,
-		num_masks = 2,
-		stage     = .Fragment,
-	}
-	jit_compile(&p)
-	defer jit_destroy(&p)
-
-	uv_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
-		return {uv.x, uv.y, 0, 1}
-	}
-	oj: [1][4]f32
-	ov: [1][4]f32
-	run_f32(&p, nil, 1, 1, oj[:], temp_scratch(), {sampler = uv_cb})
-	run_f32_interp(&p, nil, 1, 1, ov[:], temp_scratch(), {sampler = uv_cb})
-	testing.expect_value(t, oj[0], [4]f32{0.375, 0.75, 0, 1})
-	testing.expect_value(t, ov[0], [4]f32{0.375, 0.75, 0, 1})
 }
 
 when !ODIN_DISABLE_ASSERT {
@@ -9106,6 +9072,16 @@ void main() {
 				if qy + 1 >= sy {nq_y += 1}
 			}
 			want_calls := 4 * nq_x * nq_y
+			// texelFetch calls only for the quads' lanes inside the
+			// channel (an odd side's last quad has lanes past it).
+			want_fetches := 0
+			for qy := sy &~ 1; qy < ey; qy += 2 {
+				for qx := sx &~ 1; qx < ex; qx += 2 {
+					if qx + 1 >= sx && qy + 1 >= sy {
+						want_fetches += (min(qx + 2, LW) - qx) * (min(qy + 2, LH) - qy)
+					}
+				}
+			}
 
 			full_j := make([][4]f32, LW * LH, context.temp_allocator)
 			full_i := make([][4]f32, LW * LH, context.temp_allocator)
@@ -9138,10 +9114,10 @@ void main() {
 				run_targets(&p_int, nil, LW, LH, ti[:], scratch, opts_i)
 
 				testing.expect_value(t, st_j.calls[0], want_calls)
-				testing.expect_value(t, st_j.calls[1], want_calls)
+				testing.expect_value(t, st_j.calls[1], want_fetches)
 				testing.expect_value(t, st_j.bad_uv, 0)
 				testing.expect_value(t, st_i.calls[0], want_calls)
-				testing.expect_value(t, st_i.calls[1], want_calls)
+				testing.expect_value(t, st_i.calls[1], want_fetches)
 				testing.expect_value(t, st_i.bad_uv, 0)
 				testing.expect(t, slice.equal(slice.reinterpret([]u32, bj), slice.reinterpret([]u32, bi)))
 
@@ -12231,8 +12207,9 @@ dxbc_compile :: proc(t: ^testing.T, src: string, options: Options, loc := #calle
 // that continues still ends with a break; integer division guards a zero
 // divisor; an early return from a loop in a function breaks through a
 // flag, from a switch in a switch through an if; run-time indexes are
-// clamped; textureSize is resinfo_uint; texelFetch converts a uint lod as
-// unsigned.
+// clamped; textureSize is resinfo_uint; texelFetch is ld, its w masked by
+// the texel inside the level and the levels resinfo_uint gives,
+// Shadertoy's counting p.y from that level's bottom row.
 @(test)
 test_dxbc_lowering :: proc(t: ^testing.T) {
 	Case :: struct {
@@ -12254,7 +12231,8 @@ test_dxbc_lowering :: proc(t: ^testing.T) {
 		{"int pick(int a, int b) { switch (a) { case 0: switch (b) { case 1: return 7; } return 3; } return 5; }\nvoid mainImage(out vec4 c, in vec2 f) { c = vec4(float(pick(int(f.x), int(f.y)))); }", {{.End_Switch, .If, .Break, .End_If}}, .Shadertoy, .Fragment},
 		{"void mainImage(out vec4 c, in vec2 f) { float a[4] = float[4](1.0, 2.0, 3.0, 4.0); c = vec4(a[int(f.x)]); }", {{.Imax, .Imin, .Mov}}, .Shadertoy, .Fragment},
 		{"uniform sampler2D s;\nout vec4 c;\nvoid main() { c = vec4(vec2(textureSize(s, 1)), 0.0, 1.0); }", {{.Resinfo}}, .Glsl, .Fragment},
-		{"void mainImage(out vec4 c, in vec2 f) { c = texelFetch(iChannel0, ivec2(f), uint(f.x)); }", {{.Utof, .Sample_L}}, .Shadertoy, .Fragment},
+		{"void mainImage(out vec4 c, in vec2 f) { c = texelFetch(iChannel0, ivec2(f), uint(f.x)); }", {{.Mov, .Resinfo, .Not, .Iadd, .Mov, .Ld, .Ult, .And, .And, .And}}, .Shadertoy, .Fragment},
+		{"uniform sampler2D s;\nout vec4 c;\nvoid main() { c = texelFetch(s, ivec2(gl_FragCoord.xy), int(gl_FragCoord.x)); }", {{.Mov, .Resinfo, .Mov, .Ld, .Ult, .And, .And, .And}}, .Glsl, .Fragment},
 		// Compute: a shared index clamped, then a byte address; a buffer
 		// store's word clamped to 0x3ffffffc, then a byte address; a buffer
 		// atomic's old value masked by the buffer's size; read-only images
@@ -12485,7 +12463,8 @@ dxbc_files: int
 @(private = "file")
 expect_valid_dxbc :: proc(t: ^testing.T, name: string, blob: []u8, loc := #caller_location) {
 	dir := os.temp_directory(context.temp_allocator) or_else "/tmp"
-	base := fmt.tprintf("%s/oksl_test_%d_%d", dir, os.get_pid(), sync.atomic_add(&dxbc_files, 1))
+	// Not expect_valid_spirv's names, which count apart.
+	base := fmt.tprintf("%s/oksl_test_dxbc_%d_%d", dir, os.get_pid(), sync.atomic_add(&dxbc_files, 1))
 	in_path, spv := fmt.tprintf("%s.dxbc", base), fmt.tprintf("%s.spv", base)
 	_ = os.write_entire_file(in_path, blob)
 	defer os.remove(in_path)
@@ -13851,7 +13830,9 @@ void main() {
 	cjit_interp(&m.program, block, {5, 1, 1}, rb.opts)
 	cjit_expect_same(t, "divergent", ra, rb)
 	testing.expect_value(t, ca.calls, cb_.calls)
-	testing.expect_value(t, ca.calls, 2 * 26)
+	// 26 lanes reach textureLod; their texelFetch calls only inside the
+	// 16-texel row (g 1, 4, 7 and 10; 13 returns first).
+	testing.expect_value(t, ca.calls, 26 + 4)
 	testing.expect_value(t, ca.sum, cb_.sum)
 }
 
@@ -15225,39 +15206,12 @@ void main() {
 	testing.expect(t, slice.equal(slice.reinterpret([]u32, tj[1][:]), slice.reinterpret([]u32, ti[1][:])))
 }
 
-// What the sampler callback receives where its arguments are NaN: a
-// Shadertoy texelFetch whose iChannelResolution is NaN passes 0x7fc00000 as
-// uv in both engines; a quad whose x derivative is NaN picks its level from
-// the y derivative (max as maxnum).
+// What the sampler callback receives where its arguments are NaN: a quad
+// whose x derivative is NaN picks its level from the y derivative (max as
+// maxnum).
 @(test)
 test_sampler_nan_args :: proc(t: ^testing.T) {
-	m, errs, ok := compile_shadertoy("void mainImage(out vec4 c, in vec2 p) { c = texelFetch(iChannel0, ivec2(p), 0); }")
-	defer destroy(m)
-	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
-		return
-	}
-	block := make([]u8, m.block_size, context.temp_allocator)
 	nan := transmute(f32)u32(0xffc0_1234)
-	write_builtins(block, {resolution = {4, 2, 1}, channel_resolution = {{nan, nan, 1}, {}, {}, {}}})
-	// uv's 64 bits as three subnormals (colour is clamped, alpha is 1).
-	bits :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
-		u, v := transmute(u32)uv.x, transmute(u32)uv.y
-		return {fval(u & 0x7f_ffff), fval(u >> 23 | (v & 0x3fff) << 9), fval(v >> 14), 0}
-	}
-	for engine in 0 ..< 2 {
-		sb, si := m.program.jit_body, m.program.jit_init
-		if engine == 1 {
-			m.program.jit_body, m.program.jit_init = nil, nil
-		}
-		out: [8][4]f32
-		run_f32(&m.program, block, 4, 2, out[:], temp_scratch(), {sampler = bits})
-		for px in out {
-			w := transmute([4]u32)px
-			u, v := w[0] | w[1] << 23, w[1] >> 9 | w[2] << 14
-			testing.expectf(t, u == 0x7fc0_0000 && v == 0x7fc0_0000, "engine %d: uv %08x %08x", engine, u, v)
-		}
-		m.program.jit_body, m.program.jit_init = sb, si
-	}
 	// Lanes 0, 1, 2 of each quad: u NaN to the right, 1/16 down.
 	u := [8]u32{0, transmute(u32)nan, 0, 0, 0, transmute(u32)nan, 0, 0}
 	v := [8]u32{0, 0, transmute(u32)f32(0.0625), 0, 0, 0, transmute(u32)f32(0.0625), 0}
@@ -16303,8 +16257,9 @@ test_channel_image_ensure_layers_range :: proc(t: ^testing.T) {
 // texelFetch of a sampler2DArray (ivec3, its layer in z) in every backend:
 // SPIR-V through spirv-val, DXBC through dxbc_program and vkd3d, MSL
 // through its array helper, in fragment and compute shaders; on the CPU
-// the sampler callback gets the layer p.z as it is (JIT and interpreter),
-// and an ivec2 is no overload.
+// the sampler callback gets the layer p.z as it is inside channel_sizes'
+// layers, and the fetch reads 0 outside them (JIT and interpreter); an
+// ivec2 is no overload.
 @(test)
 test_texel_fetch_layers :: proc(t: ^testing.T) {
 	FRAG :: `#version 310 es
@@ -16340,7 +16295,7 @@ void main() {
 		if have_vkd3d() {
 			expect_valid_dxbc(t, "texelFetch layers", m.dxbc)
 		}
-		testing.expectf(t, strings.contains(m.msl, "oksl_sample_level(") && strings.contains(m.msl, ".z)), float("), "%v MSL:\n%s", stage, m.msl)
+		testing.expectf(t, strings.contains(m.msl, "oksl_fetch_array(ok_s_tex, ") && !strings.contains(m.msl, "oksl_sample_level("), "%v MSL:\n%s", stage, m.msl)
 	}
 	mb, _, bad := compile("#version 310 es\nprecision highp float;\nuniform sampler2DArray s;\nout vec4 o;\nvoid main() { o = texelFetch(s, ivec2(0), 0); }", {profile = .Glsl, stage = .Fragment})
 	destroy(mb)
@@ -16367,9 +16322,611 @@ void main() {
 		}
 		for y in 0 ..< 4 {
 			for x in 0 ..< 8 {
-				z := f32(x * 3 - 7 + 2) if y != 3 else 2147483647
-				testing.expectf(t, out[y * 8 + x] == {z + 8, f32(y % 2) + 4, 3, 0}, "jit=%v (%d, %d): %v, want layer %v", jit, x, y, out[y * 8 + x], z)
+				z := x * 3 - 7 + 2 if y != 3 else 2147483647
+				want := [4]f32{f32(z) + 8, f32(y % 2) + 4, 3, 0} if z >= 0 && z < 3 else {8, 4, 3, 0}
+				testing.expectf(t, out[y * 8 + x] == want, "jit=%v (%d, %d): %v, want %v", jit, x, y, out[y * 8 + x], want)
 			}
+		}
+	}
+}
+
+// texelFetch of a channel without an image, in both engines, against the
+// rule stated apart: the sampler callback gets texel p's centre in its
+// level (flipped in the Shadertoy profile), the lod and the layer only
+// inside a full mip chain of channel_sizes' size, or its first
+// channel_levels levels, and its layers; every other fetch reads (0, 0,
+// 0, 0) without a call. Coordinates, int and uint lods and layers at and
+// around every edge, a 64 x 64 channel's levels 0 to 7 with the full
+// chain and 1, 3 and 16 levels, in fragment and compute shaders, and in
+// Shadertoy through a sampler parameter.
+@(test)
+test_texel_fetch_unbound_range :: proc(t: ^testing.T) {
+	cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		(^int)(user)^ += 1
+		return {uv.x, uv.y, lod, f32(layer) + f32(channel) * 100}
+	}
+	// Level l of w x h is max(w >> l, 1) x max(h >> l, 1) while max(w, h) >> l
+	// is not 0 and l < levels (when not 0); x, y and z signed, l unsigned.
+	ref :: proc(size: [3]i32, levels: i32, x, y, z: i32, l: u32, ch: int, arr, flip: bool) -> (want: [4]f32, ok: bool) {
+		w, h := i64(size.x), i64(size.y)
+		if w <= 0 || h <= 0 || l >= 63 || max(w, h) >> l == 0 || levels > 0 && l >= u32(levels) {
+			return
+		}
+		lw, lh := max(w >> l, 1), max(h >> l, 1)
+		if x < 0 || y < 0 || i64(x) >= lw || i64(y) >= lh || arr && (z < 0 || z >= size.z) {
+			return
+		}
+		v := (f32(y) + 0.5) / f32(lh)
+		return {(f32(x) + 0.5) / f32(lw), 1 - v if flip else v, f32(l), (f32(z) if arr else 0) + f32(ch) * 100}, true
+	}
+	FRAG :: `#version 310 es
+precision highp float;
+precision highp int;
+layout(std430) readonly buffer Q { ivec4 q[]; };
+uniform sampler2D s;
+uniform sampler2DArray a;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+void main() {
+    ivec4 c = q[int(gl_FragCoord.y) * 64 + int(gl_FragCoord.x)];
+    o0 = texelFetch(s, c.xy, c.z);
+    o1 = texelFetch(s, c.xy, uint(c.z));
+    o2 = texelFetch(a, c.xyw, c.z);
+}`
+	COMP :: `#version 310 es
+layout(local_size_x = 64) in;
+layout(std430) readonly buffer Q { ivec4 q[]; };
+layout(std430) writeonly buffer O { vec4 o[]; };
+uniform sampler2D s;
+uniform sampler2DArray a;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    ivec4 c = q[i];
+    o[i * 3u] = texelFetch(s, c.xy, c.z);
+    o[i * 3u + 1u] = texelFetch(s, c.xy, uint(c.z));
+    o[i * 3u + 2u] = texelFetch(a, c.xyw, c.z);
+}`
+	fm, ferrs, fok := compile(FRAG, {profile = .Glsl, stage = .Fragment})
+	defer destroy(fm)
+	cm, cerrs, cok := compile(COMP, {profile = .Glsl, stage = .Compute})
+	defer destroy(cm)
+	if !testing.expectf(t, fok && cok, "%s%s", format_errors(ferrs, context.temp_allocator), format_errors(cerrs, context.temp_allocator)) {
+		return
+	}
+	Case :: struct {
+		size:   [3]i32,
+		levels: i32,
+	}
+	cases := [?]Case{{{13, 6, 3}, 0}, {{6, 13, 1}, 0}, {{1, 1, 2}, 0}, {{0, 5, 1}, 0}, {{5, 0, 1}, 0}, {{4, 4, 0}, 0}, {{-3, 4, 1}, 0}, {{64, 64, 3}, 0}, {{64, 64, 3}, 1}, {{64, 64, 3}, 3}, {{64, 64, 3}, 16}, {{13, 6, 3}, 2}}
+	for cs in cases {
+		size := cs.size
+		qs := make([dynamic][4]i32, context.temp_allocator)
+		LODS :: [?]i32{-1, 0, 1, 2, 3, 4, 5, 6, 7, 31, 32, min(i32)}
+		for l in LODS {
+			lw, lh := max(size.x >> u32(l), 1), max(size.y >> u32(l), 1)
+			xs := [7]i32{min(i32), -1, 0, 1, lw - 1, lw, max(i32)}
+			ys := [7]i32{min(i32), -1, 0, 1, lh - 1, lh, max(i32)}
+			for y in ys {
+				for x in xs {
+					for z in ([4]i32{-1, 0, size.z - 1, size.z}) {
+						append(&qs, [4]i32{x, y, l, z})
+					}
+				}
+			}
+		}
+		// An even number of rows of 64, as quads take them.
+		for len(qs) % 128 != 0 {
+			append(&qs, [4]i32{})
+		}
+		n := len(qs)
+		sizes := [2][3]i32{size, size}
+		levels := [2]i32{cs.levels, cs.levels}
+		qwords := slice.reinterpret([]u32, qs[:])
+		wants := make([][3][4]f32, n, context.temp_allocator)
+		calls := 0
+		for q, i in qs {
+			for k in 0 ..< 3 {
+				ok: bool
+				wants[i][k], ok = ref(size, cs.levels, q.x, q.y, q.w, u32(q.z), 1 if k == 2 else 0, k == 2, false)
+				calls += int(ok)
+			}
+		}
+		for interp in ([2]bool{false, true}) {
+			got := 0
+			tg := [3][][4]f32{make([][4]f32, n, context.temp_allocator), make([][4]f32, n, context.temp_allocator), make([][4]f32, n, context.temp_allocator)}
+			opts := Run_Options{sampler = cb, user = &got, channel_sizes = sizes[:], channel_levels = levels[:], buffers = {qwords}}
+			if interp {
+				run_targets_interp(&fm.program, nil, 64, n / 64, tg[:], temp_scratch(), opts)
+			} else {
+				run_targets(&fm.program, nil, 64, n / 64, tg[:], temp_scratch(), opts)
+			}
+			testing.expectf(t, got == calls, "fragment %v interp=%v: %d calls, want %d", cs, interp, got, calls)
+			bad := 0
+			for i in 0 ..< n {
+				for k in 0 ..< 3 {
+					if transmute([4]u32)tg[k][i] != transmute([4]u32)wants[i][k] {
+						if bad < 4 {
+							testing.expectf(t, false, "fragment %v interp=%v query %v output %d: %v, want %v", cs, interp, qs[i], k, tg[k][i], wants[i][k])
+						}
+						bad += 1
+					}
+				}
+			}
+			testing.expectf(t, bad == 0, "fragment %v interp=%v: %d mismatches", cs, interp, bad)
+
+			got = 0
+			ow := make([]u32, n * 12, context.temp_allocator)
+			copts := Run_Options{sampler = cb, user = &got, channel_sizes = sizes[:], channel_levels = levels[:], buffers = {qwords, ow}}
+			if interp {
+				cjit_interp(&cm.program, nil, {n / 64, 1, 1}, copts)
+			} else {
+				run_compute(&cm.program, nil, {n / 64, 1, 1}, temp_scratch(), copts)
+			}
+			testing.expectf(t, got == calls, "compute %v interp=%v: %d calls, want %d", cs, interp, got, calls)
+			cw := slice.reinterpret([][3][4]u32, ow)
+			bad = 0
+			for i in 0 ..< n {
+				if cw[i] != transmute([3][4]u32)wants[i] {
+					if bad < 4 {
+						testing.expectf(t, false, "compute %v interp=%v query %v: %v, want %v", cs, interp, qs[i], transmute([3][4]f32)cw[i], wants[i])
+					}
+					bad += 1
+				}
+			}
+			testing.expectf(t, bad == 0, "compute %v interp=%v: %d mismatches", cs, interp, bad)
+		}
+	}
+
+	// Shadertoy: p.y from the level's bottom row, through a sampler
+	// parameter; iChannelResolution plays no part.
+	ST :: `vec4 fetch(sampler2D s, ivec2 p, int l) { return texelFetch(s, p, l); }
+void mainImage(out vec4 c, in vec2 f) {
+    ivec2 p = ivec2(f) - 2;
+    int l = int(f.x) % 3 + int(f.y) % 2 * 3 - 1;
+    vec4 t = fetch(iChannel1, p, l);
+    c = vec4(t.xy, t.z * 0.125, 1.0);
+}`
+	sm, serrs, sok := compile(ST, {profile = .Shadertoy})
+	defer destroy(sm)
+	if !testing.expectf(t, sok, "%s", format_errors(serrs, context.temp_allocator)) {
+		return
+	}
+	W, H :: 18, 10
+	block := make([]u8, sm.block_size, context.temp_allocator)
+	write_builtins(block, {resolution = {W, H, 1}, channel_resolution = {1 = {3, 2, 1}}})
+	ssizes := [2][3]i32{{}, {13, 6, 1}}
+	want := make([][4]f32, W * H, context.temp_allocator)
+	calls := 0
+	for y in 0 ..< H {
+		for x in 0 ..< W {
+			fy := H - 1 - y
+			r, ok := ref(ssizes[1], 0, i32(x - 2), i32(fy - 2), 0, u32(i32(x % 3 + fy % 2 * 3 - 1)), 1, false, true)
+			want[y * W + x] = {r.x, r.y, r.z * 0.125, 1}
+			calls += int(ok)
+		}
+	}
+	for interp in ([2]bool{false, true}) {
+		got := 0
+		out := make([][4]f32, W * H, context.temp_allocator)
+		opts := Run_Options{sampler = cb, user = &got, channel_sizes = ssizes[:]}
+		if interp {
+			run_f32_interp(&sm.program, block, W, H, out, temp_scratch(), opts)
+		} else {
+			run_f32(&sm.program, block, W, H, out, temp_scratch(), opts)
+		}
+		testing.expectf(t, got == calls, "Shadertoy interp=%v: %d calls, want %d", interp, got, calls)
+		testing.expectf(t, slice.equal(slice.reinterpret([]u32, out), slice.reinterpret([]u32, want)), "Shadertoy interp=%v: %v, want %v", interp, out, want)
+	}
+}
+
+// texelFetch of a channel without an image under a branch that runs
+// some lanes of a quad, in both engines: in a fragment shader each lane
+// of a quad with a running lane fetches (calls the sampler, when in
+// range), as a GPU's helper invocations do, so dFdx of the result in a
+// running lane reads its neighbour's texel; a quad with no running lane
+// fetches nothing. Every pattern of running lanes, on an odd-sized layer
+// (whose last quads run lanes past it, as helpers), at levels 0 and 1,
+// partly out of range. In a compute shader only the running invocations
+// fetch.
+@(test)
+test_texel_fetch_helper_lanes :: proc(t: ^testing.T) {
+	cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
+		(^int)(user)^ += 1
+		return {uv.x, uv.y, lod + 0.25, 1}
+	}
+	W, H :: 17, 9
+	sizes := [1][3]i32{{W, H, 1}}
+	// The callback's texel, or (0, 0, 0, 0) out of range.
+	fetch :: proc(x, y, l: i32) -> (c: [4]f32, ok: bool) {
+		lw, lh := max(i32(W) >> u32(l), 1), max(i32(H) >> u32(l), 1)
+		if x < 0 || y < 0 || x >= lw || y >= lh {
+			return
+		}
+		return {(f32(x) + 0.5) / f32(lw), (f32(y) + 0.5) / f32(lh), f32(l) + 0.25, 1}, true
+	}
+	FRAG :: `#version 310 es
+precision highp float;
+precision highp int;
+uniform sampler2D s;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    int q = (p.x >> 1) + (p.y >> 1) * 9;
+    int lane = (p.x & 1) | ((p.y & 1) << 1);
+    vec4 t = vec4(-1.0);
+    vec4 d = vec4(-2.0);
+    if ((((q & 15) >> lane) & 1) != 0) {
+        vec4 f = texelFetch(s, p - ivec2(1, 0), (p.y >> 2) % 2);
+        t = f;
+        d = dFdx(f);
+    }
+    o0 = t;
+    o1 = d;
+}`
+	fm, ferrs, fok := compile(FRAG, {profile = .Glsl, stage = .Fragment})
+	defer destroy(fm)
+	if !testing.expectf(t, fok, "%s", format_errors(ferrs, context.temp_allocator)) {
+		return
+	}
+	want0 := make([][4]f32, W * H, context.temp_allocator)
+	want1 := make([][4]f32, W * H, context.temp_allocator)
+	calls := 0
+	// The quads' lanes: the layer's, and past its odd edges the ones that
+	// complete its last quads.
+	for y in 0 ..< i32(H + 1) {
+		for x in 0 ..< i32(W + 1) {
+			bits := ((x >> 1) + (y >> 1) * 9) & 15
+			l := (y >> 2) % 2
+			c, ok := fetch(x - 1, y, l)
+			calls += int(bits != 0 && ok)
+			if x == W || y == H {
+				continue
+			}
+			i := y * W + x
+			want0[i], want1[i] = -1, -2
+			if (bits >> u32((x & 1) | (y & 1) << 1)) & 1 != 0 {
+				want0[i] = c
+				a, _ := fetch(x &~ 1 - 1, y, l)
+				b, _ := fetch(x | 1 - 1, y, l)
+				want1[i] = b - a
+			}
+		}
+	}
+	for interp in ([2]bool{false, true}) {
+		got := 0
+		tg := [2][][4]f32{make([][4]f32, W * H, context.temp_allocator), make([][4]f32, W * H, context.temp_allocator)}
+		opts := Run_Options{sampler = cb, user = &got, channel_sizes = sizes[:]}
+		if interp {
+			run_targets_interp(&fm.program, nil, W, H, tg[:], temp_scratch(), opts)
+		} else {
+			run_targets(&fm.program, nil, W, H, tg[:], temp_scratch(), opts)
+		}
+		testing.expectf(t, got == calls, "fragment interp=%v: %d calls, want %d", interp, got, calls)
+		bad := 0
+		for i in 0 ..< W * H {
+			if transmute([4]u32)tg[0][i] != transmute([4]u32)want0[i] || transmute([4]u32)tg[1][i] != transmute([4]u32)want1[i] {
+				if bad < 4 {
+					testing.expectf(t, false, "fragment interp=%v (%d, %d): %v %v, want %v %v", interp, i % W, i / W, tg[0][i], tg[1][i], want0[i], want1[i])
+				}
+				bad += 1
+			}
+		}
+		testing.expectf(t, bad == 0, "fragment interp=%v: %d mismatches", interp, bad)
+	}
+
+	COMP :: `#version 310 es
+layout(local_size_x = 64) in;
+layout(std430) writeonly buffer O { vec4 o[]; };
+uniform sampler2D s;
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i % 5 < 2) o[i] = texelFetch(s, ivec2(i % 20 - 2, i / 20), 0);
+}`
+	cm, cerrs, cok := compile(COMP, {profile = .Glsl, stage = .Compute})
+	defer destroy(cm)
+	if !testing.expectf(t, cok, "%s", format_errors(cerrs, context.temp_allocator)) {
+		return
+	}
+	N :: 256
+	cwant := make([][4]f32, N, context.temp_allocator)
+	ccalls := 0
+	for i in 0 ..< i32(N) {
+		if i % 5 < 2 {
+			ok: bool
+			cwant[i], ok = fetch(i % 20 - 2, i / 20, 0)
+			ccalls += int(ok)
+		}
+	}
+	for interp in ([2]bool{false, true}) {
+		got := 0
+		ow := make([][4]f32, N, context.temp_allocator)
+		opts := Run_Options{sampler = cb, user = &got, channel_sizes = sizes[:], buffers = {slice.reinterpret([]u32, ow)}}
+		if interp {
+			cjit_interp(&cm.program, nil, {N / 64, 1, 1}, opts)
+		} else {
+			run_compute(&cm.program, nil, {N / 64, 1, 1}, temp_scratch(), opts)
+		}
+		testing.expectf(t, got == ccalls, "compute interp=%v: %d calls, want %d", interp, got, ccalls)
+		testing.expectf(t, slice.equal(slice.reinterpret([]u32, ow), slice.reinterpret([]u32, cwant)), "compute interp=%v: %v, want %v", interp, ow, cwant)
+	}
+}
+
+// Run_Options.channel_levels out of range.
+@(test)
+test_run_options_channel_levels_negative :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	levels := [1]i32{-1}
+	testing.expect_assert_message(t, "oksl: Run_Options.channel_levels must be 0 to 16")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_levels = levels[:]})
+}
+
+@(test)
+test_run_options_channel_levels_past_16 :: proc(t: ^testing.T) {
+	m := compile_simple_frag_for_ensure(t)
+	levels := [2]i32{16, 17}
+	testing.expect_assert_message(t, "oksl: Run_Options.channel_levels must be 0 to 16")
+	run_f32(&m.program, nil, 0, 0, nil, temp_scratch(), {channel_levels = levels[:]})
+}
+
+// A SPIR-V module's instructions, and the ones with a result type and id
+// by id.
+@(private = "file")
+Spv_Ins :: struct {
+	op: Op,
+	w:  []u32,
+}
+
+@(private = "file")
+spv_decode :: proc(words: []u32) -> (all: []Spv_Ins, def: map[u32]Spv_Ins) {
+	out := make([dynamic]Spv_Ins, context.temp_allocator)
+	def = make(map[u32]Spv_Ins, context.temp_allocator)
+	for i := 5; i < len(words) && words[i] >> 16 != 0; i += int(words[i] >> 16) {
+		in_ := Spv_Ins{Op(words[i] & 0xffff), words[i + 1:i + int(words[i] >> 16)]}
+		append(&out, in_)
+		// Opcodes whose words start with a result type and id.
+		#partial switch in_.op {
+		case .Constant, .Constant_Composite, .Constant_Null, .Load, .Composite_Construct, .Composite_Extract, .Composite_Insert, .Image_Fetch, .Image, .Image_Query_Size_Lod, .Image_Query_Levels, .Bitcast, .I_Sub, .All, .Logical_And, .Select, .U_Less_Than:
+			if len(in_.w) >= 2 {
+				def[in_.w[1]] = in_
+			}
+		}
+	}
+	return out[:], def
+}
+
+// texelFetch's lowering in each backend, decoded: in SPIR-V each
+// OpImageFetch reads the image at Lod lod' = select(lod < levels, lod, 0)
+// (ULessThan, OpImageQueryLevels of the same image) and texel select(p' <
+// size, p', 0) (ULessThan, OpImageQuerySizeLod at lod'), p' being
+// insert(size.y - 1 - p.y) into p in the Shadertoy profile, and only an
+// OpSelect of (all(p' < size) && lod < levels) takes it, against vec4(0);
+// nothing samples. In DXBC each is one ld of t#, its address p.xy (and a
+// layer's z) then the lod in w, Shadertoy's p.y as resinfo_uint's height +
+// ~p.y, its w then masked by the address below resinfo_uint's size (and
+// layers) and levels, each source's register and components checked; no
+// sample, int-to-float or divide. MSL calls a
+// helper that checks the level before its size and the texel before
+// read(). Every module through spirv-val, dxbc_program and vkd3d.
+@(test)
+test_texel_fetch_lowering :: proc(t: ^testing.T) {
+	Case :: struct {
+		src:     string,
+		profile: Profile,
+		stage:   Stage,
+		arr:     bool,
+		fetches: int,
+	}
+	cases := [?]Case {
+		{"#version 310 es\nprecision highp float;\nuniform sampler2D s;\nuniform int uL;\nout vec4 o;\nvoid main() { o = texelFetch(s, ivec2(gl_FragCoord.xy) - 3, uL); }", .Glsl, .Fragment, false, 1},
+		{"#version 310 es\nprecision highp float;\nuniform sampler2D s;\nuniform uint uL;\nout vec4 o;\nvoid main() { o = texelFetch(s, ivec2(gl_FragCoord.xy) - 3, uL) * 2.0; }", .Glsl, .Fragment, false, 1},
+		{"#version 310 es\nprecision highp float;\nuniform sampler2DArray a;\nuniform int uL;\nout vec4 o;\nvoid main() { ivec2 p = ivec2(gl_FragCoord.xy); o = texelFetch(a, ivec3(p, p.x - uL), uL); }", .Glsl, .Fragment, true, 1},
+		{"#version 310 es\nuniform sampler2D s;\nuniform int uL;\nvoid main() { gl_Position = texelFetch(s, ivec2(gl_VertexID, uL), uL); }", .Glsl, .Vertex, false, 1},
+		{"#version 310 es\nlayout(local_size_x = 8) in;\nuniform sampler2D s;\nuniform sampler2DArray a;\nbuffer O { vec4 o[]; };\nvoid main() { int i = int(gl_GlobalInvocationID.x); o[i] = texelFetch(s, ivec2(i, 1), i - 2) + texelFetch(a, ivec3(i, 1, i), 0); }", .Glsl, .Compute, false, 2},
+		{"void mainImage(out vec4 c, in vec2 f) { c = texelFetch(iChannel0, ivec2(f) - 3, int(f.x) % 4); }", .Shadertoy, .Fragment, false, 1},
+	}
+	for c in cases {
+		flip := c.profile == .Shadertoy
+		m, errs, ok := compile(c.src, {profile = c.profile, stage = c.stage, dxbc = true})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%s: %s", c.src, format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		if have_spirv_val() {
+			expect_valid_spirv(t, c.src, m.spirv)
+		}
+		if have_vkd3d() {
+			expect_valid_dxbc(t, c.src, m.dxbc)
+		}
+
+		// SPIR-V.
+		all, def := spv_decode(m.spirv)
+		is_const :: proc(def: map[u32]Spv_Ins, id: u32, v: u32) -> bool {
+			c, ok := def[id]
+			switch {
+			case !ok:
+				return false
+			case c.op == .Constant:
+				return len(c.w) == 3 && c.w[2] == v
+			case c.op == .Constant_Null:
+				return v == 0
+			case c.op == .Constant_Composite:
+				for k in c.w[2:] {
+					if !is_const(def, k, v) {
+						return false
+					}
+				}
+				return true
+			}
+			return false
+		}
+		fetches, samples := 0, 0
+		for in_ in all {
+			if in_.op == .Image_Sample_Implicit_Lod || in_.op == .Image_Sample_Explicit_Lod {
+				samples += 1
+			}
+			if in_.op != .Image_Fetch {
+				continue
+			}
+			fetches += 1
+			f := in_.w
+			if !testing.expectf(t, len(f) == 6 && f[4] == 0x2, "%s: OpImageFetch %v", c.src, f) {
+				continue
+			}
+			img, lodc, pc := f[2], f[5], f[3]
+			testing.expectf(t, def[img].op == .Image, "%s: the image is no OpImage", c.src)
+			ls := def[lodc]
+			ok = ls.op == .Select && is_const(def, ls.w[4], 0)
+			lod_in := def[ls.w[2]] if ok else {}
+			ok &&= lod_in.op == .U_Less_Than && lod_in.w[2] == ls.w[3] && def[lod_in.w[3]].op == .Image_Query_Levels && def[lod_in.w[3]].w[2] == img
+			testing.expectf(t, ok, "%s: lod' is no select(lod < levels(image), lod, 0): %v %v", c.src, ls, lod_in)
+			cs := def[pc]
+			ok = cs.op == .Select && is_const(def, cs.w[4], 0)
+			inside := def[cs.w[2]] if ok else {}
+			size := def[inside.w[3]] if inside.op == .U_Less_Than else {}
+			ok &&= inside.op == .U_Less_Than && inside.w[2] == cs.w[3] && size.op == .Image_Query_Size_Lod && size.w[2] == img && size.w[3] == lodc
+			testing.expectf(t, ok, "%s: the texel is no select(p < size(image, lod'), p, 0): %v %v %v", c.src, cs, inside, size)
+			if ok {
+				ins := def[cs.w[3]]
+				if flip {
+					y := def[ins.w[2]] if ins.op == .Composite_Insert else {}
+					hm1 := def[y.w[2]] if y.op == .I_Sub else {}
+					h := def[hm1.w[2]] if hm1.op == .I_Sub else {}
+					py := def[y.w[3]] if y.op == .I_Sub else {}
+					ok = ins.op == .Composite_Insert && len(ins.w) == 5 && ins.w[4] == 1 && hm1.op == .I_Sub && is_const(def, hm1.w[3], 1) &&
+					     h.op == .Composite_Extract && h.w[2] == size.w[1] && h.w[3] == 1 && py.op == .Composite_Extract && py.w[2] == ins.w[3] && py.w[3] == 1
+					testing.expectf(t, ok, "%s: p' is no insert(size.y - 1 - p.y, p, 1): %v", c.src, ins)
+				} else {
+					testing.expectf(t, ins.op != .Composite_Insert, "%s: p flipped outside Shadertoy", c.src)
+				}
+			}
+			// The one select taking the texel.
+			users := 0
+			for u in all {
+				if u.op == .Select && len(u.w) == 5 && (u.w[3] == f[1] || u.w[4] == f[1]) {
+					users += 1
+					c4 := def[u.w[2]]
+					and := def[c4.w[2]] if c4.op == .Composite_Construct && len(c4.w) == 6 else {}
+					every := def[and.w[2]] if and.op == .Logical_And else {}
+					ok = u.w[3] == f[1] && is_const(def, u.w[4], 0) && c4.op == .Composite_Construct && c4.w[3] == c4.w[2] && c4.w[4] == c4.w[2] && c4.w[5] == c4.w[2] &&
+					     and.op == .Logical_And && every.op == .All && every.w[2] == cs.w[2] && and.w[3] == ls.w[2]
+					testing.expectf(t, ok, "%s: the result is no select(all(p < size) && lod < levels, texel, 0): %v %v %v", c.src, u, c4, and)
+				}
+			}
+			testing.expectf(t, users == 1, "%s: %d selects take the texel", c.src, users)
+		}
+		testing.expectf(t, fetches == c.fetches && samples == 0, "%s: %d OpImageFetch, %d samples", c.src, fetches, samples)
+
+		// DXBC: at the ld, back to its address's first write and on to
+		// the mask of its w, each instruction's opcode, the register and
+		// components it writes, and the registers and components it reads.
+		_, prog := dxbc_program(t, m, c.src)
+		Want :: struct {
+			op:    Dx_Op,
+			dst:   int, // 0 the address, 1 the size, 2 the texel
+			mask:  u32,
+			srcs:  []int, // registers read, as dst (-1 any other)
+			comps: []int, // their components: one, XYZW the swizzle .xyzw (-1 any)
+		}
+		XYZW :: 4
+		lds := 0
+		for in_, i in prog {
+			#partial switch Dx_Op(in_.op) {
+			case .Sample, .Sample_L, .Sample_B, .Sample_D, .Itof, .Utof, .Div:
+				testing.expectf(t, false, "%s: %v", c.src, Dx_Op(in_.op))
+			case .Resinfo:
+				testing.expectf(t, in_.ctl & 3 == 2, "%s: resinfo %x", c.src, in_.ctl)
+			}
+			if Dx_Op(in_.op) != .Ld {
+				continue
+			}
+			lds += 1
+			arr := c.arr || c.stage == .Compute && lds == 2
+			m3: u32 = 0x7 if arr else 0x3
+			want := make([dynamic]Want, context.temp_allocator)
+			append(&want, Want{.Mov, 0, m3, {-1}, {-1}}, Want{.Resinfo, 1, m3 | 0x8, {-1}, {-1}})
+			if flip {
+				// at.y = ~p.y + size.y, the level's height.
+				append(&want, Want{.Not, 0, 0x2, {-1}, {-1}}, Want{.Iadd, 0, 0x2, {0, 1}, {1, 1}})
+			}
+			// at.w = the level; at < size, then x &= y, x &= w (the
+			// levels), x &= z (the layers), texel.w &= x.
+			append(&want, Want{.Mov, 0, 0x8, {-1}, {-1}}, Want{.Ld, 2, 0xf, {0}, {XYZW}}, Want{.Ult, 1, m3 | 0x8, {0, 1}, {XYZW, XYZW}}, Want{.And, 1, 0x1, {1, 1}, {0, 1}}, Want{.And, 1, 0x1, {1, 1}, {0, 3}})
+			if arr {
+				append(&want, Want{.And, 1, 0x1, {1, 1}, {0, 2}})
+			}
+			append(&want, Want{.And, 2, 0x8, {2, 1}, {3, 0}})
+			first := i - (4 if flip else 2) - 1
+			if !testing.expectf(t, first >= 0 && first + len(want) <= len(prog), "%s: ld at %d", c.src, i) {
+				continue
+			}
+			regs := [3]u32{max(u32), max(u32), max(u32)}
+			// resinfo's level, which w must take too, and p, whose y the
+			// flip takes.
+			level, p: Operand
+			for w, k in want {
+				in2 := prog[first + k]
+				ops, _ := dxbc_operands(in2.words)
+				if !testing.expectf(t, Dx_Op(in2.op) == w.op && len(ops) >= 2 && ops[0].file == 0 && ops[0].mode == 0 && ops[0].sel == w.mask, "%s: instruction %d of the fetch: %v %v, want %v .%x", c.src, k, Dx_Op(in2.op), ops, w.op, w.mask) {
+					break
+				}
+				if regs[w.dst] == max(u32) {
+					regs[w.dst] = ops[0].idx[0]
+				}
+				testing.expectf(t, ops[0].idx[0] == regs[w.dst], "%s: %v writes r%d, want r%d", c.src, w.op, ops[0].idx[0], regs[w.dst])
+				for r, j in w.srcs {
+					if r >= 0 {
+						testing.expectf(t, ops[1 + j].file == 0 && ops[1 + j].idx[0] == regs[r], "%s: %v reads %v, want r%d", c.src, w.op, ops[1 + j], regs[r])
+					}
+				}
+				for s, j in w.comps {
+					o := ops[1 + j]
+					switch {
+					case s == XYZW:
+						testing.expectf(t, o.mode == 1 && o.sel == 0xe4, "%s: %v reads %v, want .xyzw", c.src, w.op, o)
+					case s >= 0:
+						testing.expectf(t, o.mode == 2 && o.sel == u32(s), "%s: %v reads %v, want component %d", c.src, w.op, o, s)
+					}
+				}
+				#partial switch w.op {
+				case .Ld:
+					testing.expectf(t, ops[2].file == 7, "%s: ld %v", c.src, ops)
+				case .Resinfo:
+					testing.expectf(t, ops[2].file == 7, "%s: resinfo of %v", c.src, ops[2])
+					level = ops[1]
+				case .Mov:
+					if w.mask == 0x8 {
+						testing.expectf(t, ops[1] == level, "%s: w is %v, not the level %v", c.src, ops[1], level)
+					} else {
+						p = ops[1]
+					}
+				case .Not:
+					// p's y, as the address's mov takes it.
+					testing.expectf(t, p.mode == 1 && ops[1].file == p.file && ops[1].idx == p.idx && ops[1].mode == 2 && ops[1].sel == (p.sel >> 2) & 3, "%s: not reads %v, want p.y of %v", c.src, ops[1], p)
+				}
+			}
+		}
+		testing.expectf(t, lds == c.fetches, "%s: %d ld", c.src, lds)
+
+		// MSL.
+		k := "oksl_fetch_array(" if c.arr else ("oksl_fetch_flip(" if flip else "oksl_fetch(")
+		testing.expectf(t, strings.contains(m.msl, k) && !strings.contains(m.msl, ".sample("), "%s: MSL:\n%s", c.src, m.msl)
+	}
+	// The helpers (Metal can't be run here: tools/gpu_parity on a Mac).
+	helpers := [3]string {
+		"inline float4 oksl_fetch(texture2d<float> t, int2 p, uint l) {\n\tif (l >= t.get_num_mip_levels()) return float4(0.0f);\n\tuint2 q = uint2(p);\n\treturn q.x < t.get_width(l) && q.y < t.get_height(l) ? t.read(q, l) : float4(0.0f);\n}\n",
+		"inline float4 oksl_fetch_array(texture2d_array<float> t, int3 p, uint l) {\n\tif (l >= t.get_num_mip_levels()) return float4(0.0f);\n\tuint3 q = uint3(p);\n\treturn q.x < t.get_width(l) && q.y < t.get_height(l) && q.z < t.get_array_size() ? t.read(q.xy, q.z, l) : float4(0.0f);\n}\n",
+		"inline float4 oksl_fetch_flip(texture2d<float> t, int2 p, uint l) {\n\tif (l >= t.get_num_mip_levels()) return float4(0.0f);\n\tuint h = t.get_height(l);\n\tuint2 q = uint2(uint(p.x), h - 1u - uint(p.y));\n\treturn q.x < t.get_width(l) && q.y < h ? t.read(q, l) : float4(0.0f);\n}\n",
+	}
+	calls := [3]string{"oksl_fetch(ok_s_tex, ", "oksl_fetch_array(ok_a_tex, ", "oksl_fetch_flip(ok_iChannel0_tex, "}
+	which := [3]int{0, 2, 5}
+	for k in 0 ..< 3 {
+		c := cases[which[k]]
+		m, _, ok := compile(c.src, {profile = c.profile, stage = c.stage})
+		defer destroy(m)
+		if ok {
+			testing.expectf(t, strings.count(m.msl, helpers[k]) == 1 && strings.contains(m.msl, calls[k]), "%s: MSL:\n%s", c.src, m.msl)
 		}
 	}
 }

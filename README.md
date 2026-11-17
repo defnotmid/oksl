@@ -153,13 +153,14 @@ GLSL ES 3, through the same parser, checker and backends as SkSL:
   allowed. A shader uses (and the host binds) only the ones it reads.
 - **Sampling:** `texture(iChannelN, uv)` takes 0..1 uv with the origin at
   the bottom left, like Shadertoy; `textureLod`, `texelFetch` (integer
-  texels from the bottom left) and `textureSize` work too. `texture`
+  texels from the bottom left of their level; see texelFetch below) and
+  `textureSize` work too. `texture`
   samples at the level its uv derivatives pick (plus its bias), the others
   at an explicit level, as SkSL's `.eval` does; on the CPU the host
   sampler sees the level (see the CPU interpreter). A `uniform sampler2D name;` takes a
   channel the source doesn't name as `iChannelN`, and samplers can be
-  function parameters (`texelFetch` and `textureSize` need the channel
-  itself, for its size).
+  function parameters (`textureSize`, which is `iChannelResolution[N].xy`
+  at every lod, needs the channel itself).
 - **Preprocessor:** token level: object-like and function-like `#define`
   (with `##`), `#undef`, `#if` / `#ifdef` / `#ifndef` / `#elif` / `#else`
   / `#endif` with `defined()` and integer expressions, `#line`, `#error`;
@@ -231,14 +232,51 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   declaration order (`Module.channel_arrays` marks the arrays). `texture`
   uv starts at the top left, as in Vulkan (no flip). `textureSize` queries
   the image (on the CPU, the size the host gives; an array's z is its
-  layers) and `texelFetch` samples the texel's centre at its level, so
-  both take sampler parameters too. A `sampler2DArray` takes `vec3(uv,
-  layer)` in `texture`, `textureLod` and `textureGrad` (the layer rounded
-  to nearest even and clamped, as GPUs take it; RADV does, not GLSL ES's
-  `floor(r + 0.5)`) and `ivec3(x, y, layer)` in `texelFetch` (GLSL
-  profiles; the GPU backends sample the texel's centre at that layer).
+  layers) and `texelFetch` reads the image's texel (below), so both take
+  sampler parameters too. A `sampler2DArray` takes `vec3(uv, layer)` in
+  `texture`, `textureLod` and `textureGrad` (the layer rounded to nearest
+  even and clamped, as GPUs take it; RADV does, not GLSL ES's `floor(r +
+  0.5)`) and `ivec3(x, y, layer)` in `texelFetch` (GLSL profiles).
   `textureGrad(s, uv, dPdx, dPdy)` samples at the level
   those derivatives pick, in any stage.
+- **texelFetch** reads exactly one texel: texel `p` (a `sampler2DArray`'s
+  layer `p.z`) of level `lod`, whatever sampler is bound with the texture
+  (its filter, wrap, `max_lod`, lod bias and anisotropy play no part), and
+  `(0, 0, 0, 0)` where `p`, the layer or `lod` is outside the image's,
+  negative ones included (an `int` lod and a `uint` one alike, so
+  `0x80000000u` and up are out), on every GPU backend and on the CPU.
+  SPIR-V reads it with `OpImageFetch` behind a bounds check (Vulkan leaves
+  a fetch out of range undefined, and `robustImageAccess` allows `(0, 0,
+  0, 1)`): `uint(lod) < OpImageQueryLevels`, `uvec2(p) < uvec2(size at
+  that lod)` and a layer below the layers, the lod and coordinates it
+  queries and fetches moved to 0 where they are out of range, the result
+  selected from the in-range mask. MSL calls `read()` behind the same
+  check, the level checked before its size is queried. DXBC is one `ld`,
+  which D3D12 makes 0 out of range in the format's components but 1 in an
+  alpha the format lacks (vkd3d's `R8` and `R16` read `(0, 0, 0, 1)`), so
+  its w is masked by the texel being inside `resinfo_uint`'s size at that
+  lod (and layers) and its levels. In the Shadertoy profile `p.y`
+  counts from the bottom row of its level (`h - 1 - p.y` with `h` that
+  level's height, as the image reports it). A shader that wants the edge
+  texel instead clamps the coordinate itself: `texelFetch(s, clamp(p,
+  ivec2(0), size - 1), lod)` with `size` the level's (`textureSize(s,
+  lod)`; in Shadertoy, whose `textureSize` is level 0's, `max(size >> lod,
+  1)`). The image's levels are the GPU texture's `num_levels`: on the CPU
+  a channel read through the sampler callback has the full mip chain of
+  its `channel_sizes` unless `Run_Options.channel_levels` says fewer, so
+  set `channel_levels` to your GPU texture's `num_levels` for the CPU to
+  match it (a texture made with `num_levels = 1` reads 0 on the GPU at
+  every lod above 0, where the full chain calls the sampler).
+  `tools/gpu_parity` and `tools/d3d12_parity`'s `bound_fetch` check it on
+  every format, with SDL's default sampler (whose `max_lod` 0 pinned a
+  sampled texelFetch to level 0), `max_lod` 1000 wrapping and clamped, and
+  a 16x anisotropic sampler with a lod bias of 3: the texel inside, `(0,
+  0, 0, 0)` bit for bit outside; `d3d12_parity`'s `bound_fetch_layers` the
+  same through arrays of every format, layers out of range included (where
+  `R8` and `R16` would read alpha 1); and both tools'
+  `testdata/st_texel_fetch_levels.glsl` the Shadertoy flip at every level
+  of a non-square 48 x 20 image with 4 of its 6 levels, which the CPU gets
+  as `channel_levels` 4.
 - **Storage buffers:** in vertex and fragment shaders, read-only, GLSL ES
   3.1's block with one runtime-sized array: `layout(std430) readonly buffer
   Rows { Row rows[]; } rowBuf;` read as `rowBuf.rows[i]` (or `rows[i]`
@@ -451,7 +489,7 @@ The inputs come first, at fixed offsets, whether or not they are used:
 | 28 | `iSampleRate` |
 | 32 | `iMouse` vec4 |
 | 48 | `iDate` vec4 |
-| 64 | `iChannelResolution`: channel sizes in pixels, vec3[4] (stride 16; `.eval` and `texelFetch` divide by xy) |
+| 64 | `iChannelResolution`: channel sizes in pixels, vec3[4] (stride 16; `.eval` divides by xy, `textureSize` gives xy) |
 | 128 | `iChannelTime` float[4] (stride 16) |
 | 192 | user uniforms, std140, in declaration order |
 
@@ -614,9 +652,11 @@ RGBA8, or `run_f32` for float RGBA, from the output at location 0;
 so runs that reuse one allocate nothing. `Run_Options` takes a
 sampler callback (`proc(user, channel, uv, lod, layer) -> [4]f32`; `.eval`
 passes lod 0; `layer` is a `sampler2DArray`'s, rounded to nearest even
-and saturated to an int (NaN as 0), or texelFetch's `p.z` as it is, for
-the host to clamp to its layers), the channels' sizes in texels (and
-layers), optional bound images (`channel_images`, below), the
+and saturated to an int (NaN as 0), for the host to clamp to its layers,
+or texelFetch's `p.z`), the channels' sizes in texels (and layers; in
+every profile, Shadertoy's too) and the levels texelFetch finds there
+(`channel_levels`, below), optional bound images (`channel_images`,
+below), the
 storage buffers' words (`buffers`, one `[]u32` per buffer in
 `Module.storage_buffers` order; a read past one gives 0 and a write past
 one is dropped), the compute storage images (`images`, one `Storage_Image`
@@ -731,6 +771,29 @@ higher), and where uv jumps inside a quad (a `fract` seam) which pixels
 they difference decides it; `tools/gpu_parity` samples a mip chain to
 show both.
 
+`texelFetch` of a channel without an image calls the sampler only inside
+a full mip chain of the channel's `channel_sizes` size `w x h` (level `l`
+is `max(w >> l, 1) x max(h >> l, 1)` while `max(w, h) >> l` is not 0), or
+its first `n` levels when `Run_Options.channel_levels` gives the channel
+`n > 0` (at most 16, as a bound image's; 0, or a channel past the slice,
+is the full chain), and its layers, with the texel's centre in its level
+(`(p + 0.5) / size`, flipped in Shadertoy), the lod and `p.z`; anywhere
+else it reads `(0, 0, 0, 0)` without a call, as a GPU does and a bound
+image does. A channel without a size reads 0. The CPU takes the full
+chain unless told otherwise, so a host whose GPU texture has fewer levels
+sets `channel_levels` to its `num_levels`: with one level (`num_levels =
+1`, as many hosts create textures), `texelFetch(s, p, 1)` reads 0 on the
+GPU and, without `channel_levels`, the callback's texel on the CPU.
+`channel_levels` is texelFetch's only: `texture`, `textureLod` and
+`textureGrad` pass the sampler their level whatever it is, for the host to
+clamp to the levels it has. `channel_levels` is validated once per run
+(`ensure`: each from 0 to 16). In a fragment shader every lane of a quad
+with a running lane fetches, as a GPU's helper invocations do, so
+derivatives of the result are the quad's; a compute shader's running
+invocations alone fetch. (Before v0.0.25 the callback got every fetch, out
+of range included, with the uv and lod to wrap or clamp, and Shadertoy's
+uv came from `iChannelResolution`, level 0's size, at every lod.)
+
 For images the caller owns, `Run_Options.channel_images` (`[]Channel_Image`,
 indexed by channel) binds a channel's texels directly to any `run*` entry
 point, sampled in the JIT (AVX2 gathers on x86-64) and the interpreter
@@ -788,7 +851,8 @@ oksl.Channel_Image{format = .Rgba8, pixels = rgba_bytes, width = w, height = h,
   1` as `c0 + (c1 - c0) * w / 256` with `w` the fraction `l - l0` rounded
   to 1/256 (to nearest even), as GPUs blend levels.
 - **texelFetch** reads its level's texel, `(0, 0, 0, 0)` for a level or
-  texel out of range (flipping `y` in the Shadertoy profile);
+  texel out of range (flipping `y` in the Shadertoy profile), as the GPU
+  backends do whatever the sampler;
   **textureSize** gives level `clamp(lod, 0, levels - 1)`'s size (a
   `uint` lod clamped unsigned, so `0x80000000u` and up give the top level).
 
@@ -804,8 +868,9 @@ format as `_UNORM` or `_FLOAT`, `CLAMP_TO_EDGE` or `REPEAT` per axis,
 `NEAREST` or `LINEAR` min and mag filters, `mipmap_mode = LINEAR` with the
 same levels uploaded (so `.Nearest` with levels still blends between two
 levels, on the CPU as on the GPU), `max_lod` at or above the top level
-(`SDL_GPUSamplerCreateInfo`'s zero default pins every lookup to level 0;
-`tools/gpu_parity` sets 1000), and no anisotropy. A textureSize lod
+(`SDL_GPUSamplerCreateInfo`'s zero default pins every sample to level 0;
+`tools/gpu_parity` sets 1000), and no anisotropy (texelFetch takes none of
+it). A textureSize lod
 outside the levels (below 0 or past the top) differs: the CPU clamps it,
 GPU backends give 0 or an undefined size. Bindings are validated up front via `ensure` (layers only on a
 `sampler2DArray` channel, components, format, filter and wrap values,

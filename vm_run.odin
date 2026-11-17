@@ -33,11 +33,26 @@ Run_Options :: struct {
 	// 0, which is the layer's uv (what the layer vertex shader writes).
 	varyings: []Varying,
 	// Each channel's size in texels (level 0) and its layers (a
-	// sampler2DArray's; ignored for a sampler2D), for textureSize and
-	// texelFetch in GLSL shaders and the level texture() and textureGrad
-	// pick. A channel without one is 0x0, and texture() samples it at its
-	// bias.
+	// sampler2DArray's; ignored for a sampler2D): textureSize's in GLSL
+	// shaders (Shadertoy's is iChannelResolution), the level texture() and
+	// textureGrad pick, and in every profile, Shadertoy's too, the texels
+	// texelFetch reads: the sampler is called only for a texel, level and
+	// layer inside them (a full mip chain of w x h, level l max(w >> l, 1)
+	// x max(h >> l, 1) while max(w, h) >> l is not 0, or channel_levels'
+	// levels of it), and (0, 0, 0, 0) is read anywhere else. A channel
+	// without one is 0x0: texture() samples it at its bias, and texelFetch
+	// reads 0.
 	channel_sizes: [][3]i32,
+	// Each channel's mip levels for texelFetch: n > 0 means levels 0 ..< n
+	// of channel_sizes' chain (n at most 16, as a Channel_Image's levels,
+	// ensured once per run), so
+	// texelFetch reads 0 at a level from n on without calling the sampler;
+	// 0, or a channel past the end, the full chain. Set it to the GPU
+	// texture's num_levels for the CPU to match the GPU: a texture of one
+	// level reads 0 there at every lod above 0, where the full chain calls
+	// the sampler. texture(), textureLod and textureGrad pass the sampler
+	// their level whatever it is, and a bound image has its own levels.
+	channel_levels: []i32,
 	// run_vertex: gl_VertexID of its first vertex (vertex i's is
 	// first_vertex + i), as a draw's first vertex counts on the GPU.
 	first_vertex: int,
@@ -505,8 +520,13 @@ validate_channel_level :: proc(texels: int, w, h, stride, tb: int, format: Chann
 	}
 }
 
+// The channels' options, once per run: channel_levels and each bound
+// image.
 @(private)
-validate_channel_images :: proc(p: ^Program, opts: Run_Options) {
+validate_channels :: proc(p: ^Program, opts: Run_Options) {
+	for n in opts.channel_levels {
+		ensure(n >= 0 && n <= CHANNEL_MAX_LEVELS, "oksl: Run_Options.channel_levels must be 0 to 16")
+	}
 	for im, ch in opts.channel_images {
 		if !channel_bound(im) {
 			continue
@@ -581,7 +601,7 @@ fill_chan_level :: proc "contextless" (dst: ^Chan_Level, texels: rawptr, w, h, s
 }
 
 // Channels past `images` and unbound entries get ptr = nil; the rest
-// their levels (validated by validate_channel_images).
+// their levels (validated by validate_channels).
 @(private)
 fill_chan_imgs :: proc "contextless" (dst: []Chan_Img, images: []Channel_Image) {
 	for i in 0 ..< len(dst) {
@@ -820,7 +840,7 @@ validate_region_targets :: proc(width, height: int, opts: Run_Options, targets: 
 @(private)
 runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) {
 	ensure(p.stage == .Fragment, "oksl: run requires a fragment program")
-	validate_channel_images(p, opts)
+	validate_channels(p, opts)
 	if opts.region_targets {
 		validate_region_targets(width, height, opts, targets)
 	}
@@ -1000,7 +1020,7 @@ Attribute :: struct {
 // at once, each with its own scratch.
 run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: int, position: [][4]f32, varyings: []f32, scratch: ^Scratch, opts := Run_Options{}) {
 	ensure(p.stage == .Vertex, "oksl: run_vertex requires a vertex program")
-	validate_channel_images(p, opts)
+	validate_channels(p, opts)
 	if count <= 0 {
 		return
 	}
@@ -1105,7 +1125,7 @@ Fragment_Quads :: struct {
 // own scratch.
 run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, targets: [][][4]f32, shaded: []Quad_Lanes, scratch: ^Scratch, opts := Run_Options{}, sample_masks: []u32 = nil) {
 	ensure(p.stage == .Fragment, "oksl: run_fragment requires a fragment program")
-	validate_channel_images(p, opts)
+	validate_channels(p, opts)
 	if quads.count <= 0 {
 		return
 	}
@@ -1215,7 +1235,7 @@ run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, scratch: ^Scrat
 	ensure(p.stage == .Compute, "oksl: run_compute requires a compute program")
 	ensure(len(opts.buffers) >= p.num_buffers, "oksl: Run_Options.buffers has fewer buffers than declared")
 	ensure(len(opts.images) >= len(p.image_formats), "oksl: Run_Options.images has fewer images than declared")
-	validate_channel_images(p, opts)
+	validate_channels(p, opts)
 	for want_fmt, i in p.image_formats {
 		im := opts.images[i]
 		ensure(im.format == want_fmt, "oksl: Storage_Image.format does not match shader declaration")
@@ -1514,19 +1534,8 @@ canon_bits :: #force_inline proc "contextless" (b: u32) -> u32 {
 }
 
 @(private)
-canon_f32 :: #force_inline proc "contextless" (x: f32) -> f32 {
-	return fval(canon_bits(fbits(x)))
-}
-
-@(private)
 canon8 :: #force_inline proc "contextless" (x: F8) -> F8 {
 	return intrinsics.simd_select(intrinsics.simd_lanes_ne(x, x), F8(fval(0x7fc0_0000)), x)
-}
-
-// canon8 in place, for the JIT's helpers (vectors by pointer: see math_8).
-@(private)
-canon_lanes8 :: #force_inline proc "contextless" (x: ^[8]f32) {
-	intrinsics.unaligned_store((^F8)(x), canon8(intrinsics.unaligned_load((^F8)(x))))
 }
 
 @(private)
@@ -3138,19 +3147,55 @@ bound_size_lod_lanes :: proc "contextless" (im: ^Chan_Img, lods: [^]u32, dx, dy:
 	}
 }
 
+// Of eight lanes (two 2x2 quads) with `run` running, the ones a fragment
+// shader's texelFetch of a channel without an image fetches for (of those
+// the batch has): every lane of a quad with a running lane, as a GPU's
+// helper invocations fetch for the quad's derivatives.
 @(private)
-texel_fetch_mip :: #force_inline proc "contextless" (size: [3]i32, lod_bits: u32) -> (sx, sy: f32) {
-	return f32(max(size.x >> lod_bits, 1) if size.x > 0 else 0), f32(max(size.y >> lod_bits, 1) if size.y > 0 else 0)
+fetch_quad_lanes8 :: #force_inline proc "contextless" (run: u32) -> u32 {
+	return u32(0xf if run & 0xf != 0 else 0) | u32(0xf0 if run & 0xf0 != 0 else 0)
 }
 
+// texelFetch of a channel without an image, eight lanes of texel (x, y),
+// layer z (a sampler2DArray's) and lod L: what the sampler callback
+// receives (uv, lod), and in `ok` bit l whether lane l is inside a full
+// mip chain of the channel's size w x h (levels max(w >> l, 1) x max(h >>
+// l, 1) while max(w, h) >> l is not 0), or its first `levels` levels when
+// that is not 0 (Run_Options.channel_levels), its level and `size.z`
+// layers; outside, texelFetch reads (0, 0, 0, 0) without a call, as GPUs
+// and bound images do. Inside, uv is the texel's centre in its level
+// (flipped: 1 - v), never NaN, and lod L. The interpreter and the JIT's
+// helper both.
 @(private)
-texel_fetch_uv :: #force_inline proc "contextless" (px, py: i32, sx, sy: f32, flags: i32) -> [2]f32 {
-	ux := (f32(px) + 0.5) / sx
-	uy := (f32(py) + 0.5) / sy
-	if (flags & 1) != 0 {
-		uy = uy * -1 + 1
+texel_fetch_args8 :: #force_inline proc "contextless" (px, py, pz, pl: ^u32, size: [3]i32, levels: i32, arr, flip: bool, cu, cv, cl: ^f32) -> (ok: u32) {
+	U :: #simd[8]u32
+	I :: #simd[8]i32
+	x, y, z, L := intrinsics.unaligned_load((^U)(px)), intrinsics.unaligned_load((^U)(py)), intrinsics.unaligned_load((^U)(pz)), intrinsics.unaligned_load((^U)(pl))
+	w, h := u32(max(size.x, 0)), u32(max(size.y, 0))
+	if w == 0 || h == 0 {
+		return 0
 	}
-	return {canon_f32(ux), canon_f32(uy)}
+	// Shifts of 32 or more give 0.
+	lw := intrinsics.simd_max(intrinsics.simd_shr(U(w), L), U(1))
+	lh := intrinsics.simd_max(intrinsics.simd_shr(U(h), L), U(1))
+	in_ := intrinsics.simd_lanes_ne(intrinsics.simd_shr(U(max(w, h)), L), U(0)) & intrinsics.simd_lanes_lt(x, lw) & intrinsics.simd_lanes_lt(y, lh)
+	if levels > 0 {
+		in_ &= intrinsics.simd_lanes_lt(L, U(u32(levels)))
+	}
+	if arr {
+		in_ &= intrinsics.simd_lanes_lt(z, U(u32(max(size.z, 0))))
+	}
+	// Inside, x, y, L and the level's sides are below 2^31: converted as
+	// ints.
+	u := (cast(F8)transmute(I)x + 0.5) / cast(F8)transmute(I)lw
+	v := (cast(F8)transmute(I)y + 0.5) / cast(F8)transmute(I)lh
+	if flip {
+		v = v * -1 + 1
+	}
+	intrinsics.unaligned_store((^F8)(cu), u)
+	intrinsics.unaligned_store((^F8)(cv), v)
+	intrinsics.unaligned_store((^F8)(cl), cast(F8)transmute(I)L)
+	return intrinsics.simd_reduce_or(in_ & U{1, 2, 4, 8, 16, 32, 64, 128})
 }
 
 // A sample: dst = channel k at uv a, lod b (Texture_Bias: b plus the
@@ -3181,39 +3226,25 @@ sample_texture :: proc(r: ^Runner, in_: Instr, exec: Lane_Mask) #no_bounds_check
 	size := channel_size(r, ch)
 	running, have := transmute(Lane_Bits)exec, transmute(Lane_Bits)r.lanes
 	if in_.op == .Texel_Fetch {
-		px, py, lb := &regs[in_.a], &regs[in_.a + 1], &regs[in_.b]
-		uint_lod := (in_.d & 4) != 0
-		if r.p.stage == .Compute {
-			for l in 0 ..< LANES {
-				if (running >> uint(l)) & 1 == 0 {
-					continue
-				}
-				sx, sy := texel_fetch_mip(size, lb[l])
-				flod := f32(lb[l]) if uint_lod else f32(i32(lb[l]))
-				layer := int(i32(regs[in_.a + 2][l])) if in_.n == 3 else 0
-				c := r.opts.sampler(r.opts.user, ch, texel_fetch_uv(i32(px[l]), i32(py[l]), sx, sy, 0), flod, layer)
-				for i in 0 ..< i32(4) {
-					regs[dst + i][l] = fbits(c[i])
-				}
+		px, py, pz, lb := &regs[in_.a], &regs[in_.a + 1], &regs[in_.a + 2 if in_.n == 3 else in_.a], &regs[in_.b]
+		arr, flip := in_.n == 3, (in_.d & 1) != 0
+		levels := r.opts.channel_levels[ch] if ch < len(r.opts.channel_levels) else 0
+		for g := 0; g < LANES; g += 8 {
+			// Compute has no quads: its running lanes fetch.
+			run8 := u32(running >> uint(g)) & 0xff
+			calls := run8
+			if r.p.stage != .Compute {
+				calls = fetch_quad_lanes8(run8) & u32(have >> uint(g))
 			}
-			return
-		}
-		hdr := (in_.d & 2) != 0
-		for o := 0; o < LANES; o += 4 {
-			if (running >> uint(o)) & 0xf == 0 {
+			if calls == 0 {
 				continue
 			}
-			for l in o ..< o + 4 {
-				if (have >> uint(l)) & 1 == 0 {
-					continue
-				}
-				sx, sy := texel_fetch_mip(size, lb[l])
-				if hdr {
-					sx, sy = fval(regs[in_.c][l]), fval(regs[in_.c + 1][l])
-				}
-				flod := f32(lb[l]) if uint_lod else f32(i32(lb[l]))
-				layer := int(i32(regs[in_.a + 2][l])) if in_.n == 3 else 0
-				c := r.opts.sampler(r.opts.user, ch, texel_fetch_uv(i32(px[l]), i32(py[l]), sx, sy, in_.d), flod, layer)
+			u, v, lod: [8]f32
+			calls &= texel_fetch_args8(&px[g], &py[g], &pz[g], &lb[g], size, levels, arr, flip, &u[0], &v[0], &lod[0])
+			for ; calls != 0; calls &= calls - 1 {
+				k := int(intrinsics.count_trailing_zeros(calls))
+				l := g + k
+				c := r.opts.sampler(r.opts.user, ch, {u[k], v[k]}, lod[k], int(pz[l]) if arr else 0)
 				for i in 0 ..< i32(4) {
 					regs[dst + i][l] = fbits(c[i])
 				}

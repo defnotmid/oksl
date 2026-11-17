@@ -153,8 +153,9 @@ VM_Op :: enum u8 {
 	Image_Load,
 	Image_Store,
 	Image_Size,
-	// dst vec4 = channel k fetched at ivec2 a, lod b, header size c
-	// (d: bit 0 flip_y, bit 1 header, bit 2 uint lod).
+	// dst vec4 = channel k's texel at ivec2 a (n 3: ivec3, its layer at
+	// a + 2), lod b, 0 out of range (d: flip_y, p.y counted from the
+	// level's bottom row).
 	Texel_Fetch,
 	// Shared memory: dst + i = shared[c + (k != 0 ? a : 0) + i];
 	// shared[c + (k != 0 ? b : 0) + i] = a + i in exec.
@@ -2271,9 +2272,6 @@ trim_buffer_loads :: proc(p: ^Program, blocks: []Slots) {
 		case .Texture, .Texture_Bias, .Texel_Fetch:
 			mark(used, {in_.a, n})
 			mark(used, {in_.b, 1})
-			if in_.d & 2 != 0 {
-				mark(used, {in_.c, 2})
-			}
 		case .Store, .Deriv_X, .Deriv_Y, .Fwidth:
 			mark(used, {in_.a, n})
 		case .Load_Buf:
@@ -2387,9 +2385,9 @@ instr_reg_fields :: proc(in_: ^Instr) -> (ptrs: [5]^i32, count: int) {
 	     .F_Fn2, .I_Fn2, .U_Fn2,
 	     .Dot, .Distance, .Cross, .Reflect,
 	     .Mat_Mul, .Vec_Mat, .Outer,
-	     .Texture, .Texture_Bias:
+	     .Texture, .Texture_Bias, .Texel_Fetch:
 		return {&in_.dst, &in_.a, &in_.b, nil, nil}, 3
-	case .Select, .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward, .Refract, .Texel_Fetch, .Atomic_Shared, .Atomic_Buf:
+	case .Select, .F_Fn3, .I_Fn3, .U_Fn3, .Faceforward, .Refract, .Atomic_Shared, .Atomic_Buf:
 		return {&in_.dst, &in_.a, &in_.b, &in_.c, nil}, 4
 	case .Gather:
 		ptrs = {&in_.dst, &in_.a, &in_.b, &in_.c, &in_.d}
@@ -2733,10 +2731,10 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	case .Texture_Lod:
 		emit(l, .Texture, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
 	case .Texel_Fetch:
-		rules := PROFILE_RULES[u.profile]
-		flags := i32(rules.flip_y) | (i32(rules.header) << 1) | (i32(vals[2].t.base == .Uint) << 2)
-		// n: 3 for a sampler2DArray's, its layer at a + 2.
-		emit(l, .Texel_Fetch, n = cc(l, vals[1].t), k = int(vals[0].slot), d = flags, dst = s, a = vals[1].slot, b = vals[2].slot, c = vals[3].slot if rules.header else vals[2].slot)
+		// n: 3 for a sampler2DArray's, its layer at a + 2. An int lod and
+		// a uint one are the same bits: a negative int is out of range as
+		// a huge uint.
+		emit(l, .Texel_Fetch, n = cc(l, vals[1].t), k = int(vals[0].slot), d = i32(PROFILE_RULES[u.profile].flip_y), dst = s, a = vals[1].slot, b = vals[2].slot)
 	case .Texture:
 		emit(l, .Texture_Bias, n = cc(l, vals[1].t), k = int(vals[0].slot), dst = s, a = vals[1].slot, b = vals[2].slot)
 	case .Texture_Size:

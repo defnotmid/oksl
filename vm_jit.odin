@@ -2028,9 +2028,6 @@ instr_read_write :: proc(in_: Instr) -> (writes: Slots, full_write: bool, reads:
 	case .Texture, .Texture_Bias, .Texel_Fetch:
 		reads[0] = {in_.a, n}
 		reads[1] = {in_.b, 1}
-		if in_.d & 2 != 0 {
-			reads[2] = {in_.c, 2}
-		}
 		return {in_.dst, 4}, true, reads
 	case .Deriv_X, .Deriv_Y, .Fwidth:
 		reads[0] = {in_.a, n}
@@ -2293,6 +2290,9 @@ jit_help_texture :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_
 	}
 }
 
+// texelFetch of a channel without an image: the interpreter's lanes
+// (texel_fetch_args8, which takes its vectors by pointer: see math_8).
+// In compute ctx.lanes is the running lanes, which then call alone.
 @(private, enable_target_feature = "avx2")
 jit_help_texel_fetch :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bounds_check {
 	slots := ctx.slots
@@ -2307,46 +2307,20 @@ jit_help_texel_fetch :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, exec: u32) #no_bou
 	ch := int(in_.k)
 	context = ctx.host_ctx
 	size := opts.channel_sizes[ch] if ch < len(opts.channel_sizes) else [3]i32{}
-	px := (^Simd_I8)(&slots[in_.a])^
-	py := (^Simd_I8)(&slots[in_.a + 1])^
-	lb := &slots[in_.b]
-	lb_v := (^Simd_U8)(lb)^
-	sx, sy: Simd_F8
-	if (in_.d & 2) != 0 {
-		sx = (^Simd_F8)(&slots[in_.c])^
-		sy = (^Simd_F8)(&slots[in_.c + 1])^
-	} else {
-		if size.x > 0 {
-			sx = (Simd_F8)((Simd_I8)(intrinsics.simd_max(intrinsics.simd_shr(Simd_U8(u32(size.x)), lb_v), Simd_U8(1))))
-		}
-		if size.y > 0 {
-			sy = (Simd_F8)((Simd_I8)(intrinsics.simd_max(intrinsics.simd_shr(Simd_U8(u32(size.y)), lb_v), Simd_U8(1))))
-		}
+	levels := opts.channel_levels[ch] if ch < len(opts.channel_levels) else 0
+	pz := &slots[in_.a + 2 if in_.n == 3 else in_.a]
+	arr := in_.n == 3
+	calls := fetch_quad_lanes8(exec) & u32(ctx.lanes)
+	if calls == 0 {
+		return
 	}
-	ux := transmute([8]f32)(((Simd_F8)(px) + 0.5) / sx)
-	uy_v := (((Simd_F8)(py) + 0.5) / sy)
-	if (in_.d & 1) != 0 {
-		uy_v = uy_v * -1 + 1
-	}
-	uy := transmute([8]f32)uy_v
-	canon_lanes8(&ux)
-	canon_lanes8(&uy)
-	uint_lod := (in_.d & 4) != 0
-	have := u32(ctx.lanes)
-	for o := 0; o < JIT_LANES; o += 4 {
-		if (exec >> uint(o)) & 0xf == 0 {
-			continue
-		}
-		for l in o ..< o + 4 {
-			if (have >> uint(l)) & 1 == 0 {
-				continue
-			}
-			flod := f32(lb[l]) if uint_lod else f32(i32(lb[l]))
-			layer := int(i32(slots[in_.a + 2][l])) if in_.n == 3 else 0
-			c := opts.sampler(opts.user, ch, {ux[l], uy[l]}, flod, layer)
-			for i in 0 ..< i32(4) {
-				slots[dst + i][l] = fbits(c[i])
-			}
+	u, v, lod: [8]f32
+	calls &= texel_fetch_args8(&slots[in_.a][0], &slots[in_.a + 1][0], &pz[0], &slots[in_.b][0], size, levels, arr, (in_.d & 1) != 0, &u[0], &v[0], &lod[0])
+	for ; calls != 0; calls &= calls - 1 {
+		l := int(intrinsics.count_trailing_zeros(calls))
+		c := opts.sampler(opts.user, ch, {u[l], v[l]}, lod[l], int(pz[l]) if arr else 0)
+		for i in 0 ..< i32(4) {
+			slots[dst + i][l] = fbits(c[i])
 		}
 	}
 }

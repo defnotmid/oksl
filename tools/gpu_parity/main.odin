@@ -4,7 +4,8 @@
 // whose uv a .frag reads at location 0) and with the CPU interpreter, and
 // compares the colour at location 0: sampler2DArrays read LAYERS copies
 // of a checker texture with their colours rotated, sampler2D channel n
-// layer n % LAYERS, and every storage buffer the test words. It also
+// layer n % LAYERS (channel parity.WIDE_CHANNEL a non-square image with
+// part of its mip chain), and every storage buffer the test words. It also
 // checks a tap of the layer vertex shader (Options.taps), its position
 // drawn as colour, a vertex shader placing the quad's corners by
 // gl_VertexID from a storage buffer, against run_vertex's, gl_SampleMask
@@ -46,6 +47,8 @@ Gpu :: struct {
 	// % LAYERS]), and the array of them.
 	tex:            [LAYERS]^sdl.GPUTexture,
 	layers:         ^sdl.GPUTexture,
+	// parity.WIDE_CHANNEL's image.
+	wide:           ^sdl.GPUTexture,
 	tex_r32f:       ^sdl.GPUTexture,
 	tex_rg32f:      ^sdl.GPUTexture,
 	tex_rgba32f:    ^sdl.GPUTexture,
@@ -205,6 +208,7 @@ gpu_init :: proc(g: ^Gpu) -> bool {
 		t = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = TEX, height = TEX, layer_count_or_depth = 1, num_levels = LEVELS})
 	}
 	g.layers = sdl.CreateGPUTexture(g.device, {type = .D2_ARRAY, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = TEX, height = TEX, layer_count_or_depth = LAYERS, num_levels = LEVELS})
+	g.wide = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = parity.WIDE_W, height = parity.WIDE_H, layer_count_or_depth = 1, num_levels = parity.WIDE_LEVELS})
 	g.tex_r32f = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32_FLOAT, usage = {.SAMPLER}, width = parity.BOUND_R_W, height = parity.BOUND_R_H, layer_count_or_depth = 1, num_levels = 1})
 	g.tex_rg32f = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32G32_FLOAT, usage = {.SAMPLER}, width = parity.BOUND_RG_W, height = parity.BOUND_RG_H, layer_count_or_depth = 1, num_levels = 1})
 	g.tex_rgba32f = sdl.CreateGPUTexture(g.device, {type = .D2, format = .R32G32B32A32_FLOAT, usage = {.SAMPLER}, width = parity.BOUND_RGBA_W, height = parity.BOUND_RGBA_H, layer_count_or_depth = 1, num_levels = 1})
@@ -236,20 +240,21 @@ gpu_init :: proc(g: ^Gpu) -> bool {
 	quad := parity.QUAD
 	g.quad = sdl.CreateGPUBuffer(g.device, {usage = {.VERTEX}, size = size_of(quad)})
 	g.words = sdl.CreateGPUBuffer(g.device, {usage = {.GRAPHICS_STORAGE_READ}, size = size_of(parity.test_words)})
-	if g.vert == nil || g.target == nil || g.target_f32 == nil || g.tex[0] == nil || g.tex[1] == nil || g.tex[2] == nil || g.layers == nil ||
+	if g.vert == nil || g.target == nil || g.target_f32 == nil || g.tex[0] == nil || g.tex[1] == nil || g.tex[2] == nil || g.layers == nil || g.wide == nil ||
 	   g.tex_r32f == nil || g.tex_rg32f == nil || g.tex_rgba32f == nil ||
 	   g.sampler == nil || g.sampler_near == nil || g.sampler_linear == nil || g.quad == nil || g.words == nil {
 		return false
 	}
 
-	// Upload the quad, the words, the texture, the array's layers and the float textures.
+	// Upload the quad, the words, the texture, the array's layers, the float textures and the wide image.
 	pixels := len(parity.texture_pixels)
 	at_words := size_of(quad)
 	at_layers := at_words + size_of(parity.test_words)
 	at_r32 := at_layers + LAYERS * pixels
 	at_rg32 := at_r32 + size_of(parity.bound_r_texels)
 	at_rgba32 := at_rg32 + size_of(parity.bound_rg_texels)
-	total_upload := at_rgba32 + size_of(parity.bound_rgba_texels)
+	at_wide := at_rgba32 + size_of(parity.bound_rgba_texels)
+	total_upload := at_wide + len(parity.wide_pixels)
 	transfer := sdl.CreateGPUTransferBuffer(g.device, {usage = .UPLOAD, size = u32(total_upload)})
 	defer sdl.ReleaseGPUTransferBuffer(g.device, transfer)
 	mapped := ([^]u8)(sdl.MapGPUTransferBuffer(g.device, transfer, false))
@@ -263,6 +268,7 @@ gpu_init :: proc(g: ^Gpu) -> bool {
 	mem.copy(mapped[at_r32:], &parity.bound_r_texels, size_of(parity.bound_r_texels))
 	mem.copy(mapped[at_rg32:], &parity.bound_rg_texels, size_of(parity.bound_rg_texels))
 	mem.copy(mapped[at_rgba32:], &parity.bound_rgba_texels, size_of(parity.bound_rgba_texels))
+	mem.copy(mapped[at_wide:], raw_data(parity.wide_pixels), len(parity.wide_pixels))
 	sdl.UnmapGPUTransferBuffer(g.device, transfer)
 	cmd := sdl.AcquireGPUCommandBuffer(g.device)
 	pass := sdl.BeginGPUCopyPass(cmd)
@@ -282,11 +288,27 @@ gpu_init :: proc(g: ^Gpu) -> bool {
 	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_r32), pixels_per_row = BR_W, rows_per_layer = BR_H}, {texture = g.tex_r32f, w = BR_W, h = BR_H, d = 1}, false)
 	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_rg32), pixels_per_row = BRG_W, rows_per_layer = BRG_H}, {texture = g.tex_rg32f, w = BRG_W, h = BRG_H, d = 1}, false)
 	sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_rgba32), pixels_per_row = BRGBA_W, rows_per_layer = BRGBA_H}, {texture = g.tex_rgba32f, w = BRGBA_W, h = BRGBA_H, d = 1}, false)
+	for l in 0 ..< parity.WIDE_LEVELS {
+		w, h, o := parity.wide_size(l)
+		sdl.UploadToGPUTexture(pass, {transfer_buffer = transfer, offset = u32(at_wide + o), pixels_per_row = u32(w), rows_per_layer = u32(h)}, {texture = g.wide, mip_level = u32(l), w = u32(w), h = u32(h), d = 1}, false)
+	}
 	sdl.EndGPUCopyPass(pass)
 	fence := sdl.SubmitGPUCommandBufferAndAcquireFence(cmd)
 	_ = sdl.WaitForGPUFences(g.device, true, &fence, 1)
 	sdl.ReleaseGPUFence(g.device, fence)
 	return true
+}
+
+// The texture a module's channel reads: the array, parity.WIDE_CHANNEL's
+// image, or sampler2D channel n's layer n % LAYERS.
+channel_texture :: proc(g: ^Gpu, m: ^oksl.Module, ch: int) -> ^sdl.GPUTexture {
+	switch {
+	case ch in m.channel_arrays:
+		return g.layers
+	case parity.channel_wide(m.channel_arrays, ch):
+		return g.wide
+	}
+	return g.tex[ch % LAYERS]
 }
 
 gpu_render :: proc(g: ^Gpu, m: ^oksl.Module, block: []u8) -> ([]u8, bool) {
@@ -337,7 +359,7 @@ gpu_render :: proc(g: ^Gpu, m: ^oksl.Module, block: []u8) -> ([]u8, bool) {
 	if m.num_samplers > 0 {
 		samplers := make([]sdl.GPUTextureSamplerBinding, m.num_samplers, context.temp_allocator)
 		for &s, ch in samplers {
-			s = {texture = g.layers if ch in m.channel_arrays else g.tex[ch % LAYERS], sampler = g.sampler}
+			s = {texture = channel_texture(g, m, ch), sampler = g.sampler}
 		}
 		sdl.BindGPUFragmentSamplers(pass, 0, raw_data(samplers), u32(len(samplers)))
 	}
@@ -850,7 +872,7 @@ compute_module_check :: proc(g: ^Gpu, m: ^oksl.Module, shape: parity.Compute_Sha
 	if m.num_samplers > 0 {
 		samplers := make([]sdl.GPUTextureSamplerBinding, m.num_samplers, context.temp_allocator)
 		for &s, ch in samplers {
-			s = {texture = g.layers if ch in m.channel_arrays else g.tex[ch % LAYERS], sampler = g.sampler}
+			s = {texture = channel_texture(g, m, ch), sampler = g.sampler}
 		}
 		sdl.BindGPUComputeSamplers(pass, 0, raw_data(samplers), u32(len(samplers)))
 	}
@@ -1041,11 +1063,10 @@ bound_formats_check :: proc(g: ^Gpu, scratch: ^oksl.Scratch, failed: ^int) -> in
 }
 
 // texelFetch in and out of range (parity.bound_fetch_compare) on the
-// bound format textures: with SDL's default sampler and with that sampler
-// but max_lod 1000, what the GPU returns outside, reported; the texels
-// inside, with max_lod 1000, a check (the default's max_lod 0 may pin
-// texelFetch to level 0, as on RADV, which then reads the level-0 texel at
-// the level's texel centre).
+// bound format textures, with SDL's default sampler (repeat, max_lod 0),
+// with max_lod 1000, clamped to the edge as well, and anisotropic with a
+// lod bias of 3: the texel inside and (0, 0, 0, 0) outside whatever the
+// sampler (16 checks).
 bound_fetch_check :: proc(g: ^Gpu, texs: [4]^sdl.GPUTexture, scratch: ^oksl.Scratch, failed: ^int) -> int {
 	m, errors, ok := oksl.compile(parity.BOUND_FETCH_FRAG, {profile = .Glsl, stage = .Fragment})
 	defer oksl.destroy(m)
@@ -1099,11 +1120,15 @@ bound_fetch_check :: proc(g: ^Gpu, texs: [4]^sdl.GPUTexture, scratch: ^oksl.Scra
 	sdl.ReleaseGPUFence(g.device, fence)
 	formats := parity.BOUND_FORMATS
 	// SDL's defaults (repeat, max_lod 0), then max_lod 1000, then clamped to
-	// the edge as well.
-	samplers := [3]sdl.GPUSamplerCreateInfo{{}, {max_lod = 1000}, {max_lod = 1000, address_mode_u = .CLAMP_TO_EDGE, address_mode_v = .CLAMP_TO_EDGE, address_mode_w = .CLAMP_TO_EDGE}}
-	names := [3]string{"SDL default sampler", "max_lod 1000", "max_lod 1000, clamp to edge"}
-	for si in 0 ..< 3 {
-	lod_range := si > 0
+	// the edge as well, then anisotropic (trilinear) with a lod bias of 3.
+	samplers := [4]sdl.GPUSamplerCreateInfo {
+		{},
+		{max_lod = 1000},
+		{max_lod = 1000, address_mode_u = .CLAMP_TO_EDGE, address_mode_v = .CLAMP_TO_EDGE, address_mode_w = .CLAMP_TO_EDGE},
+		{min_filter = .LINEAR, mag_filter = .LINEAR, mipmap_mode = .LINEAR, address_mode_u = .CLAMP_TO_EDGE, address_mode_v = .CLAMP_TO_EDGE, address_mode_w = .CLAMP_TO_EDGE, mip_lod_bias = 3, max_anisotropy = 16, enable_anisotropy = true, max_lod = 1000},
+	}
+	names := [4]string{"SDL default sampler", "max_lod 1000", "max_lod 1000, clamp to edge", "anisotropic 16, lod bias 3"}
+	for si in 0 ..< 4 {
 	smp := sdl.CreateGPUSampler(g.device, samplers[si])
 	defer sdl.ReleaseGPUSampler(g.device, smp)
 	for fi in 0 ..< 4 {
@@ -1135,17 +1160,13 @@ bound_fetch_check :: proc(g: ^Gpu, texs: [4]^sdl.GPUTexture, scratch: ^oksl.Scra
 		sdl.UnmapGPUTransferBuffer(g.device, dl)
 		sdl.ReleaseGPUTransferBuffer(g.device, dl)
 		detail, bf_ok := parity.bound_fetch_compare(m, fi, gpu_f, scratch)
-		if lod_range {
-			if !bf_ok {
-				failed^ += 1
-			}
-			fmt.printfln("%-20s %v %s: %s  %s", "bound_fetch", formats[fi], names[si], detail, "ok" if bf_ok else "MISMATCH")
-		} else {
-			fmt.printfln("%-20s %v %s (reported): %s", "bound_fetch", formats[fi], names[si], detail)
+		if !bf_ok {
+			failed^ += 1
 		}
+		fmt.printfln("%-20s %v %s: %s  %s", "bound_fetch", formats[fi], names[si], detail, "ok" if bf_ok else "MISMATCH")
 	}
 	}
-	return 8
+	return 16
 }
 
 // A fragment shader reading a storage buffer of queries and one sampler,

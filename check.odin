@@ -2458,13 +2458,15 @@ check_eval :: proc(c: ^Checker, id: Expr_Id) -> Type {
 //
 //     texture(s, uv [, bias])  ->  sample(s, flip(uv), implicit + bias)
 //     textureLod(s, uv, lod)   ->  sample(s, flip(uv), lod)
-//     texelFetch(s, p, lod)    ->  sample(s, flip((vec2(p) + 0.5) / size), lod)
+//     texelFetch(s, p, lod)    ->  fetch(s, flip(p), lod)
 //     textureSize(s, lod)      ->  ivec2(size)
 //
-// With the inputs header (Shadertoy) `size` is the channel's
-// iChannelResolution.xy, so texelFetch and textureSize take a channel
-// itself rather than a sampler parameter; without it (GLSL shaders) it is
-// the image's own size at lod.
+// texelFetch reads texel p of level lod itself, (0, 0, 0, 0) outside the
+// level, the levels or the layers, whatever the sampler; flip(p) is
+// (p.x, h - 1 - p.y), h the height of level lod. With the inputs header
+// (Shadertoy) `size` is the channel's iChannelResolution.xy, so
+// textureSize takes a channel itself rather than a sampler parameter;
+// without it (GLSL shaders) it is the image's own size at lod.
 // A sampler's coordinate: uv, and the layer of a sampler2DArray.
 @(private)
 texture_coord :: proc "contextless" (sampler: Type) -> Type {
@@ -2586,15 +2588,7 @@ check_texture :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		if !ok || !is_integer_base(expr_type(u, args[2]).base) || !is_scalar(expr_type(u, args[2])) {
 			return no_overload(c, e, args)
 		}
-		if c.rules.header {
-			size: Expr_Id
-			if size, ok = channel_size(c, e, sampler); !ok {
-				return T_ERROR
-			}
-			u.exprs[id].args = push_ids(u, {u32(sampler), u32(p), u32(lod), u32(size)})
-		} else {
-			u.exprs[id].args = push_ids(u, {u32(sampler), u32(p), u32(lod)})
-		}
+		u.exprs[id].args = push_ids(u, {u32(sampler), u32(p), u32(lod)})
 		u.exprs[id].call = .Builtin
 		u.exprs[id].builtin = .Texel_Fetch
 		return vec_type(.Float, 4)

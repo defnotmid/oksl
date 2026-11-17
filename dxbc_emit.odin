@@ -2136,23 +2136,42 @@ dx_texture :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 		t := expr_type(u, id)
 		return dx_resinfo(d, ch, dx_comp(args[0], 0), true, dx_mask(int(t.rows)))
 	case .Texel_Fetch:
-		// The texel's centre at its level, as the other backends sample it.
-		rules := PROFILE_RULES[u.profile]
-		pf := dx_op(d, .Itof, 2, dx_n(args[0], 2))
-		centre := dx_op(d, .Add, 2, pf, dx_imm_f(0.5))
-		sz := dx_n(args[2], 2) if rules.header else dx_resinfo(d, ch, dx_comp(args[1], 0), false, 0x3)
-		uv2 := dx_op(d, .Div, 2, centre, sz)
-		if rules.flip_y {
-			fy := dx_comp(uv2, 1)
-			fy.neg = true
-			dx_ins(&d.code, .Add, 0, uv2, 0x2, dx_imm_f(1), fy)
+		// One texel, whatever the sampler: ld's address is p.xy, a
+		// sampler2DArray's layer p.z in z, and the level in w, each taken
+		// unsigned (a negative int one out of range as a huge uint). Out
+		// of range ld reads 0 in the format's components but 1 in a
+		// missing alpha (R8's (0, 0, 0, 1)), so w is masked by the texel
+		// being inside the level and the levels: resinfo_uint's size at
+		// the level (and layers) and its levels in w, which D3D gives
+		// past the levels too (vkd3d's size there is RADV's undefined
+		// one).
+		lod := dx_comp(args[1], 0)
+		arr := expr_type(u, argx[0]) == T_SAMPLER_ARRAY
+		mask: u8 = 0x7 if arr else 0x3
+		at := dx_temp(d)
+		dx_ins(&d.code, .Mov, 0, at, mask, dx_n(args[0], 3 if arr else 2))
+		size := dx_resinfo(d, ch, lod, true, mask | 0x8)
+		if PROFILE_RULES[u.profile].flip_y {
+			// p.y counted from the level's bottom row: h + ~p.y.
+			dx_ins(&d.code, .Not, 0, at, 0x2, dx_comp(args[0], 1))
+			dx_ins(&d.code, .Iadd, 0, at, 0x2, at, dx_comp(size, 1))
 		}
-		if expr_type(u, argx[0]) == T_SAMPLER_ARRAY {
-			// A sampler2DArray's layer p.z, in z.
-			dx_ins(&d.code, .Itof, 0, uv2, 0x4, dx_comp(args[0], 2))
+		dx_ins(&d.code, .Mov, 0, at, 0x8, lod)
+		r := dx_temp(d)
+		start := len(d.code)
+		append(&d.code, u32(Dx_Op.Ld))
+		dx_put_dst(&d.code, r, 0xf)
+		dx_put_src(&d.code, at, 0xf, vector = true)
+		dx_put_src(&d.code, Dx_Src{file = .Resource, idx = {d.tex_id[ch], u32(ch), 0}, rel = -1, swz = DX_XYZW}, 0xf, vector = true)
+		dx_end(&d.code, start)
+		dx_ins(&d.code, .Ult, 0, size, mask | 0x8, at, size)
+		dx_ins(&d.code, .And, 0, size, 0x1, dx_comp(size, 0), dx_comp(size, 1))
+		dx_ins(&d.code, .And, 0, size, 0x1, dx_comp(size, 0), dx_comp(size, 3))
+		if arr {
+			dx_ins(&d.code, .And, 0, size, 0x1, dx_comp(size, 0), dx_comp(size, 2))
 		}
-		flod := dx_op(d, .Utof if expr_type(u, argx[2]).base == .Uint else .Itof, 1, dx_comp(args[1], 0))
-		return dx_sample(d, .Sample_L, ch, uv2, {dx_comp(flod, 0)})
+		dx_ins(&d.code, .And, 0, r, 0x8, r, dx_comp(size, 0))
+		return r
 	}
 	return dx_imm(0)
 }

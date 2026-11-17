@@ -32,8 +32,19 @@ test_words: [WORDS]u32
 // 2x2 box average of the one above, in 8 bits (so both sides see the same
 // values). Layer l of it has its colours rotated l places: a
 // sampler2DArray's layers, and sampler2D channel n's image is layer n %
-// LAYERS (so channels differ).
+// LAYERS (so channels differ), but for WIDE_CHANNEL's.
 texture_pixels: [(TEX * TEX * 4 * 4 - 4) / 3]u8
+
+// Sampler2D channel WIDE_CHANNEL's image: WIDE_W x WIDE_H RGBA8 texels and
+// WIDE_LEVELS levels above them, each its own pseudo-random texels, of the
+// 6 of its full chain, so the CPU takes them as Run_Options.channel_levels
+// (st_texel_fetch_levels.glsl: texelFetch's Shadertoy flip at each level
+// of a non-square image, and the levels past the GPU texture's).
+WIDE_CHANNEL :: 3
+WIDE_W :: 48
+WIDE_H :: 20
+WIDE_LEVELS :: 4
+wide_pixels: []u8
 
 BOUND_R_W :: 16
 BOUND_R_H :: 8
@@ -64,6 +75,15 @@ Vertex :: struct {
 }
 
 QUAD := [6]Vertex{{{0, 0}, {0, 0}}, {{0, H}, {0, 1}}, {{W, H}, {1, 1}}, {{0, 0}, {0, 0}}, {{W, H}, {1, 1}}, {{W, 0}, {1, 0}}}
+
+// Level l's size of the wide image, and where it starts in wide_pixels.
+wide_size :: proc(l: int) -> (w, h, offset: int) {
+	for i in 0 ..< l {
+		w, h, _ = wide_size(i)
+		offset += w * h * 4
+	}
+	return max(WIDE_W >> uint(l), 1), max(WIDE_H >> uint(l), 1), offset
+}
 
 // Level l's size of the bound format image.
 bound_fmt_size :: proc(l: int) -> (w, h: int) {
@@ -143,11 +163,12 @@ bound_formats_compare :: proc(m: ^oksl.Module, fi: int, filter: oksl.Channel_Fil
 	return bound_compare(m, bound_fmt_image(fi, filter, wrap), bound_fmt_queries[:], gpu_f, scratch, metal)
 }
 
-// ---- texelFetch out of range (bound_fetch_compare) ----------------------------------------
+// ---- texelFetch in and out of range (bound_fetch_compare) ---------------------------------
 //
-// A measurement, not oksl's rule against itself: what a GPU's texelFetch
-// returns outside the level or the texture, for the bound format images
-// bound as SDL binds a texture. oksl returns (0, 0, 0, 0) there.
+// What a GPU's texelFetch returns inside and outside the level or the
+// texture, for the bound format images bound as SDL binds a texture,
+// against oksl's CPU: the texel inside, (0, 0, 0, 0) outside, whatever the
+// sampler.
 
 // texelFetch at each pixel's query: (x, y, level, 0).
 BOUND_FETCH_FRAG :: `#version 310 es
@@ -171,7 +192,9 @@ bound_fetch_wrapped: [W * H][4]i32
 
 // Every pairing of x and y from -2^20, -2, -1, 0, the middle, n - 1, n and
 // n + 5 (n the level's size, the top level's past the top), at levels -1,
-// 0, 2, the top, the top + 1 and the top + 3, repeated over the target.
+// 0, 2, the top, the top + 1 and the top + 3, repeated over the target,
+// each time at another layer (w: bound_fetch_layers_compare's) of -2^20,
+// -1, 0, 1, 2, 3 and 2^20.
 make_bound_fetch_data :: proc() {
 	LEVELS :: [6]i32{-1, 0, 2, BOUND_FMT_LEVELS - 1, BOUND_FMT_LEVELS, BOUND_FMT_LEVELS + 3}
 	cases := make([dynamic][4]i32, context.temp_allocator)
@@ -186,8 +209,10 @@ make_bound_fetch_data :: proc() {
 			}
 		}
 	}
+	layer_cases := [7]i32{-1 << 20, -1, 0, 1, 2, BOUND_LAYERS, 1 << 20}
 	for &q, i in bound_fetch_queries {
 		q = cases[i % len(cases)]
+		q.w = layer_cases[i / len(cases) % len(layer_cases)]
 		lc := clamp(q.z, 0, BOUND_FMT_LEVELS - 1)
 		w, h := bound_fmt_size(int(lc))
 		bound_fetch_clamped[i] = {clamp(q.x, 0, i32(w - 1)), clamp(q.y, 0, i32(h - 1)), lc, 0}
@@ -198,12 +223,15 @@ make_bound_fetch_data :: proc() {
 // Sorts a GPU's texelFetch results at bound_fetch_queries: inside (level
 // and texel in range), and outside the texture or the level, each result
 // as zero (rgb 0, alpha 0 or 1), the clamped texel, the wrapped one, more
-// than one of those, or other. Within 1e-3 of the CPU's texels (decoded
-// exactly by both). The verdict: every inside result the CPU's texel.
+// than one of those, or other; within 1e-3 of the CPU's texels (decoded
+// exactly by both). The verdict: every inside result the CPU's texel, and
+// every outside one the CPU's (0, 0, 0, 0), bit for bit.
 bound_fetch_compare :: proc(m: ^oksl.Module, fi: int, gpu_f: [][4]f32, scratch: ^oksl.Scratch) -> (string, bool) {
 	im := bound_fmt_image(fi, .Nearest, {.Clamp, .Clamp})
+	cpu := make([][4]f32, W * H, context.temp_allocator)
 	clamped := make([][4]f32, W * H, context.temp_allocator)
 	wrapped := make([][4]f32, W * H, context.temp_allocator)
+	oksl.run_f32(&m.program, nil, W, H, cpu, scratch, {channel_images = {im}, buffers = {slice.reinterpret([]u32, bound_fetch_queries[:])}})
 	oksl.run_f32(&m.program, nil, W, H, clamped, scratch, {channel_images = {im}, buffers = {slice.reinterpret([]u32, bound_fetch_clamped[:])}})
 	oksl.run_f32(&m.program, nil, W, H, wrapped, scratch, {channel_images = {im}, buffers = {slice.reinterpret([]u32, bound_fetch_wrapped[:])}})
 	near :: proc(a, b: [4]f32) -> bool {
@@ -220,6 +248,9 @@ bound_fetch_compare :: proc(m: ^oksl.Module, fi: int, gpu_f: [][4]f32, scratch: 
 	}
 	inside: Tally
 	coord, level: Tally
+	// Outside results that are not the CPU's (0, 0, 0, 0) bits.
+	outside_off := 0
+	outside_example := ""
 	for i in 0 ..< W * H {
 		q := bound_fetch_queries[i]
 		g := gpu_f[i]
@@ -228,6 +259,12 @@ bound_fetch_compare :: proc(m: ^oksl.Module, fi: int, gpu_f: [][4]f32, scratch: 
 		texel_in := q.x >= 0 && q.y >= 0 && int(q.x) < lw && int(q.y) < lh
 		t := &inside if level_in && texel_in else (&coord if level_in else &level)
 		t.n += 1
+		if t != &inside && (transmute([4]u32)g != {} || transmute([4]u32)cpu[i] != {}) {
+			if outside_off == 0 {
+				outside_example = fmt.tprintf(" (e.g. %v at %v)", g, q)
+			}
+			outside_off += 1
+		}
 		zero := g.xyz == {0, 0, 0} && (g.w == 0 || g.w == 1)
 		cl, wr := near(g, clamped[i]), near(g, wrapped[i])
 		switch {
@@ -247,7 +284,57 @@ bound_fetch_compare :: proc(m: ^oksl.Module, fi: int, gpu_f: [][4]f32, scratch: 
 		return fmt.tprintf("%d: zero %d + %d (alpha 0 + 1), clamped %d, wrapped %d, several %d, other %d%s", t.n, t.zero0, t.zero1, t.clamped, t.wrapped, t.several, t.other, t.example)
 	}
 	inside_ok := inside.clamped + inside.several == inside.n && inside.zero0 + inside.zero1 + inside.wrapped + inside.other == 0
-	return fmt.tprintf("inside %s; texel out %s; level out %s", line(inside), line(coord), line(level)), inside_ok
+	return fmt.tprintf("inside %s; texel out %s; level out %s; outside not (0, 0, 0, 0) %d%s", line(inside), line(coord), line(level), outside_off, outside_example), inside_ok && outside_off == 0
+}
+
+// texelFetch of a layered bound image at each pixel's query (x, y, level,
+// layer).
+BOUND_FETCH_LAYERS_FRAG :: `#version 310 es
+precision highp float;
+precision highp int;
+readonly buffer Q { ivec4 q[]; };
+uniform sampler2DArray s;
+layout(location = 0) out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec4 c = q[p.y * 256 + p.x];
+    o = texelFetch(s, c.xyw, c.z);
+}`
+
+// A GPU's texelFetch of format fi's layered image (bound_layer_image) at
+// bound_fetch_queries against the CPU: within 1e-3 of the CPU's texel
+// where the texel, level and layer are inside, and (0, 0, 0, 0) bit for
+// bit outside, an alpha-less format's alpha included.
+bound_fetch_layers_compare :: proc(m: ^oksl.Module, fi: int, gpu_f: [][4]f32, scratch: ^oksl.Scratch) -> (string, bool) {
+	cpu := make([][4]f32, W * H, context.temp_allocator)
+	oksl.run_f32(&m.program, nil, W, H, cpu, scratch, {channel_images = {bound_layer_image(fi, .Nearest, {.Clamp, .Clamp})}, buffers = {slice.reinterpret([]u32, bound_fetch_queries[:])}})
+	inside, layer_out, other_out, bad := 0, 0, 0, 0
+	example := ""
+	for i in 0 ..< W * H {
+		q, g, c := bound_fetch_queries[i], gpu_f[i], cpu[i]
+		lw, lh := bound_fmt_size(int(clamp(q.z, 0, BOUND_FMT_LEVELS - 1)))
+		texel_in := q.z >= 0 && q.z < BOUND_FMT_LEVELS && q.x >= 0 && q.y >= 0 && int(q.x) < lw && int(q.y) < lh
+		ok := transmute([4]u32)g == {} && transmute([4]u32)c == {}
+		switch {
+		case texel_in && q.w >= 0 && q.w < BOUND_LAYERS:
+			inside += 1
+			ok = true
+			for k in 0 ..< 4 {
+				ok &&= abs(g[k] - c[k]) <= 1e-3
+			}
+		case texel_in:
+			layer_out += 1
+		case:
+			other_out += 1
+		}
+		if !ok {
+			if bad == 0 {
+				example = fmt.tprintf(" (e.g. %v at %v, CPU %v)", g, q, c)
+			}
+			bad += 1
+		}
+	}
+	return fmt.tprintf("inside %d, layer out %d, texel or level out %d: mismatches %d%s", inside, layer_out, other_out, bad, example), bad == 0
 }
 
 // Metal's level of detail (Apple GPUs, measured on the M4 with
@@ -364,8 +451,8 @@ make_bound_layer_data :: proc() {
 	}
 	// Quarter by quarter: magnified at every tie of the layer coordinate
 	// and either side of it; minified across the levels at random layers;
-	// NaN, infinite, huge and negative layers; texelFetch at in-range
-	// texels, levels and layers.
+	// NaN, infinite, huge and negative layers; texelFetch at texels, levels
+	// and layers in range, and one in four past one end of one of them.
 	specials := [?]f32{math.nan_f32(), math.inf_f32(1), math.inf_f32(-1), 1e30, -1e30, -0.0, 0.5, 1.5, 2.5, -0.5, 3.5, 0.49999997, 0.50000006, 1.4999999, 1.5000001}
 	for &q, i in bound_layer_queries {
 		x, y := i % W, i / W
@@ -383,6 +470,12 @@ make_bound_layer_data :: proc() {
 			l := int(next(&state) % BOUND_FMT_LEVELS)
 			w, h := bound_fmt_size(l)
 			q = {f32(next(&state) % u32(w)), f32(next(&state) % u32(h)), -1000 - f32(l), f32(next(&state) % BOUND_LAYERS)}
+			switch next(&state) % 16 {
+			case 0: q.w = -1
+			case 1: q.w = BOUND_LAYERS
+			case 2: q.z = -1000 - BOUND_FMT_LEVELS
+			case 3: q.x = f32(w)
+			}
 		}
 	}
 }
@@ -627,6 +720,13 @@ make_data :: proc() {
 	make_bound_fmt_data()
 	make_bound_fetch_data()
 	make_bound_layer_data()
+	_, _, wide_bytes := wide_size(WIDE_LEVELS)
+	wide_pixels = make([]u8, wide_bytes)
+	state := u32(4321)
+	for &b in wide_pixels {
+		state = state * 1664525 + 1013904223
+		b = u8(state >> 24)
+	}
 	for &w, i in test_words {
 		w = transmute(u32)(f32((i * 37 + 11) % 256) / 255)
 	}
@@ -693,7 +793,14 @@ layer_pixel :: proc(i, layer: int) -> u8 {
 	return texture_pixels[i - k + (k + layer) % 3] if k < 3 else texture_pixels[i]
 }
 
-texel :: proc(l, x, y, layer: int) -> [4]f32 {
+// Texel (x, y) of level l, wrapped: of the checker's layer `layer`, or of
+// the wide image.
+texel :: proc(l, x, y, layer: int, wide: bool) -> [4]f32 {
+	if wide {
+		w, h, o := wide_size(l)
+		i := o + ((((y % h) + h) % h) * w + ((x % w) + w) % w) * 4
+		return {f32(wide_pixels[i]), f32(wide_pixels[i + 1]), f32(wide_pixels[i + 2]), f32(wide_pixels[i + 3])} / 255
+	}
 	n := TEX >> uint(l)
 	xx := ((x % n) + n) % n
 	yy := ((y % n) + n) % n
@@ -701,16 +808,19 @@ texel :: proc(l, x, y, layer: int) -> [4]f32 {
 	return {f32(layer_pixel(i, layer)), f32(layer_pixel(i + 1, layer)), f32(layer_pixel(i + 2, layer)), f32(layer_pixel(i + 3, layer))} / 255
 }
 
-bilinear :: proc(l: int, uv: [2]f32, layer: int) -> [4]f32 {
-	n := f32(int(TEX) >> uint(l))
-	fx := uv.x * n - 0.5
-	fy := uv.y * n - 0.5
+bilinear :: proc(l: int, uv: [2]f32, layer: int, wide: bool) -> [4]f32 {
+	w, h := TEX >> uint(l), TEX >> uint(l)
+	if wide {
+		w, h, _ = wide_size(l)
+	}
+	fx := uv.x * f32(w) - 0.5
+	fy := uv.y * f32(h) - 0.5
 	x0 := int(fx) if fx >= 0 else int(fx) - 1
 	y0 := int(fy) if fy >= 0 else int(fy) - 1
 	tx := fx - f32(x0)
 	ty := fy - f32(y0)
-	a, b := texel(l, x0, y0, layer), texel(l, x0 + 1, y0, layer)
-	c, d := texel(l, x0, y0 + 1, layer), texel(l, x0 + 1, y0 + 1, layer)
+	a, b := texel(l, x0, y0, layer, wide), texel(l, x0 + 1, y0, layer, wide)
+	c, d := texel(l, x0, y0 + 1, layer, wide), texel(l, x0 + 1, y0 + 1, layer, wide)
 	return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty
 }
 
@@ -721,19 +831,38 @@ channel_layer :: proc(arrays: bit_set[0 ..< oksl.SAMPLER_COUNT], channel, layer:
 	return clamp(layer, 0, LAYERS - 1) if channel in arrays else channel % LAYERS
 }
 
-// Trilinear and repeating, the level clamped to the chain: what the GPU
+// Whether a module's channel reads the wide image.
+channel_wide :: proc(arrays: bit_set[0 ..< oksl.SAMPLER_COUNT], channel: int) -> bool {
+	return channel == WIDE_CHANNEL && channel not_in arrays
+}
+
+// Trilinear and repeating, the level clamped to the levels: what the GPU
 // sampler the tools bind does. Run_Options.user is the module's
 // channel_arrays.
 cpu_sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
-	ly := channel_layer((^bit_set[0 ..< oksl.SAMPLER_COUNT])(user)^, channel, layer)
+	arrays := (^bit_set[0 ..< oksl.SAMPLER_COUNT])(user)^
+	ly := channel_layer(arrays, channel, layer)
+	wide := channel_wide(arrays, channel)
 	if !(lod > 0) {
-		return bilinear(0, uv, ly)
+		return bilinear(0, uv, ly, wide)
 	}
-	level := min(lod, LEVELS - 1)
+	top := WIDE_LEVELS - 1 if wide else LEVELS - 1
+	level := min(lod, f32(top))
 	l0 := int(level)
-	l1 := min(l0 + 1, LEVELS - 1)
+	l1 := min(l0 + 1, top)
 	t := level - f32(l0)
-	return bilinear(l0, uv, ly) * (1 - t) + bilinear(l1, uv, ly) * t
+	return bilinear(l0, uv, ly, wide) * (1 - t) + bilinear(l1, uv, ly, wide) * t
+}
+
+// The channels' sizes and levels as the tools' textures have them
+// (Run_Options.channel_sizes and channel_levels).
+channel_extents :: proc(arrays: bit_set[0 ..< oksl.SAMPLER_COUNT], sizes: ^[oksl.SAMPLER_COUNT][3]i32, levels: ^[oksl.SAMPLER_COUNT]i32) {
+	for ch in 0 ..< oksl.SAMPLER_COUNT {
+		sizes[ch], levels[ch] = {TEX, TEX, LAYERS if ch in arrays else 1}, LEVELS
+		if channel_wide(arrays, ch) {
+			sizes[ch], levels[ch] = {WIDE_W, WIDE_H, 1}, WIDE_LEVELS
+		}
+	}
 }
 
 // The fragment shaders' uniform block: the built-ins for a W x H target
@@ -741,7 +870,7 @@ cpu_sampler :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int
 uniform_block :: proc(m: ^oksl.Module) -> []u8 {
 	block := make([]u8, m.block_size)
 	ch := [3]f32{TEX, TEX, 1}
-	oksl.write_builtins(block, {resolution = {W, H, 1}, time = TIME, time_delta = 1.0 / 60, frame = 90, frame_rate = 60, channel_resolution = {ch, ch, ch, ch}})
+	oksl.write_builtins(block, {resolution = {W, H, 1}, time = TIME, time_delta = 1.0 / 60, frame = 90, frame_rate = 60, channel_resolution = {ch, ch, ch, {WIDE_W, WIDE_H, 1}}})
 	oksl.set_uniform(m, block, "uSpeed", {0.5})
 	oksl.set_uniform(m, block, "uScale", {1.5})
 	oksl.set_uniform(m, block, "uTint", {1, 0.9, 0.8})
@@ -755,18 +884,16 @@ uniform_block :: proc(m: ^oksl.Module) -> []u8 {
 }
 
 // The CPU's run options for a fragment shader on the test data: the
-// sampler, the channels' sizes and every storage buffer the test words.
-// `arrays` must outlive the run (Run_Options.user points at it).
-run_options :: proc(m: ^oksl.Module, arrays: ^bit_set[0 ..< oksl.SAMPLER_COUNT], sizes: ^[oksl.SAMPLER_COUNT][3]i32) -> oksl.Run_Options {
+// sampler, the channels' sizes and levels and every storage buffer the
+// test words. `arrays`, `sizes` and `levels` must outlive the run.
+run_options :: proc(m: ^oksl.Module, arrays: ^bit_set[0 ..< oksl.SAMPLER_COUNT], sizes: ^[oksl.SAMPLER_COUNT][3]i32, levels: ^[oksl.SAMPLER_COUNT]i32) -> oksl.Run_Options {
 	arrays^ = m.channel_arrays
-	for &s, ch in sizes {
-		s = {TEX, TEX, LAYERS if ch in m.channel_arrays else 1}
-	}
+	channel_extents(m.channel_arrays, sizes, levels)
 	buffers := make([][]u32, len(m.storage_buffers), context.temp_allocator)
 	for &b in buffers {
 		b = test_words[:]
 	}
-	return {sampler = cpu_sampler, user = arrays, channel_sizes = sizes[:], buffers = buffers}
+	return {sampler = cpu_sampler, user = arrays, channel_sizes = sizes[:], channel_levels = levels[:], buffers = buffers}
 }
 
 write_png :: proc(path: string, px: []u8) {
@@ -784,7 +911,8 @@ fragment_reference :: proc(m: ^oksl.Module, block: []u8, scratch: ^oksl.Scratch)
 	}
 	arrays: bit_set[0 ..< oksl.SAMPLER_COUNT]
 	sizes: [oksl.SAMPLER_COUNT][3]i32
-	oksl.run(&m.program, block, W, H, cpu_px, W * 4, scratch, run_options(m, &arrays, &sizes))
+	levels: [oksl.SAMPLER_COUNT]i32
+	oksl.run(&m.program, block, W, H, cpu_px, W * 4, scratch, run_options(m, &arrays, &sizes, &levels))
 	return cpu_px
 }
 
@@ -832,7 +960,8 @@ fragment_reference_f32 :: proc(m: ^oksl.Module, block: []u8, scratch: ^oksl.Scra
 	}
 	arrays: bit_set[0 ..< oksl.SAMPLER_COUNT]
 	sizes: [oksl.SAMPLER_COUNT][3]i32
-	oksl.run_f32(&m.program, block, W, H, px, scratch, run_options(m, &arrays, &sizes))
+	levels: [oksl.SAMPLER_COUNT]i32
+	oksl.run_f32(&m.program, block, W, H, px, scratch, run_options(m, &arrays, &sizes, &levels))
 	return px
 }
 
@@ -1423,11 +1552,10 @@ Range_Job :: struct {
 // with its own Scratch), into cd.cpu_bufs and cd.cpu_imgs.
 compute_cpu :: proc(m: ^oksl.Module, cd: ^Compute_Data) {
 	sizes: [oksl.SAMPLER_COUNT][3]i32
-	for &s, ch in sizes {
-		s = {TEX, TEX, LAYERS if ch in m.channel_arrays else 1}
-	}
+	levels: [oksl.SAMPLER_COUNT]i32
+	channel_extents(m.channel_arrays, &sizes, &levels)
 	arrays := m.channel_arrays
-	opts := oksl.Run_Options{sampler = cpu_sampler, user = &arrays, channel_sizes = sizes[:], buffers = cd.cpu_bufs, images = cd.cpu_imgs}
+	opts := oksl.Run_Options{sampler = cpu_sampler, user = &arrays, channel_sizes = sizes[:], channel_levels = levels[:], buffers = cd.cpu_bufs, images = cd.cpu_imgs}
 	total := cd.groups.x * cd.groups.y * cd.groups.z
 	third := total / 3
 	jobs := [3]Range_Job {

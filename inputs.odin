@@ -52,7 +52,8 @@ OFFSET_FRAME_RATE :: 24 // float
 OFFSET_SAMPLE_RATE :: 28 // float
 OFFSET_MOUSE :: 32 // vec4
 OFFSET_DATE :: 48 // vec4
-// Channel n's size in pixels (what `.eval` and texelFetch divide by),
+// Channel n's size in pixels (what `.eval` divides by and Shadertoy's
+// textureSize gives at every lod; texelFetch takes the image's own),
 // vec3[4], stride 16.
 OFFSET_CHANNEL_RESOLUTION :: 64
 // Channel n's playback time in seconds, float[4], stride 16.

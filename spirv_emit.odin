@@ -926,56 +926,49 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		inst(&s.body, .Image_Sample_Explicit_Lod, rt, r, img, args[1], 0x2, args[2]) // Lod
 		return r
 	case .Texel_Fetch:
-		rules := PROFILE_RULES[u.profile]
-		v2 := vec_type(.Float, 2)
-		v2t := type_id(s, v2)
-		arr := at == T_SAMPLER_ARRAY
-		p := args[1]
-		iv2 := vec_type(.Int, 2)
-		if arr {
-			// A sampler2DArray's: (x, y) as a sampler2D's, its layer p.z.
-			p = swizzle_value(s, args[1], types[1], {0, 1, 0, 0}, 2)
+		// One texel, whatever the sampler: OpImageFetch of texel p (its
+		// layer p.z) at level lod, (0, 0, 0, 0) outside the level, the
+		// levels or the layers, where Vulkan leaves a fetch undefined
+		// (robustImageAccess allows (0, 0, 0, 1)). The size query and the
+		// fetch read only a lod and coordinates in range (0 for those that
+		// are not), and the in-range mask selects the result.
+		if !s.image_query {
+			inst(&s.caps, .Capability, 50) // ImageQuery
+			s.image_query = true
 		}
-		pf := convert(s, p, iv2 if arr else types[1], v2)
-		half := const_f32(s, 0.5)
-		centre := binop_raw(s, .F_Add, v2t, pf, construct(s, v2t, half, half))
-		sz: u32
-		if rules.header {
-			sz = args[3]
-		} else {
-			if !s.image_query {
-				inst(&s.caps, .Capability, 50) // ImageQuery
-				s.image_query = true
-			}
-			sampled := new_id(s)
-			inst(&s.body, .Load, type_id(s, at), sampled, args[0])
-			qimg := new_id(s)
-			inst(&s.body, .Image, s.t_image[int(arr)], qimg, sampled)
-			isz := new_id(s)
-			if arr {
-				iv3 := vec_type(.Int, 3)
-				inst(&s.body, .Image_Query_Size_Lod, type_id(s, iv3), isz, qimg, args[2])
-				isz = swizzle_value(s, isz, iv3, {0, 1, 0, 0}, 2)
-			} else {
-				inst(&s.body, .Image_Query_Size_Lod, type_id(s, iv2), isz, qimg, args[2])
-			}
-			sz = convert(s, isz, iv2, v2)
-		}
-		uv := binop_raw(s, .F_Div, v2t, centre, sz)
-		if rules.flip_y {
-			scale := construct(s, v2t, const_f32(s, 1), const_f32(s, -1))
-			offset := construct(s, v2t, const_f32(s, 0), const_f32(s, 1))
-			uv = binop_raw(s, .F_Add, v2t, binop_raw(s, .F_Mul, v2t, uv, scale), offset)
-		}
-		flod := convert(s, args[2], types[2], T_FLOAT)
-		if arr {
-			layer := convert(s, swizzle_value(s, args[1], types[1], {2, 0, 0, 0}, 1), T_INT, T_FLOAT)
-			uv = construct(s, type_id(s, vec_type(.Float, 3)), extract(s, type_id(s, T_FLOAT), uv, 0), extract(s, type_id(s, T_FLOAT), uv, 1), layer)
-		}
+		pt, lt := types[1], types[2]
+		pti, lti, bt := type_id(s, pt), type_id(s, lt), type_id(s, T_BOOL)
+		sampled := new_id(s)
+		inst(&s.body, .Load, type_id(s, at), sampled, args[0])
 		img := new_id(s)
-		inst(&s.body, .Load, type_id(s, at), img, args[0])
+		inst(&s.body, .Image, s.t_image[int(at == T_SAMPLER_ARRAY)], img, sampled)
+		levels := new_id(s)
+		inst(&s.body, .Image_Query_Levels, lti, levels, img)
+		// A negative int lod is out of range as a huge uint.
+		lod_in := binop_raw(s, .U_Less_Than, bt, args[2], levels)
+		lod := new_id(s)
+		inst(&s.body, .Select, lti, lod, lod_in, args[2], const_of(s, lt.base, 0))
+		// (w, h), and a sampler2DArray's layers.
+		size := new_id(s)
+		inst(&s.body, .Image_Query_Size_Lod, pti, size, img, lod)
+		p := args[1]
+		if PROFILE_RULES[u.profile].flip_y {
+			// p.y counted from the level's bottom row: h - 1 - p.y.
+			it := type_id(s, T_INT)
+			hm1 := binop_raw(s, .I_Sub, it, extract(s, it, size, 1), const_i32(s, 1))
+			y := binop_raw(s, .I_Sub, it, hm1, extract(s, it, p, 1))
+			fp := new_id(s)
+			inst(&s.body, .Composite_Insert, pti, fp, y, p, 1)
+			p = fp
+		}
+		inside := binop_raw(s, .U_Less_Than, type_id(s, vec_type(.Bool, int(pt.rows))), p, size)
+		pc := new_id(s)
+		inst(&s.body, .Select, pti, pc, inside, p, splat_const(s, pt, 0))
+		ok := binop_raw(s, .Logical_And, bt, unop(s, .All, bt, inside), lod_in)
+		texel := new_id(s)
+		inst(&s.body, .Image_Fetch, rt, texel, img, pc, 0x2, lod) // Lod
 		r := new_id(s)
-		inst(&s.body, .Image_Sample_Explicit_Lod, rt, r, img, uv, 0x2, flod)
+		inst(&s.body, .Select, rt, r, construct(s, type_id(s, vec_type(.Bool, 4)), ok, ok, ok, ok), texel, splat_const(s, t, 0))
 		return r
 	case .Texture:
 		img := new_id(s)

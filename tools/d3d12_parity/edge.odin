@@ -220,7 +220,7 @@ void main() {
         o = vec4(ps[pix[px]].a, ps[pix[px]].b, ps[big].b);
     }
 }`, glsl = true, f32 = true},
-	// texelFetch of a sampler2DArray (its layer in z) and of a sampler2D at levels 0-2, and textureSize's layers.
+	// texelFetch of a sampler2DArray (its layer in z, -1 to 3 of 3) and of a sampler2D at levels 0-2, and textureSize's layers.
 	{name = "edge_fetch_layers", source = `#version 310 es
 precision highp float;
 uniform sampler2DArray layers;
@@ -229,7 +229,7 @@ out vec4 o;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     int lod = (p.x / 64) % 3;
-    int z = (p.y / 16) % 3;
+    int z = (p.y / 16) % 5 - 1;
     ivec2 q = ivec2(p.x % (64 >> lod), p.y % (64 >> lod));
     vec3 size = vec3(textureSize(layers, lod));
     o = texelFetch(layers, ivec3(q, z), lod) * 0.5 + texelFetch(plain, q, lod) * 0.25 + vec4(size.xy / 256.0, size.z / 12.0, 0.25);
@@ -249,7 +249,7 @@ void mainImage(out vec4 c, in vec2 f) {
     vec2 uv = f / iResolution.xy;
     c = vec4(pair(iChannel0, iChannel1, uv).rgb * 0.5 + tap(iChannel2, uv * 2.0).gbr * 0.5, 1.0);
 }`},
-	// texelFetch at a uint lod of 2^31 (the coarsest level, not level 0) and at level 2.
+	// texelFetch at a uint lod of 2^31 (past the levels: 0) and at level 2 (p.y from that level's bottom row).
 	{name = "edge_texel_lod", source = `uniform int uMode;
 void mainImage(out vec4 c, in vec2 f) {
     ivec2 p = ivec2(f) % 64;

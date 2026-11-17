@@ -185,7 +185,7 @@ compute_module_check :: proc(g: ^Gpu, m: ^oksl.Module, shape: parity.Compute_Sha
 		return h
 	}
 	for ch in 0 ..< ns {
-		write_srv(g, Srv.Layers if ch in m.channel_arrays else Srv(int(Srv.Tex0) + ch % LAYERS), slot)
+		write_srv(g, channel_srv(m, ch), slot)
 		write_sampler(g, .Repeat, ch)
 		slot += 1
 	}

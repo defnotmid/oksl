@@ -89,7 +89,7 @@ Builtin :: enum u8 {
 	Image_Load,
 	Image_Store,
 	Image_Size,
-	// texelFetch(sampler, p, lod, header_size): integer texel coordinate, no uv round-trip on CPU.
+	// texelFetch(sampler, p, lod): texel p of level lod, 0 outside it.
 	Texel_Fetch,
 	// Invocation and memory barriers (checked by check_barrier_op).
 	Barrier,
