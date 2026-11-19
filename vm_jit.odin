@@ -73,15 +73,18 @@ Jit_Ctx :: struct #align(16) {
 	// Compute: the workgroup's shared memory (Program.shared_words) and the
 	// storage images (Run_Options.images).
 	shared:   [^]u32,
-	imgs:        [IMAGE_COUNT]Jit_Img,
-	// Pad arm64 so tex_tmp is 16-byte aligned for NEON ld1/st1 without shifting x86's offset.
-	tex_tmp_pad: [1 when JIT_A64 else 0]u64,
-	// Scratch vector buffer for in-block helpers (`jit_help_math_a64` on arm64).
-	tex_tmp:     [3][8]f32,
+	imgs:     [IMAGE_COUNT]Jit_Img,
+	// arm64's in-block math helper's result (jit_help_math_a64), read back
+	// with one ldp of two q registers.
+	math_out: Jit_Floats_Q,
+}
+
+@(private)
+Jit_Floats_Q :: struct #align(16) {
+	f: Jit_Floats,
 }
 
 #assert(align_of(Jit_Ctx) >= 16)
-#assert(!JIT_A64 || offset_of(Jit_Ctx, tex_tmp) % 16 == 0)
 #assert(size_of(Jit_Slot) == 32)
 
 // A storage image as generated code reads it: width and height biased by 2^31
@@ -189,7 +192,7 @@ OFF_CTX_LANES :: i32(offset_of(Jit_Ctx, lanes))
 @(private)
 OFF_CTX_IMGS :: i32(offset_of(Jit_Ctx, imgs))
 @(private)
-OFF_CTX_TEX_TMP :: i32(offset_of(Jit_Ctx, tex_tmp))
+OFF_CTX_MATH_OUT :: i32(offset_of(Jit_Ctx, math_out))
 @(private)
 OFF_IMG_PTR :: i32(offset_of(Jit_Img, ptr))
 @(private)
@@ -496,8 +499,8 @@ is_helper_instr :: proc(p: ^Program, in_: Instr) -> bool {
 	case .Load_Buf:
 		return int(in_.k) >= 4
 	}
-	// F_Fn1 and F_Fn2's vm_math.odin built-ins call jit_help_math inside
-	// their basic block (emit_math_call).
+	// F_Fn1 and F_Fn2's vm_math.odin built-ins call a helper inside their
+	// basic block (x86's emit_math_call, arm64's a_math_call).
 	return false
 }
 
@@ -1369,6 +1372,9 @@ jit_compile :: proc(p: ^Program, fma := true, f16c := true) {
 	init_bytes := 0
 	if has_init {
 		jit_emit_fn(&e, p, p.code[:p.init_len], true)
+		if e.unsupported {
+			return
+		}
 		init_bytes = len(e.buf)
 		for (len(e.buf) & 31) != 0 {
 			append(&e.buf, JIT_PAD)
@@ -1734,7 +1740,7 @@ jit_runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Ru
 	opts_local := opts
 	ctx := jit_begin(p, scratch, uniforms, &opts_local)
 	when JIT_A64 {
-		assert(uintptr(&ctx.tex_tmp) % 16 == 0)
+		assert(uintptr(&ctx.math_out) % 16 == 0)
 	}
 	slots := ctx.slots
 	masks := ctx.masks
@@ -1866,7 +1872,7 @@ jit_run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, cou
 	opts_local := opts
 	ctx := jit_begin(p, scratch, uniforms, &opts_local)
 	when JIT_A64 {
-		assert(uintptr(&ctx.tex_tmp) % 16 == 0)
+		assert(uintptr(&ctx.math_out) % 16 == 0)
 	}
 	slots := ctx.slots
 	masks := ctx.masks
@@ -2066,7 +2072,7 @@ jit_run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, tar
 	opts_local := opts
 	ctx := jit_begin(p, scratch, uniforms, &opts_local)
 	when JIT_A64 {
-		assert(uintptr(&ctx.tex_tmp) % 16 == 0)
+		assert(uintptr(&ctx.math_out) % 16 == 0)
 	}
 	slots := ctx.slots
 	masks := ctx.masks
@@ -2266,7 +2272,7 @@ jit_run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, start, end:
 	opts_local := opts
 	ctx := jit_begin(p, scratch, uniforms, &opts_local)
 	when JIT_A64 {
-		assert(uintptr(&ctx.tex_tmp) % 16 == 0)
+		assert(uintptr(&ctx.math_out) % 16 == 0)
 	}
 	slots := ctx.slots
 	masks := ctx.masks

@@ -22,10 +22,10 @@ import "core:math"
 // fmaxnm, the shader's and the lowering's (the Shadertoy output clamp,
 // saturate, textureGrad's lod, smoothstep's clamp of its interpolant, where
 // they agree): a quiet NaN operand gives the other, a signaling one NaN,
-// and +0 is above -0;
-// and NaN payloads inside a program are the hardware's (what reaches the
-// host or an integer is canonical, as everywhere). Each multiply and add
-// rounds apart, as in the interpreter (no fused multiply-add).
+// and +0 is above -0. NaN payloads inside a program are the hardware's
+// (what reaches the host or an integer is canonical, as everywhere). Each
+// multiply and add rounds apart, as in the interpreter (no fused
+// multiply-add).
 
 _ :: runtime
 _ :: math
@@ -430,7 +430,8 @@ a_pair_mem :: proc(e: ^Jit_Emitter, load: bool, r, base: u8, off: i64) {
 		return
 	}
 	a_mov_imm(e, A_X17, u64(off))
-	ai(e, 0x8b000000 | u32(A_X17) << 16 | u32(base) << 5 | u32(A_X17)) // add x17, base, x17
+	// The extended-register add, whose Rn of 31 is sp (the shifted one's is xzr).
+	ai(e, 0x8b206000 | u32(A_X17) << 16 | u32(base) << 5 | u32(A_X17)) // add x17, base, x17, uxtx
 	ai(e, pair_op | q1 << 10 | u32(A_X17) << 5 | q0)
 }
 
@@ -657,10 +658,10 @@ a_call_in_block :: proc(e: ^Jit_Emitter, fn: rawptr, in_ptr: ^Instr, arg: i32, r
 }
 
 // Component i of a vm_math.odin built-in through the interpreter's math_8,
-// into ctx.tex_tmp[0].
+// into ctx.math_out.
 @(private, enable_target_feature = JIT_FEATURE)
 jit_help_math_a64 :: proc "c" (ctx: ^Jit_Ctx, in_: ^Instr, i: i32) #no_bounds_check {
-	math_8(in_.op, Builtin(in_.k), &ctx.slots[in_.a + i], &ctx.slots[in_.b + i], (^[8]u32)(&ctx.tex_tmp[0]))
+	math_8(in_.op, Builtin(in_.k), &ctx.slots[in_.a + i], &ctx.slots[in_.b + i], (^[8]u32)(&ctx.math_out))
 }
 
 @(private)
@@ -669,7 +670,7 @@ a_math_call :: proc(e: ^Jit_Emitter, in_ptr: ^Instr, i: i32) {
 	n := i32(in_.n)
 	reads := [2]Slots{{in_.a, n}, {in_.b, n if in_.op == .F_Fn2 else 0}}
 	a_call_in_block(e, rawptr(jit_help_math_a64), in_ptr, i, reads[:], in_.dst + i, 1)
-	a_pair_mem(e, true, 0, A_CTX, i64(OFF_CTX_TEX_TMP))
+	a_pair_mem(e, true, 0, A_CTX, i64(OFF_CTX_MATH_OUT))
 	copy_to_dst(e, in_.dst + i, 0)
 }
 

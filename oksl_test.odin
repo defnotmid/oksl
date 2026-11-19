@@ -16082,6 +16082,9 @@ test_signaling_nan_builtins :: proc(t: ^testing.T) {
 			if !testing.expectf(t, ok, "%v: %s", stage, format_errors(errs, context.temp_allocator)) {
 				return
 			}
+			when JIT_ENABLED {
+				testing.expectf(t, (m.program.jit_body != nil) == jit_ready, "%v expressions %d..: jit compiled %v", stage, first, m.program.jit_body != nil)
+			}
 			for quiet in 0 ..< 2 {
 				block := make([]u8, m.block_size, context.temp_allocator)
 				uv := [4]f32{0.25, 0.75, transmute(f32)u32(0x7fc0_0001 if quiet == 1 else 0x7f80_0001), 1}
@@ -18242,11 +18245,17 @@ abi_run_wrapped :: proc(t: ^testing.T, label: string, p: ^Program, invoke: proc(
 	st: Abi_Check_State
 	orig_init, orig_body := p.jit_init, p.jit_body
 	wrap_body, mem_body := abi_wrap_fn(orig_body, &st)
+	if !testing.expectf(t, mem_body != nil, "%s: mapping the body's thunk failed", label, loc = loc) {
+		return
+	}
 	defer virtual.release(raw_data(mem_body), len(mem_body))
 	wrap_init: rawptr
 	mem_init: []u8
 	if orig_init != nil {
 		wrap_init, mem_init = abi_wrap_fn(orig_init, &st)
+		if !testing.expectf(t, mem_init != nil, "%s: mapping the init's thunk failed", label, loc = loc) {
+			return
+		}
 	}
 	defer if mem_init != nil {
 		virtual.release(raw_data(mem_init), len(mem_init))
@@ -18264,6 +18273,9 @@ abi_run_wrapped :: proc(t: ^testing.T, label: string, p: ^Program, invoke: proc(
 @(test)
 test_jit_abi_callee_saved :: proc(t: ^testing.T) {
 	when JIT_ENABLED {
+		if !jit_ready {
+			return
+		}
 		sampler_cb :: proc(user: rawptr, channel: int, uv: [2]f32, lod: f32, layer: int) -> [4]f32 {
 			return {uv.x * 0.25 + f32(channel) * 0.1, uv.y * 0.5, lod * 0.125, 1.0}
 		}
@@ -18583,8 +18595,15 @@ test_jit_a64_patch_range :: proc(t: ^testing.T) {
 			bits:  uint,
 			shift: uint,
 		}
-		forms := [4]Form {
+		forms := [6]Form {
 			{"b", proc(e: ^Jit_Emitter) -> int {return a_branch(e, -1)}, 26, 0},
+			{"bl", proc(e: ^Jit_Emitter) -> int {
+				calls := make([dynamic]int, context.temp_allocator)
+				a_bl(e, &calls)
+				return calls[0]
+			}, 26, 0},
+			// The cbz x15 to an unbound channel's stub (jit_emit_fn).
+			{"cbz x", proc(e: ^Jit_Emitter) -> int {ai(e, 0xb400000f); return 0}, 19, 5},
 			{"b.ne", proc(e: ^Jit_Emitter) -> int {return a_branch(e, 1)}, 19, 5},
 			{"cbnz", proc(e: ^Jit_Emitter) -> int {return a_cbz(e, 11, true)}, 19, 5},
 			{"tbz", proc(e: ^Jit_Emitter) -> int {return a_tbz(e, 3, 5, false)}, 14, 5},

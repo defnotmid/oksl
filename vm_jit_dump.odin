@@ -26,7 +26,7 @@ when JIT_ENABLED {
 @(private = "file")
 jit_dump_seq: int
 
-// Dumps generated AVX2 machine code and basic-block / VM-instruction boundaries
+// Dumps generated machine code (AVX2 or NEON) and basic-block / VM-instruction boundaries
 // when built with `-define:OKSL_JIT_DUMP=true`. Writes:
 //   - `/tmp/perf-<pid>.map` symbol entries for `perf record` / `perf script`
 //   - `<dir>/jit_<pid>_<id>_body.bin` (and `_init.bin` when present)
