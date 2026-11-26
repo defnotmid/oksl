@@ -119,6 +119,38 @@ is_atomic_builtin :: #force_inline proc "contextless" (b: Builtin) -> bool {
 	return b >= .Atomic_Add && b <= .Atomic_Comp_Swap
 }
 
+// pow(x, 2.0) with a literal 2.0 (or a vector constructed from literal
+// 2.0s) is x * x on every backend, as GPU compilers (NIR, fxc) fold it, so
+// a negative x squares where exp2(2 * log2(x)) can give NaN (WARP's
+// does). GLSL leaves any
+// other pow of a negative x undefined. The CPU's pow already takes x * x
+// wherever y is 2.
+@(private)
+pow_is_square :: proc "contextless" (u: ^Unit, args: []Expr_Id) -> bool {
+	is_two :: proc "contextless" (u: ^Unit, id: Expr_Id) -> bool {
+		e := u.exprs[id]
+		#partial switch e.kind {
+		case .Float_Lit:
+			return transmute(f64)e.value == 2
+		case .Int_Lit, .Uint_Lit:
+			// Inside a constructor, as vec2(2).
+			return e.value == 2
+		case .Call:
+			if e.call != .Constructor || e.args.count == 0 {
+				return false
+			}
+			for a in list(u, e.args) {
+				if !is_two(u, Expr_Id(a)) {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	}
+	return len(args) == 2 && is_two(u, args[1])
+}
+
 // How a built-in's arguments are checked (and converted). Each rule runs
 // after the argument count is checked; on failure the call is reported
 // with the argument types as converted so far.

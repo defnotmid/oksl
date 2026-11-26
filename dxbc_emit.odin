@@ -1626,6 +1626,9 @@ dx_builtin :: proc(d: ^Dx, id: Expr_Id) -> Dx_Src {
 		l := dx_ln(d, n, dx_op(d, .Div, n, num, den))
 		return dx_near_zero(d, n, x, dx_op(d, .Mul, n, l, dx_imm_f(0.5)))
 	case .Pow:
+		if pow_is_square(u, argx) {
+			return dx_op(d, .Mul, n, x, x)
+		}
 		l := dx_op(d, .Log, n, x)
 		return dx_op(d, .Exp, n, dx_op(d, .Mul, n, l, arg(args, types, 1, n)))
 	case .Exp:

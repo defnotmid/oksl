@@ -886,6 +886,9 @@ emit_builtin :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 	for i in BUILTINS[b].broadcast {
 		args[i] = splat(s, args[i], types[i], with_base(t, types[i].base))
 	}
+	if b == .Pow && pow_is_square(u, argx) {
+		return binop_raw(s, .F_Mul, rt, args[0], args[0])
+	}
 	if op := SPV_EXT_BUILTINS[b][at.base]; op != Glsl(0) {
 		return ext(s, rt, op, ..args)
 	}

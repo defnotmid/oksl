@@ -34,6 +34,8 @@ Msl :: struct {
 	sh_words:      int,
 	sh_off:        []int,
 	has_cas:       bool,
+	// oksl_square, pow(x, 2.0)'s helper (pow_is_square), written to `helpers`.
+	has_square:    bool,
 }
 
 // A sampler's Metal texture type.
@@ -1955,6 +1957,13 @@ msl_builtin :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 		if i in BUILTINS[b].broadcast {
 			a[i] = splat_text(m, a[i], at, t)
 		}
+	}
+	if b == .Pow && pow_is_square(u, args) {
+		if !m.has_square {
+			m.has_square = true
+			strings.write_string(&m.helpers, "template<typename T> inline T oksl_square(T x) { return x * x; }\n")
+		}
+		return wrap_pre(pre[:], fmt.aprintf("oksl_square(%s)", a[0]))
 	}
 	if form := MSL_BUILTINS[b]; form != "" {
 		if strings.contains_rune(form, '%') {

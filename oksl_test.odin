@@ -18628,3 +18628,73 @@ test_jit_a64_patch_range :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+// pow's lowering with a literal 2.0 exponent (pow_is_square): x * x in
+// SPIR-V (no GLSL.std.450 Pow), MSL (oksl_square, no pow) and DXBC (a mul,
+// no log), for a scalar, vec2(2.0), vec3(2.0, 2.0, 2.0) and vec2(2); any
+// other exponent stays pow. Both CPU engines give x * x for a negative x,
+// as before. Every module through spirv-val and vkd3d.
+@(test)
+test_pow_square_lowering :: proc(t: ^testing.T) {
+	Case :: struct {
+		expr:   string,
+		square: bool,
+	}
+	cases := [?]Case{
+		{"vec4(pow(u.x, 2.0))", true},
+		{"vec4(pow(u.xy, vec2(2.0)), 0.0, 1.0)", true},
+		{"vec4(pow(u.xyz, vec3(2.0, 2.0, 2.0)), 1.0)", true},
+		{"vec4(pow(u.xy, vec2(2)), 0.0, 1.0)", true},
+		{"vec4(pow(u.x, 3.0))", false},
+		{"vec4(pow(u.x, -2.0))", false},
+		{"vec4(pow(u.x, u.w))", false},
+		{"vec4(pow(u.xy, vec2(2.0, 3.0)), 0.0, 1.0)", false},
+	}
+	for c in cases {
+		src := fmt.tprintf("#version 310 es\nprecision highp float;\nuniform vec4 u;\nlayout(location = 0) out vec4 o;\nvoid main() {{ o = %s; }}\n", c.expr)
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment, dxbc = true})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%s: %s", c.expr, format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		if have_spirv_val() {
+			expect_valid_spirv(t, c.expr, m.spirv)
+		}
+		if have_vkd3d() {
+			expect_valid_dxbc(t, c.expr, m.dxbc)
+		}
+		all, _ := spv_decode(m.spirv)
+		pows := 0
+		for in_ in all {
+			if in_.op == .Ext_Inst && len(in_.w) >= 4 && in_.w[3] == u32(Glsl.Pow) {
+				pows += 1
+			}
+		}
+		testing.expectf(t, pows == (0 if c.square else 1), "%s: %d GLSL.std.450 Pow", c.expr, pows)
+		testing.expectf(t, strings.count(m.msl, "pow(") == (0 if c.square else 1) && strings.contains(m.msl, "oksl_square(") == c.square, "%s: MSL\n%s", c.expr, m.msl)
+		_, prog := dxbc_program(t, m, c.expr)
+		logs, muls := 0, 0
+		for in_ in prog {
+			#partial switch Dx_Op(in_.op) {
+			case .Log:
+				logs += 1
+			case .Mul:
+				muls += 1
+			}
+		}
+		testing.expectf(t, logs == (0 if c.square else 1) && (!c.square || muls > 0), "%s: DXBC %d log, %d mul", c.expr, logs, muls)
+		if c.square {
+			block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+			uv := [4]f32{-0.5, -1.5, -3.0, 2.0}
+			set_uniform(m, block, "u", uv[:])
+			for engine in 0 ..< 2 {
+				if engine == 1 {
+					m.program.jit_body, m.program.jit_init = nil, nil
+				}
+				out: [8][4]f32
+				run_f32(&m.program, block, 8, 1, out[:], temp_scratch())
+				testing.expectf(t, out[0].x == 0.25, "%s engine %d: %v", c.expr, engine, out[0])
+			}
+		}
+	}
+}

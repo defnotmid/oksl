@@ -1055,7 +1055,12 @@ it makes the others, and `built_levels` lists and skips them.
   `acos`, `log2` and the hyperbolic functions 3 ulp, and `pow` within
   1.5 + 3 * |y * log2(x)| ulp, as `exp2(y * log2(x))` on a GPU (`pow(x,
   2.0)` is `x * x`), with `pow` and `atan(y, x)` following C99's special
-  cases. A NaN's sign and payload depend on the
+  cases. GLSL leaves `pow` of a negative `x` undefined, and GPUs differ
+  (`exp2(y * log2(x))` is NaN on D3D12's WARP), but a literal exponent of 2.0, or a
+  vector of them, is `x * x` on every backend (SPIR-V, MSL and DXBC emit
+  the multiply, as GPU compilers fold it), so `pow(-0.5, 2.0)` is 0.25
+  everywhere; for any other exponent a negative `x` follows C99 on the
+  CPU (`pow(-0.5, 3.0)` is -0.125) and may be NaN on a GPU. A NaN's sign and payload depend on the
   CPU (x86 makes `0xffc00000`, arm64 `0x7fc00000`) and on the operand
   order a compiler picks, so wherever a float's bits reach the host or an
   integer they are canonical: every NaN in a target, a `run_vertex`
