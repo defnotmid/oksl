@@ -74,11 +74,15 @@ Jit_Tables :: struct #align(32) {
 	ql_24:         [8]f32,
 	ql_half:       [8]f32,
 	ql_neg_inf:    [8]u32,
+	// Packed u16 0x00FF and 2^-16 scale for RGBA8/Gray8 integer bilinear.
+	w_00ff:        [8]u32,
+	inv65536:      [8]f32,
 }
 
 #assert(offset_of(Jit_Tables, sign_mask) % 32 == 0)
 #assert(offset_of(Jit_Tables, two52_d) % 32 == 0)
 #assert(offset_of(Jit_Tables, ql_flt_min) % 32 == 0)
+#assert(offset_of(Jit_Tables, w_00ff) % 32 == 0)
 
 // FMA3, for the bound channels' exact products in f32 (else f64).
 @(private)
@@ -155,6 +159,8 @@ jit_x64_init :: proc "contextless" () -> bool {
 	jit_tables.ql_24 = 24
 	jit_tables.ql_half = 0.5
 	jit_tables.ql_neg_inf = 0xff80_0000
+	jit_tables.w_00ff = 0x00FF_00FF
+	jit_tables.inv65536 = 1.0 / 65536.0
 
 	max_id, _, _, _ := intrinsics.x86_cpuid(0, 0)
 	if max_id < 7 {
@@ -206,6 +212,8 @@ jit_x64_init :: proc "contextless" () -> bool {
 @(private) OFF_TAB_QL_24 :: i32(offset_of(Jit_Tables, ql_24))
 @(private) OFF_TAB_QL_HALF :: i32(offset_of(Jit_Tables, ql_half))
 @(private) OFF_TAB_QL_NEG_INF :: i32(offset_of(Jit_Tables, ql_neg_inf))
+@(private) OFF_TAB_W00FF :: i32(offset_of(Jit_Tables, w_00ff))
+@(private) OFF_TAB_INV65536 :: i32(offset_of(Jit_Tables, inv65536))
 
 @(private) OFF_CI_NEAR_ROUTE :: i32(offset_of(Chan_Img, near_route))
 @(private) OFF_CI_FS32 :: i32(offset_of(Chan_Img, fs32))
@@ -579,6 +587,27 @@ vpbroadcastd_mem :: #force_inline proc(buf: ^[dynamic]u8, dst, base: u8, disp: i
 	emit_i32(buf, 0)
 }
 
+// Packed words (66 0F op) and word shifts vpsllw (ext 6) / vpsrlw (ext 2).
+@(private) vop_w :: #force_inline proc(buf: ^[dynamic]u8, op, dst, a, b: u8) {emit_vex_rr(buf, 1, 1, 1, 0, op, dst, a, b)}
+@(private)
+vshift_w_imm :: #force_inline proc(buf: ^[dynamic]u8, ext, dst, src, imm: u8) {
+	emit_vex_rr(buf, 1, 1, 1, 0, 0x71, ext, dst, src)
+	append(buf, imm)
+}
+// Unaligned 128-bit SIB load (vmovups xmm, [base + idx]) and high insert (vinsertf128 ymm, ymm, [base + idx], 1).
+@(private) x_vmovups_xmm_sib :: #force_inline proc(buf: ^[dynamic]u8, dst, base, idx: u8) {emit_vex_sib(buf, 1, 0, 0, 0, 0x10, dst, 0, base, idx, 0, 0)}
+@(private)
+x_vinsertf128_sib :: #force_inline proc(buf: ^[dynamic]u8, dst, src, base, idx: u8) {
+	emit_vex_sib(buf, 3, 1, 1, 0, 0x18, dst, src, base, idx, 0, 0)
+	append(buf, 1)
+}
+@(private)
+x_shufps :: #force_inline proc(buf: ^[dynamic]u8, dst, a, b, imm: u8) {
+	emit_vex_rr(buf, 1, 0, 1, 0, 0xC6, dst, a, b)
+	append(buf, imm)
+}
+
+@(private) JCC_JB :: u8(0x82)
 @(private) JCC_JE :: u8(0x84)
 @(private) JCC_JNE :: u8(0x85)
 @(private) JCC_JBE :: u8(0x86)
@@ -850,7 +879,7 @@ emit_chan_gather_rgba :: proc(buf: ^[dynamic]u8, chan_base: u8, chan_disp: i32, 
 // x = f64(c) * size - half, the texel indexes floor(x) and the next one as
 // the axis's wrap addresses them, and the weight round_even(fract(x) * 256).
 @(private)
-emit_chan_axis :: proc(buf: ^[dynamic]u8, ax: i32, f_c, f_i0, f_i1, f_w: i32, nearest: bool) {
+emit_chan_axis :: proc(buf: ^[dynamic]u8, ax: i32, f_c, f_i0, f_i1, f_w: i32, nearest: bool, int_weight := false) {
 	x_bcast_sd(buf, 3, GPR_RSI, OFF_LV_FS + ax * 8)
 	for h in 0 ..< i32(2) {
 		x_ps2pd_m(buf, 0, GPR_RSP, f_c + h * 16)
@@ -924,8 +953,10 @@ emit_chan_axis :: proc(buf: ^[dynamic]u8, ax: i32, f_c, f_i0, f_i1, f_w: i32, ne
 		x_ins128(buf, 6, 6, 7)
 		vzero(buf, 3)
 		vop38_d(buf, 0x3D, 6, 6, 3)
-		x_dq2ps(buf, 6, 6)
-		vop_ps_tab(buf, 0x59, 6, 6, OFF_TAB_INV256) // the fraction w / 256
+		if !int_weight {
+			x_dq2ps(buf, 6, 6)
+			vop_ps_tab(buf, 0x59, 6, 6, OFF_TAB_INV256) // the fraction w / 256
+		}
 		x_st(buf, GPR_RSP, f_i1, 5)
 		x_st(buf, GPR_RSP, f_w, 6)
 	}
@@ -1084,13 +1115,19 @@ emit_chan_nearest_xy_fma :: proc(buf: ^[dynamic]u8, base: u8, disp: i32) {
 // (checked over all 2^32 f32 c for 19 sizes from 1 to 32768), so output
 // stays identical across platforms, FMA or not.
 @(private)
-emit_chan_axis_clamp_lin :: proc(buf: ^[dynamic]u8, ax: i32, f_c, f_i0, f_i1, f_t: i32, fma: bool) {
+emit_chan_axis_clamp_lin :: proc(buf: ^[dynamic]u8, ax: i32, f_c, f_i0, f_i1, f_t: i32, fma: bool, from_level := false, int_weight := false) {
 	x_ld(buf, 0, GPR_RSP, f_c)
 	vzero(buf, 1)
 	vop_ps(buf, 0x5F, 0, 0, 1)
 	vop_ps_tab(buf, 0x5D, 0, 0, OFF_TAB_ONE_F)
 	if fma {
-		vbroadcastss_mem(buf, 3, GPR_RDI, OFF_CI_FN512 + ax * 4)
+		if from_level {
+			vpbroadcastd_mem(buf, 3, GPR_RSI, OFF_LV_SIZE + ax * 4)
+			vshift_imm(buf, 6, 3, 3, 9) // 512 * size (exact in f32 for size <= 32768)
+			x_dq2ps(buf, 3, 3)
+		} else {
+			vbroadcastss_mem(buf, 3, GPR_RDI, OFF_CI_FN512 + ax * 4)
+		}
 		vop_ps(buf, 0x59, 1, 0, 3)                    // q = c * N
 		emit_vex_rr(buf, 2, 1, 1, 0, 0xAA, 0, 3, 1)   // vfmsub213ps: e = N * c - q
 		vroundps(buf, 2, 1, 0x09)                     // floor(q)
@@ -1134,8 +1171,10 @@ emit_chan_axis_clamp_lin :: proc(buf: ^[dynamic]u8, ax: i32, f_c, f_i0, f_i1, f_
 	}
 	vshift_imm(buf, 6, 5, 4, 8)
 	vop_d(buf, 0xFA, 6, 6, 5)    // weight
-	x_dq2ps(buf, 6, 6)
-	vop_ps_tab(buf, 0x59, 6, 6, OFF_TAB_INV256)
+	if !int_weight {
+		x_dq2ps(buf, 6, 6)
+		vop_ps_tab(buf, 0x59, 6, 6, OFF_TAB_INV256)
+	}
 	x_st(buf, GPR_RSP, f_t, 6)
 	vzero(buf, 3)
 	vpbroadcastd_mem(buf, 0, GPR_RSI, OFF_LV_MAX + ax * 4)
@@ -1146,6 +1185,9 @@ emit_chan_axis_clamp_lin :: proc(buf: ^[dynamic]u8, ax: i32, f_c, f_i0, f_i1, f_
 		vpbroadcastd_mem(buf, 0, GPR_RSI, OFF_LV_PITCH)
 		vop38_d(buf, 0x40, 4, 4, 0)
 		vop38_d(buf, 0x40, 5, 5, 0)
+		if from_level {
+			emit_chan_layer_rows(buf, SF_LAYER, 4, 5, 0)
+		}
 	}
 	x_st(buf, GPR_RSP, f_i0, 4)
 	x_st(buf, GPR_RSP, f_i1, 5)
@@ -1210,18 +1252,73 @@ emit_chan_bilinear_sub :: proc(buf: ^[dynamic]u8, fma: bool) {
 		emit_chan_axis_clamp_lin(buf, 0, BF_U, BF_X0, BF_X1, BF_TX, false)
 		emit_chan_axis_clamp_lin(buf, 1, BF_V, BF_Y0, BF_Y1, BF_TY, false)
 	}
-	emit_bytes(buf, 0x0F, 0xB6) // movzx ecx, byte [rdi + shift]
-	emit_modrm_mem(buf, GPR_RCX, GPR_RDI, OFF_CI_SHIFT)
-	x_bcast_gpr(buf, 6, GPR_RCX)
 	corners := [4][2]i32{{BF_X0, BF_Y0}, {BF_X1, BF_Y0}, {BF_X0, BF_Y1}, {BF_X1, BF_Y1}}
 	for c, i in corners {
 		x_ld(buf, 4, GPR_RSP, c[1])
 		x_d_m(buf, 0xFE, 4, 4, GPR_RSP, c[0])
-		vop38_d(buf, 0x47, 4, 4, 6)
 		x_st(buf, GPR_RSP, BF_E + i32(i) * 32, 4)
 	}
 	emit_bytes(buf, 0x48, 0x8B) // mov rax, [rsi + ptr]
 	emit_modrm_mem(buf, GPR_RAX, GPR_RSI, OFF_LV_PTR)
+	emit_bytes(buf, 0x84, 0xD2) // test dl, dl
+	dead := x_jump(buf, JCC_JE)
+	x_cmp_b(buf, GPR_RDI, OFF_CI_COMPS, 4)
+	not_v4 := x_jump(buf, JCC_JNE)
+	// F32x4: load whole 128-bit texels for paired lanes (i, i + 4), blend, transpose.
+	x_ld(buf, 6, GPR_RSP, BF_TX)
+	x_ld(buf, 7, GPR_RSP, BF_TY)
+	for i in 0 ..< 4 {
+		for ci in 0 ..< 4 {
+			disp_lo := BF_E + i32(ci) * 32 + i32(i) * 4
+			disp_hi := disp_lo + 16
+			emit_b(buf, 0x8B) // mov ecx, [rsp + disp_lo]
+			emit_modrm_mem(buf, GPR_RCX, GPR_RSP, disp_lo)
+			emit_bytes(buf, 0x44, 0x8B) // mov r8d, [rsp + disp_hi]
+			emit_modrm_mem(buf, 8, GPR_RSP, disp_hi)
+			emit_bytes(buf, 0x48, 0xC1, 0xE1, 0x04) // shl rcx, 4
+			emit_bytes(buf, 0x49, 0xC1, 0xE0, 0x04) // shl r8, 4
+			x_vmovups_xmm_sib(buf, u8(ci), GPR_RAX, GPR_RCX)
+			x_vinsertf128_sib(buf, u8(ci), u8(ci), GPR_RAX, 8)
+		}
+		x_shufps(buf, 4, 6, 6, u8(i) * 0x55)
+		x_shufps(buf, 5, 7, 7, u8(i) * 0x55)
+		vop_ps(buf, 0x5C, 1, 1, 0)
+		vop_ps(buf, 0x59, 1, 1, 4)
+		vop_ps(buf, 0x58, 0, 0, 1) // top
+		vop_ps(buf, 0x5C, 3, 3, 2)
+		vop_ps(buf, 0x59, 3, 3, 4)
+		vop_ps(buf, 0x58, 2, 2, 3) // bottom
+		vop_ps(buf, 0x5C, 2, 2, 0)
+		vop_ps(buf, 0x59, 2, 2, 5)
+		vop_ps(buf, 0x58, 0, 0, 2) // top + (bottom - top) * ty
+		if i < 3 {
+			x_st(buf, GPR_RSP, BF_U + i32(i) * 32, 0)
+		} else {
+			vmovaps_rr(buf, 3, 0)
+		}
+	}
+	x_ld(buf, 0, GPR_RSP, BF_U)
+	x_ld(buf, 1, GPR_RSP, BF_U + 32)
+	x_ld(buf, 2, GPR_RSP, BF_U + 64)
+	vop_ps(buf, 0x14, 4, 0, 1)
+	vop_ps(buf, 0x15, 5, 0, 1)
+	vop_ps(buf, 0x14, 6, 2, 3)
+	vop_ps(buf, 0x15, 7, 2, 3)
+	x_shufps(buf, 0, 4, 6, 0x44)
+	x_shufps(buf, 1, 4, 6, 0xEE)
+	x_shufps(buf, 2, 5, 7, 0x44)
+	x_shufps(buf, 3, 5, 7, 0xEE)
+	v4_done := x_jump(buf, 0)
+
+	x_land(buf, not_v4)
+	emit_bytes(buf, 0x0F, 0xB6) // movzx ecx, byte [rdi + shift]
+	emit_modrm_mem(buf, GPR_RCX, GPR_RDI, OFF_CI_SHIFT)
+	x_bcast_gpr(buf, 6, GPR_RCX)
+	for i in 0 ..< 4 {
+		x_ld(buf, 4, GPR_RSP, BF_E + i32(i) * 32)
+		vop38_d(buf, 0x47, 4, 4, 6)
+		x_st(buf, GPR_RSP, BF_E + i32(i) * 32, 4)
+	}
 	for k in 0 ..< 4 {
 		s0, s1 := x_if_comp(buf, k, true)
 		yk := u8(k)
@@ -1245,6 +1342,8 @@ emit_chan_bilinear_sub :: proc(buf: ^[dynamic]u8, fma: bool) {
 		vop_ps(buf, 0x58, yk, yk, 4) // top + (bottom - top) * ty
 		x_end_if(buf, s0, s1)
 	}
+	x_land(buf, v4_done)
+	x_land(buf, dead)
 	emit_chan_lacking(buf)
 	emit_bytes(buf, 0x48, 0x81, 0xC4) // add rsp, frame
 	emit_i32(buf, BF_FRAME)
@@ -1289,7 +1388,8 @@ emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma
 	x_st(buf, GPR_RSP, SF_LAYER, 3)
 
 	// Levels: l0 and l0 + 1's weight w per lane (Channel_Image), the levels
-	// some lane uses as bits in r8d; r10d = 1 with more than one level.
+	// some lane uses as bits in r8d; r10d = 0 (1 level), 1 (2 levels iter 0),
+	// 2 (2 levels iter 1), or 3 (>= 3 levels across the quad).
 	emit_bytes(buf, 0x45, 0x31, 0xD2) // xor r10d, r10d
 	emit_bytes(buf, 0x41, 0xB8)       // mov r8d, 1
 	emit_u32(buf, 1)
@@ -1297,8 +1397,6 @@ emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma
 	emit_modrm_mem(buf, 7, GPR_RDI, OFF_CI_NLEV)
 	emit_b(buf, 1)
 	single := x_jump(buf, JCC_JE)
-	emit_bytes(buf, 0x41, 0xBA) // mov r10d, 1
-	emit_u32(buf, 1)
 	vbroadcastss_mem(buf, 4, GPR_RDI, OFF_CI_TOP)
 	vzero(buf, 3)
 	vcmpps(buf, 5, 2, 3, 0x1E) // lod > 0
@@ -1321,6 +1419,18 @@ emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma
 	vop_d(buf, 0xDF, 2, 3, 2)
 	vop_d(buf, 0xEB, 1, 1, 2)
 	x_hor_or_r8(buf)
+	emit_bytes(buf, 0x41, 0x8D, 0x40, 0xFF) // lea eax, [r8 - 1]
+	emit_bytes(buf, 0x44, 0x21, 0xC0)       // and eax, r8d -> t = r8d & (r8d - 1)
+	one_bit := x_jump(buf, JCC_JE)
+	emit_bytes(buf, 0x41, 0xBA) // mov r10d, 1
+	emit_u32(buf, 1)
+	emit_bytes(buf, 0x8D, 0x48, 0xFF) // lea ecx, [rax - 1]
+	emit_bytes(buf, 0x85, 0xC8)       // test eax, ecx -> 0 iff popcount(r8d) == 2
+	two_bits := x_jump(buf, JCC_JE)
+	emit_bytes(buf, 0x41, 0xBA) // mov r10d, 3
+	emit_u32(buf, 3)
+	x_land(buf, two_bits)
+	x_land(buf, one_bit)
 	x_land(buf, single)
 
 	loop_top := len(buf^)
@@ -1331,9 +1441,158 @@ emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma
 	emit_chan_axis(buf, 1, SF_V, SF_Y0, SF_Y1, SF_TY, true)
 	emit_chan_texel(buf, SF_X0, SF_Y0, decode_calls)
 	tapped := x_jump(buf, 0)
+
 	x_land(buf, linear)
-	emit_chan_axis(buf, 0, SF_U, SF_X0, SF_X1, SF_TX, false)
-	emit_chan_axis(buf, 1, SF_V, SF_Y0, SF_Y1, SF_TY, false)
+	if fma {
+		emit_b(buf, 0x66) // cmp word [rdi + wrap], 0 ({.Clamp, .Clamp})
+		emit_b(buf, 0x83)
+		emit_modrm_mem(buf, 7, GPR_RDI, OFF_CI_WRAP)
+		emit_b(buf, 0)
+		f64_ax0 := x_jump(buf, JCC_JNE)
+		emit_b(buf, 0x81) // cmp dword [rsi + size.x], 32768
+		emit_modrm_mem(buf, 7, GPR_RSI, OFF_LV_SIZE)
+		emit_u32(buf, 32768)
+		f64_ax1 := x_jump(buf, JCC_JA)
+		emit_b(buf, 0x81) // cmp dword [rsi + size.y], 32768
+		emit_modrm_mem(buf, 7, GPR_RSI, OFF_LV_SIZE + 4)
+		emit_u32(buf, 32768)
+		f64_ax2 := x_jump(buf, JCC_JA)
+		emit_chan_axis_clamp_lin(buf, 0, SF_U, SF_X0, SF_X1, SF_TX, true, true, true)
+		emit_chan_axis_clamp_lin(buf, 1, SF_V, SF_Y0, SF_Y1, SF_TY, true, true, true)
+		axes_done := x_jump(buf, 0)
+		x_land(buf, f64_ax0)
+		x_land(buf, f64_ax1)
+		x_land(buf, f64_ax2)
+		emit_chan_axis(buf, 0, SF_U, SF_X0, SF_X1, SF_TX, false, true)
+		emit_chan_axis(buf, 1, SF_V, SF_Y0, SF_Y1, SF_TY, false, true)
+		x_land(buf, axes_done)
+	} else {
+		emit_chan_axis(buf, 0, SF_U, SF_X0, SF_X1, SF_TX, false, true)
+		emit_chan_axis(buf, 1, SF_V, SF_Y0, SF_Y1, SF_TY, false, true)
+	}
+
+	x_cmp_b(buf, GPR_RDI, OFF_CI_FORMAT, u8(Channel_Format.Rgba8))
+	not_rgba8 := x_jump(buf, JCC_JNE)
+	// Rgba8 per-level linear tap: integer bilinear in 16/32 bits, exact to f32.
+	emit_bytes(buf, 0x84, 0xD2) // test dl, dl
+	rgba8_dead := x_jump(buf, JCC_JE)
+	emit_bytes(buf, 0x48, 0x8B) // mov rax, [rsi + ptr]
+	emit_modrm_mem(buf, GPR_RAX, GPR_RSI, OFF_LV_PTR)
+	x_ld(buf, 6, GPR_RSP, SF_TX)
+	vshift_imm(buf, 6, 7, 6, 16)
+	vop_d(buf, 0xEB, 6, 6, 7) // wx_pair = (wx << 16) | wx
+	for pair in 0 ..< 2 {
+		fy := SF_Y0 if pair == 0 else SF_Y1
+		x_ld(buf, 4, GPR_RSP, fy)
+		x_d_m(buf, 0xFE, 4, 4, GPR_RSP, SF_X0)
+		x_gather(buf, 0, GPR_RAX, 4, 7, 2, 0)
+		x_ld(buf, 4, GPR_RSP, fy)
+		x_d_m(buf, 0xFE, 4, 4, GPR_RSP, SF_X1)
+		x_gather(buf, 1, GPR_RAX, 4, 7, 2, 0)
+		if pair == 0 {
+			// T_rb -> ymm2, T_ga -> ymm3
+			vop_d_tab(buf, 0xDB, 4, 0, OFF_TAB_W00FF)
+			vop_d_tab(buf, 0xDB, 5, 1, OFF_TAB_W00FF)
+			vop_w(buf, 0xF9, 5, 5, 4)
+			vop_w(buf, 0xD5, 5, 5, 6)
+			vshift_w_imm(buf, 6, 4, 4, 8)
+			vop_w(buf, 0xFD, 2, 4, 5)
+			vshift_w_imm(buf, 2, 4, 0, 8)
+			vshift_w_imm(buf, 2, 5, 1, 8)
+			vop_w(buf, 0xF9, 5, 5, 4)
+			vop_w(buf, 0xD5, 5, 5, 6)
+			vshift_w_imm(buf, 6, 4, 4, 8)
+			vop_w(buf, 0xFD, 3, 4, 5)
+		} else {
+			// B_rb -> ymm4, B_ga -> ymm5 (preserve ymm2, ymm3)
+			vop_d_tab(buf, 0xDB, 4, 0, OFF_TAB_W00FF)
+			vop_d_tab(buf, 0xDB, 5, 1, OFF_TAB_W00FF)
+			vop_w(buf, 0xF9, 5, 5, 4)
+			vop_w(buf, 0xD5, 5, 5, 6)
+			vshift_w_imm(buf, 6, 4, 4, 8)
+			vop_w(buf, 0xFD, 4, 4, 5)
+			vshift_w_imm(buf, 2, 0, 0, 8)
+			vshift_w_imm(buf, 2, 1, 1, 8)
+			vop_w(buf, 0xF9, 1, 1, 0)
+			vop_w(buf, 0xD5, 1, 1, 6)
+			vshift_w_imm(buf, 6, 0, 0, 8)
+			vop_w(buf, 0xFD, 5, 0, 1)
+		}
+	}
+	x_ld(buf, 6, GPR_RSP, SF_TY)
+	// Vertical blend in order R (0), B (2), G (1), A (3) so ymm2/ymm3 stay valid until both halves are read.
+	Rgba8_Comp :: struct {
+		dst, t_src, b_src: u8,
+		hi:                bool,
+	}
+	for rc in ([4]Rgba8_Comp{{0, 2, 4, false}, {2, 2, 4, true}, {1, 3, 5, false}, {3, 3, 5, true}}) {
+		s0, s1 := x_if_comp(buf, int(rc.dst), false)
+		if rc.hi {
+			vshift_imm(buf, 2, rc.dst, rc.t_src, 16)
+			vshift_imm(buf, 2, 7, rc.b_src, 16)
+		} else {
+			vop_d_tab(buf, 0xDB, rc.dst, rc.t_src, OFF_TAB_U16)
+			vop_d_tab(buf, 0xDB, 7, rc.b_src, OFF_TAB_U16)
+		}
+		vop_d(buf, 0xFA, 7, 7, rc.dst)
+		vop38_d(buf, 0x40, 7, 7, 6)
+		vshift_imm(buf, 6, rc.dst, rc.dst, 8)
+		vop_d(buf, 0xFE, rc.dst, rc.dst, 7)
+		x_dq2ps(buf, rc.dst, rc.dst)
+		vop_ps_tab(buf, 0x59, rc.dst, rc.dst, OFF_TAB_INV65536)
+		x_end_if(buf, s0, s1)
+	}
+	x_land(buf, rgba8_dead)
+	rgba8_done := x_jump(buf, 0)
+
+	x_land(buf, not_rgba8)
+	x_cmp_b(buf, GPR_RDI, OFF_CI_FORMAT, u8(Channel_Format.Gray8))
+	not_gray8 := x_jump(buf, JCC_JNE)
+	// Gray8 per-level linear tap: four byte gathers + integer bilinear.
+	emit_bytes(buf, 0xF6, 0xC2, 0x01) // test dl, 1
+	g8_dead := x_jump(buf, JCC_JE)
+	emit_bytes(buf, 0x48, 0x8B) // mov rax, [rsi + ptr]
+	emit_modrm_mem(buf, GPR_RAX, GPR_RSI, OFF_LV_PTR)
+	g8_corners := [4][2]i32{{SF_X0, SF_Y0}, {SF_X1, SF_Y0}, {SF_X0, SF_Y1}, {SF_X1, SF_Y1}}
+	for gc, ci in g8_corners {
+		x_ld(buf, 4, GPR_RSP, gc[1])
+		x_d_m(buf, 0xFE, 4, 4, GPR_RSP, gc[0])
+		vpbroadcastd_mem(buf, 5, GPR_RSI, OFF_LV_MIS)
+		vop_d(buf, 0xFE, 4, 4, 5)
+		vop_d_tab(buf, 0xDB, 5, 4, OFF_TAB_THREE_U)
+		vshift_imm(buf, 6, 5, 5, 3)
+		vop_d_tab(buf, 0xDB, 4, 4, OFF_TAB_NOT3)
+		x_gather(buf, u8(ci), GPR_RAX, 4, 7, 0, 0)
+		vop38_d(buf, 0x45, u8(ci), u8(ci), 5)
+		vop_d_tab(buf, 0xDB, u8(ci), u8(ci), OFF_TAB_BYTE)
+	}
+	x_ld(buf, 6, GPR_RSP, SF_TX)
+	x_ld(buf, 7, GPR_RSP, SF_TY)
+	vop_d(buf, 0xFA, 1, 1, 0)
+	vop38_d(buf, 0x40, 1, 1, 6)
+	vshift_imm(buf, 6, 0, 0, 8)
+	vop_d(buf, 0xFE, 0, 0, 1) // T
+	vop_d(buf, 0xFA, 3, 3, 2)
+	vop38_d(buf, 0x40, 3, 3, 6)
+	vshift_imm(buf, 6, 2, 2, 8)
+	vop_d(buf, 0xFE, 2, 2, 3) // B
+	vop_d(buf, 0xFA, 2, 2, 0)
+	vop38_d(buf, 0x40, 2, 2, 7)
+	vshift_imm(buf, 6, 0, 0, 8)
+	vop_d(buf, 0xFE, 0, 0, 2) // R
+	x_dq2ps(buf, 0, 0)
+	vop_ps_tab(buf, 0x59, 0, 0, OFF_TAB_INV65536)
+	x_land(buf, g8_dead)
+	g8_done := x_jump(buf, 0)
+
+	// General linear fallback (F32, Rgba16f, Gray16): weights i32 -> f32 / 256.
+	x_land(buf, not_gray8)
+	for fw in ([2]i32{SF_TX, SF_TY}) {
+		x_ld(buf, 6, GPR_RSP, fw)
+		x_dq2ps(buf, 6, 6)
+		vop_ps_tab(buf, 0x59, 6, 6, OFF_TAB_INV256)
+		x_st(buf, GPR_RSP, fw, 6)
+	}
 	// The rows' blends across x, then theirs across y.
 	emit_chan_texel(buf, SF_X0, SF_Y0, decode_calls)
 	emit_chan_store4(buf, SF_A)
@@ -1352,11 +1611,17 @@ emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma
 		vop_ps(buf, 0x58, u8(k), 4, 5)
 		x_end_if(buf, s0, s1)
 	}
+	x_land(buf, g8_done)
+	x_land(buf, rgba8_done)
 	x_land(buf, tapped)
+
 	emit_bytes(buf, 0x45, 0x85, 0xD2) // test r10d, r10d
 	one_level := x_jump(buf, JCC_JE)
-	// With levels: this tap is level l0's for the lanes at l0, l0 + 1's for
-	// the lanes blending toward it.
+	emit_bytes(buf, 0x41, 0x83, 0xFA, 0x02) // cmp r10d, 2
+	two_iter0 := x_jump(buf, JCC_JB)
+	two_iter1 := x_jump(buf, JCC_JE)
+	// General (>= 3 levels across lanes): this tap is level l0's for the
+	// lanes at l0, l0 + 1's for the lanes blending toward it.
 	x_bcast_gpr(buf, 4, 9)
 	x_ld(buf, 5, GPR_RSP, SF_L0)
 	vop_d(buf, 0x76, 6, 5, 4)
@@ -1391,6 +1656,40 @@ emit_chan_sample_sub :: proc(buf: ^[dynamic]u8, decode_calls: ^[dynamic]int, fma
 		vblendvps(buf, u8(k), u8(k), 4, 6)
 		x_end_if(buf, s0, s1)
 	}
+	gen_done := x_jump(buf, 0)
+
+	// Two levels (L_a < L_b): keep tap(L_a) in SF_C0 and blend directly
+	// against tap(L_b) in ymm0..3 without touching SF_C1's array.
+	x_land(buf, two_iter0)
+	emit_chan_store4(buf, SF_C0)
+	emit_bytes(buf, 0x41, 0xBA) // mov r10d, 2
+	emit_u32(buf, 2)
+	emit_b(buf, 0xE9) // jmp loop_top
+	emit_i32(buf, i32(loop_top - (len(buf^) + 4)))
+
+	x_land(buf, two_iter1)
+	x_bcast_gpr(buf, 4, 9)
+	x_ld(buf, 5, GPR_RSP, SF_L0)
+	vop_d(buf, 0x76, 5, 5, 4) // l0 == L_b
+	x_st(buf, GPR_RSP, SF_C1, 5)
+	x_ld(buf, 6, GPR_RSP, SF_WL)
+	x_dq2ps(buf, 7, 6)
+	vop_ps_tab(buf, 0x59, 7, 7, OFF_TAB_INV256)
+	vzero(buf, 5)
+	vop_d(buf, 0x66, 6, 6, 5) // wl > 0
+	for k in 0 ..< 4 {
+		s0, s1 := x_if_comp(buf, k, true)
+		x_ld(buf, 4, GPR_RSP, SF_C0 + i32(k) * 32)
+		vop_ps(buf, 0x5C, 5, u8(k), 4)
+		vop_ps(buf, 0x59, 5, 5, 7)
+		vop_ps(buf, 0x58, 5, 4, 5)
+		vblendvps(buf, 4, 4, 5, 6)
+		x_ld(buf, 5, GPR_RSP, SF_C1)
+		vblendvps(buf, u8(k), 4, u8(k), 5)
+		x_end_if(buf, s0, s1)
+	}
+
+	x_land(buf, gen_done)
 	x_land(buf, one_level)
 	emit_bytes(buf, 0x48, 0x81, 0xC4) // add rsp, frame
 	emit_i32(buf, SF_FRAME)

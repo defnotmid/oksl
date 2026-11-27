@@ -256,9 +256,9 @@ list_reset :: proc(l: rawptr, allocator: rawptr) {
 	check(gl->Reset((^d3d12.ICommandAllocator)(allocator), nil), "CommandList::Reset")
 }
 
-draw_instanced :: proc(l: rawptr, vertices, first: u32) {
+draw_instanced :: proc(l: rawptr, vertices, first: u32, instances: u32 = 1) {
 	gl := (^d3d12.IGraphicsCommandList)(l)
-	gl->DrawInstanced(vertices, 1, first, 0)
+	gl->DrawInstanced(vertices, instances, first, 0)
 }
 
 dispatch :: proc(l: rawptr, x, y, z: u32) {

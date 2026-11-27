@@ -361,7 +361,7 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 			}
 		case .Storage_Image:
 			l.sym_img[row.sym] = i32(u.syms[row.sym].index)
-		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID,
+		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID, .Instance_ID,
 		     .Global_Invocation_ID, .Local_Invocation_ID, .Work_Group_ID, .Num_Work_Groups, .Local_Invocation_Index:
 			append(&inputs, stage_var(&l, row))
 		}

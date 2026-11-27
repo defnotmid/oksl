@@ -1226,6 +1226,97 @@ vertex_id_compare :: proc(vm: ^oksl.Module, block: []u8, corners: []Corner, firs
 	return
 }
 
+// ---- gl_InstanceID ----------------------------------------------------------------------
+
+INSTANCE_COUNT :: 4
+
+Instance_Row :: struct {
+	rect:  [4]f32, // x0, y0, x1, y1 in target pixels
+	color: [4]f32,
+}
+
+INSTANCE_ID_VS :: `#version 310 es
+struct Row { vec4 rect; vec4 color; };
+readonly buffer Instances { Row rows[]; };
+uniform vec4 size;
+out vec4 vColor;
+void main() {
+    Row r = rows[gl_InstanceID];
+    vec2 p;
+    if (gl_VertexID == 0 || gl_VertexID == 3) p = r.rect.xy;
+    else if (gl_VertexID == 1) p = r.rect.xw;
+    else if (gl_VertexID == 2 || gl_VertexID == 4) p = r.rect.zw;
+    else p = r.rect.zy;
+    vColor = r.color;
+    gl_Position = vec4(2.0 * p.x / size.x - 1.0, 1.0 - 2.0 * p.y / size.y, 0.0, 1.0);
+}`
+
+instance_id_rows :: proc(first, count: int) -> []Instance_Row {
+	rows := make([]Instance_Row, first + count, context.temp_allocator)
+	for i in 0 ..< first {
+		rows[i] = {{1e6, 1e6, 2e6, 2e6}, {1, 0, 1, 1}}
+	}
+	hw, hh := f32(W) * 0.5, f32(H) * 0.5
+	rects := [INSTANCE_COUNT][4]f32{
+		{0, 0, hw, hh},
+		{hw, 0, W, hh},
+		{0, hh, hw, H},
+		{hw, hh, W, H},
+	}
+	colors := [INSTANCE_COUNT][4]f32{
+		{0.9, 0.2, 0.2, 1},
+		{0.2, 0.8, 0.3, 1},
+		{0.2, 0.4, 0.9, 1},
+		{0.9, 0.8, 0.2, 1},
+	}
+	for i in 0 ..< count {
+		rows[first + i] = {rects[i], colors[i]}
+	}
+	return rows
+}
+
+instance_id_block :: proc(vm: ^oksl.Module) -> []u8 {
+	block := make([]u8, vm.block_size, context.temp_allocator)
+	oksl.set_uniform(vm, block, "size", {W, H, 0, 0})
+	return block
+}
+
+instance_id_compare :: proc(vm: ^oksl.Module, block: []u8, rows: []Instance_Row, first, count: int, gpu_px: []u8) -> (max_d: int) {
+	positions: [6][4]f32
+	record := vm.varying_floats
+	varyings := make([]f32, 6 * record, context.temp_allocator)
+	want_px := make([]u8, W * H * 4, context.temp_allocator)
+	scratch: oksl.Scratch
+	defer oksl.scratch_destroy(&scratch)
+	for inst in 0 ..< count {
+		oksl.run_vertex(&vm.program, block, nil, 6, positions[:], varyings, &scratch, {buffers = {slice.reinterpret([]u32, rows)}, instance = first + inst})
+		px: [6][2]f32
+		for p, i in positions {
+			px[i] = {(p.x / p.w + 1) * 0.5 * W, (1 - p.y / p.w) * 0.5 * H}
+		}
+		for y in 0 ..< H {
+			for x in 0 ..< W {
+				c := [2]f32{f32(x) + 0.5, f32(y) + 0.5}
+				for tri in 0 ..< 2 {
+					l, inside := barycentric(px[tri * 3], px[tri * 3 + 1], px[tri * 3 + 2], c)
+					if !inside {
+						continue
+					}
+					for k in 0 ..< 4 {
+						v := l[0] * varyings[(tri * 3) * record + k] + l[1] * varyings[(tri * 3 + 1) * record + k] + l[2] * varyings[(tri * 3 + 2) * record + k]
+						want_px[(y * W + x) * 4 + k] = u8(clamp(v, 0, 1) * 255 + 0.5)
+					}
+					break
+				}
+			}
+		}
+	}
+	for i in 0 ..< W * H * 4 {
+		max_d = max(max_d, abs(int(want_px[i]) - int(gpu_px[i])))
+	}
+	return
+}
+
 // Screen-space barycentric coordinates of `p` in triangle abc, and whether
 // it is inside (with a 1e-4 margin).
 barycentric :: proc(a, b, d, p: [2]f32) -> (l: [3]f32, inside: bool) {

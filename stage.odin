@@ -67,6 +67,10 @@ Interface_Kind :: enum u8 {
 	// A 2D storage image; `binding` is its SPIR-V binding in `set` (its
 	// place among Module.storage_images is the symbol's index).
 	Storage_Image,
+	// The instance's index in the draw (gl_InstanceID), as SPIR-V's
+	// InstanceIndex and Metal's instance_id count it (D3D's SV_InstanceID
+	// counts from 0).
+	Instance_ID,
 }
 
 // The kinds a host binds as resources.
@@ -127,7 +131,7 @@ FRAGMENT_OUTPUTS :: 8
 STAGE_RULES := [Stage]Stage_Rules {
 	// OriginUpperLeft: Vulkan's window origin (and Metal's).
 	.Fragment = {
-		lacks = {.Gl_Position, .Gl_Vertex_ID, .Writable_Buffers, .Storage_Images, .Compute_Ids},
+		lacks = {.Gl_Position, .Gl_Vertex_ID, .Gl_Instance_ID, .Writable_Buffers, .Storage_Images, .Compute_Ids},
 		missing = #partial {.Writable_Buffers = .Buffer_Writable, .Storage_Images = .Compute_Only, .Compute_Ids = .Compute_Only},
 		in_locations = 16,
 		out_locations = FRAGMENT_OUTPUTS,
@@ -148,7 +152,7 @@ STAGE_RULES := [Stage]Stage_Rules {
 		msl_qualifier = "vertex",
 	},
 	.Compute = {
-		lacks = {.Discard, .Derivatives, .Implicit_Lod, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing, .Stage_Variables, .Gl_Position, .Gl_Vertex_ID, .Gl_Sample_Mask},
+		lacks = {.Discard, .Derivatives, .Implicit_Lod, .Sk_Frag_Coord, .Gl_Frag_Coord, .Gl_Front_Facing, .Stage_Variables, .Gl_Position, .Gl_Vertex_ID, .Gl_Instance_ID, .Gl_Sample_Mask},
 		missing = #partial {
 			.Discard         = .Fragment_Only,
 			.Derivatives     = .Fragment_Only,
@@ -230,6 +234,9 @@ stage_var_rows :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 	}
 	if c.gl_vertex_id != 0 {
 		append(rows, Interface_Var{kind = .Vertex_ID, sym = c.gl_vertex_id})
+	}
+	if c.gl_instance_id != 0 {
+		append(rows, Interface_Var{kind = .Instance_ID, sym = c.gl_instance_id})
 	}
 	if c.gl_sample_mask != 0 {
 		append(rows, Interface_Var{kind = .Sample_Mask, sym = c.gl_sample_mask})

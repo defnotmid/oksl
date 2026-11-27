@@ -60,6 +60,7 @@ Srv :: enum {
 	Layers,
 	Words,
 	Corners,
+	Instances,
 	R32f,
 	Rg32f,
 	Rgba32f,
@@ -301,9 +302,9 @@ Draw :: struct {
 	vs_srvs:            []Srv,
 	// Vertex attributes: TEXCOORD<location> from the quad's position (0)
 	// or uv (8).
-	attributes:         [][2]u32,
-	vertices, first:    u32,
-	target:             Target,
+	attributes:                 [][2]u32,
+	vertices, first, instances: u32,
+	target:                     Target,
 }
 
 LAYER_ATTRIBUTES := [][2]u32{{0, 0}, {1, 8}}
@@ -333,9 +334,12 @@ write_srv :: proc(g: ^Gpu, s: Srv, slot: int) {
 		desc.Format = FMT_DXGI[int(s) - int(Srv.Lay_Rgba8)]
 		desc.ViewDimension = .TEXTURE2DARRAY
 		desc.Texture2DArray = {MipLevels = parity.BOUND_FMT_LEVELS, ArraySize = parity.BOUND_LAYERS}
-	case .Words, .Corners, .Fetch_Q:
+	case .Words, .Corners, .Instances, .Fetch_Q:
 		desc.Format, desc.ViewDimension = .R32_TYPELESS, .BUFFER
 		n := parity.WORDS if s == .Words else len(parity.QUAD) * size_of(parity.Corner) / 4
+		if s == .Instances {
+			n = parity.INSTANCE_COUNT * size_of(parity.Instance_Row) / 4
+		}
 		if s == .Fetch_Q {
 			n = len(parity.bound_fetch_queries) * 4
 		}
@@ -482,7 +486,7 @@ draw :: proc(g: ^Gpu, dr: Draw) -> (px: []u8, err: string) {
 	set_viewport_scissor(l, W, H)
 	set_render_target(l, &rtv)
 	clear_render_target(l, rtv, TARGET_CLEARS[dr.target])
-	draw_instanced(l, dr.vertices, dr.first)
+	draw_instanced(l, dr.vertices, dr.first, dr.instances if dr.instances != 0 else 1)
 
 	src := rt
 	bpp := 16 if dr.target == .Rgba32f else 4
@@ -599,6 +603,8 @@ main :: proc() {
 	report("layer.vert tap", tap_d, tap_ok, &failed)
 	id_d, id_ok := vertex_id_check(&g)
 	report("gl_VertexID", id_d, id_ok, &failed)
+	iid_d, iid_ok := instance_id_check(&g)
+	report("gl_InstanceID", iid_d, iid_ok, &failed)
 	mask_d, mask_ok := sample_mask_check(&g)
 	report("gl_SampleMask", mask_d, mask_ok, &failed)
 	bound_fetch_check(&g, &scratch, &failed)
@@ -631,7 +637,7 @@ main :: proc() {
 		detail, ok := compute_check(&g, e.name, e.source, {profile = .Glsl, stage = .Compute}, e.shape)
 		compute_report(e.name, detail, ok, &failed)
 	}
-	checks := len(names) + len(EDGE_SHADERS) + 4 + len(comp_names) + 1 + len(EDGE_COMPUTE) + 16 + 4
+	checks := len(names) + len(EDGE_SHADERS) + 5 + len(comp_names) + 1 + len(EDGE_COMPUTE) + 16 + 4
 	fmt.printfln("%d/%d checks match (images in %s)", checks - failed, checks, out_dir)
 	if failed > 0 {
 		os.exit(1)
@@ -795,6 +801,31 @@ vertex_id_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
 	}
 	defer delete(gpu_px)
 	return parity.vertex_id_compare(vm, block, corners, 0, gpu_px), true
+}
+
+// gl_InstanceID from instance 0: D3D's SV_InstanceID leaves out the
+// draw's first instance (gpu_parity draws from 2).
+instance_id_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
+	vm, verrors, vok := oksl.compile(parity.INSTANCE_ID_VS, {profile = .Glsl, stage = .Vertex, dxbc = true})
+	defer oksl.destroy(vm)
+	fm, ferrors, fok := oksl.compile(parity.VERTEX_ID_FS, {profile = .Glsl, dxbc = true})
+	defer oksl.destroy(fm)
+	if !vok || !fok {
+		fmt.eprint(oksl.format_errors(verrors), oksl.format_errors(ferrors))
+		return 0, false
+	}
+	rows := parity.instance_id_rows(0, parity.INSTANCE_COUNT)
+	if g.resources[.Instances] == nil {
+		g.resources[.Instances] = upload_buffer(g, slice.to_bytes(rows))
+	}
+	block := parity.instance_id_block(vm)
+	gpu_px, err := draw(g, {vs = vm.dxbc, ps = fm.dxbc, vs_block = block, vs_srvs = {.Instances}, vertices = 6, instances = parity.INSTANCE_COUNT})
+	if err != "" {
+		fmt.eprintln(err)
+		return 0, false
+	}
+	defer delete(gpu_px)
+	return parity.instance_id_compare(vm, block, rows, 0, parity.INSTANCE_COUNT, gpu_px), true
 }
 
 // gl_SampleMask, 4x MSAA resolved over black.

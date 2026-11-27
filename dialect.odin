@@ -68,6 +68,8 @@ Feature :: enum u8 {
 	Implicit_Lod,
 	// gl_GlobalInvocationID and the other compute invocation built-ins.
 	Compute_Ids,
+	// gl_InstanceID: the instance's index in the draw.
+	Gl_Instance_ID,
 }
 Features :: bit_set[Feature;u32]
 
@@ -91,7 +93,7 @@ DIALECT_RULES := [Dialect]Dialect_Rules {
 		missing = #partial {.Preprocessor = .No_Preprocessor, .Samplers = .Sksl_Texture_Call, .Discard = .Sksl_Discard, .Sampler_Params = .Sampler_Param, .Stage_Variables = .Global_In_Out},
 	},
 	.GLSL = {
-		has = {.Preprocessor, .Samplers, .Implicit_Lod, .Discard, .Gl_Frag_Coord, .Sampler_Params, .Stage_Variables, .Derivatives, .Gl_Position, .Gl_Front_Facing, .Gl_Vertex_ID, .Storage_Buffers, .Writable_Buffers, .Gl_Sample_Mask, .Storage_Images, .Compute_Ids},
+		has = {.Preprocessor, .Samplers, .Implicit_Lod, .Discard, .Gl_Frag_Coord, .Sampler_Params, .Stage_Variables, .Derivatives, .Gl_Position, .Gl_Front_Facing, .Gl_Vertex_ID, .Gl_Instance_ID, .Storage_Buffers, .Writable_Buffers, .Gl_Sample_Mask, .Storage_Images, .Compute_Ids},
 		missing = #partial {.Children = .Glsl_Eval},
 		predefined = {{"GL_ES", "1"}, {"__VERSION__", "300"}},
 	},

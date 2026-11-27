@@ -1887,6 +1887,10 @@ jit_run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, cou
 				for l in 0 ..< lanes {reg[l] = u32(i32(opts_local.first_vertex + first + l))}
 				continue
 			}
+			if v.kind == .Instance_ID {
+				slots[v.slot] = u32(i32(opts_local.instance))
+				continue
+			}
 			a := attributes[v.location] if int(v.location) < len(attributes) else Attribute{}
 			comps := 4
 			if a.format <= .Uint4 {

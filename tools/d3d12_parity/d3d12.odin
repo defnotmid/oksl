@@ -223,9 +223,9 @@ list_reset :: proc(l: rawptr, allocator: rawptr) {
 	check((F)(vtbl(l)[10])(l, allocator, nil), "CommandList::Reset")
 }
 
-draw_instanced :: proc(l: rawptr, vertices, first: u32) {
+draw_instanced :: proc(l: rawptr, vertices, first: u32, instances: u32 = 1) {
 	F :: proc "win64" (this: rawptr, vertices, instances, first_vertex, first_instance: u32)
-	(F)(vtbl(l)[12])(l, vertices, 1, first, 0)
+	(F)(vtbl(l)[12])(l, vertices, instances, first, 0)
 }
 
 dispatch :: proc(l: rawptr, x, y, z: u32) {

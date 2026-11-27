@@ -27,9 +27,11 @@ import "core:slice"
 // SV_VertexID (VS input).
 @(private)
 DX_POSITION_REGISTER :: 16
-// SV_IsFrontFace's PS input register.
+// SV_IsFrontFace's PS input register, and SV_InstanceID's VS input register.
 @(private)
 DX_FRONT_FACE_REGISTER :: 17
+@(private)
+DX_INSTANCE_ID_REGISTER :: 17
 
 @(private)
 Dx_Op :: enum u32 {
@@ -1155,6 +1157,11 @@ dx_declare_interface :: proc(d: ^Dx, res: ^[dynamic]u32) {
 			reg := u32(DX_POSITION_REGISTER)
 			ins_decl(io, .Dcl_Input_Sgv, 0, dx_token(.Input, 2, 0, 0x1, 1, {}), reg, 6)
 			append(&d.sig_in, Dx_Sig{"SV_VertexID", 0, 6, 1, reg, 1})
+			d.sym_loc[row.sym] = dx_reg(.Input, reg)
+		case .Instance_ID:
+			reg := u32(DX_INSTANCE_ID_REGISTER)
+			ins_decl(io, .Dcl_Input_Sgv, 0, dx_token(.Input, 2, 0, 0x1, 1, {}), reg, 8)
+			append(&d.sig_in, Dx_Sig{"SV_InstanceID", 0, 8, 1, reg, 1})
 			d.sym_loc[row.sym] = dx_reg(.Input, reg)
 		}
 	}

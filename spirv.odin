@@ -266,6 +266,8 @@ BUILTIN_GLOBAL_INVOCATION_ID :: 28
 BUILTIN_LOCAL_INVOCATION_INDEX :: 29
 @(private)
 BUILTIN_VERTEX_INDEX :: 42
+@(private)
+BUILTIN_INSTANCE_INDEX :: 43
 
 // Where break and continue go: a loop's merge and continue blocks, or a
 // switch's merge and the continue block of the loop around it.
@@ -708,7 +710,7 @@ declare_interface :: proc(s: ^Spv) {
 	c := s.checked
 	for row in c.interface {
 		switch row.kind {
-		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID, .Stage_Out, .Position, .Sample_Mask,
+		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID, .Instance_ID, .Stage_Out, .Position, .Sample_Mask,
 		     .Global_Invocation_ID, .Local_Invocation_ID, .Work_Group_ID, .Num_Work_Groups, .Local_Invocation_Index:
 			sym := s.u.syms[row.sym]
 			class := u32(SC_OUTPUT if row.kind == .Stage_Out || row.kind == .Position || row.kind == .Sample_Mask else SC_INPUT)
@@ -721,6 +723,8 @@ declare_interface :: proc(s: ^Spv) {
 				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_FRONT_FACING)
 			case .Vertex_ID:
 				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_VERTEX_INDEX)
+			case .Instance_ID:
+				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_INSTANCE_INDEX)
 			case .Sample_Mask:
 				inst(&s.annotations, .Decorate, v, DEC_BUILTIN, BUILTIN_SAMPLE_MASK)
 			case .Position:

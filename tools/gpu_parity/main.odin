@@ -139,6 +139,8 @@ main :: proc() {
 	report("layer.vert tap", max_d, tap_ok, &failed)
 	id_d, id_ok := vertex_id_check(&g)
 	report("gl_VertexID", id_d, id_ok, &failed)
+	iid_d, iid_ok := instance_id_check(&g)
+	report("gl_InstanceID", iid_d, iid_ok, &failed)
 	mask_d, mask_ok := sample_mask_check(&g)
 	report("gl_SampleMask", mask_d, mask_ok, &failed)
 	face_detail, face_ok := facing_check(&g)
@@ -162,7 +164,7 @@ main :: proc() {
 		failed += 1
 	}
 	fmt.printfln("%-20s %s  %s", "image_formats", fmt_detail, "ok" if fmt_ok else "MISMATCH")
-	checks := len(names) + 4 + len(comp_names) + 1 + bf_checks
+	checks := len(names) + 5 + len(comp_names) + 1 + bf_checks
 	fmt.printfln("%d/%d shaders match (images in %s)", checks - failed, checks, out_dir)
 	if failed > 0 {
 		os.exit(1)
@@ -594,6 +596,62 @@ vertex_id_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
 	gpu_px := download(g, cmd)
 	defer delete(gpu_px)
 	return parity.vertex_id_compare(vm, block, corners, FIRST, gpu_px), true
+}
+
+// Instanced draw with non-zero first_instance: each instance reads its
+// quadrant and colour from a storage buffer via gl_InstanceID.
+instance_id_check :: proc(g: ^Gpu) -> (max_d: int, ok: bool) {
+	vm, verrors, vok := oksl.compile(parity.INSTANCE_ID_VS, {profile = .Glsl, stage = .Vertex})
+	defer oksl.destroy(vm)
+	fm, ferrors, fok := oksl.compile(parity.VERTEX_ID_FS, {profile = .Glsl})
+	defer oksl.destroy(fm)
+	if !vok || !fok {
+		fmt.eprint(oksl.format_errors(verrors), oksl.format_errors(ferrors))
+		return 0, false
+	}
+	FIRST :: 2
+	rows := parity.instance_id_rows(FIRST, parity.INSTANCE_COUNT)
+	size := u32(len(rows) * size_of(parity.Instance_Row))
+
+	vert := make_shader(g, vm, .VERTEX)
+	frag := make_shader(g, fm, .FRAGMENT)
+	defer sdl.ReleaseGPUShader(g.device, vert)
+	defer sdl.ReleaseGPUShader(g.device, frag)
+	color := sdl.GPUColorTargetDescription{format = .R8G8B8A8_UNORM}
+	pipeline := sdl.CreateGPUGraphicsPipeline(g.device, {
+		vertex_shader = vert,
+		fragment_shader = frag,
+		primitive_type = .TRIANGLELIST,
+		rasterizer_state = {fill_mode = .FILL, cull_mode = .NONE},
+		multisample_state = {sample_count = ._1},
+		target_info = {color_target_descriptions = &color, num_color_targets = 1},
+	})
+	buffer := sdl.CreateGPUBuffer(g.device, {usage = {.GRAPHICS_STORAGE_READ}, size = size})
+	if vert == nil || frag == nil || pipeline == nil || buffer == nil {
+		return 0, false
+	}
+	defer sdl.ReleaseGPUGraphicsPipeline(g.device, pipeline)
+	defer sdl.ReleaseGPUBuffer(g.device, buffer)
+	transfer := sdl.CreateGPUTransferBuffer(g.device, {usage = .UPLOAD, size = size})
+	defer sdl.ReleaseGPUTransferBuffer(g.device, transfer)
+	mem.copy(sdl.MapGPUTransferBuffer(g.device, transfer, false), raw_data(rows), int(size))
+	sdl.UnmapGPUTransferBuffer(g.device, transfer)
+	block := parity.instance_id_block(vm)
+
+	cmd := sdl.AcquireGPUCommandBuffer(g.device)
+	copy_pass := sdl.BeginGPUCopyPass(cmd)
+	sdl.UploadToGPUBuffer(copy_pass, {transfer_buffer = transfer}, {buffer = buffer, size = size}, false)
+	sdl.EndGPUCopyPass(copy_pass)
+	target := sdl.GPUColorTargetInfo{texture = g.target, load_op = .CLEAR, store_op = .STORE, clear_color = {0, 0, 0, 1}}
+	pass := sdl.BeginGPURenderPass(cmd, &target, 1, nil)
+	sdl.BindGPUGraphicsPipeline(pass, pipeline)
+	sdl.BindGPUVertexStorageBuffers(pass, 0, &buffer, 1)
+	sdl.PushGPUVertexUniformData(cmd, 0, raw_data(block), u32(len(block)))
+	sdl.DrawGPUPrimitives(pass, 6, parity.INSTANCE_COUNT, 0, FIRST)
+	sdl.EndGPURenderPass(pass)
+	gpu_px := download(g, cmd)
+	defer delete(gpu_px)
+	return parity.instance_id_compare(vm, block, rows, FIRST, parity.INSTANCE_COUNT, gpu_px), true
 }
 
 // gl_SampleMask, 4x MSAA resolved over black.

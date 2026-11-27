@@ -183,7 +183,7 @@ emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
 	}
 	for row in c.interface {
 		#partial switch row.kind {
-		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID,
+		case .Stage_In, .Frag_Coord, .Front_Facing, .Vertex_ID, .Instance_ID,
 		     .Global_Invocation_ID, .Local_Invocation_ID, .Work_Group_ID, .Num_Work_Groups, .Local_Invocation_Index:
 			w(&m, "\t%s in_%s;\n", msl_type(&m, sym_type(u, row.sym)), u.syms[row.sym].name)
 		case .Stage_Out, .Position, .Sample_Mask:
@@ -685,6 +685,9 @@ emit_msl_entry :: proc(m: ^Msl) {
 			// Built-ins of a vertex function are its parameters.
 			w(m, "%suint oksl_vertex_id [[vertex_id]]", sep)
 			sep = ", "
+		case .Instance_ID:
+			w(m, "%suint oksl_instance_id [[instance_id]]", sep)
+			sep = ", "
 		case .Global_Invocation_ID:
 			w(m, "%suint3 oksl_global_id [[thread_position_in_grid]]", sep)
 			sep = ", "
@@ -735,6 +738,8 @@ emit_msl_entry :: proc(m: ^Msl) {
 			w(m, "\tg.in_%s = oksl_in.in_%s;\n", n, n)
 		case .Vertex_ID:
 			w(m, "\tg.in_%s = int(oksl_vertex_id);\n", u.syms[row.sym].name)
+		case .Instance_ID:
+			w(m, "\tg.in_%s = int(oksl_instance_id);\n", u.syms[row.sym].name)
 		case .Global_Invocation_ID:
 			w(m, "\tg.in_%s = oksl_global_id;\n", u.syms[row.sym].name)
 		case .Local_Invocation_ID:

@@ -56,6 +56,8 @@ Run_Options :: struct {
 	// run_vertex: gl_VertexID of its first vertex (vertex i's is
 	// first_vertex + i), as a draw's first vertex counts on the GPU.
 	first_vertex: int,
+	// run_vertex: gl_InstanceID for every vertex in this call.
+	instance: int,
 	// The storage buffers' words, in SDL_GPU binding order
 	// (Module.storage_buffers: read-only first, then read-write/writeonly).
 	// A read past a buffer's words gives 0 here and a write past them is
@@ -1043,6 +1045,10 @@ run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: 
 			if v.kind == .Vertex_ID {
 				reg := &r.regs[v.slot]
 				for l in 0 ..< lanes {reg[l] = u32(i32(opts.first_vertex + first + l))}
+				continue
+			}
+			if v.kind == .Instance_ID {
+				r.regs[v.slot] = u32(i32(opts.instance))
 				continue
 			}
 			a := attributes[v.location] if int(v.location) < len(attributes) else Attribute{}

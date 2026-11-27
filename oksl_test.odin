@@ -2486,6 +2486,100 @@ void main() {
 	testing.expect(t, !fok && strings.contains(format_errors(ferrs, context.temp_allocator), "gl_VertexID"))
 }
 
+// gl_InstanceID counts from Run_Options.instance across full and partial
+// vertex batches, matches SPIR-V/MSL/DXBC encodings, and rejects non-vertex stages.
+@(test)
+test_instance_id :: proc(t: ^testing.T) {
+	vs := `#version 310 es
+struct Inst { vec4 offset; vec4 color; };
+readonly buffer Instances { Inst insts[]; } ub;
+uniform int uBase;
+in vec3 position;
+out vec4 vcol;
+flat out int iid;
+flat out int vid;
+void main() {
+    Inst d = ub.insts[uBase + gl_InstanceID];
+    vcol = d.color + vec4(float(gl_VertexID) * 0.01);
+    iid = gl_InstanceID;
+    vid = gl_VertexID;
+    gl_Position = vec4(position, 1.0) + d.offset;
+}`
+	m, errs, ok := compile_glsl(vs, {stage = .Vertex, dxbc = true})
+	defer destroy(m)
+	if !testing.expectf(t, ok, "%s", format_errors(errs, context.temp_allocator)) {
+		return
+	}
+	testing.expect_value(t, len(m.stage_inputs), 1)
+	for want in ([]string{"uint oksl_instance_id [[instance_id]]", "g.in_gl_InstanceID = int(oksl_instance_id);", "uint oksl_vertex_id [[vertex_id]]"}) {
+		testing.expectf(t, strings.contains(m.msl, want), "MSL lacks %s", want)
+	}
+	if have_spirv_val() {
+		expect_valid_spirv(t, "test_instance_id", m.spirv)
+	}
+	if have_vkd3d() {
+		expect_valid_dxbc(t, "test_instance_id", m.dxbc)
+	}
+	ins := dxbc_sig(dxbc_chunk(m.dxbc, "ISGN"))
+	want_in := [?]Sig_Row{
+		{"TEXCOORD", 0, 0, 3, 0, 7, 7},
+		{"SV_VertexID", 0, 6, 1, 16, 1, 1},
+		{"SV_InstanceID", 0, 8, 1, 17, 1, 1},
+	}
+	testing.expectf(t, slice.equal(ins, want_in[:]), "ISGN %v", ins)
+
+	// Full batch + partial tail batch so uniform-splat of gl_InstanceID is exercised.
+	N :: LANES + 3
+	FIRST_V, BASE, INSTS :: 4, 2, 8
+	pos := make([][3]f32, N, context.temp_allocator)
+	for &p, i in pos {
+		p = {f32(i), 0.5, 0}
+	}
+	inst_buf := make([]u32, INSTS * 8, context.temp_allocator)
+	for i in 0 ..< INSTS {
+		for k in 0 ..< 8 {
+			inst_buf[i * 8 + k] = transmute(u32)f32(100 * i + k)
+		}
+	}
+	block := make([]u8, m.block_size, context.temp_allocator)
+	testing.expect(t, set_uniform(m, block, "uBase", {BASE}))
+	positions := make([][4]f32, N, context.temp_allocator)
+	record := m.varying_floats
+	vary := make([]f32, N * record, context.temp_allocator)
+	attrs := []Attribute{{raw_data(pos), size_of([3]f32), .Float3}}
+	scratch: Scratch
+	defer scratch_destroy(&scratch)
+	offsets: map[string]int
+	defer delete(offsets)
+	for o in m.stage_outputs {
+		offsets[o.name] = o.offset
+	}
+	for inst in ([?]int{0, 3, 7}) {
+		run_vertex(&m.program, block, attrs, N, positions, vary, &scratch, {buffers = {inst_buf}, first_vertex = FIRST_V, instance = inst})
+		d := BASE + inst
+		off := [4]f32{f32(100 * d), f32(100 * d + 1), f32(100 * d + 2), f32(100 * d + 3)} if d < INSTS else {}
+		col := [4]f32{f32(100 * d + 4), f32(100 * d + 5), f32(100 * d + 6), f32(100 * d + 7)} if d < INSTS else {}
+		for i in 0 ..< N {
+			near(t, positions[i], [4]f32{f32(i), 0.5, 0, 1} + off)
+			r := vary[i * record:]
+			testing.expect_value(t, transmute(i32)r[offsets["iid"]], i32(inst))
+			testing.expect_value(t, transmute(i32)r[offsets["vid"]], i32(FIRST_V + i))
+			vid_bias := f32(FIRST_V + i) * 0.01
+			near(t, {r[offsets["vcol"]], r[offsets["vcol"] + 1], r[offsets["vcol"] + 2], r[offsets["vcol"] + 3]}, col + {vid_bias, vid_bias, vid_bias, vid_bias})
+		}
+	}
+	// Fragment shader rejects gl_InstanceID; write to gl_InstanceID is rejected; SkSL/Shadertoy reject it.
+	fm, ferrs, fok := compile_glsl("out vec4 c;\nvoid main() { c = vec4(float(gl_InstanceID)); }")
+	defer destroy(fm)
+	testing.expect(t, !fok && strings.contains(format_errors(ferrs, context.temp_allocator), "gl_InstanceID"))
+	wm, _, wok := compile_glsl("void main() { gl_InstanceID = 1; gl_Position = vec4(0.0); }", {stage = .Vertex})
+	defer destroy(wm)
+	testing.expect(t, !wok)
+	sm, _, sok := compile("half4 main(float2 p) { return half4(float(gl_InstanceID)); }")
+	defer destroy(sm)
+	testing.expect(t, !sok)
+}
+
 // sampler2DArray: texture, textureLod and textureSize, the layer rounded
 // to nearest even for the host's sampler; textureGrad picks the level
 // texture() picks from the same derivatives.
@@ -3698,6 +3792,7 @@ test_compute_diagnostics :: proc(t: ^testing.T) {
 	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { gl_SampleMask[0] = 1; }", .Fragment_Only)
 	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { gl_Position = vec4(0); }", .Vertex_Only)
 	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { int v = gl_VertexID; }", .Vertex_Only)
+	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { int i = gl_InstanceID; }", .Vertex_Only)
 	expect_code(t, "layout(local_size_x = 8) in;\nvoid main() { gl_WorkGroupSize = uvec3(1u); }", .Is_Const)
 
 	// Implicit-LOD sampling rejected in compute.
@@ -6599,6 +6694,211 @@ void main() {
 		}
 	}
 	testing.expectf(t, found > 0, "no coordinate reaches the floor fix-up")
+}
+
+// Per-level RGBA8/Gray8 linear taps, 1/2/3+ active mip levels, layered
+// clamped FMA axes, partial comp_mask, Gray8 mis alignment, and F32x1/2/4
+// whole-texel bilinear_sub: JIT vs interpreter bit for bit.
+@(test)
+test_bound_channel_fast_routes :: proc(t: ^testing.T) {
+	run_and_cmp :: proc(t: ^testing.T, m: ^Module, w, h: int, opts: Run_Options, label: string, loc := #caller_location) {
+		n := w * h
+		out_jit := make([][4]f32, n, context.temp_allocator)
+		out_vm := make([][4]f32, n, context.temp_allocator)
+		for fma in ([2]bool{false, true}) {
+			jit_destroy(&m.program)
+			jit_compile(&m.program, fma)
+			run_f32(&m.program, nil, w, h, out_jit, temp_scratch(), opts)
+			run_f32_interp(&m.program, nil, w, h, out_vm, temp_scratch(), opts)
+			a, b := slice.reinterpret([]u32, out_jit), slice.reinterpret([]u32, out_vm)
+			for i in 0 ..< len(a) {
+				if a[i] != b[i] {
+					testing.expectf(t, false, "%s (fma=%v) word %d: jit %08x != vm %08x", label, fma, i, a[i], b[i], loc = loc)
+					return
+				}
+			}
+		}
+	}
+
+	// 1. Queries covering exact wx/wy edges (0, 1, 128, 255, 256), out-of-range,
+	//    NaN / +-inf / -0, and 1-level / 2-level / 3+-level mip patterns across 8 lanes.
+	W :: 16
+	H :: 10
+	queries := make([][4]f32, W * H, context.temp_allocator)
+	// Row 0: 1-level all lanes lod 0.0 (critical weights on 8x8 -> n=8: (m/2 + 128)/(256*8))
+	// Row 1: 1-level all lanes lod 1.0 (mip 1)
+	// Row 2: 2-level mix (wl=0 at L0, wl>0 at L0->L1, and wl=0 at L1)
+	// Row 3: 2-level skipped gap (L0 and L2 only)
+	// Row 4: 3+-level divergent (0.0, 0.3, 1.4, 2.7, 0.5, 1.0, 2.0, 3.2)
+	// Row 5..7: critical weights/repeats/clamp out-of-range/NaN/+-inf/-0
+	// Row 8..9: texture() implicit gradients (used in implicit-lod shader)
+	seed := u32(0x9e3779b9)
+	rnd :: proc(s: ^u32) -> u32 {
+		s^ = s^ * 1664525 + 1013904223
+		return s^
+	}
+	lods_r2 := [8]f32{0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 0.00390625, 0.99609375}
+	lods_r3 := [8]f32{0.0, 0.0, 2.0, 2.0, 0.0, 2.0, 0.0, 2.0}
+	lods_r4 := [8]f32{0.0, 0.3, 1.4, 2.7, 0.5, 1.0, 2.0, 3.2}
+	for y in 0 ..< H {
+		for x in 0 ..< W {
+			i := y * W + x
+			lane := (x & 3) + (y & 1) * 4
+			u := (f32(x) + 0.125 * f32(lane)) / f32(W)
+			v := (f32(y) + 0.25 * f32(lane)) / f32(H)
+			lod := f32(0.0)
+			layer := f32(x % 4) - 0.5
+			switch y {
+			case 0, 1:
+				lod = 0.0 if (y & 2) == 0 else 1.0
+				// Hit wx/wy near 0, 1, 128, 255, 256 on w=8.
+				u = f32(f64(lane * 64 + (x & 3)) / (256.0 * 8.0))
+				v = f32(f64(x * 128 + 128) / (256.0 * 8.0))
+			case 2:
+				lod = lods_r2[lane]
+			case 3:
+				lod = lods_r3[lane]
+			case 4:
+				lod = lods_r4[lane]
+			case 5:
+				lod = 1.0
+				u = f32(rnd(&seed) % 500) / 100.0 - 1.5
+				v = f32(rnd(&seed) % 500) / 100.0 - 1.5
+			case 6:
+				lod = f32(lane) * 0.4
+				vals := [8]u32{0, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x4040_0000}
+				u = transmute(f32)vals[(x + y) & 7]
+				v = transmute(f32)vals[(x * 3 + 1) & 7]
+			case 7:
+				lod = -0.5 if lane < 4 else 10.0
+				u = (f32(lane) - 1.0) * 0.375
+				v = (f32(x) - 3.0) * 0.25
+			case:
+				lod = 0.4
+				u = f32(x) * 0.13 - 0.2
+				v = f32(y) * 0.17 - 0.1
+			}
+			queries[i] = {u, v, lod, layer}
+		}
+	}
+	qwords := slice.reinterpret([]u32, queries)
+
+	// Extreme RGBA8 bytes (0, 1, 127, 128, 255) across 16x16 with full mip chain.
+	extremes := [6]u8{0, 255, 1, 128, 127, 254}
+	mk_rgba8 := proc(mips: bool, wrap: [2]Channel_Wrap, layers: int, extremes: []u8, s: ^u32) -> Channel_Image {
+		w, h :: 16, 16
+		n := w * h * layers
+		px := make([][4]u8, n, context.temp_allocator)
+		for &p, idx in px {
+			p = {
+				extremes[(idx + 0) % len(extremes)] if idx < 64 else u8(rnd(s)),
+				extremes[(idx + 1) % len(extremes)] if idx < 64 else u8(rnd(s)),
+				extremes[(idx + 2) % len(extremes)] if idx < 64 else u8(rnd(s)),
+				extremes[(idx + 3) % len(extremes)] if idx < 64 else u8(rnd(s)),
+			}
+		}
+		im := Channel_Image{pixels = slice.to_bytes(px), width = w, height = h, layers = layers, format = .Rgba8, filter = .Linear, wrap = wrap}
+		if mips {
+			nc := channel_level_count(w, h)
+			lvs := make([]Channel_Level, nc - 1, context.temp_allocator)
+			lw, lh := w, h
+			for k in 0 ..< nc - 1 {
+				lw, lh = max(lw >> 1, 1), max(lh >> 1, 1)
+				lpx := make([][4]u8, lw * lh * layers, context.temp_allocator)
+				for &lp in lpx {
+					lp = {u8(rnd(s)), u8(rnd(s)), u8(rnd(s)), u8(rnd(s))}
+				}
+				lvs[k] = channel_level(lpx, lw, lh)
+			}
+			im.levels = lvs
+		}
+		return im
+	}
+
+	mk_gray8 := proc(mips: bool, wrap: [2]Channel_Wrap, mis: int, extremes: []u8, s: ^u32) -> Channel_Image {
+		w, h :: 16, 16
+		raw := make([]u8, w * h + 4, context.temp_allocator)
+		for i in 0 ..< w * h {
+			raw[mis + i] = extremes[i % len(extremes)] if i < 64 else u8(rnd(s))
+		}
+		im := Channel_Image{pixels = raw[mis:][:w * h], width = w, height = h, format = .Gray8, filter = .Linear, wrap = wrap}
+		if mips {
+			nc := channel_level_count(w, h)
+			lvs := make([]Channel_Level, nc - 1, context.temp_allocator)
+			lw, lh := w, h
+			for k in 0 ..< nc - 1 {
+				lw, lh = max(lw >> 1, 1), max(lh >> 1, 1)
+				lraw := make([]u8, lw * lh + 4, context.temp_allocator)
+				lmis := (mis + k + 1) & 3
+				for j in 0 ..< lw * lh {
+					lraw[lmis + j] = u8(rnd(s))
+				}
+				lvs[k] = {texels = lraw[lmis:][:lw * lh], width = lw, height = lh}
+			}
+			im.levels = lvs
+		}
+		return im
+	}
+
+	Mask_Case :: struct {
+		name, swiz: string,
+	}
+	masks := [?]Mask_Case{
+		{"rgba", "t"},
+		{"r", "vec4(t.r, 0.0, 0.0, 1.0)"},
+		{"ga", "vec4(0.0, t.g, 0.0, t.a)"},
+		{"b", "vec4(0.0, 0.0, t.b, 1.0)"},
+		{"rgb", "vec4(t.rgb, 1.0)"},
+	}
+	for mc in masks {
+		src := fmt.tprintf("#version 310 es\nprecision highp float;\nreadonly buffer Q {{ vec4 q[]; }};\nuniform sampler2D s;\nout vec4 o;\nvoid main() {{\n    ivec2 p = ivec2(gl_FragCoord.xy);\n    vec4 c = q[p.y * %d + p.x];\n    vec4 t = textureLod(s, c.xy, c.z);\n    o = %s;\n}}", W, mc.swiz)
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%s: %s", mc.name, format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		for mips in ([2]bool{false, true}) {
+			for wrap in ([3][2]Channel_Wrap{{.Clamp, .Clamp}, {.Repeat, .Repeat}, {.Clamp, .Repeat}}) {
+				im_rgba := mk_rgba8(mips, wrap, 1, extremes[:], &seed)
+				run_and_cmp(t, m, W, H, {buffers = {qwords}, channel_images = {im_rgba}}, fmt.tprintf("rgba8_%s_mips%v_%v", mc.name, mips, wrap))
+				im_gray := mk_gray8(mips, wrap, int(mc.name[0]) & 3, extremes[:], &seed)
+				run_and_cmp(t, m, W, H, {buffers = {qwords}, channel_images = {im_gray}}, fmt.tprintf("gray8_%s_mips%v_%v", mc.name, mips, wrap))
+			}
+		}
+	}
+
+	// Layered sampler2DArray RGBA8 & Gray8 with mip chain (exercises Clamp+FMA+layers and Repeat).
+	{
+		arr_src := fmt.tprintf("#version 310 es\nprecision highp float;\nreadonly buffer Q {{ vec4 q[]; }};\nuniform sampler2DArray s;\nout vec4 o;\nvoid main() {{\n    ivec2 p = ivec2(gl_FragCoord.xy);\n    vec4 c = q[p.y * %d + p.x];\n    o = textureLod(s, vec3(c.xy, c.w), c.z);\n}}", W)
+		am, aerrs, aok := compile(arr_src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(am)
+		if testing.expectf(t, aok, "arr: %s", format_errors(aerrs, context.temp_allocator)) {
+			for wrap in ([2][2]Channel_Wrap{{.Clamp, .Clamp}, {.Repeat, .Repeat}}) {
+				im := mk_rgba8(true, wrap, 3, extremes[:], &seed)
+				run_and_cmp(t, am, W, H, {buffers = {qwords}, channel_images = {im}}, fmt.tprintf("rgba8_array_%v", wrap))
+			}
+		}
+	}
+
+	// 2. F32x4 / F32x2 / F32x1 1-level Clamp Linear (`bilinear_sub`) whole-texel path + partial comp_mask.
+	for mc in masks {
+		src := fmt.tprintf("#version 310 es\nprecision highp float;\nreadonly buffer Q {{ vec4 q[]; }};\nuniform sampler2D s;\nout vec4 o;\nvoid main() {{\n    ivec2 p = ivec2(gl_FragCoord.xy);\n    vec4 c = q[p.y * %d + p.x];\n    vec4 t = textureLod(s, c.xy, 0.0);\n    o = %s;\n}}", W, mc.swiz)
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "f32_%s: %s", mc.name, format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		for comps in ([3]int{4, 2, 1}) {
+			im := make_test_image(.F32, comps, 16, 16, false, u32(101 + comps))
+			im.filter = .Linear
+			im.data[0] = -0.0
+			if comps == 4 {
+				im.data[7] = 1234.5
+				im.data[11] = -99.25
+			}
+			run_and_cmp(t, m, W, H, {buffers = {qwords}, channel_images = {im}}, fmt.tprintf("f32x%d_%s", comps, mc.name))
+		}
+	}
 }
 
 // A signaling NaN coordinate reads what a quiet one does (the rule: any
@@ -12488,6 +12788,8 @@ dxbc_check_signatures :: proc(t: ^testing.T, m: ^Module, name: string, prog: []I
 			testing.expectf(t, fragment && r == Sig_Row{"SV_IsFrontFace", 0, 9, 1, 17, 1, 1}, "%s: %v", name, r, loc = loc)
 		case "SV_VertexID":
 			testing.expectf(t, !fragment && r == Sig_Row{"SV_VertexID", 0, 6, 1, 16, 1, 1}, "%s: %v", name, r, loc = loc)
+		case "SV_InstanceID":
+			testing.expectf(t, !fragment && r == Sig_Row{"SV_InstanceID", 0, 8, 1, 17, 1, 1}, "%s: %v", name, r, loc = loc)
 		case:
 			testing.expectf(t, false, "%s: input %s", name, r.name, loc = loc)
 		}

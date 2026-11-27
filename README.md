@@ -218,7 +218,10 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   the triangle faces the camera. **gl_VertexID** (vertex shaders): the
   vertex's index in the draw, its first vertex included (Vulkan's
   VertexIndex, Metal's `vertex_id`); on the CPU, `Run_Options.first_vertex`
-  plus the vertex's index in `run_vertex`. **gl_SampleMask[0]** (fragment
+  plus the vertex's index in `run_vertex`. **gl_InstanceID** (vertex shaders):
+  the instance's index in the draw, its first instance included (Vulkan's
+  InstanceIndex, Metal's `instance_id`); on the CPU, `Run_Options.instance`.
+  **gl_SampleMask[0]** (fragment
   shaders): the samples of the fragment's coverage it keeps (SPIR-V's
   SampleMask, Metal's `sample_mask`; `run_fragment`'s `sample_masks`).
   `dFdx`, `dFdy` and `fwidth` are fine derivatives, per row and column of
@@ -316,7 +319,7 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   without `flat`, initializers on stage variables, writes to inputs,
   gl_FragCoord and gl_FrontFacing, fragment-only features (`discard`,
   derivatives, gl_FragCoord, gl_SampleMask) in vertex shaders, gl_VertexID
-  in fragment shaders, `sampler2DArray` in the Shadertoy profile (whose channels are
+  and gl_InstanceID in fragment shaders, `sampler2DArray` in the Shadertoy profile (whose channels are
   2D), more than 16 samplers, taps outside a vertex
   shader, a tap position, attribute or twin not declared as one, a
   position the shader uses itself, and two taps writing one position.
@@ -524,10 +527,10 @@ four channels (the rows above); GLSL shaders have 16 (`SAMPLER_COUNT`).
   offsets.
 - **Vertex shaders:** SPIR-V entry `main` (Vertex), attributes at their
   locations, `gl_Position` as the `Position` built-in, varyings at their
-  locations, `gl_VertexID` as `VertexIndex`; samplers then storage buffers
+  locations, `gl_VertexID` as `VertexIndex`, `gl_InstanceID` as `InstanceIndex`; samplers then storage buffers
   at set 0, the uniform block at set 1, binding 0. MSL: `vertex Oksl_Out
   oksl_main` with attributes as `[[attribute(N)]]` of a `[[stage_in]]`
-  struct, `gl_VertexID` as a `[[vertex_id]]` parameter, varyings as
+  struct, `gl_VertexID` as a `[[vertex_id]]` parameter, `gl_InstanceID` as `[[instance_id]]`, varyings as
   `[[user(locnN)]]` and the position as `[[position]]`; the block at
   `[[buffer(0)]]`, storage buffers after it. One vertex uniform block
   (`Module.num_uniform_buffers` 1, or 0 when there is none).
@@ -560,13 +563,15 @@ four channels (the rows above); GLSL shaders have 16 (`SAMPLER_COUNT`).
   (SDL_GPU's vertex semantics), so a vertex shader's outputs and a
   fragment shader's inputs agree by register whichever a stage reads;
   `SV_Position` takes register 16 (after the 16 locations), as do a vertex
-  shader's `SV_VertexID` input, and `SV_IsFrontFace` 17; colour target N
+  shader's `SV_VertexID` input, `SV_InstanceID` 17 (on VS inputs), and `SV_IsFrontFace` 17 (on PS inputs); colour target N
   is `SV_Target`N and `gl_SampleMask[0]` `SV_Coverage` (`oMask`).
   `gl_FragCoord.w` is `1 / SV_Position.w` (D3D gives the clip w). D3D's
   `SV_VertexID` leaves out the draw's first vertex (`StartVertexLocation`,
-  and `BaseVertexLocation` of an indexed draw), so on D3D12 `gl_VertexID`
-  is 0 at the draw's first vertex, where Vulkan and Metal (and
-  `Run_Options.first_vertex` on the CPU) count SDL's `first_vertex` in
+  and `BaseVertexLocation` of an indexed draw) and `SV_InstanceID` leaves out
+  its first instance (`StartInstanceLocation`), so on D3D12 `gl_VertexID`
+  and `gl_InstanceID` are 0 at the draw's first vertex and instance, where
+  Vulkan and Metal (and `Run_Options.first_vertex` and `Run_Options.instance`
+  on the CPU) count SDL's `first_vertex` and `first_instance` in
   (a host that batches draws passes its base in a uniform instead).
   Every function is inlined (vkd3d takes no DXBC subroutines); every loop
   has one shape (a first-pass flag runs a for's step and a do-while's
@@ -1193,8 +1198,7 @@ macros, `texture` / `texelFetch` / `textureSize`, `switch` and `discard`.
   capability) and `imageAtomic*` (outside GLSL ES 3.10 core). Storage images and
   writable storage buffers are compute-only. Programs run their passes as
   fragment shaders and the host owns the float targets and swaps them each
-  frame. GLSL shaders have no `gl_FragDepth` or `gl_InstanceID` (draw
-  instances as vertex ranges and divide `gl_VertexID`), no user uniform
+  frame. GLSL shaders have no `gl_FragDepth`, no user uniform
   blocks, and no array stage variables.
 - **MSL is compiled only on macOS:** Metal has no Linux compiler, so on
   Linux the emitter is checked textually; on macOS `tools/gpu_parity` runs

@@ -85,6 +85,7 @@ Checker :: struct {
 	gl_position:     Sym_Id,
 	gl_front_facing: Sym_Id,
 	gl_vertex_id:    Sym_Id,
+	gl_instance_id:  Sym_Id,
 	gl_sample_mask:  Sym_Id,
 	gl_global_id:    Sym_Id,
 	gl_local_id:     Sym_Id,
@@ -407,6 +408,14 @@ builtin_symbol :: proc(c: ^Checker, name: string) -> Sym_Id {
 			c.gl_vertex_id = add_sym(c, Symbol{name = name, type = intern(c.u, T_INT), storage = .Stage_In, is_const = true})
 		}
 		return c.gl_vertex_id
+	case "gl_InstanceID":
+		if .Gl_Instance_ID not_in c.u.features {
+			return 0
+		}
+		if c.gl_instance_id == 0 {
+			c.gl_instance_id = add_sym(c, Symbol{name = name, type = intern(c.u, T_INT), storage = .Stage_In, is_const = true})
+		}
+		return c.gl_instance_id
 	case "gl_SampleMask":
 		if .Gl_Sample_Mask not_in c.u.features {
 			return 0
@@ -1760,7 +1769,7 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 				add_error(c, e.pos, missing_feature(u.profile, u.stage, .Compute_Ids), e.name)
 			} else if u.stage == .Compute && (e.name == "gl_FragCoord" || e.name == "gl_FrontFacing" || e.name == "gl_SampleMask") {
 				add_error(c, e.pos, .Fragment_Only, e.name)
-			} else if u.stage == .Compute && (e.name == "gl_Position" || e.name == "gl_VertexID") {
+			} else if u.stage == .Compute && (e.name == "gl_Position" || e.name == "gl_VertexID" || e.name == "gl_InstanceID") {
 				add_error(c, e.pos, .Vertex_Only, e.name)
 			} else {
 				add_error(c, e.pos, .Undeclared, e.name)

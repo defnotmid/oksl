@@ -300,6 +300,22 @@ when ODIN_OS == .Darwin {
 @(private) FMOV_NEG_ONE :: u32(0x4f07f600)
 @(private) FMOV_TWO :: u32(0x4f00f400)
 @(private) FMOV_THREE :: u32(0x4f00f500)
+@(private) V_XTN_4H :: u32(0x0e612800)
+@(private) V_XTN2_8H :: u32(0x4e612800)
+@(private) MOVI_256_8H :: u32(0x4f00a420)
+@(private) V_SUB_8H :: u32(0x6e608400)
+@(private) V_UXTL_8H :: u32(0x2f08a400)
+@(private) V_MUL_8H :: u32(0x4e609c00)
+@(private) V_MLA_8H :: u32(0x4e609400)
+@(private) V_UMULL_4S :: u32(0x2e60c000)
+@(private) V_UMLAL_4S :: u32(0x2e608000)
+@(private) V_UMULL2_4S :: u32(0x6e60c000)
+@(private) V_UMLAL2_4S :: u32(0x6e608000)
+@(private) V_UCVTF_F16 :: u32(0x6f30e400)
+@(private) V_MUL_8H_E :: u32(0x4f408000)
+@(private) V_MLA_8H_E :: u32(0x6f400000)
+@(private) V_UMULL_4S_E :: u32(0x2f40a000)
+@(private) V_UMLAL2_4S_E :: u32(0x6f402000)
 @(private) MOVI_31 :: u32(0x4f0007e0)
 
 @(private)
@@ -380,6 +396,12 @@ psel :: proc(e: ^Jit_Emitter, d, m, t, f: u8) {
 @(private)
 a_imm :: #force_inline proc(e: ^Jit_Emitter, op: u32, q: u8) {
 	ai(e, op | u32(q))
+}
+
+@(private)
+a_elem_h :: #force_inline proc(e: ^Jit_Emitter, op: u32, d, n, m: u8, l: u32) {
+	assert(m < 16)
+	ai(e, op | ((l & 3) << 20) | u32(m) << 16 | ((l >> 2) << 11) | u32(n) << 5 | u32(d))
 }
 
 // ldr q, [x23, #off] (a table constant).
@@ -1039,7 +1061,7 @@ a_chan_nearest_xy :: proc(e: ^Jit_Emitter) {
 // in pair 4. Rows (ax 1) times the pitch, plus the layer's offset with layers.
 // Preserves v16..v31, w1, w11..w14, x0 and x2.
 @(private)
-a_chan_axis :: proc(e: ^Jit_Emitter, ax: i32, f_c: i64, nearest: bool) {
+a_chan_axis :: proc(e: ^Jit_Emitter, ax: i32, f_c: i64, nearest: bool, int_weight := false) {
 	a_pair_mem(e, true, 0, A_SP, f_c)
 	a_bcast_d(e, 14, A_X2, OFF_LV_FS + ax * 8)
 	a_v2(e, V_FCVTL_2D, 2, 0)
@@ -1125,9 +1147,11 @@ a_chan_axis :: proc(e: ^Jit_Emitter, ax: i32, f_c: i64, nearest: bool) {
 		a_v2(e, V_XTN2, 8, 3)
 		a_v2(e, V_XTN, 9, 4)
 		a_v2(e, V_XTN2, 9, 5)
-		p2(e, V_SCVTF, 4, 4)
-		a_tab(e, 15, A64_OFF_INV256)
-		p3q(e, V_FMUL, 4, 4, 15)
+		if !int_weight {
+			p2(e, V_SCVTF, 4, 4)
+			a_tab(e, 15, A64_OFF_INV256)
+			p3q(e, V_FMUL, 4, 4, 15)
+		}
 	}
 }
 
@@ -1472,18 +1496,106 @@ a_emit_sample_sub :: proc(e: ^Jit_Emitter) {
 	tapped := a_branch(e, -1)
 
 	a_land(e, linear)
-	// Linear in registers: axis 0 -> (X0=8, X1=9, TX=10), axis 1 -> (Y0=6, Y1=5, TY=11),
-	// then four corner indices (c00=4, c10=7, c01=8, c11=9), blending A in 12..15.
-	a_chan_axis(e, 0, A_SF_U, false)
+	// Linear in registers: axis 0 -> (X0=8, X1=9, WX=10), axis 1 -> (Y0=6, Y1=5, WY=11),
+	// then four corner indices (c00=4, c10=7, c01=8, c11=9).
+	a_chan_axis(e, 0, A_SF_U, false, true)
 	pmov(e, 8, 6)
 	pmov(e, 9, 5)
 	pmov(e, 10, 4)
-	a_chan_axis(e, 1, A_SF_V, false)
+	a_chan_axis(e, 1, A_SF_V, false, true)
 	pmov(e, 11, 4)
 	p3(e, V_ADD, 4, 6, 8)  // c00
 	p3(e, V_ADD, 7, 6, 9)  // c10
 	p3(e, V_ADD, 8, 5, 8)  // c01
 	p3(e, V_ADD, 9, 5, 9)  // c11
+	a_ldrb(e, A_X16, A_X0, OFF_CI_FORMAT)
+	a_cmp_w(e, A_X16, u32(Channel_Format.Rgba8))
+	not_rgba8 := a_branch(e, 1) // b.ne
+	// Rgba8 per-level linear tap: integer bilinear via uxtw loads and ucvtf #16.
+	rgba8_dead := a_cbz(e, A_X1, false)
+	a_ldr_x(e, 15, A_X2, OFF_LV_PTR)
+	a_v2(e, V_XTN_4H, 0, 20)
+	a_v2(e, V_XTN2_8H, 0, 21)
+	a_imm(e, MOVI_256_8H, 24)
+	a_v3(e, V_SUB_8H, 1, 24, 0)
+	a_v2(e, V_XTN_4H, 2, 22)
+	a_v2(e, V_XTN2_8H, 2, 23)
+	a_v3(e, V_SUB_8H, 3, 24, 2)
+	for l in u32(0) ..< 8 {
+		h, i := u8(l / 4), l % 4
+		a_umov_s(e, A_X3, 8 + h, i)
+		a_umov_s(e, A_X3 + 1, 14 + h, i)
+		a_umov_s(e, A_X3 + 2, 16 + h, i)
+		a_umov_s(e, A_X3 + 3, 18 + h, i)
+		ai(e, A_LDR_S | u32(A_X3) << 16 | 15 << 5 | 4)
+		ai(e, A_LDR_S | u32(A_X3 + 1) << 16 | 15 << 5 | 5)
+		ai(e, A_LDR_S | u32(A_X3 + 2) << 16 | 15 << 5 | 6)
+		ai(e, A_LDR_S | u32(A_X3 + 3) << 16 | 15 << 5 | 7)
+		ai(e, 0x6e0c0400 | 6 << 5 | 4) // ins v4.s[1], v6.s[0]
+		ai(e, 0x6e0c0400 | 7 << 5 | 5) // ins v5.s[1], v7.s[0]
+		a_v2(e, V_UXTL_8H, 4, 4)
+		a_v2(e, V_UXTL_8H, 5, 5)
+		a_elem_h(e, V_MUL_8H_E, 4, 4, 1, l)
+		a_elem_h(e, V_MLA_8H_E, 4, 5, 0, l)
+		a_elem_h(e, V_UMULL_4S_E, 24 + u8(l), 4, 3, l)
+		a_elem_h(e, V_UMLAL2_4S_E, 24 + u8(l), 4, 2, l)
+		a_v2(e, V_UCVTF_F16, 24 + u8(l), 24 + u8(l))
+	}
+	for h in u8(0) ..< 2 {
+		b := 24 + 4 * h
+		a_v3(e, V_TRN1, 20, b, b + 1)
+		a_v3(e, V_TRN2, 21, b, b + 1)
+		a_v3(e, V_TRN1, 22, b + 2, b + 3)
+		a_v3(e, V_TRN2, 23, b + 2, b + 3)
+		a_v3(e, V_TRN1_2D, h, 20, 22)
+		a_v3(e, V_TRN2_2D, 4 + h, 20, 22)
+		a_v3(e, V_TRN1_2D, 2 + h, 21, 23)
+		a_v3(e, V_TRN2_2D, 6 + h, 21, 23)
+	}
+	a_land(e, rgba8_dead)
+	rgba8_done := a_branch(e, -1)
+
+	a_land(e, not_rgba8)
+	a_cmp_w(e, A_X16, u32(Channel_Format.Gray8))
+	not_gray8 := a_branch(e, 1) // b.ne
+	g8_dead := a_tbz(e, A_X1, 0, false)
+	a_ldr_x(e, 15, A_X2, OFF_LV_PTR)
+	a_ldr_w(e, A_X16, A_X2, OFF_LV_MIS)
+	ai(e, 0x8b3041ef) // add x15, x15, w16, uxtw
+	a_v2(e, V_XTN_4H, 24, 20)
+	a_v2(e, V_XTN2_8H, 24, 21)
+	a_imm(e, MOVI_256_8H, 12)
+	a_v3(e, V_SUB_8H, 25, 12, 24)
+	a_v2(e, V_XTN_4H, 26, 22)
+	a_v2(e, V_XTN2_8H, 26, 23)
+	a_v3(e, V_SUB_8H, 27, 12, 26)
+	for cr, ci in ([4]u8{4, 7, 8, 9}) {
+		a_lane_idx(e, cr)
+		a_gather_s8(e, A_LDR_B, 0)
+		a_v2(e, V_XTN_4H, 28 + u8(ci), 0)
+		a_v2(e, V_XTN2_8H, 28 + u8(ci), 1)
+	}
+	a_v3(e, V_MUL_8H, 28, 28, 25)
+	a_v3(e, V_MLA_8H, 28, 29, 24)
+	a_v3(e, V_MUL_8H, 30, 30, 25)
+	a_v3(e, V_MLA_8H, 30, 31, 24)
+	a_v3(e, V_UMULL_4S, 0, 28, 27)
+	a_v3(e, V_UMLAL_4S, 0, 30, 26)
+	a_v3(e, V_UMULL2_4S, 1, 28, 27)
+	a_v3(e, V_UMLAL2_4S, 1, 30, 26)
+	a_v2(e, V_UCVTF_F16, 0, 0)
+	a_v2(e, V_UCVTF_F16, 1, 1)
+	a_land(e, g8_dead)
+	g8_done := a_branch(e, -1)
+
+	// General float fallback (F32, Rgba16f, Gray16): convert integer weights -> f32 / 256.
+	// Pairs 4 (v8..9), 7 (v14..15), 8..11 (v16..23) hold corners and weights, so use v12 for 1/256.
+	a_land(e, not_gray8)
+	a_tab(e, 12, A64_OFF_INV256)
+	p2(e, V_SCVTF, 10, 10)
+	p3q(e, V_FMUL, 10, 10, 12)
+	p2(e, V_SCVTF, 11, 11)
+	p3q(e, V_FMUL, 11, 11, 12)
 	// Corner 00 -> pair (12 + k).
 	a_bl(e, &e.decode_calls)
 	for k in u8(0) ..< 4 {
@@ -1532,6 +1644,8 @@ a_emit_sample_sub :: proc(e: ^Jit_Emitter) {
 		a_land(e, sk)
 	}
 
+	a_land(e, g8_done)
+	a_land(e, rgba8_done)
 	a_land(e, tapped)
 	one_level := a_cbz(e, 12, false)
 	a_cmp_w(e, 12, 2)
