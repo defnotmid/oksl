@@ -1054,13 +1054,16 @@ it makes the others, and `built_levels` lists and skips them.
   3.7 ulp on [-pi, pi], `atan` 1.8 ulp and `atan(y, x)` 1.9, `asin`,
   `acos`, `log2` and the hyperbolic functions 3 ulp, and `pow` within
   1.5 + 3 * |y * log2(x)| ulp, as `exp2(y * log2(x))` on a GPU (`pow(x,
-  2.0)` is `x * x`), with `pow` and `atan(y, x)` following C99's special
-  cases. GLSL leaves `pow` of a negative `x` undefined, and GPUs differ
-  (`exp2(y * log2(x))` is NaN on D3D12's WARP), but a literal exponent of 2.0, or a
-  vector of them, is `x * x` on every backend (SPIR-V, MSL and DXBC emit
-  the multiply, as GPU compilers fold it), so `pow(-0.5, 2.0)` is 0.25
-  everywhere; for any other exponent a negative `x` follows C99 on the
-  CPU (`pow(-0.5, 3.0)` is -0.125) and may be NaN on a GPU. A NaN's sign and payload depend on the
+  2.0)` is `x * x` wherever y is 2), with `pow` and `atan(y, x)` following C99's special
+  cases. A literal whole exponent n from 2 to 5, or a vector of the same
+  n, is n - 1 multiplies, `x * x * ... * x`, on every backend and both CPU
+  engines (as GPU compilers fold small whole powers), cheaper than
+  `exp2(y * log2(x))` and within 2.61 ulp, inside the 3 ulp Vulkan allows
+  `pow` at the least. GLSL leaves `pow` of a negative
+  `x` undefined, and GPUs differ (`exp2(y * log2(x))` is NaN on D3D12's
+  WARP), but with such an exponent a negative `x` is the product
+  everywhere (`pow(-0.5, 2.0)` is 0.25 and `pow(-0.5, 3.0)` -0.125); for
+  any other exponent it follows C99 on the CPU and may be NaN on a GPU. A NaN's sign and payload depend on the
   CPU (x86 makes `0xffc00000`, arm64 `0x7fc00000`) and on the operand
   order a compiler picks, so wherever a float's bits reach the host or an
   integer they are canonical: every NaN in a target, a `run_vertex`

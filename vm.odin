@@ -2704,6 +2704,16 @@ lower_builtin :: proc(l: ^Lower, id: Expr_Id) -> Val {
 	at := vals[0].t
 	n := cc(l, t)
 	s := alloc_slots(l, n)
+	if k := pow_int_exponent(u, argx) if b == .Pow else 0; k != 0 {
+		// Each step its own temporary, the last the result.
+		r := vals[0].slot
+		for i in 1 ..< k {
+			d := s if i == k - 1 else alloc_slots(l, n)
+			emit(l, .F_Mul, n = n, dst = d, a = r, b = vals[0].slot)
+			r = d
+		}
+		return {s, t}
+	}
 	if op := VM_BUILTINS[b][at.base]; op != .Nop {
 		// Component-wise over the result, or a reduction over the first
 		// argument (dot, length, any, ...) when the result is a scalar.

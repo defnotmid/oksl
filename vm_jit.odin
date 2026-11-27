@@ -2020,6 +2020,24 @@ jit_store_quad :: #force_inline proc "contextless" (t: Jit_Out_Target, base_out,
 	if (qalive & 8) != 0 {intrinsics.unaligned_store((^Simd_F4)(&t.dst[base_out + 3]), p3)}
 }
 
+// The pair's sample masks from base, for its alive lanes only, as its
+// colors: the shader's gl_SampleMask, or every sample (src all ones).
+@(private)
+jit_store_sample_masks :: #force_inline proc "contextless" (dst: []u32, src: ^Jit_Slot, base: int, alive: u8) #no_bounds_check {
+	if alive == 0xFF {
+		intrinsics.unaligned_store((^Jit_Slot)(&dst[base]), src^)
+		return
+	}
+	for l in 0 ..< JIT_LANES {
+		if alive & (1 << uint(l)) != 0 {
+			dst[base + l] = src[l]
+		}
+	}
+}
+
+@(private, rodata)
+jit_all_samples := Jit_Slot{~u32(0), ~u32(0), ~u32(0), ~u32(0), ~u32(0), ~u32(0), ~u32(0), ~u32(0)}
+
 @(private)
 JIT_FRAG_DX :: Simd_F8{0.5, 1.5, 0.5, 1.5, 0.5, 1.5, 0.5, 1.5}
 @(private)
@@ -2081,7 +2099,8 @@ jit_run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, tar
 
 	active_outs: [FRAGMENT_OUTPUTS]Jit_Out_Target
 	n_active := 0
-	fast_outs := sample_masks == nil && len(targets) <= FRAGMENT_OUTPUTS
+	fast_outs := len(targets) <= FRAGMENT_OUTPUTS
+	mask_src := &slots[meta.sample_mask_slot] if meta.has_sample_mask else &jit_all_samples
 	if fast_outs {
 		for target, n_t in targets {
 			if target == nil {
@@ -2206,6 +2225,9 @@ jit_run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, tar
 					}
 				}
 			}
+			if sample_masks != nil {
+				jit_store_sample_masks(sample_masks, mask_src, first * 4, alive)
+			}
 		} else {
 			jit_write_fragment_slow(meta, slots, quads, targets, shaded, sample_masks, first, 2, alive)
 		}
@@ -2257,6 +2279,9 @@ jit_run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, tar
 				for ti in 0 ..< n_active {
 					jit_store_quad(active_outs[ti], base_out, 0, alive)
 				}
+			}
+			if sample_masks != nil {
+				jit_store_sample_masks(sample_masks, mask_src, first * 4, alive)
 			}
 		} else {
 			jit_write_fragment_slow(meta, slots, quads, targets, shaded, sample_masks, first, 1, alive)

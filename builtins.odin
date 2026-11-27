@@ -119,36 +119,51 @@ is_atomic_builtin :: #force_inline proc "contextless" (b: Builtin) -> bool {
 	return b >= .Atomic_Add && b <= .Atomic_Comp_Swap
 }
 
-// pow(x, 2.0) with a literal 2.0 (or a vector constructed from literal
-// 2.0s) is x * x on every backend, as GPU compilers (NIR, fxc) fold it, so
-// a negative x squares where exp2(2 * log2(x)) can give NaN (WARP's
-// does). GLSL leaves any
-// other pow of a negative x undefined. The CPU's pow already takes x * x
-// wherever y is 2.
+// pow(x, n) with n a literal whole number from 2 to POW_INT_MAX (or a
+// vector constructed from literal n's, all the same) is x * x * ... * x,
+// n - 1 multiplies left to right, on every backend and both CPU engines.
+// GPU compilers fold small whole powers too (NIR, fxc); the multiplies cost
+// less than exp2(n * log2(x)), and a negative x takes the sign C99 gives it
+// where exp2(n * log2(x)) can be NaN (WARP's is). GLSL leaves any other pow
+// of a negative x undefined. Over every f32 in [1, 2) the product's error
+// is at most 0.5, 1.29, 1.98 and 2.61 ulp for n = 2 to 5 (3.24 at 6), so 5
+// keeps it within the 3 ulp that Vulkan allows pow at the least. The CPU's
+// pow still takes x * x wherever y is 2 at run time, for a 2 that isn't a
+// literal. Returns n, or 0 for any other exponent.
+POW_INT_MAX :: 5
+
 @(private)
-pow_is_square :: proc "contextless" (u: ^Unit, args: []Expr_Id) -> bool {
-	is_two :: proc "contextless" (u: ^Unit, id: Expr_Id) -> bool {
+pow_int_exponent :: proc "contextless" (u: ^Unit, args: []Expr_Id) -> int {
+	whole :: proc "contextless" (u: ^Unit, id: Expr_Id) -> int {
 		e := u.exprs[id]
 		#partial switch e.kind {
 		case .Float_Lit:
-			return transmute(f64)e.value == 2
+			v := transmute(f64)e.value
+			if v >= 2 && v <= POW_INT_MAX && v == f64(int(v)) {
+				return int(v)
+			}
 		case .Int_Lit, .Uint_Lit:
-			// Inside a constructor, as vec2(2).
-			return e.value == 2
+			// SkSL's pow(x, 5), or inside a constructor, as vec2(5).
+			if e.value >= 2 && e.value <= POW_INT_MAX {
+				return int(e.value)
+			}
 		case .Call:
 			if e.call != .Constructor || e.args.count == 0 {
-				return false
+				return 0
 			}
+			n := 0
 			for a in list(u, e.args) {
-				if !is_two(u, Expr_Id(a)) {
-					return false
+				k := whole(u, Expr_Id(a))
+				if k == 0 || (n != 0 && k != n) {
+					return 0
 				}
+				n = k
 			}
-			return true
+			return n
 		}
-		return false
+		return 0
 	}
-	return len(args) == 2 && is_two(u, args[1])
+	return whole(u, args[1]) if len(args) == 2 else 0
 }
 
 // How a built-in's arguments are checked (and converted). Each rule runs

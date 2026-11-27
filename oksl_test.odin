@@ -18629,26 +18629,35 @@ test_jit_a64_patch_range :: proc(t: ^testing.T) {
 	}
 }
 
-// pow's lowering with a literal 2.0 exponent (pow_is_square): x * x in
-// SPIR-V (no GLSL.std.450 Pow), MSL (oksl_square, no pow) and DXBC (a mul,
-// no log), for a scalar, vec2(2.0), vec3(2.0, 2.0, 2.0) and vec2(2); any
-// other exponent stays pow. Both CPU engines give x * x for a negative x,
-// as before. Every module through spirv-val and vkd3d.
+// pow's lowering with a literal whole exponent n from 2 to POW_INT_MAX
+// (pow_int_exponent): n - 1 multiplies in SPIR-V (no GLSL.std.450 Pow), MSL
+// (oksl_powi<n>, no pow), DXBC (n - 1 muls, no log) and the CPU program (n - 1
+// F_Mul, no F_Fn2), for a scalar, vectors of literal n's (float and int) and
+// both ends of the range; both CPU engines give (-0.5)^n exactly. Past the
+// range (6), a fraction, a negative, 1, 0, a uniform and a vector of different
+// n's stay pow. Every module through spirv-val and vkd3d.
 @(test)
-test_pow_square_lowering :: proc(t: ^testing.T) {
+test_pow_int_lowering :: proc(t: ^testing.T) {
 	Case :: struct {
-		expr:   string,
-		square: bool,
+		expr: string,
+		n:    int,
 	}
 	cases := [?]Case{
-		{"vec4(pow(u.x, 2.0))", true},
-		{"vec4(pow(u.xy, vec2(2.0)), 0.0, 1.0)", true},
-		{"vec4(pow(u.xyz, vec3(2.0, 2.0, 2.0)), 1.0)", true},
-		{"vec4(pow(u.xy, vec2(2)), 0.0, 1.0)", true},
-		{"vec4(pow(u.x, 3.0))", false},
-		{"vec4(pow(u.x, -2.0))", false},
-		{"vec4(pow(u.x, u.w))", false},
-		{"vec4(pow(u.xy, vec2(2.0, 3.0)), 0.0, 1.0)", false},
+		{"vec4(pow(u.x, 2.0))", 2},
+		{"vec4(pow(u.xy, vec2(2.0)), 0.0, 1.0)", 2},
+		{"vec4(pow(u.xyz, vec3(2.0, 2.0, 2.0)), 1.0)", 2},
+		{"vec4(pow(u.xy, vec2(2)), 0.0, 1.0)", 2},
+		{"vec4(pow(u.x, 3.0))", 3},
+		{"vec4(pow(u.x, 5.0))", 5},
+		{"vec4(pow(u.xyz, vec3(4.0)), 1.0)", 4},
+		{"vec4(pow(u.xy, vec2(5, 5)), 0.0, 1.0)", 5},
+		{"vec4(pow(u.x, 6.0))", 0},
+		{"vec4(pow(u.x, 2.5))", 0},
+		{"vec4(pow(u.x, -2.0))", 0},
+		{"vec4(pow(u.x, 1.0))", 0},
+		{"vec4(pow(u.x, 0.0))", 0},
+		{"vec4(pow(u.x, u.w))", 0},
+		{"vec4(pow(u.xy, vec2(2.0, 3.0)), 0.0, 1.0)", 0},
 	}
 	for c in cases {
 		src := fmt.tprintf("#version 310 es\nprecision highp float;\nuniform vec4 u;\nlayout(location = 0) out vec4 o;\nvoid main() {{ o = %s; }}\n", c.expr)
@@ -18663,15 +18672,20 @@ test_pow_square_lowering :: proc(t: ^testing.T) {
 		if have_vkd3d() {
 			expect_valid_dxbc(t, c.expr, m.dxbc)
 		}
+		lowered := c.n != 0
 		all, _ := spv_decode(m.spirv)
-		pows := 0
+		pows, fmuls := 0, 0
 		for in_ in all {
 			if in_.op == .Ext_Inst && len(in_.w) >= 4 && in_.w[3] == u32(Glsl.Pow) {
 				pows += 1
 			}
+			if in_.op == .F_Mul {
+				fmuls += 1
+			}
 		}
-		testing.expectf(t, pows == (0 if c.square else 1), "%s: %d GLSL.std.450 Pow", c.expr, pows)
-		testing.expectf(t, strings.count(m.msl, "pow(") == (0 if c.square else 1) && strings.contains(m.msl, "oksl_square(") == c.square, "%s: MSL\n%s", c.expr, m.msl)
+		testing.expectf(t, pows == (0 if lowered else 1) && fmuls == max(c.n - 1, 0), "%s: SPIR-V %d Pow, %d FMul", c.expr, pows, fmuls)
+		powi := fmt.tprintf("oksl_powi<%d>(", c.n)
+		testing.expectf(t, strings.count(m.msl, "pow(") == (0 if lowered else 1) && strings.contains(m.msl, "oksl_powi<") == lowered && (!lowered || strings.contains(m.msl, powi)), "%s: MSL\n%s", c.expr, m.msl)
 		_, prog := dxbc_program(t, m, c.expr)
 		logs, muls := 0, 0
 		for in_ in prog {
@@ -18682,18 +18696,86 @@ test_pow_square_lowering :: proc(t: ^testing.T) {
 				muls += 1
 			}
 		}
-		testing.expectf(t, logs == (0 if c.square else 1) && (!c.square || muls > 0), "%s: DXBC %d log, %d mul", c.expr, logs, muls)
-		if c.square {
+		testing.expectf(t, logs == (0 if lowered else 1) && (!lowered || muls == c.n - 1), "%s: DXBC %d log, %d mul", c.expr, logs, muls)
+		fn2s, vmuls := 0, 0
+		for in_ in m.program.code {
+			#partial switch in_.op {
+			case .F_Fn2:
+				fn2s += 1
+			case .F_Mul:
+				vmuls += 1
+			}
+		}
+		testing.expectf(t, fn2s == (0 if lowered else 1) && vmuls == max(c.n - 1, 0), "%s: CPU %d F_Fn2, %d F_Mul", c.expr, fn2s, vmuls)
+		if lowered {
 			block := make([]u8, max(m.block_size, 16), context.temp_allocator)
 			uv := [4]f32{-0.5, -1.5, -3.0, 2.0}
 			set_uniform(m, block, "u", uv[:])
+			want := f32(1)
+			for _ in 0 ..< c.n {
+				want *= -0.5
+			}
 			for engine in 0 ..< 2 {
 				if engine == 1 {
 					m.program.jit_body, m.program.jit_init = nil, nil
 				}
 				out: [8][4]f32
 				run_f32(&m.program, block, 8, 1, out[:], temp_scratch())
-				testing.expectf(t, out[0].x == 0.25, "%s engine %d: %v", c.expr, engine, out[0])
+				testing.expectf(t, out[0].x == want, "%s engine %d: %v, want %v", c.expr, engine, out[0], want)
+			}
+		}
+	}
+}
+
+// The JIT's fast fragment write with sample masks (o3d's main pass): float
+// targets and a gl_SampleMask[0] the shader writes, or none (every sample),
+// against the interpreter, with discards, helper lanes, a pair partly
+// alive and a single quad left at the end, sentinels where nothing may be
+// written.
+@(test)
+test_fragment_sample_mask_fast :: proc(t: ^testing.T) {
+	srcs := [2]string{
+		"#version 310 es\nprecision highp float;\nlayout(location = 0) out vec4 c;\nvoid main() {\n    ivec2 p = ivec2(gl_FragCoord.xy);\n    if (((p.x * 7 + p.y * 3) % 5) == 0) discard;\n    gl_SampleMask[0] = (p.x + 3 * p.y) & 15;\n    c = vec4(gl_FragCoord.xy, 0.5, 1.0);\n}\n",
+		"#version 310 es\nprecision highp float;\nlayout(location = 0) out vec4 c;\nvoid main() {\n    ivec2 p = ivec2(gl_FragCoord.xy);\n    if (((p.x * 7 + p.y * 3) % 5) == 0) discard;\n    c = vec4(gl_FragCoord.xy, 0.25, 1.0);\n}\n",
+	}
+	Q :: 7
+	SENT :: u32(0xDEAD_BEEF)
+	origin: [Q][2]i32
+	helpers: [Q]Quad_Lanes
+	for q in 0 ..< Q {
+		origin[q] = {i32(q * 2), i32(q & 1) * 2}
+		helpers[q] = transmute(Quad_Lanes)u8((q * 5) & 0xF) if q != 2 else {}
+	}
+	for src, si in srcs {
+		m, errs, ok := compile(src, {profile = .Glsl, stage = .Fragment})
+		defer destroy(m)
+		if !testing.expectf(t, ok, "%d: %s", si, format_errors(errs, context.temp_allocator)) {
+			continue
+		}
+		// No JIT (or -define:OKSL_JIT=false): nothing to compare.
+		if m.program.jit_body == nil {
+			continue
+		}
+		p_int := m.program
+		p_int.jit_body, p_int.jit_init = nil, nil
+		block := make([]u8, max(m.block_size, 16), context.temp_allocator)
+		for qc in ([]int{1, 2, 3, Q}) {
+			for use_helpers in ([2]bool{false, true}) {
+				quads := Fragment_Quads{count = qc, origin = origin[:qc], helpers = helpers[:qc] if use_helpers else nil}
+				outs: [2][Q * 4][4]f32
+				masks: [2][Q * 4]u32
+				shaded: [2][Q]Quad_Lanes
+				for e in 0 ..< 2 {
+					for i in 0 ..< Q * 4 {
+						outs[e][i] = transmute([4]f32)[4]u32{SENT, SENT, SENT, SENT}
+						masks[e][i] = SENT
+					}
+					targets := [1][][4]f32{outs[e][:qc * 4]}
+					run_fragment(&m.program if e == 0 else &p_int, block, quads, targets[:], shaded[e][:qc], temp_scratch(), {}, masks[e][:qc * 4])
+				}
+				testing.expectf(t, shaded[0] == shaded[1], "%d qc=%d h=%v: shaded %v, interpreter %v", si, qc, use_helpers, shaded[0], shaded[1])
+				testing.expectf(t, masks[0] == masks[1], "%d qc=%d h=%v: masks %x, interpreter %x", si, qc, use_helpers, masks[0], masks[1])
+				testing.expectf(t, transmute([Q * 4][4]u32)outs[0] == transmute([Q * 4][4]u32)outs[1], "%d qc=%d h=%v: targets differ", si, qc, use_helpers)
 			}
 		}
 	}

@@ -34,8 +34,8 @@ Msl :: struct {
 	sh_words:      int,
 	sh_off:        []int,
 	has_cas:       bool,
-	// oksl_square, pow(x, 2.0)'s helper (pow_is_square), written to `helpers`.
-	has_square:    bool,
+	// oksl_powi, pow(x, n)'s helper for a literal whole n (pow_int_exponent), written to `helpers`.
+	has_powi:      bool,
 }
 
 // A sampler's Metal texture type.
@@ -1958,12 +1958,12 @@ msl_builtin :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 			a[i] = splat_text(m, a[i], at, t)
 		}
 	}
-	if b == .Pow && pow_is_square(u, args) {
-		if !m.has_square {
-			m.has_square = true
-			strings.write_string(&m.helpers, "template<typename T> inline T oksl_square(T x) { return x * x; }\n")
+	if k := pow_int_exponent(u, args) if b == .Pow else 0; k != 0 {
+		if !m.has_powi {
+			m.has_powi = true
+			strings.write_string(&m.helpers, "template<int N, typename T> inline T oksl_powi(T x) { T r = x; for (int i = 1; i < N; i++) { r = r * x; } return r; }\n")
 		}
-		return wrap_pre(pre[:], fmt.aprintf("oksl_square(%s)", a[0]))
+		return wrap_pre(pre[:], fmt.aprintf("oksl_powi<%d>(%s)", k, a[0]))
 	}
 	if form := MSL_BUILTINS[b]; form != "" {
 		if strings.contains_rune(form, '%') {
