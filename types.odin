@@ -478,6 +478,8 @@ shared_type_layout :: proc(u: ^Unit, t: Type) -> (size, align: int, ok: bool) {
 // ---- Odin layout (Layout.Oplat) --------------------------------------------------------
 
 PUSH_MAX_BYTES :: 128
+GPU_PTR_SIZE :: 8
+GPU_PTR_ALIGN :: 8
 
 // Size and alignment in bytes of a value type under Odin's struct layout:
 // 32-bit scalars and vectors align to 4, mat2 to 8, mat3 to 4 (36 B), mat4
@@ -557,4 +559,24 @@ odin_field_offset :: proc(u: ^Unit, st: i32, field: i32) -> int {
 		off += size
 	}
 	return off
+}
+
+// Element byte stride in a storage buffer or oplat push pointer (`std430` under
+// `Layout.Sdl_Gpu`, Odin struct layout under `Layout.Oplat`).
+buf_stride :: proc(u: ^Unit, t: Type) -> int {
+	if u.layout == .Oplat {
+		size, _, ok := odin_layout(u, t)
+		return size if ok else 0
+	}
+	return std430_stride(u, t)
+}
+
+// Field byte offset inside struct `st` in a storage buffer or oplat push
+// pointer (`std430` under `Layout.Sdl_Gpu`, Odin struct layout under
+// `Layout.Oplat`).
+buf_field_offset :: proc(u: ^Unit, st: i32, field: i32) -> int {
+	if u.layout == .Oplat {
+		return odin_field_offset(u, st, field)
+	}
+	return std430_field_offset(u, st, field)
 }

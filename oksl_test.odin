@@ -56,7 +56,7 @@ eval :: proc(t: ^testing.T, body: string, prelude := "", loc := #caller_location
 // Working memory for one run, freed with the temp allocator.
 @(private = "file")
 temp_scratch :: proc() -> ^Scratch {
-	return new_clone(Scratch{make([dynamic]Reg, context.temp_allocator), make([dynamic]Lane_Mask, context.temp_allocator), make([dynamic]u32, context.temp_allocator), make([dynamic]Chan_Img, context.temp_allocator)}, context.temp_allocator)
+	return new_clone(Scratch{make([dynamic]Reg, context.temp_allocator), make([dynamic]Lane_Mask, context.temp_allocator), make([dynamic]u32, context.temp_allocator), make([dynamic]Chan_Img, context.temp_allocator), make([dynamic][]u32, context.temp_allocator)}, context.temp_allocator)
 }
 
 @(private = "file")

@@ -235,7 +235,7 @@ addressable :: proc(u: ^Unit, id: Expr_Id) -> bool {
 			return false
 		}
 		st := u.syms[e.sym].storage
-		return st != .Channel && st != .Storage_Image && st != .Work_Group_Size
+		return st != .Channel && st != .Storage_Image && st != .Work_Group_Size && !(u.layout == .Oplat && (st == .Uniform || st == .Builtin_Uniform))
 	case .Index:
 		return addressable(u, e.a)
 	case .Field:
@@ -282,7 +282,7 @@ emit_lvalue :: proc(s: ^Spv, id: Expr_Id) -> LValue {
 			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_OUTPUT}
 		case .Local, .Param:
 			return {ptr = local_sym(s, e.sym), type = t, storage = SC_FUNCTION}
-		case .Channel, .Buffer, .Storage_Image, .Work_Group_Size, .Push_Block:
+		case .Channel, .Buffer, .Storage_Image, .Work_Group_Size, .Push_Block, .Push_Ptr:
 		}
 	case .Index:
 		base := emit_lvalue(s, e.a)
@@ -501,6 +501,16 @@ store_buf_lvalue :: proc(s: ^Spv, blv: Spv_Buf_LV, val: u32) {
 // ---- expressions -----------------------------------------------------------------------
 
 @(private)
+load_push_psb_ptr :: proc(s: ^Spv, member_idx: u32) -> u32 {
+	psb_ptr_ty := ptr_type(s, SC_PHYSICAL_STORAGE_BUFFER, psb_buffer_type(s))
+	push_member_ptr := new_id(s)
+	inst(&s.body, .Access_Chain, ptr_type(s, SC_PUSH_CONSTANT, psb_ptr_ty), push_member_ptr, s.block_var, const_u32(s, member_idx))
+	psb_ptr := new_id(s)
+	inst(&s.body, .Load, psb_ptr_ty, psb_ptr, push_member_ptr)
+	return psb_ptr
+}
+
+@(private)
 emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 	u := s.u
 	e := u.exprs[id]
@@ -524,6 +534,10 @@ emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		if st == .Work_Group_Size {
 			return workgroup_size_const(s)
 		}
+		if u.layout == .Oplat && (st == .Uniform || st == .Builtin_Uniform) {
+			psb_ptr := load_push_psb_ptr(s, 0)
+			return buffer_value(s, psb_ptr, t, const_u32(s, 0), u.syms[e.sym].index / 4, SC_PHYSICAL_STORAGE_BUFFER, 4)
+		}
 		return load_lvalue(s, emit_lvalue(s, id))
 	case .Convert:
 		return convert(s, emit_expr(s, e.a), expr_type(u, e.a), t)
@@ -533,8 +547,12 @@ emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		if expr_type(u, e.b).base == .Int {
 			idx = unop(s, .Bitcast, t_uint, idx)
 		}
-		stride := std430_stride(u, t)
+		stride := buf_stride(u, t)
 		base := binop_raw(s, .I_Mul, t_uint, idx, const_u32(s, u32(stride / 4)))
+		if u.syms[e.sym].storage == .Push_Ptr {
+			psb_ptr := load_push_psb_ptr(s, s.members[e.sym])
+			return buffer_value(s, psb_ptr, t, base, 0, SC_PHYSICAL_STORAGE_BUFFER, 4)
+		}
 		return buffer_value(s, s.sym_ids[e.sym], t, base, 0)
 	case .Comma:
 		emit_expr(s, e.a)
@@ -623,6 +641,24 @@ emit_expr :: proc(s: ^Spv, id: Expr_Id) -> u32 {
 		inst(&s.body, .Phi, type_id(s, t), r, a, a_block, b, b_block)
 		return r
 	case .Index:
+		if u.layout == .Oplat && u.exprs[e.a].kind == .Ident && u.exprs[e.a].sym != 0 {
+			sym := u.syms[u.exprs[e.a].sym]
+			if sym.storage == .Uniform || sym.storage == .Builtin_Uniform {
+				at := ty(u, sym.type)
+				if at.array > 0 {
+					t_uint := type_id(s, T_UINT)
+					idx := emit_expr(s, e.b)
+					if expr_type(u, e.b).base == .Int {
+						idx = unop(s, .Bitcast, t_uint, idx)
+					}
+					et := elem_type(at)
+					step := buf_stride(u, et) / 4
+					base := idx if step == 1 else binop_raw(s, .I_Mul, t_uint, idx, const_u32(s, u32(step)))
+					psb_ptr := load_push_psb_ptr(s, 0)
+					return buffer_value(s, psb_ptr, et, base, sym.index / 4, SC_PHYSICAL_STORAGE_BUFFER, 4)
+				}
+			}
+		}
 		if addressable(u, e.a) {
 			return load_lvalue(s, emit_lvalue(s, id))
 		}

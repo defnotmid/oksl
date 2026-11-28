@@ -222,6 +222,15 @@ SC_PRIVATE :: 6
 SC_FUNCTION :: 7
 @(private)
 SC_PUSH_CONSTANT :: 9
+@(private)
+SC_PHYSICAL_STORAGE_BUFFER :: 5349
+
+@(private)
+CAP_PSB_ADDR :: 5347
+@(private)
+ADDR_MODEL_PSB64 :: 5348
+@(private)
+MEM_ALIGNED :: 2
 
 @(private)
 DEC_BLOCK :: 2
@@ -326,6 +335,7 @@ Spv :: struct {
 	buffer_type:    u32,
 	rw_buffer_type: u32,
 	wo_buffer_type: u32,
+	psb_type:       u32,
 	workgroup_size_id: u32,
 	// Member index of each user uniform symbol in the block.
 	members:     map[Sym_Id]u32,
@@ -367,6 +377,9 @@ emit_spirv :: proc(u: ^Unit, c: ^Checked) -> []u32 {
 	s.loops = make([dynamic]Loop_Target)
 
 	inst(&s.caps, .Capability, 1) // Shader
+	if u.layout == .Oplat {
+		inst(&s.caps, .Capability, CAP_PSB_ADDR)
+	}
 	s.glsl = new_id(&s)
 	inst_str(&s.imports, .Ext_Inst_Import, {s.glsl}, "GLSL.std.450")
 
@@ -381,7 +394,8 @@ emit_spirv :: proc(u: ^Unit, c: ^Checked) -> []u32 {
 	entry := s.func_ids[c.entry]
 
 	header := make([dynamic]u32)
-	inst(&header, .Memory_Model, 0, 1) // Logical, GLSL450
+	addr_model := u32(ADDR_MODEL_PSB64) if u.layout == .Oplat else u32(0)
+	inst(&header, .Memory_Model, addr_model, 1) // PhysicalStorageBuffer64 or Logical, GLSL450
 	ep := make([dynamic]u32, context.temp_allocator)
 	stage := STAGE_RULES[u.stage]
 	append(&ep, stage.execution_model, entry)
@@ -867,18 +881,46 @@ wo_buffer_type :: proc(s: ^Spv) -> u32 {
 	return s.wo_buffer_type
 }
 
-// The value of type `t` at `word` words past word `base` of buffer `v`:
-// scalars and vectors from their words, structs from their fields at their
-// std430 offsets.
+// A PhysicalStorageBuffer words block: `struct { uint w[]; }`, Block +
+// Offset 0 + ArrayStride 4 + NonWritable.
 @(private)
-buffer_value :: proc(s: ^Spv, v: u32, t: Type, base: u32, word: int) -> u32 {
+psb_buffer_type :: proc(s: ^Spv) -> u32 {
+	if s.psb_type != 0 {
+		return s.psb_type
+	}
+	words := new_id(s)
+	inst(&s.globals, .Type_Runtime_Array, words, type_id(s, T_UINT))
+	inst(&s.annotations, .Decorate, words, DEC_ARRAY_STRIDE, 4)
+	s.psb_type = new_id(s)
+	inst(&s.globals, .Type_Struct, s.psb_type, words)
+	inst(&s.annotations, .Decorate, s.psb_type, DEC_BLOCK)
+	inst(&s.annotations, .Member_Decorate, s.psb_type, 0, DEC_OFFSET, 0)
+	inst(&s.annotations, .Member_Decorate, s.psb_type, 0, DEC_NON_WRITABLE)
+	name(s, s.psb_type, "Oksl_Psb_Words")
+	return s.psb_type
+}
+
+// The value of type `t` at `word` words past word `base` of buffer `v`:
+// scalars and vectors from their words, fixed arrays, and structs from their
+// fields at `buf_field_offset` (`std430` under Sdl_Gpu, Odin under Oplat).
+@(private)
+buffer_value :: proc(s: ^Spv, v: u32, t: Type, base: u32, word: int, sc := u32(SC_UNIFORM), aligned := u32(0)) -> u32 {
 	u := s.u
+	if t.array > 0 {
+		et := elem_type(t)
+		step := buf_stride(u, et) / 4
+		parts := make([dynamic]u32, context.temp_allocator)
+		for i in 0 ..< int(t.array) {
+			append(&parts, buffer_value(s, v, et, base, word + i * step, sc, aligned))
+		}
+		return construct(s, type_id(s, t), ..parts[:])
+	}
 	if t.base == .Struct {
 		parts := make([dynamic]u32, context.temp_allocator)
 		for f, i in struct_fields(u, t.strukt) {
 			ft := ty(u, f.type)
-			off := std430_field_offset(u, t.strukt, i32(i))
-			append(&parts, buffer_value(s, v, ft, base, word + off / 4))
+			off := buf_field_offset(u, t.strukt, i32(i))
+			append(&parts, buffer_value(s, v, ft, base, word + off / 4, sc, aligned))
 		}
 		return construct(s, type_id(s, t), ..parts[:])
 	}
@@ -887,9 +929,13 @@ buffer_value :: proc(s: ^Spv, v: u32, t: Type, base: u32, word: int) -> u32 {
 	for i in 0 ..< int(t.rows) {
 		w := base if word + i == 0 else binop_raw(s, .I_Add, t_uint, base, const_u32(s, u32(word + i)))
 		ptr := new_id(s)
-		inst(&s.body, .Access_Chain, ptr_type(s, SC_UNIFORM, t_uint), ptr, v, const_u32(s, 0), w)
+		inst(&s.body, .Access_Chain, ptr_type(s, sc, t_uint), ptr, v, const_u32(s, 0), w)
 		comps[i] = new_id(s)
-		inst(&s.body, .Load, t_uint, comps[i], ptr)
+		if aligned != 0 {
+			inst(&s.body, .Load, t_uint, comps[i], ptr, MEM_ALIGNED, aligned)
+		} else {
+			inst(&s.body, .Load, t_uint, comps[i], ptr)
+		}
 		if t.base != .Uint {
 			comps[i] = unop(s, .Bitcast, type_id(s, scalar_of(t)), comps[i])
 		}
@@ -1026,7 +1072,11 @@ declare_push_block :: proc(s: ^Spv) {
 	member_types := make([dynamic]u32)
 	for id in c.push.fields {
 		sym := s.u.syms[id]
-		append(&member_types, push_type_id(s, ty(s.u, sym.type)))
+		if sym.storage == .Push_Ptr {
+			append(&member_types, ptr_type(s, SC_PHYSICAL_STORAGE_BUFFER, psb_buffer_type(s)))
+		} else {
+			append(&member_types, push_type_id(s, ty(s.u, sym.type)))
+		}
 	}
 	s.member_types = member_types[:]
 	s.block_type = new_id(s)
@@ -1040,7 +1090,7 @@ declare_push_block :: proc(s: ^Spv) {
 		sym := s.u.syms[id]
 		ft := ty(s.u, sym.type)
 		inst(&s.annotations, .Member_Decorate, s.block_type, u32(i), DEC_OFFSET, u32(sym.index))
-		if is_matrix(ft) {
+		if sym.storage != .Push_Ptr && is_matrix(ft) {
 			inst(&s.annotations, .Member_Decorate, s.block_type, u32(i), DEC_COL_MAJOR)
 			inst(&s.annotations, .Member_Decorate, s.block_type, u32(i), DEC_MATRIX_STRIDE, u32(odin_matrix_stride(ft)))
 		}

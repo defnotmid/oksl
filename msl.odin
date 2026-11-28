@@ -222,6 +222,13 @@ emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
 			emit_buffer_load(&m, b)
 		}
 	}
+	if u.layout == .Oplat && !c.push.fixed_rule {
+		for sid in c.push.fields {
+			if u.syms[sid].storage == .Push_Ptr {
+				emit_buffer_load(&m, sid)
+			}
+		}
+	}
 	for f in c.funcs {
 		if f != c.entry {
 			emit_msl_function(&m, f)
@@ -396,7 +403,7 @@ emit_uniform_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 	}
 	for s in m.c.uniforms {
 		sym := m.u.syms[s]
-		append(&members, Msl_Member{uniform_member_name(sym), ty(m.u, sym.type), sym.index})
+		append(&members, Msl_Member{uniform_member_name(sym, m.u.layout), ty(m.u, sym.type), sym.index})
 	}
 	strings.write_string(out, "struct Oksl_Uniforms {\n")
 	cur := 0
@@ -434,7 +441,11 @@ emit_uniform_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 // ---- push block (Layout.Oplat) ---------------------------------------------------------
 
 @(private)
-msl_push_field_decl :: proc(out: ^strings.Builder, u: ^Unit, name: string, t: Type) {
+msl_push_field_decl :: proc(out: ^strings.Builder, u: ^Unit, name: string, t: Type, is_ptr := false) {
+	if is_ptr {
+		fmt.sbprintf(out, "\tconst device uint* ok_%s;\n", name)
+		return
+	}
 	if t.array > 0 {
 		e := elem_type(t)
 		if e.base == .Struct {
@@ -508,7 +519,10 @@ msl_push_read :: proc(m: ^Msl, sym: Symbol) -> string {
 emit_push_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 	u := m.u
 	c := m.c
-	for sd in u.structs {
+	for sd, st_idx in u.structs {
+		if i32(st_idx) == c.push.record_struct {
+			continue
+		}
 		fmt.sbprintf(out, "struct ok_%s {{\n", sd.name)
 		for f in u.fields[sd.fields.start:][:sd.fields.count] {
 			fmt.sbprintf(out, "\t%s ok_%s;\n", msl_type(m, ty(u, f.type)), f.name)
@@ -540,6 +554,9 @@ emit_push_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 		}
 	}
 	for sid in c.push.fields {
+		if u.syms[sid].storage == .Push_Ptr {
+			continue
+		}
 		scan_push(u, sym_type(u, sid), seen_structs, &has_mat3)
 	}
 	if has_mat3 {
@@ -590,12 +607,16 @@ emit_push_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 	for sid in c.push.fields {
 		sym := u.syms[sid]
 		t := ty(u, sym.type)
-		fsize, _, _ := odin_layout(u, t)
+		is_ptr := sym.storage == .Push_Ptr
+		fsize := GPU_PTR_SIZE
+		if !is_ptr {
+			fsize, _, _ = odin_layout(u, t)
+		}
 		if sym.index > cur {
 			fmt.sbprintf(out, "\tchar _pad%d[%d];\n", pad, sym.index - cur)
 			pad += 1
 		}
-		msl_push_field_decl(out, u, sym.name, t)
+		msl_push_field_decl(out, u, sym.name, t, is_ptr)
 		cur = sym.index + fsize
 	}
 	if cur < c.push.size {
@@ -612,6 +633,9 @@ emit_push_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 
 	for sid in c.push.fields {
 		sym := u.syms[sid]
+		if sym.storage == .Push_Ptr {
+			continue
+		}
 		t := ty(u, sym.type)
 		if t.array > 0 {
 			body := msl_push_unpack(m, fmt.aprintf("u.ok_%s", sym.name), t)
@@ -624,8 +648,11 @@ emit_push_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 // offset: the checker's internal alias ($channel_resolution, used by
 // child.eval) names the iChannelResolution member.
 @(private)
-uniform_member_name :: proc(sym: Symbol) -> string {
+uniform_member_name :: proc(sym: Symbol, layout := Layout.Sdl_Gpu) -> string {
 	if sym.storage == .Builtin_Uniform {
+		if in_, ok := input_at_offset(sym.index, layout); ok {
+			return INPUTS[in_].name
+		}
 		return builtin_members()[builtin_member_index(sym.index)].name
 	}
 	if sym.name == NUM_GROUPS_SYM {
@@ -635,11 +662,31 @@ uniform_member_name :: proc(sym: Symbol) -> string {
 }
 
 // How to read uniform `sym` as a value of its GLSL type, and element `i`
-// of a uniform array (`idx` is the index expression text).
+// of a uniform array (`idx` is the index expression text, or `const_idx >= 0`).
 @(private)
-uniform_read :: proc(m: ^Msl, sym: Symbol, idx: string = "") -> string {
+uniform_read :: proc(m: ^Msl, sym: Symbol, idx: string = "", const_idx := -1) -> string {
 	t := ty(m.u, sym.type)
-	name := uniform_member_name(sym)
+	name := uniform_member_name(sym, m.u.layout)
+	if m.c.push.fixed_rule {
+		base_word := sym.index / 4
+		if t.array > 0 {
+			if idx == "" && const_idx < 0 {
+				return fmt.aprintf("oksl_array_%s(u)", name)
+			}
+			et := elem_type(t)
+			step := buf_stride(m.u, et) / 4
+			if const_idx >= 0 {
+				return msl_buf_read_at(m, "u.ok_u", "", et, base_word + const_idx * step)
+			}
+			if et.rows == 1 {
+				base := fmt.aprintf("uint(%s)", idx) if step == 1 else fmt.aprintf("uint(%s) * %du", idx, step)
+				return msl_buf_read_at(m, "u.ok_u", base, et, base_word)
+			}
+			b := msl_temp(m, T_UINT)
+			return fmt.aprintf("((%s = %du + uint(%s) * %du), %s)", b, base_word, idx, step, msl_buf_read_at(m, "u.ok_u", b, et, 0))
+		}
+		return msl_buf_read_at(m, "u.ok_u", "", t, base_word)
+	}
 	ref := fmt.aprintf("u.%s", name)
 	elem := t
 	if t.array > 0 {
@@ -700,7 +747,7 @@ uniform_helpers :: proc(m: ^Msl) {
 		sym := m.u.syms[id]
 		t := ty(m.u, sym.type)
 		e := elem_type(t)
-		name := uniform_member_name(sym)
+		name := uniform_member_name(sym, m.u.layout)
 		// Built-ins can have two symbols ($channel_resolution and a
 		// declared iChannelResolution).
 		if done[name] {
@@ -716,9 +763,10 @@ uniform_helpers :: proc(m: ^Msl) {
 		}
 		elems := make([dynamic]string, context.temp_allocator)
 		for i in 0 ..< int(t.array) {
-			append(&elems, uniform_read(m, sym, fmt.tprintf("%d", i)))
+			append(&elems, uniform_read(m, sym, fmt.tprintf("%d", i), i))
 		}
-		fmt.sbprintf(&m.helpers, "inline %s oksl_array_%s(constant Oksl_Uniforms& u) {{ return %s{{%s}}; }}\n", msl_type(m, t), name, msl_type(m, t), strings.join(elems[:], ", "))
+		param := fmt.tprintf("constant ok_%s& u", m.c.push.name) if m.c.push.fixed_rule else "constant Oksl_Uniforms& u"
+		fmt.sbprintf(&m.helpers, "inline %s oksl_array_%s(%s) {{ return %s{{%s}}; }}\n", msl_type(m, t), name, param, msl_type(m, t), strings.join(elems[:], ", "))
 	}
 	strings.write_string(&m.helpers, "\n")
 }
@@ -798,22 +846,33 @@ emit_msl_function :: proc(m: ^Msl, f: Func_Id) {
 	w(m, "}\n\n")
 }
 
-// Element i of a storage buffer, from its words at their std430 offsets
-// (oksl_buffer_<name>(words, i)).
+// Element i of a storage buffer or push pointer, from its words at `buf_stride` /
+// `buf_field_offset` (`oksl_buffer_<name>(words, i)`).
 @(private)
 emit_buffer_load :: proc(m: ^Msl, b: Sym_Id) {
 	u := m.u
 	t := sym_type(u, b)
-	stride := std430_stride(u, t)
+	stride := buf_stride(u, t)
 	w(m, "static %s oksl_buffer_%s(const device uint* w, uint i) {{\n", msl_type(m, t), u.syms[b].name)
 	w(m, "\tuint b = i * %du;\n\treturn ", stride / 4)
 	value :: proc(m: ^Msl, t: Type, word: int) {
 		u := m.u
+		if t.array > 0 {
+			et := elem_type(t)
+			step := buf_stride(u, et) / 4
+			w(m, "%s{{", msl_type(m, t))
+			for k in 0 ..< int(t.array) {
+				w(m, ", " if k > 0 else "")
+				value(m, et, word + k * step)
+			}
+			w(m, "}}")
+			return
+		}
 		if t.base == .Struct {
 			w(m, "%s{{", msl_type(m, t))
 			for f, i in struct_fields(u, t.strukt) {
 				ft := ty(u, f.type)
-				off := std430_field_offset(u, t.strukt, i32(i))
+				off := buf_field_offset(u, t.strukt, i32(i))
 				w(m, ", " if i > 0 else "")
 				value(m, ft, word + off / 4)
 			}
@@ -1367,14 +1426,14 @@ msl_buf_read_at :: proc(m: ^Msl, buf_ptr, base_var: string, t: Type, word: int) 
 		parts := make([dynamic]string, context.temp_allocator)
 		for f, i in struct_fields(u, t.strukt) {
 			ft := ty(u, f.type)
-			off := std430_field_offset(u, t.strukt, i32(i))
+			off := buf_field_offset(u, t.strukt, i32(i))
 			append(&parts, msl_buf_read_at(m, buf_ptr, base_var, ft, word + off / 4))
 		}
 		return fmt.aprintf("%s{{%s}}", msl_type(m, t), strings.join(parts[:], ", "))
 	}
 	comps := make([dynamic]string, context.temp_allocator)
 	for i in 0 ..< int(t.rows) {
-		ref := fmt.aprintf("%s[%s + %du]", buf_ptr, base_var, word + i)
+		ref := fmt.aprintf("%s[%du]", buf_ptr, word + i) if base_var == "" else fmt.aprintf("%s[%s + %du]", buf_ptr, base_var, word + i)
 		#partial switch t.base {
 		case .Float:
 			append(&comps, fmt.aprintf("as_type<float>(%s)", ref))
@@ -1409,7 +1468,7 @@ msl_buf_write_at :: proc(m: ^Msl, buf_ptr, base_var: string, t: Type, word: int,
 	if t.base == .Struct {
 		for f, i in struct_fields(u, t.strukt) {
 			ft := ty(u, f.type)
-			off := std430_field_offset(u, t.strukt, i32(i))
+			off := buf_field_offset(u, t.strukt, i32(i))
 			msl_buf_write_at(m, buf_ptr, base_var, ft, word + off / 4, fmt.aprintf("%s.ok_%s", val_ref, f.name), post)
 		}
 		return
@@ -1723,7 +1782,8 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 		return ""
 	case .Buffer_Load:
 		n := u.syms[e.sym].name
-		return fmt.aprintf("oksl_buffer_%s(oksl_buf_%s, uint(%s))", n, n, msl_expr(m, e.b))
+		ptr := fmt.aprintf("u.ok_%s", n) if u.syms[e.sym].storage == .Push_Ptr else fmt.aprintf("oksl_buf_%s", n)
+		return fmt.aprintf("oksl_buffer_%s(%s, uint(%s))", n, ptr, msl_expr(m, e.b))
 	case .Int_Lit:
 		return "(-2147483647 - 1)" if i32(e.value) == min(i32) else fmt.aprintf("%d", i32(e.value))
 	case .Uint_Lit:
@@ -1751,7 +1811,7 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 		case .Shared:
 			sp, _ := msl_sh_path(m, id)
 			return msl_sh_read(m, sp, "")
-		case .Local, .Param, .Channel, .Buffer, .Storage_Image, .Push_Block:
+		case .Local, .Param, .Channel, .Buffer, .Storage_Image, .Push_Block, .Push_Ptr:
 		}
 		return fmt.aprintf("ok_%s", sym.name)
 	case .Convert:
@@ -1903,6 +1963,11 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 		if a.kind == .Ident && a.sym != 0 {
 			sym := u.syms[a.sym]
 			if (sym.storage == .Uniform || sym.storage == .Builtin_Uniform) && ty(u, sym.type).array > 0 {
+				at := ty(u, sym.type)
+				ix := u.exprs[e.b]
+				if m.c.push.fixed_rule && (ix.kind == .Int_Lit || ix.kind == .Uint_Lit) {
+					return uniform_read(m, sym, "", clamp(int(ix.value), 0, int(at.array) - 1))
+				}
 				return uniform_read(m, sym, msl_expr(m, e.b))
 			}
 			if sym.storage == .Push_Field && ty(u, sym.type).array > 0 {

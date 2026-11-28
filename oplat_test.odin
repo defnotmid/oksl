@@ -2,9 +2,18 @@ package oksl
 
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:testing"
+
+@(private = "file")
+expect_jit :: proc(t: ^testing.T, p: ^Program, name: string, loc := #caller_location) {
+	when JIT_ENABLED {
+		testing.expectf(t, p.jit_body != nil, "%s: expected JIT compilation (jit_body != nil)", name, loc = loc)
+	}
+}
 
 @(private = "file")
 oplat_spv_counter: int
@@ -561,7 +570,7 @@ precision highp float;
 push P { float* ptr; } u;
 out vec4 c; void main() { c = vec4(1.0); }`,
 			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
-			.Push_Unsupported_Field, false,
+			.Push_Pointer_Readonly, false,
 		},
 		{
 			"texture2D handle field",
@@ -597,7 +606,7 @@ precision highp float;
 uniform float a;
 out vec4 c; void main() { c = vec4(a); }`,
 			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
-			.Oplat_No_Push, false,
+			{}, true,
 		},
 		{
 			"unsupported sampler2D without push in GLSL",
@@ -613,13 +622,13 @@ out vec4 c; void main() { c = texture(tex, vec2(0.5)); }`,
 			`uniform float4 tint;
 half4 main(float2 p) { return half4(tint); }`,
 			{profile = .Sksl, stage = .Fragment, layout = .Oplat},
-			.Oplat_No_Push, false,
+			{}, true,
 		},
 		{
 			"Shadertoy with iTime/uniform under Oplat",
 			`void mainImage(out vec4 c, in vec2 p) { c = vec4(sin(iTime), 0.0, 0.0, 1.0); }`,
 			{profile = .Shadertoy, stage = .Fragment, layout = .Oplat},
-			.Oplat_No_Push, false,
+			{}, true,
 		},
 		{
 			"dxbc requested with Oplat",
@@ -692,8 +701,13 @@ out vec4 c; void main() { c = vec4(0.25, 0.5, 0.75, 1.0); }`,
 		if tc.want_ok {
 			testing.expectf(t, ok, "%s: expected ok, got %s", tc.name, format_errors(errs, context.temp_allocator))
 			if ok {
-				testing.expect_value(t, m.push.size, 0)
-				testing.expect_value(t, len(m.push.fields), 0)
+				if m.push.name == "Oksl_Push" {
+					testing.expect_value(t, m.push.size, 8)
+					testing.expect_value(t, len(m.push.fields), 1)
+				} else {
+					testing.expect_value(t, m.push.size, 0)
+					testing.expect_value(t, len(m.push.fields), 0)
+				}
 			}
 		} else {
 			testing.expectf(t, !ok && has_error_code(errs, tc.want), "%s: want %v, got ok=%v errs=%s", tc.name, tc.want, ok, format_errors(errs, context.temp_allocator))
@@ -839,6 +853,58 @@ out vec4 col; void main() { col = vec4(u.s.a, u.s.b, u.tail); }`,
 	}
 }
 
+@(private = "file")
+spirv_has_mem_model :: proc(words: []u32, addr, mem: u32) -> bool {
+	i := 5
+	for i < len(words) {
+		wc := int(words[i] >> 16)
+		op := u16(words[i] & 0xffff)
+		if op == 14 && wc >= 3 && words[i + 1] == addr && words[i + 2] == mem {
+			return true
+		}
+		if wc <= 0 {
+			break
+		}
+		i += wc
+	}
+	return false
+}
+
+// Checks that every OpLoad through a PhysicalStorageBuffer pointer carries Aligned 4.
+@(private = "file")
+spirv_psb_loads_aligned :: proc(words: []u32) -> (psb_loads: int, all_aligned: bool) {
+	psb_ptr_types := make(map[u32]bool, context.temp_allocator)
+	psb_ptrs := make(map[u32]bool, context.temp_allocator)
+	all_aligned = true
+	i := 5
+	for i < len(words) {
+		wc := int(words[i] >> 16)
+		op := u16(words[i] & 0xffff)
+		if wc <= 0 {
+			break
+		}
+		switch op {
+		case 32: // OpTypePointer id sc base
+			if wc >= 4 && words[i + 2] == SC_PHYSICAL_STORAGE_BUFFER {
+				psb_ptr_types[words[i + 1]] = true
+			}
+		case 65: // OpAccessChain rtype rid base ...
+			if wc >= 4 && psb_ptr_types[words[i + 1]] {
+				psb_ptrs[words[i + 2]] = true
+			}
+		case 61: // OpLoad rtype rid ptr [mem [align]]
+			if wc >= 4 && psb_ptrs[words[i + 3]] {
+				psb_loads += 1
+				if wc < 6 || words[i + 4] != MEM_ALIGNED || words[i + 5] != 4 {
+					all_aligned = false
+				}
+			}
+		}
+		i += wc
+	}
+	return
+}
+
 @(test)
 test_oplat_spirv_val :: proc(t: ^testing.T) {
 	// Fragment with discard (must emit SPIR-V 1.6 + OpTerminateInvocation, no OpDemote/OpKill/DescriptorSet).
@@ -904,26 +970,77 @@ void main() {
 	if (r.x < -1000.0) { scratch[i] = r; }
 }`
 
+	// Pointer-bearing vertex, fragment, compute, and fixed-rule modules.
+	ptr_vert := `#version 300 es
+struct Vertex { vec3 pos; vec2 uv; };
+push Draw { mat4 view_proj; readonly Vertex* verts; vec4 tint; } draw;
+layout(location = 0) out vec2 v_uv;
+void main() {
+	Vertex v = draw.verts[gl_VertexID];
+	gl_Position = draw.view_proj * vec4(v.pos, 1.0);
+	v_uv = v.uv;
+}`
+	ptr_frag := `#version 300 es
+precision highp float;
+struct Mat { vec3 col; float alpha; };
+push FragPtr { readonly Mat* mats; uint idx; } fp;
+out vec4 col;
+void main() {
+	Mat m = fp.mats[fp.idx];
+	col = vec4(m.col, m.alpha);
+}`
+	ptr_comp := `#version 310 es
+layout(local_size_x = 4) in;
+struct Item { vec3 v; float s[2]; };
+push CompPtr { readonly Item* items; uint count; } cp;
+shared vec4 out_v;
+void main() {
+	uint i = gl_LocalInvocationID.x;
+	if (i < cp.count) {
+		Item it = cp.items[i];
+		out_v = vec4(it.v + it.s[0], it.s[1]);
+	}
+}`
+	fixed_st := `uniform float uScale;
+void mainImage(out vec4 c, in vec2 p) {
+	vec2 uv = p / iResolution.xy;
+	c = vec4(uv * uScale, iTime, 1.0);
+}`
+
 	Spec :: struct {
 		name:           string,
 		src:            string,
+		profile:        Profile,
 		stage:          Stage,
 		check_term:     bool,
 		check_msl_term: bool,
+		expect_psb_ld:  bool,
 	}
 	specs := [?]Spec{
-		{"frag_discard", frag_discard, .Fragment, true, false},
-		{"frag_discard_func_loop", frag_discard_func_loop, .Fragment, true, true},
-		{"frag_global", frag_global, .Fragment, false, false},
-		{"comp_shared", comp_shared, .Compute, false, false},
+		{"frag_discard", frag_discard, .Glsl, .Fragment, true, false, false},
+		{"frag_discard_func_loop", frag_discard_func_loop, .Glsl, .Fragment, true, true, false},
+		{"frag_global", frag_global, .Glsl, .Fragment, false, false, false},
+		{"comp_shared", comp_shared, .Glsl, .Compute, false, false, false},
+		{"ptr_vert", ptr_vert, .Glsl, .Vertex, false, false, true},
+		{"ptr_frag", ptr_frag, .Glsl, .Fragment, false, false, true},
+		{"ptr_comp", ptr_comp, .Glsl, .Compute, false, false, true},
+		{"fixed_st", fixed_st, .Shadertoy, .Fragment, false, false, true},
 	}
 
 	for sp in specs {
-		m, errs, ok := compile(sp.src, {profile = .Glsl, stage = sp.stage, layout = .Oplat})
+		m, errs, ok := compile(sp.src, {profile = sp.profile, stage = sp.stage, layout = .Oplat})
 		testing.expectf(t, ok, "%s: %s", sp.name, format_errors(errs, context.temp_allocator))
 		if ok {
 			testing.expectf(t, len(m.spirv) >= 5 && m.spirv[1] == 0x00010600, "%s: spv version %08x", sp.name, m.spirv[1] if len(m.spirv) > 1 else 0)
-			// DescriptorSet decoration == 34; oplat rung 1 emits no descriptor sets.
+			// Every .Oplat module declares PhysicalStorageBufferAddresses (5347) and PhysicalStorageBuffer64 GLSL450 (5348, 1).
+			testing.expectf(t, spirv_has_cap(m.spirv, CAP_PSB_ADDR), "%s: missing PhysicalStorageBufferAddresses cap", sp.name)
+			testing.expectf(t, spirv_has_mem_model(m.spirv, ADDR_MODEL_PSB64, 1), "%s: expected PhysicalStorageBuffer64 memory model", sp.name)
+			psb_cnt, psb_ok := spirv_psb_loads_aligned(m.spirv)
+			testing.expectf(t, psb_ok, "%s: PhysicalStorageBuffer OpLoad missing Aligned 4", sp.name)
+			if sp.expect_psb_ld {
+				testing.expectf(t, psb_cnt > 0, "%s: expected >= 1 PhysicalStorageBuffer OpLoad", sp.name)
+			}
+			// DescriptorSet decoration == 34; oplat rung 2 emits no descriptor sets.
 			testing.expectf(t, !spirv_has_decor(m.spirv, 34), "%s: unexpected DescriptorSet decoration", sp.name)
 			if sp.check_term {
 				testing.expectf(t, spirv_has_op(m.spirv, 4416), "%s: missing OpTerminateInvocation", sp.name)
@@ -1009,6 +1126,7 @@ void main() {
 		scratch: Scratch
 		defer scratch_destroy(&scratch)
 		run_f32(&mf.program, bytes, W, H, jit_out[:], &scratch)
+		expect_jit(t, &mf.program, "vm frag")
 		saved_body, saved_init := mf.program.jit_body, mf.program.jit_init
 		mf.program.jit_body, mf.program.jit_init = nil, nil
 		run_f32(&mf.program, bytes, W, H, int_out[:], &scratch)
@@ -1063,6 +1181,7 @@ void main() {
 		scratch: Scratch
 		defer scratch_destroy(&scratch)
 		run_vertex(&mv.program, bytes, nil, N, pos_j[:], var_j, &scratch)
+		expect_jit(t, &mv.program, "vm vert")
 		saved_body, saved_init := mv.program.jit_body, mv.program.jit_init
 		mv.program.jit_body, mv.program.jit_init = nil, nil
 		run_vertex(&mv.program, bytes, nil, N, pos_i[:], var_i, &scratch)
@@ -1143,6 +1262,7 @@ void main() {
 		scratch: Scratch
 		defer scratch_destroy(&scratch)
 		run_f32(&ma.program, bytes, AW, AH, aj[:], &scratch)
+		expect_jit(t, &ma.program, "vm all_types")
 		saved_body, saved_init := ma.program.jit_body, ma.program.jit_init
 		ma.program.jit_body, ma.program.jit_init = nil, nil
 		run_f32(&ma.program, bytes, AW, AH, ai[:], &scratch)
@@ -1186,6 +1306,7 @@ void main() {
 		scratch: Scratch
 		defer scratch_destroy(&scratch)
 		run_compute(&mc.program, bytes, {1, 1, 1}, &scratch)
+		expect_jit(t, &mc.program, "vm compute")
 		saved_body, saved_init := mc.program.jit_body, mc.program.jit_init
 		mc.program.jit_body, mc.program.jit_init = nil, nil
 		run_compute(&mc.program, bytes, {1, 1, 1}, &scratch)
@@ -1269,6 +1390,7 @@ void main() {
 	defer scratch_destroy(&scratch)
 
 	run_fragment(&fm.program, bytes, {count = Q, origin = origin[:], front_facing = facing[:], helpers = helpers[:], varyings = varyings}, tgts_j[:], shaded_j[:], &scratch)
+	expect_jit(t, &fm.program, "discard derivatives frag")
 	saved_body, saved_init := fm.program.jit_body, fm.program.jit_init
 	fm.program.jit_body, fm.program.jit_init = nil, nil
 	run_fragment(&fm.program, bytes, {count = Q, origin = origin[:], front_facing = facing[:], helpers = helpers[:], varyings = varyings}, tgts_i[:], shaded_i[:], &scratch)
@@ -1335,6 +1457,7 @@ void main() {
 		t_j := [1][][4]f32{lo_j[:]}
 		t_i := [1][][4]f32{lo_i[:]}
 		run_fragment(&ml.program, lbytes, {count = 1, origin = orig[:], front_facing = fac[:], helpers = hlp[:]}, t_j[:], ls_j[:], &scratch)
+		expect_jit(t, &ml.program, "discard loop frag")
 		saved_b, saved_in := ml.program.jit_body, ml.program.jit_init
 		ml.program.jit_body, ml.program.jit_init = nil, nil
 		run_fragment(&ml.program, lbytes, {count = 1, origin = orig[:], front_facing = fac[:], helpers = hlp[:]}, t_i[:], ls_i[:], &scratch)
@@ -1344,5 +1467,830 @@ void main() {
 		testing.expect_value(t, lo_j[0], [4]f32{5, 0, 0, 1})
 		testing.expect_value(t, lo_j[1], [4]f32{9, 9, 9, 9})
 		testing.expect_value(t, lo_j, lo_i)
+	}
+}
+
+@(test)
+test_oplat_rung2_layout_and_msl :: proc(t: ^testing.T) {
+	// Pointer after float, after vec3, after mat4; block align 8 without mat4; tail padding.
+	PtrAfterFloat :: struct {
+		f: f32,
+		p: u64,
+	}
+	PtrAfterVec3 :: struct {
+		v: [3]f32,
+		p: u64,
+	}
+	PtrAfterMat4 :: struct {
+		m: matrix[4, 4]f32,
+		p: u64,
+	}
+	PtrTailPad :: struct {
+		p: u64,
+		f: f32,
+	}
+	// Pointee structs: Vertex, nested struct, struct with fixed array.
+	Vertex :: struct {
+		pos: [3]f32,
+		uv:  [2]f32,
+	}
+	Inner :: struct {
+		a:   [3]f32,
+		k:   i32,
+		arr: [3]f32,
+	}
+	Outer :: struct {
+		h:    f32,
+		in_s: Inner,
+		tail: [3]f32,
+	}
+	#assert(size_of(PtrAfterFloat) == 16 && align_of(PtrAfterFloat) == 8 && offset_of(PtrAfterFloat, p) == 8)
+	#assert(size_of(PtrAfterVec3) == 24 && align_of(PtrAfterVec3) == 8 && offset_of(PtrAfterVec3, p) == 16)
+	#assert(size_of(PtrAfterMat4) == 80 && align_of(PtrAfterMat4) == 16 && offset_of(PtrAfterMat4, p) == 64)
+	#assert(size_of(PtrTailPad) == 16 && align_of(PtrTailPad) == 8 && offset_of(PtrTailPad, p) == 0 && offset_of(PtrTailPad, f) == 8)
+	#assert(size_of(Vertex) == 20 && align_of(Vertex) == 4 && offset_of(Vertex, pos) == 0 && offset_of(Vertex, uv) == 12)
+	#assert(size_of(Inner) == 28 && align_of(Inner) == 4 && offset_of(Inner, k) == 12 && offset_of(Inner, arr) == 16)
+	#assert(size_of(Outer) == 44 && align_of(Outer) == 4 && offset_of(Outer, in_s) == 4 && offset_of(Outer, tail) == 32)
+
+	Layout_Case :: struct {
+		name:     string,
+		src:      string,
+		want_sz:  int,
+		want_al:  int,
+		want_off: int,
+	}
+	cases := [?]Layout_Case{
+		{
+			"after_float",
+			`#version 300 es
+precision highp float;
+push PtrAfterFloat { float f; readonly float* p; } u;
+out vec4 c; void main() { c = vec4(u.f + u.p[0]); }`,
+			size_of(PtrAfterFloat), align_of(PtrAfterFloat), int(offset_of(PtrAfterFloat, p)),
+		},
+		{
+			"after_vec3",
+			`#version 300 es
+precision highp float;
+push PtrAfterVec3 { vec3 v; readonly vec2* p; } u;
+out vec4 c; void main() { c = vec4(u.v, u.p[0].x); }`,
+			size_of(PtrAfterVec3), align_of(PtrAfterVec3), int(offset_of(PtrAfterVec3, p)),
+		},
+		{
+			"after_mat4",
+			`#version 300 es
+precision highp float;
+push PtrAfterMat4 { mat4 m; readonly float* p; } u;
+out vec4 c; void main() { c = u.m[0] * u.p[0]; }`,
+			size_of(PtrAfterMat4), align_of(PtrAfterMat4), int(offset_of(PtrAfterMat4, p)),
+		},
+		{
+			"tail_pad",
+			`#version 300 es
+precision highp float;
+push PtrTailPad { readonly float* p; float f; } u;
+out vec4 c; void main() { c = vec4(u.p[0], u.f, 0.0, 1.0); }`,
+			size_of(PtrTailPad), align_of(PtrTailPad), int(offset_of(PtrTailPad, p)),
+		},
+	}
+	for lc in cases {
+		m, errs, ok := compile(lc.src, {profile = .Glsl, stage = .Fragment, layout = .Oplat})
+		testing.expectf(t, ok, "%s: %s", lc.name, format_errors(errs, context.temp_allocator))
+		if ok {
+			testing.expect_value(t, m.push.size, lc.want_sz)
+			testing.expect_value(t, m.push.align, lc.want_al)
+			pf, found := find_push_field(m, "p")
+			testing.expect(t, found, lc.name)
+			testing.expect_value(t, pf.kind, Push_Field_Kind.Pointer)
+			testing.expect_value(t, pf.offset, lc.want_off)
+			testing.expect_value(t, pf.size, 8)
+			testing.expect(t, strings.contains(m.msl, "const device uint* ok_p;"), lc.name)
+		}
+		destroy(m)
+	}
+
+	// Pointee structs + nested struct + fixed array reflection + MSL buffer helper + --odin-asserts.
+	struct_src := `#version 300 es
+precision highp float;
+struct Vertex { vec3 pos; vec2 uv; };
+struct Inner { vec3 a; int k; float arr[3]; };
+struct Outer { float h; Inner in_s; vec3 tail; };
+push P {
+	mat4 mvp;
+	readonly Vertex* verts;
+	readonly Outer* outers;
+} u;
+out vec4 col;
+void main() {
+	Vertex v = u.verts[0];
+	Outer o = u.outers[0];
+	col = u.mvp * vec4(v.pos, v.uv.x + o.in_s.arr[2] + o.tail.z);
+}`
+	ms, serrs, sok := compile(struct_src, {profile = .Glsl, stage = .Fragment, layout = .Oplat})
+	testing.expectf(t, sok, "pointee structs compile: %s", format_errors(serrs, context.temp_allocator))
+	defer destroy(ms)
+	if sok {
+		find_struct :: proc(m: ^Module, name: string) -> (Buffer_Struct_Info, bool) {
+			for st in m.structs {
+				if st.name == name {
+					return st, true
+				}
+			}
+			return {}, false
+		}
+		sv, ok_v := find_struct(ms, "Vertex")
+		si, ok_i := find_struct(ms, "Inner")
+		so, ok_o := find_struct(ms, "Outer")
+		testing.expect(t, ok_v && ok_i && ok_o, "missing pointee structs in Module.structs")
+		testing.expect_value(t, sv.size, size_of(Vertex))
+		testing.expect_value(t, sv.align, align_of(Vertex))
+		testing.expect_value(t, sv.fields[1].offset, int(offset_of(Vertex, uv)))
+		testing.expect_value(t, si.size, size_of(Inner))
+		testing.expect_value(t, si.align, align_of(Inner))
+		testing.expect_value(t, si.fields[1].offset, int(offset_of(Inner, k)))
+		testing.expect_value(t, si.fields[2].offset, int(offset_of(Inner, arr)))
+		testing.expect_value(t, so.size, size_of(Outer))
+		testing.expect_value(t, so.align, align_of(Outer))
+		testing.expect_value(t, so.fields[1].offset, int(offset_of(Outer, in_s)))
+		testing.expect_value(t, so.fields[2].offset, int(offset_of(Outer, tail)))
+
+		asserts := format_odin_asserts(ms, context.temp_allocator)
+		testing.expect(t, strings.contains(asserts, "#assert(size_of(Vertex) == 20)"), asserts)
+		testing.expect(t, strings.contains(asserts, "#assert(offset_of(Vertex, uv) == 12)"), asserts)
+		testing.expect(t, strings.contains(asserts, "#assert(offset_of(P, verts) == 64)"), asserts)
+		testing.expect(t, strings.contains(asserts, "#assert(size_of(Outer) == 44)"), asserts)
+
+		// MSL must declare const device uint* and use Odin stride (20/4 = 5u) and field offset (12/4 = 3u).
+		testing.expectf(t, strings.contains(ms.msl, "const device uint* ok_verts;"), "%s", ms.msl)
+		testing.expectf(t, strings.contains(ms.msl, "uint b = i * 5u;"), "%s", ms.msl)
+		testing.expectf(t, strings.contains(ms.msl, "as_type<float>(w[b + 3u])"), "%s", ms.msl)
+		testing.expectf(t, strings.contains(ms.msl, "__builtin_offsetof(ok_P, ok_verts) == 64"), "%s", ms.msl)
+	}
+}
+
+@(test)
+test_oplat_rung2_diagnostics :: proc(t: ^testing.T) {
+	Case :: struct {
+		name:    string,
+		src:     string,
+		opts:    Options,
+		want:    Error_Code,
+	}
+	cases := [?]Case{
+		{
+			"unqualified ptr",
+			`#version 300 es
+precision highp float;
+push P { float* p; } u;
+out vec4 c; void main() { c = vec4(u.p[0]); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Readonly,
+		},
+		{
+			"writeonly ptr",
+			`#version 300 es
+precision highp float;
+push P { writeonly float* p; } u;
+out vec4 c; void main() { c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Readonly,
+		},
+		{
+			"coherent ptr",
+			`#version 300 es
+precision highp float;
+push P { coherent float* p; } u;
+out vec4 c; void main() { c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Readonly,
+		},
+		{
+			"readonly ptr to bool",
+			`#version 300 es
+precision highp float;
+push P { readonly bool* p; } u;
+out vec4 c; void main() { c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Element,
+		},
+		{
+			"readonly ptr to mat4",
+			`#version 300 es
+precision highp float;
+push P { readonly mat4* p; } u;
+out vec4 c; void main() { c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Element,
+		},
+		{
+			"readonly ptr to struct with matrix",
+			`#version 300 es
+precision highp float;
+struct S { vec3 a; mat2 m; };
+push P { readonly S* p; } u;
+out vec4 c; void main() { c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Element,
+		},
+		{
+			"readonly ptr to struct with bool",
+			`#version 300 es
+precision highp float;
+struct S { vec3 a; bool b; };
+push P { readonly S* p; } u;
+out vec4 c; void main() { c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Element,
+		},
+		{
+			"readonly ptr to array",
+			`#version 300 es
+precision highp float;
+push P { readonly float* p[4]; } u;
+out vec4 c; void main() { c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Element,
+		},
+		{
+			"readonly ptr to ptr",
+			`#version 300 es
+precision highp float;
+push P { readonly float** p; } u;
+out vec4 c; void main() { c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Element,
+		},
+		{
+			"readonly ptr to handle",
+			`#version 300 es
+precision highp float;
+push P { readonly texture2D* p; } u;
+out vec4 c; void main() { c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Pointer_Element,
+		},
+		{
+			"ptr arithmetic",
+			`#version 300 es
+precision highp float;
+push P { readonly float* p; } u;
+out vec4 c; void main() { c = vec4(u.p + 1); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Buffer_Use,
+		},
+		{
+			"ptr comparison",
+			`#version 300 es
+precision highp float;
+push P { readonly float* p; readonly float* q; } u;
+out vec4 c; void main() { c = vec4(u.p == u.q ? 1.0 : 0.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Buffer_Use,
+		},
+		{
+			"ptr assign to local",
+			`#version 300 es
+precision highp float;
+push P { readonly float* p; } u;
+out vec4 c; void main() { float x = u.p; c = vec4(x); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Buffer_Use,
+		},
+		{
+			"ptr passed to func",
+			`#version 300 es
+precision highp float;
+push P { readonly float* p; } u;
+float f(float x) { return x; }
+out vec4 c; void main() { c = vec4(f(u.p)); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Buffer_Use,
+		},
+		{
+			"ptr length()",
+			`#version 300 es
+precision highp float;
+push P { readonly float* p; } u;
+out vec4 c; void main() { c = vec4(float(u.p.length())); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Buffer_Use,
+		},
+		{
+			"ptr write through index",
+			`#version 300 es
+precision highp float;
+push P { readonly vec4* p; } u;
+out vec4 c; void main() { u.p[0].x = 1.0; c = vec4(1.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Read_Only,
+		},
+		{
+			"ptr float index",
+			`#version 300 es
+precision highp float;
+push P { readonly float* p; } u;
+out vec4 c; void main() { c = vec4(u.p[1.5]); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Index_Type,
+		},
+		{
+			"ptr negative const index",
+			`#version 300 es
+precision highp float;
+push P { readonly float* p; } u;
+out vec4 c; void main() { c = vec4(u.p[-1]); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Index_Range,
+		},
+		{
+			"fixed rule matrix uniform",
+			`uniform float4x4 uXform;
+half4 main(float2 p) { return (uXform * float4(p, 0.0, 1.0)).xyzw; }`,
+			{profile = .Sksl, stage = .Fragment, layout = .Oplat},
+			.Oplat_Record_Type,
+		},
+		{
+			"fixed rule bool uniform",
+			`#version 300 es
+precision highp float;
+uniform bool uFlag;
+out vec4 c; void main() { c = vec4(uFlag ? 1.0 : 0.0); }`,
+			{profile = .Glsl, stage = .Fragment, layout = .Oplat},
+			.Push_Bool,
+		},
+		{
+			"fixed rule shadertoy channel",
+			`void mainImage(out vec4 c, in vec2 p) { c = texture(iChannel0, p / iResolution.xy); }`,
+			{profile = .Shadertoy, stage = .Fragment, layout = .Oplat},
+			.Oplat_Unsupported_Resource,
+		},
+		{
+			"fixed rule sksl child shader",
+			`uniform shader child;
+half4 main(float2 p) { return child.eval(p); }`,
+			{profile = .Sksl, stage = .Fragment, layout = .Oplat},
+			.Oplat_Unsupported_Resource,
+		},
+		{
+			"num_work_groups_uniform under Oplat rejected",
+			`#version 310 es
+layout(local_size_x = 1) in;
+void main() { uvec3 n = gl_NumWorkGroups; }`,
+			{profile = .Glsl, stage = .Compute, layout = .Oplat, num_work_groups_uniform = true},
+			.Oplat_Num_Work_Groups,
+		},
+	}
+
+	for dc in cases {
+		m, errs, ok := compile(dc.src, dc.opts)
+		testing.expectf(t, !ok && has_error_code(errs, dc.want), "%s: want %v, got ok=%v errs=%s", dc.name, dc.want, ok, format_errors(errs, context.temp_allocator))
+		destroy(m)
+	}
+
+	// Pipeline stage mismatch on pointee type or ptr-vs-value.
+	vs_v3 := `#version 300 es
+push P { readonly vec3* ptr; } u;
+void main() { gl_Position = vec4(u.ptr[gl_VertexID], 1.0); }`
+	fs_v4 := `#version 300 es
+precision highp float;
+push P { readonly vec4* ptr; } u;
+out vec4 c; void main() { c = u.ptr[0]; }`
+	pm1, perrs1, pok1 := compile_pipeline({vertex = vs_v3, fragment = fs_v4}, {layout = .Oplat})
+	testing.expectf(t, !pok1 && has_error_code(perrs1, .Push_Stage_Field_Type), "pipeline pointee mismatch: %s", format_errors(perrs1, context.temp_allocator))
+	destroy_pipeline(pm1)
+
+	fs_val := `#version 300 es
+precision highp float;
+push P { vec3 ptr; } u;
+out vec4 c; void main() { c = vec4(u.ptr, 1.0); }`
+	pm2, perrs2, pok2 := compile_pipeline({vertex = vs_v3, fragment = fs_val}, {layout = .Oplat})
+	testing.expectf(t, !pok2 && has_error_code(perrs2, .Push_Stage_Field_Type), "pipeline ptr-vs-value mismatch: %s", format_errors(perrs2, context.temp_allocator))
+	destroy_pipeline(pm2)
+
+	// Compute gl_NumWorkGroups works natively under .Oplat without num_work_groups_uniform (no fixed-rule record).
+	mnw, nerrs, nw_ok := compile(
+		`#version 310 es
+layout(local_size_x = 1) in;
+void main() { uint g = gl_NumWorkGroups.x; }`,
+		{profile = .Glsl, stage = .Compute, layout = .Oplat},
+	)
+	testing.expectf(t, nw_ok, "native gl_NumWorkGroups: %s", format_errors(nerrs, context.temp_allocator))
+	if nw_ok {
+		testing.expect_value(t, mnw.push.size, 0)
+		testing.expect_value(t, mnw.block_size, 0)
+		expect_spirv_v13(t, "native_num_work_groups", mnw.spirv)
+	}
+	destroy(mnw)
+}
+
+@(test)
+test_oplat_rung2_fixed_rule :: proc(t: ^testing.T) {
+	// Header profiles (Shadertoy, SkSL): Builtins (128 B) + user uniforms.
+	// Plain GLSL loose uniforms: user uniforms only starting at offset 0.
+	Oplat_Uniform_Rec :: struct {
+		using builtins: Builtins,
+		u_scale:        f32,
+		u_tint:         [3]f32,
+		u_count:        i32,
+		u_arr:          [3][2]f32,
+	}
+	Glsl_Uniform_Rec :: struct {
+		u_scale: f32,
+		u_tint:  [3]f32,
+		u_count: i32,
+		u_arr:   [3][2]f32,
+	}
+	#assert(size_of(Builtins) == 128)
+	#assert(offset_of(Oplat_Uniform_Rec, u_scale) == 128)
+	#assert(offset_of(Oplat_Uniform_Rec, u_tint) == 132)
+	#assert(offset_of(Oplat_Uniform_Rec, u_count) == 144)
+	#assert(offset_of(Oplat_Uniform_Rec, u_arr) == 148)
+	#assert(size_of(Oplat_Uniform_Rec) == 172)
+	#assert(offset_of(Glsl_Uniform_Rec, u_scale) == 0)
+	#assert(offset_of(Glsl_Uniform_Rec, u_tint) == 4)
+	#assert(offset_of(Glsl_Uniform_Rec, u_count) == 16)
+	#assert(offset_of(Glsl_Uniform_Rec, u_arr) == 20)
+	#assert(size_of(Glsl_Uniform_Rec) == 44)
+
+	st_src := `uniform float u_scale;
+uniform vec3 u_tint;
+uniform int u_count;
+uniform vec2 u_arr[3];
+void mainImage(out vec4 c, in vec2 p) {
+	vec2 uv = p / iResolution.xy;
+	float cr = iChannelResolution[2].z;
+	float ct = iChannelTime[1];
+	c = vec4(uv.x * u_scale + u_arr[u_count].x, u_tint.z + ct, cr * 0.1 + iTime, 1.0);
+}`
+	sk_src := `uniform float3 iResolution;
+uniform float iTime;
+uniform float3 iChannelResolution[4];
+uniform float iChannelTime[4];
+uniform float u_scale;
+uniform float3 u_tint;
+uniform int u_count;
+uniform float2 u_arr[3];
+half4 main(float2 p) {
+	return half4(p.x / iResolution.x * u_scale + u_arr[u_count].x, u_tint.y + iChannelTime[1], iChannelResolution[2].x * 0.01 + iTime, 1.0);
+}`
+	gl_src := `#version 300 es
+precision highp float;
+uniform float u_scale;
+uniform vec3 u_tint;
+uniform int u_count;
+uniform vec2 u_arr[3];
+out vec4 c;
+void main() {
+	c = vec4(u_scale + u_arr[u_count].y, u_tint.x, u_tint.z, 1.0);
+}`
+	Spec :: struct {
+		name:    string,
+		src:     string,
+		profile: Profile,
+		header:  bool,
+	}
+	specs := [?]Spec{
+		{"shadertoy", st_src, .Shadertoy, true},
+		{"sksl", sk_src, .Sksl, true},
+		{"glsl_loose", gl_src, .Glsl, false},
+	}
+
+	b_val := Builtins {
+		resolution         = {8, 4, 1},
+		time               = 1.25,
+		time_delta         = 0.016,
+		frame              = 7,
+		frame_rate         = 60,
+		sample_rate        = 48000,
+		mouse              = {1, 2, 3, 4},
+		date               = {2026, 11, 28, 500},
+		channel_resolution = {0 = {10, 20, 1}, 2 = {12, 34, 5}},
+		channel_time       = {1 = 0.75},
+	}
+
+	scratch: Scratch
+	defer scratch_destroy(&scratch)
+
+	for sp in specs {
+		m_op, e_op, ok_op := compile(sp.src, {profile = sp.profile, stage = .Fragment, layout = .Oplat})
+		testing.expectf(t, ok_op, "%s oplat: %s", sp.name, format_errors(e_op, context.temp_allocator))
+		m_sd, e_sd, ok_sd := compile(sp.src, {profile = sp.profile, stage = .Fragment, layout = .Sdl_Gpu})
+		testing.expectf(t, ok_sd, "%s sdl: %s", sp.name, format_errors(e_sd, context.temp_allocator))
+		if ok_op && ok_sd {
+			testing.expect_value(t, m_op.push.name, "Oksl_Push")
+			testing.expect_value(t, m_op.push.size, 8)
+			testing.expect_value(t, m_op.push.align, 8)
+			testing.expect_value(t, len(m_op.push.fields), 1)
+			testing.expect_value(t, m_op.push.fields[0].name, "u")
+			testing.expect_value(t, m_op.push.fields[0].kind, Push_Field_Kind.Pointer)
+
+			u_s, _ := find_uniform(m_op, "u_scale")
+			u_t, _ := find_uniform(m_op, "u_tint")
+			u_c, _ := find_uniform(m_op, "u_count")
+			u_a, _ := find_uniform(m_op, "u_arr")
+			testing.expect_value(t, u_a.stride, size_of([2]f32))
+			asserts := format_odin_asserts(m_op, context.temp_allocator)
+			if sp.header {
+				testing.expect_value(t, m_op.block_size, size_of(Oplat_Uniform_Rec))
+				testing.expect_value(t, u_s.offset, int(offset_of(Oplat_Uniform_Rec, u_scale)))
+				testing.expect_value(t, u_t.offset, int(offset_of(Oplat_Uniform_Rec, u_tint)))
+				testing.expect_value(t, u_c.offset, int(offset_of(Oplat_Uniform_Rec, u_count)))
+				testing.expect_value(t, u_a.offset, int(offset_of(Oplat_Uniform_Rec, u_arr)))
+				testing.expect(t, strings.contains(asserts, "#assert(size_of(Oksl_Uniforms) == 172)"), asserts)
+				testing.expect(t, strings.contains(asserts, "#assert(offset_of(Oksl_Uniforms, iResolution) == 0)"), asserts)
+				testing.expect(t, strings.contains(asserts, "#assert(offset_of(Oksl_Uniforms, u_arr) == 148)"), asserts)
+			} else {
+				testing.expect_value(t, m_op.block_size, size_of(Glsl_Uniform_Rec))
+				testing.expect_value(t, u_s.offset, int(offset_of(Glsl_Uniform_Rec, u_scale)))
+				testing.expect_value(t, u_t.offset, int(offset_of(Glsl_Uniform_Rec, u_tint)))
+				testing.expect_value(t, u_c.offset, int(offset_of(Glsl_Uniform_Rec, u_count)))
+				testing.expect_value(t, u_a.offset, int(offset_of(Glsl_Uniform_Rec, u_arr)))
+				testing.expect(t, strings.contains(asserts, "#assert(size_of(Oksl_Uniforms) == 44)"), asserts)
+				testing.expect(t, !strings.contains(asserts, "iResolution"), asserts)
+				testing.expect(t, strings.contains(asserts, "#assert(offset_of(Oksl_Uniforms, u_arr) == 20)"), asserts)
+			}
+			testing.expect(t, !strings.contains(m_op.msl, "oksl_ur_"), m_op.msl)
+			testing.expect(t, strings.contains(m_op.msl, "u.ok_u["), m_op.msl)
+
+			// Populate both blocks identically and verify bit-identical VM parity in both JIT and interpreter.
+			rec_op := slice.to_bytes(make([]u32, (m_op.block_size + 3) / 4, context.temp_allocator))[:m_op.block_size]
+			rec_sd := slice.to_bytes(make([]u32, (m_sd.block_size + 3) / 4, context.temp_allocator))[:m_sd.block_size]
+			write_builtins(m_op, rec_op, b_val)
+			write_builtins(m_sd, rec_sd, b_val)
+			for mod in ([2]struct { m: ^Module, b: []u8 }{{m_op, rec_op}, {m_sd, rec_sd}}) {
+				set_uniform(mod.m, mod.b, "u_scale", {2.5})
+				set_uniform(mod.m, mod.b, "u_tint", {0.1, 0.2, 0.3})
+				set_uniform(mod.m, mod.b, "u_count", {2})
+				set_uniform(mod.m, mod.b, "u_arr", {0.4, 0.5}, 0)
+				set_uniform(mod.m, mod.b, "u_arr", {0.6, 0.7}, 1)
+				set_uniform(mod.m, mod.b, "u_arr", {0.8, 0.9}, 2)
+			}
+
+			base_addr := u64(0x2000_4000)
+			push_bytes := slice.bytes_from_ptr(&base_addr, 8)
+			spans := []Gpu_Span{{base = base_addr, bytes = rec_op}}
+			out_op_j, out_op_i, out_sd: [8 * 4][4]f32
+			run_f32(&m_sd.program, rec_sd, 8, 4, out_sd[:], &scratch)
+			run_f32(&m_op.program, push_bytes, 8, 4, out_op_j[:], &scratch, {spans = spans})
+			expect_jit(t, &m_op.program, sp.name)
+			sb, si := m_op.program.jit_body, m_op.program.jit_init
+			m_op.program.jit_body, m_op.program.jit_init = nil, nil
+			run_f32(&m_op.program, push_bytes, 8, 4, out_op_i[:], &scratch, {spans = spans})
+			m_op.program.jit_body, m_op.program.jit_init = sb, si
+			for px in 0 ..< len(out_sd) {
+				testing.expect_value(t, transmute([4]u32)out_op_j[px], transmute([4]u32)out_sd[px])
+				testing.expect_value(t, transmute([4]u32)out_op_i[px], transmute([4]u32)out_sd[px])
+			}
+			expect_spirv_v13(t, sp.name, m_op.spirv)
+		}
+		destroy(m_op)
+		destroy(m_sd)
+	}
+
+	// Corpus audit: classify every shader in testdata/ under .Oplat.
+	if matches, gerr := filepath.glob("testdata/*", context.temp_allocator); gerr == nil {
+		slice.sort(matches)
+		compiled := make([dynamic]string, context.temp_allocator)
+		rejected := make([dynamic]string, context.temp_allocator)
+		for path in matches {
+			opts, opt_ok := options_of_path(path)
+			if !opt_ok {
+				continue
+			}
+			opts.layout = .Oplat
+			data, rerr := os.read_entire_file(path, context.temp_allocator)
+			if rerr != nil {
+				continue
+			}
+			mc, errs, mok := compile(string(data), opts)
+			if mok {
+				append(&compiled, filepath.base(path))
+			} else if len(errs) > 0 {
+				append(&rejected, fmt.tprintf("%s:%v", filepath.base(path), errs[0].code))
+			}
+			destroy(mc)
+		}
+		fmt.printfln("corpus oplat: compiled=%d %v", len(compiled), compiled[:])
+		fmt.printfln("corpus oplat: rejected=%d %v", len(rejected), rejected[:])
+		testing.expect(t, len(compiled) > 0 && len(rejected) > 0, "corpus audit should exercise both paths")
+	}
+}
+
+@(test)
+test_oplat_rung2_cpu_vm :: proc(t: ^testing.T) {
+	// Rung-2 Draw vertex shader: vertex pulling from a span at non-zero base + negative/OOB/null/unresolved indices.
+	Vertex :: struct {
+		pos: [3]f32,
+		uv:  [2]f32,
+	}
+	DrawPush :: struct {
+		view_proj: matrix[4, 4]f32,
+		verts:     u64,
+		extra:     u64,
+		tint:      [4]f32,
+	}
+	vs_src := `#version 300 es
+struct Vertex { vec3 pos; vec2 uv; };
+push DrawPush {
+	mat4 view_proj;
+	readonly Vertex* verts;
+	readonly vec2* extra;
+	vec4 tint;
+} draw;
+layout(location = 0) out vec4 v_out;
+void main() {
+	int idx = gl_VertexID - 1; // VertexID 0 passes negative -1 -> reads 0!
+	Vertex v = draw.verts[idx];
+	vec2 e = draw.extra[gl_VertexID];
+	gl_Position = draw.view_proj * vec4(v.pos, 1.0);
+	v_out = vec4(v.uv.x + e.x, v.uv.y + e.y, draw.tint.z, draw.tint.w);
+}`
+	mv, verrs, vok := compile(vs_src, {profile = .Glsl, stage = .Vertex, layout = .Oplat})
+	testing.expectf(t, vok, "rung2 vert compile: %s", format_errors(verrs, context.temp_allocator))
+	defer destroy(mv)
+	if !vok {
+		return
+	}
+
+	// Layout verts inside a larger slab so we also test middle-of-span offset!
+	slab_a := [?]Vertex{
+		{pos = {99, 99, 99}, uv = {9, 9}}, // padding prefix (2 * 20 = 40 B)
+		{pos = {88, 88, 88}, uv = {8, 8}},
+		{pos = {1.0, 2.0, 3.0}, uv = {0.25, 0.5}},  // idx 0 -> VertexID 1
+		{pos = {4.0, 5.0, 6.0}, uv = {0.75, 1.25}}, // idx 1 -> VertexID 2
+		// idx 2..4 -> VertexID 3..5: out of truncated subslice (size below ends at index 2)!
+	}
+	slab_b := [4][2]f32{{10, 20}, {30, 40}, {50, 60}, {70, 80}}
+	base_a := u64(0x1_0000_2000)
+	base_b := u64(0x2_0000_4000)
+	bytes_a := slice.bytes_from_ptr(&slab_a[0], 4 * size_of(Vertex)) // 80 bytes = 4 verts; ptr starts at byte 40 -> 2 verts valid!
+	bytes_b := slice.bytes_from_ptr(&slab_b[0], size_of(slab_b))
+	spans := []Gpu_Span{{base = base_a, bytes = bytes_a}, {base = base_b, bytes = bytes_b}}
+
+	draw := DrawPush{
+		view_proj = {
+			1, 0, 0, 0,
+			0, 1, 0, 0,
+			0, 0, 1, 0,
+			0, 0, 0, 1,
+		},
+		verts = base_a + u64(2 * size_of(Vertex)), // Middle of span_a!
+		extra = base_b + 8,                        // Middle of span_b (index 1)!
+		tint  = {0, 0, 7.0, 8.0},
+	}
+	push_bytes := slice.bytes_from_ptr(&draw, size_of(DrawPush))
+	scratch: Scratch
+	defer scratch_destroy(&scratch)
+
+	// 4 vertices:
+	// vtx 0: draw.verts[-1] -> OOB -> {0,0,0}, {0,0}; draw.extra[0] -> {30, 40}
+	// vtx 1: draw.verts[0] -> {1,2,3}, {0.25,0.5}; draw.extra[1] -> {50, 60}
+	// vtx 2: draw.verts[1] -> {4,5,6}, {0.75,1.25}; draw.extra[2] -> {70, 80}
+	// vtx 3: draw.verts[2] (past end of 80B span!) -> {0,0,0}, {0,0}; draw.extra[3] (OOB!) -> {0, 0}
+	N :: 4
+	pos_j, pos_i: [N][4]f32
+	var_j := make([]f32, N * mv.varying_floats, context.temp_allocator)
+	var_i := make([]f32, N * mv.varying_floats, context.temp_allocator)
+	run_vertex(&mv.program, push_bytes, nil, N, pos_j[:], var_j, &scratch, {spans = spans})
+	expect_jit(t, &mv.program, "rung2 vert")
+	sb, si := mv.program.jit_body, mv.program.jit_init
+	mv.program.jit_body, mv.program.jit_init = nil, nil
+	run_vertex(&mv.program, push_bytes, nil, N, pos_i[:], var_i, &scratch, {spans = spans})
+	mv.program.jit_body, mv.program.jit_init = sb, si
+
+	want_pos := [N][4]f32{
+		{0, 0, 0, 1},
+		{1, 2, 3, 1},
+		{4, 5, 6, 1},
+		{0, 0, 0, 1},
+	}
+	want_v := [N][4]f32{
+		{30, 40, 7, 8},
+		{50.25, 60.5, 7, 8},
+		{70.75, 81.25, 7, 8},
+		{0, 0, 7, 8},
+	}
+	for k in 0 ..< N {
+		testing.expect_value(t, transmute([4]u32)pos_j[k], transmute([4]u32)pos_i[k])
+		testing.expect_value(t, transmute([4]u32)pos_j[k], transmute([4]u32)want_pos[k])
+		testing.expect_value(t, transmute([4]u32)[4]f32{var_j[k * 4], var_j[k * 4 + 1], var_j[k * 4 + 2], var_j[k * 4 + 3]}, transmute([4]u32)want_v[k])
+		for c in 0 ..< 4 {
+			testing.expect_value(t, transmute(u32)var_j[k * 4 + c], transmute(u32)var_i[k * 4 + c])
+		}
+	}
+
+	// Null, unaligned (+2), and unresolved pointers must read 0 cleanly on both engines.
+	for bad_ptr in ([3]u64{0, base_a + 2, 0xdead_beef_0000}) {
+		bad_draw := draw
+		bad_draw.verts = bad_ptr
+		bad_draw.extra = bad_ptr
+		bbytes := slice.bytes_from_ptr(&bad_draw, size_of(DrawPush))
+		bp_j, bp_i: [2][4]f32
+		bv_j := make([]f32, 2 * mv.varying_floats, context.temp_allocator)
+		bv_i := make([]f32, 2 * mv.varying_floats, context.temp_allocator)
+		run_vertex(&mv.program, bbytes, nil, 2, bp_j[:], bv_j, &scratch, {spans = spans})
+		mv.program.jit_body, mv.program.jit_init = nil, nil
+		run_vertex(&mv.program, bbytes, nil, 2, bp_i[:], bv_i, &scratch, {spans = spans})
+		mv.program.jit_body, mv.program.jit_init = sb, si
+		testing.expect_value(t, transmute([4]u32)bp_j[0], transmute([4]u32)[4]f32{0, 0, 0, 1})
+		testing.expect_value(t, transmute([4]u32)bp_j[0], transmute([4]u32)bp_i[0])
+		testing.expect_value(t, bv_j[0], f32(0))
+		testing.expect_value(t, bv_j[0], bv_i[0])
+	}
+
+	// Adjacent spans boundary: pointer at exact end of span0 (`span0.base + len(span0.bytes)`) must resolve into span1.
+	{
+		adj0 := [2]Vertex{{pos = {1, 1, 1}, uv = {0.1, 0.2}}, {pos = {2, 2, 2}, uv = {0.3, 0.4}}}
+		adj1 := [1]Vertex{{pos = {9, 8, 7}, uv = {0.5, 0.6}}}
+		adj_base := u64(0x3_0000_0000)
+		adj_b0 := slice.bytes_from_ptr(&adj0[0], size_of(adj0))
+		adj_b1 := slice.bytes_from_ptr(&adj1[0], size_of(adj1))
+		adj_spans := []Gpu_Span{{base = adj_base, bytes = adj_b0}, {base = adj_base + u64(len(adj_b0)), bytes = adj_b1}}
+		adj_draw := draw
+		adj_draw.verts = adj_base + u64(len(adj_b0)) // Exact end of adj_b0 == start of adj_b1!
+		adj_draw.extra = adj_base
+		adj_bytes := slice.bytes_from_ptr(&adj_draw, size_of(DrawPush))
+		ap_j, ap_i: [2][4]f32
+		av_j := make([]f32, 2 * mv.varying_floats, context.temp_allocator)
+		av_i := make([]f32, 2 * mv.varying_floats, context.temp_allocator)
+		run_vertex(&mv.program, adj_bytes, nil, 2, ap_j[:], av_j, &scratch, {spans = adj_spans})
+		mv.program.jit_body, mv.program.jit_init = nil, nil
+		run_vertex(&mv.program, adj_bytes, nil, 2, ap_i[:], av_i, &scratch, {spans = adj_spans})
+		mv.program.jit_body, mv.program.jit_init = sb, si
+		// Vertex 1 reads draw.verts[0] from adj1 ({9, 8, 7}).
+		testing.expect_value(t, transmute([4]u32)ap_j[1], transmute([4]u32)[4]f32{9, 8, 7, 1})
+		testing.expect_value(t, transmute([4]u32)ap_j[1], transmute([4]u32)ap_i[1])
+		testing.expect_value(t, transmute(u32)av_j[4], transmute(u32)av_i[4])
+	}
+
+	// Fragment and compute reading through pointers (with nested struct + fixed array).
+	FragArrPush :: struct {
+		items: u64,
+		idx:   u32,
+	}
+	Item :: struct {
+		v: [3]f32,
+		w: [3]f32,
+	}
+	frag_src := `#version 300 es
+precision highp float;
+struct Item { vec3 v; float w[3]; };
+push FragArrPush { readonly Item* items; uint idx; } fp;
+out vec4 col;
+void main() {
+	Item it = fp.items[fp.idx];
+	col = vec4(it.v + it.w[0], it.w[2]);
+}`
+	mf, ferrs, fok := compile(frag_src, {profile = .Glsl, stage = .Fragment, layout = .Oplat})
+	testing.expectf(t, fok, "frag ptr compile: %s", format_errors(ferrs, context.temp_allocator))
+	defer destroy(mf)
+	if fok {
+		items := [2]Item{
+			{v = {1, 2, 3}, w = {0.5, 1.5, 2.5}},
+			{v = {10, 20, 30}, w = {2.0, 4.0, 6.0}},
+		}
+		ibase := u64(0x5000_1000)
+		ibytes := slice.bytes_from_ptr(&items[0], size_of(items))
+		fp := FragArrPush{items = ibase, idx = 1}
+		fbytes := slice.bytes_from_ptr(&fp, size_of(fp))
+		fj, fi: [4][4]f32
+		run_f32(&mf.program, fbytes, 2, 2, fj[:], &scratch, {spans = {{base = ibase, bytes = ibytes}}})
+		expect_jit(t, &mf.program, "rung2 frag")
+		fsb, fsi := mf.program.jit_body, mf.program.jit_init
+		mf.program.jit_body, mf.program.jit_init = nil, nil
+		run_f32(&mf.program, fbytes, 2, 2, fi[:], &scratch, {spans = {{base = ibase, bytes = ibytes}}})
+		mf.program.jit_body, mf.program.jit_init = fsb, fsi
+		want := [4]f32{12, 22, 32, 6}
+		for px in 0 ..< 4 {
+			testing.expect_value(t, transmute([4]u32)fj[px], transmute([4]u32)fi[px])
+			testing.expect_value(t, transmute([4]u32)fj[px], transmute([4]u32)want)
+		}
+	}
+
+	comp_src := `#version 310 es
+layout(local_size_x = 4) in;
+struct Item { vec3 v; float w[3]; };
+push FragArrPush { readonly Item* items; uint idx; } cp;
+shared vec4 accum;
+void main() {
+	Item it = cp.items[cp.idx];
+	accum = vec4(it.v, it.w[1]);
+	barrier();
+}`
+	mc, cerrs, cok := compile(comp_src, {profile = .Glsl, stage = .Compute, layout = .Oplat})
+	testing.expectf(t, cok, "comp ptr compile: %s", format_errors(cerrs, context.temp_allocator))
+	defer destroy(mc)
+	if cok {
+		items := [2]Item{{v = {1, 2, 3}, w = {4, 5, 6}}, {v = {7, 8, 9}, w = {10, 11, 12}}}
+		cbase := u64(0x6000_0000)
+		cbytes := slice.bytes_from_ptr(&items[0], size_of(items))
+		cp := FragArrPush{items = cbase, idx = 1}
+		cpush := slice.bytes_from_ptr(&cp, size_of(cp))
+		run_compute(&mc.program, cpush, {1, 1, 1}, &scratch, {spans = {{base = cbase, bytes = cbytes}}})
+		expect_jit(t, &mc.program, "rung2 compute")
+		csb, csi := mc.program.jit_body, mc.program.jit_init
+		mc.program.jit_body, mc.program.jit_init = nil, nil
+		run_compute(&mc.program, cpush, {1, 1, 1}, &scratch, {spans = {{base = cbase, bytes = cbytes}}})
+		mc.program.jit_body, mc.program.jit_init = csb, csi
 	}
 }

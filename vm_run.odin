@@ -64,6 +64,9 @@ Run_Options :: struct {
 	// dropped; on the GPU out-of-bounds access is undefined (Metal reads past
 	// the buffer).
 	buffers: [][]u32,
+	// Memory spans for resolving 64-bit GPU pointers under Layout.Oplat
+	// (in Run_Options.spans, not buffers). `bytes` must be 4-byte aligned.
+	spans:   []Gpu_Span,
 	// The storage images for run_compute, in SDL_GPU binding order
 	// (Module.storage_images: read-only first, then read-write/writeonly).
 	// Out-of-bounds loads read 0 and out-of-bounds stores are dropped.
@@ -72,6 +75,14 @@ Run_Options :: struct {
 	// (Channel_Image); the others, and entries without texels, call
 	// `sampler`.
 	channel_images: []Channel_Image,
+}
+
+// A CPU-visible byte slice mapped at GPU base address `base`, used by the VM to
+// resolve 64-bit push-block pointers under Layout.Oplat. `bytes` must be 4-byte
+// aligned (non-empty spans are checked at run time).
+Gpu_Span :: struct {
+	base:  u64,
+	bytes: []u8,
 }
 
 // How a bound channel filters, as GPU texture units do (measured against
@@ -715,10 +726,11 @@ Reg :: [LANES]u32
 // own Scratch; it grows to the largest program it has run and is reused,
 // so runs allocate nothing once it has.
 Scratch :: struct {
-	regs:   [dynamic]Reg,
-	masks:  [dynamic]Lane_Mask,
-	shared: [dynamic]u32,
-	chans:  [dynamic]Chan_Img,
+	regs:          [dynamic]Reg,
+	masks:         [dynamic]Lane_Mask,
+	shared:        [dynamic]u32,
+	chans:         [dynamic]Chan_Img,
+	resolved_bufs: [dynamic][]u32,
 }
 
 scratch_destroy :: proc(s: ^Scratch) {
@@ -726,6 +738,52 @@ scratch_destroy :: proc(s: ^Scratch) {
 	delete(s.masks)
 	delete(s.shared)
 	delete(s.chans)
+	delete(s.resolved_bufs)
+}
+
+// Resolves 64-bit push-block pointer fields from `opts.spans` into
+// `scratch.resolved_bufs` once per run and publishes them as `opts.buffers`.
+@(private)
+resolve_run_buffers :: proc(p: ^Program, uniforms: []u8, scratch: ^Scratch, opts: ^Run_Options) {
+	if p.layout != .Oplat {
+		return
+	}
+	ensure(len(opts.buffers) == 0, "oksl: do not pass Run_Options.buffers under Layout.Oplat; use Run_Options.spans")
+	if len(p.ptr_offsets) == 0 {
+		return
+	}
+	if len(scratch.resolved_bufs) < len(p.ptr_offsets) {
+		resize(&scratch.resolved_bufs, len(p.ptr_offsets))
+	}
+	for sp in opts.spans {
+		if len(sp.bytes) > 0 {
+			ensure(uintptr(raw_data(sp.bytes)) & 3 == 0, "oksl: Gpu_Span.bytes must be 4-byte aligned")
+		}
+	}
+	for off, i in p.ptr_offsets {
+		scratch.resolved_bufs[i] = nil
+		if off + 8 > len(uniforms) {
+			continue
+		}
+		ptr := intrinsics.unaligned_load((^u64)(&uniforms[off]))
+		if ptr == 0 || (ptr & 3) != 0 {
+			continue
+		}
+		for sp in opts.spans {
+			if len(sp.bytes) == 0 || ptr < sp.base {
+				continue
+			}
+			rel := ptr - sp.base
+			if rel < u64(len(sp.bytes)) {
+				nwords := int((u64(len(sp.bytes)) - rel) / 4)
+				if nwords > 0 {
+					scratch.resolved_bufs[i] = ([^]u32)(uintptr(raw_data(sp.bytes)) + uintptr(rel))[:nwords]
+				}
+				break
+			}
+		}
+	}
+	opts.buffers = scratch.resolved_bufs[:len(p.ptr_offsets)]
 }
 
 @(private)
@@ -848,6 +906,8 @@ validate_region_targets :: proc(width, height: int, opts: Run_Options, targets: 
 @(private)
 runner_run :: proc(p: ^Program, uniforms: []u8, width, height: int, opts: Run_Options, out: []u8, stride: int, targets: [][][4]f32, scratch: ^Scratch) {
 	ensure(p.stage == .Fragment, "oksl: run requires a fragment program")
+	opts := opts
+	resolve_run_buffers(p, uniforms, scratch, &opts)
 	validate_channels(p, opts)
 	if opts.region_targets {
 		validate_region_targets(width, height, opts, targets)
@@ -1028,6 +1088,8 @@ Attribute :: struct {
 // at once, each with its own scratch.
 run_vertex :: proc(p: ^Program, uniforms: []u8, attributes: []Attribute, count: int, position: [][4]f32, varyings: []f32, scratch: ^Scratch, opts := Run_Options{}) {
 	ensure(p.stage == .Vertex, "oksl: run_vertex requires a vertex program")
+	opts := opts
+	resolve_run_buffers(p, uniforms, scratch, &opts)
 	validate_channels(p, opts)
 	if count <= 0 {
 		return
@@ -1137,6 +1199,8 @@ Fragment_Quads :: struct {
 // own scratch.
 run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, targets: [][][4]f32, shaded: []Quad_Lanes, scratch: ^Scratch, opts := Run_Options{}, sample_masks: []u32 = nil) {
 	ensure(p.stage == .Fragment, "oksl: run_fragment requires a fragment program")
+	opts := opts
+	resolve_run_buffers(p, uniforms, scratch, &opts)
 	validate_channels(p, opts)
 	if quads.count <= 0 {
 		return
@@ -1245,6 +1309,8 @@ run_fragment :: proc(p: ^Program, uniforms: []u8, quads: Fragment_Quads, targets
 // undersized `stride` / `data` slice.
 run_compute :: proc(p: ^Program, uniforms: []u8, groups: [3]int, scratch: ^Scratch, opts := Run_Options{}, first_group := 0, group_count := -1) {
 	ensure(p.stage == .Compute, "oksl: run_compute requires a compute program")
+	opts := opts
+	resolve_run_buffers(p, uniforms, scratch, &opts)
 	ensure(len(opts.buffers) >= p.num_buffers, "oksl: Run_Options.buffers has fewer buffers than declared")
 	ensure(len(opts.images) >= len(p.image_formats), "oksl: Run_Options.images has fewer images than declared")
 	validate_channels(p, opts)

@@ -228,6 +228,10 @@ Push_Field_Decl :: struct {
 	array_size:  Expr_Id,
 	unsized:     bool,
 	is_pointer:  bool,
+	double_ptr:  bool,
+	readonly:    bool,
+	writeonly:   bool,
+	other_qual:  bool,
 	handle_kind: string,
 	sym:         Sym_Id,
 }
@@ -298,6 +302,7 @@ Storage :: enum u8 {
 	// Layout.Oplat push block instance (`push Name { ... } inst;`) and its fields.
 	Push_Block,
 	Push_Field,
+	Push_Ptr,
 }
 
 Symbol :: struct {
@@ -555,7 +560,7 @@ buf_path :: proc(u: ^Unit, id: Expr_Id) -> (p: Buf_Path, ok: bool) {
 			p.sym = ce.sym
 			p.elem_idx = ce.b
 			et := ty(u, ce.type)
-			p.stride_words = std430_stride(u, et) / 4
+			p.stride_words = buf_stride(u, et) / 4
 			p.type = et
 			ok = true
 			break
@@ -575,7 +580,7 @@ buf_path :: proc(u: ^Unit, id: Expr_Id) -> (p: Buf_Path, ok: bool) {
 		#partial switch se.kind {
 		case .Field:
 			if se.swizzle_len == 0 {
-				p.word_off += std430_field_offset(u, p.type.strukt, se.field) / 4
+				p.word_off += buf_field_offset(u, p.type.strukt, se.field) / 4
 				p.type = ty(u, se.type)
 			} else if is_scalar(p.type) {
 				p.type = ty(u, se.type)

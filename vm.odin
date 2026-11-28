@@ -217,9 +217,11 @@ Program :: struct {
 	// Floats per vertex in the varyings' record.
 	varying_floats: int,
 	stage:          Stage,
+	layout:         Layout,
 	channel_arrays: bit_set[0 ..< SAMPLER_COUNT],
 	local_size:     [3]u32,
 	num_buffers:    int,
+	ptr_offsets:    []int,
 	shared_words:   int,
 	has_barrier:    bool,
 	image_formats:  []Image_Format,
@@ -297,6 +299,20 @@ Lower :: struct {
 	globals:   [2]i32,
 }
 
+@(private)
+push_ptr_slot :: proc(u: ^Unit, c: ^Checked, sym: Sym_Id) -> int {
+	slot := 0
+	for sid in c.push.fields {
+		if sid == sym {
+			return slot
+		}
+		if u.syms[sid].storage == .Push_Ptr {
+			slot += 1
+		}
+	}
+	return 0
+}
+
 build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	heap := runtime.default_allocator()
 	l := Lower {
@@ -328,8 +344,20 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	l.written = written_syms(u)
 	p: Program
 	p.stage = u.stage
+	p.layout = u.layout
 	p.local_size = c.local_size
-	p.num_buffers = len(c.buffers)
+	if u.layout == .Oplat && c.push.present {
+		offs := make([dynamic]int)
+		for sid in c.push.fields {
+			if u.syms[sid].storage == .Push_Ptr {
+				append(&offs, u.syms[sid].index)
+			}
+		}
+		p.ptr_offsets = offs[:]
+		p.num_buffers = len(p.ptr_offsets)
+	} else {
+		p.num_buffers = len(c.buffers)
+	}
 	if len(c.shared_vars) > 0 {
 		l.sym_shared = make([]i32, len(u.syms))
 		for sh in c.shared_vars {
@@ -398,6 +426,10 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 		t := ty(u, sym.type)
 		slot := alloc_slots(&l, component_count(u, t))
 		l.sym_slot[i] = slot
+		if c.push.fixed_rule {
+			buffer_loads(&l, t, slot, const_slot(&l, 0), 0, sym.index / 4, 0, writable = false)
+			continue
+		}
 		elem := elem_type(t)
 		count := max(int(t.array), 1)
 		stride := std140_array_stride(t) if t.array > 0 else 0
@@ -887,10 +919,19 @@ store_lv :: proc(l: ^Lower, lv: LV, v: Val) {
 }
 
 // A buffer element of type `t` at `word` of element `idx` (stride words
-// each) into dst: a Load_Buf per scalar or vector, at its std430 offset.
+// each) into dst: a Load_Buf per scalar or vector, at `buf_field_offset`.
 // Returns the slot after it.
 @(private)
 buffer_loads :: proc(l: ^Lower, t: Type, dst, idx, stride: i32, word, buf: int, writable := false) -> i32 {
+	if t.array > 0 {
+		et := elem_type(t)
+		step := buf_stride(l.u, et) / 4
+		next := dst
+		for i in 0 ..< int(t.array) {
+			next = buffer_loads(l, et, next, idx, stride, word + i * step, buf, writable)
+		}
+		return next
+	}
 	if t.base != .Struct {
 		emit(l, .Load_Buf, n = int(t.rows), k = buf, dst = dst, a = idx, b = stride, c = i32(word), d = 1 if writable else 0)
 		return dst + i32(t.rows)
@@ -898,7 +939,7 @@ buffer_loads :: proc(l: ^Lower, t: Type, dst, idx, stride: i32, word, buf: int, 
 	next := dst
 	for f, i in struct_fields(l.u, t.strukt) {
 		ft := ty(l.u, f.type)
-		off := std430_field_offset(l.u, t.strukt, i32(i))
+		off := buf_field_offset(l.u, t.strukt, i32(i))
 		next = buffer_loads(l, ft, next, idx, stride, word + off / 4, buf, writable)
 	}
 	return next
@@ -914,7 +955,7 @@ buffer_stores :: proc(l: ^Lower, t: Type, src, idx, stride: i32, word, buf: int)
 	next := src
 	for f, i in struct_fields(l.u, t.strukt) {
 		ft := ty(l.u, f.type)
-		off := std430_field_offset(l.u, t.strukt, i32(i))
+		off := buf_field_offset(l.u, t.strukt, i32(i))
 		next = buffer_stores(l, ft, next, idx, stride, word + off / 4, buf)
 	}
 	return next
@@ -1469,10 +1510,16 @@ lower_expr :: proc(l: ^Lower, id: Expr_Id) -> Val {
 		return convert_val(l, v, t)
 	case .Buffer_Load:
 		idx := lower_expr(l, e.b)
-		stride := std430_stride(u, t)
+		stride := buf_stride(u, t)
 		s := alloc_slots(l, cc(l, t))
-		buf_idx := u.syms[e.sym].index
-		writable := !u.buffer_decls[l.checked.buffer_decls[buf_idx]].readonly
+		buf_idx: int
+		writable := false
+		if u.syms[e.sym].storage == .Push_Ptr {
+			buf_idx = push_ptr_slot(u, l.checked, e.sym)
+		} else {
+			buf_idx = u.syms[e.sym].index
+			writable = !u.buffer_decls[l.checked.buffer_decls[buf_idx]].readonly
+		}
 		buffer_loads(l, t, s, idx.slot, i32(stride / 4), 0, buf_idx, writable)
 		return {s, t}
 	case .Comma:

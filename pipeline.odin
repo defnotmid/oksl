@@ -1,6 +1,7 @@
 package oksl
 
 import "core:mem/virtual"
+import "core:strings"
 
 // A vertex and a fragment shader compiled together (GLSL ES 3.0, each with
 // an optional prelude), so what passes between them agrees: varyings are
@@ -204,8 +205,16 @@ link_push_blocks :: proc(vu: ^Unit, vc: ^Checked, fu: ^Unit, fc: ^Checked, error
 			continue
 		}
 		vt, ft := ty(vu, vs.type), ty(fu, fs.type)
-		if !push_types_equal(vu, vt, fu, ft) {
-			append(errors, Error{pos = fs.pos, code = .Push_Stage_Field_Type, name = fs.name, a = type_name(vu, vt, fu.allocator), b = type_name(fu, ft, fu.allocator)})
+		if vs.storage != fs.storage || !push_types_equal(vu, vt, fu, ft) {
+			a_str := type_name(vu, vt, fu.allocator)
+			b_str := type_name(fu, ft, fu.allocator)
+			if vs.storage == .Push_Ptr {
+				a_str = strings.concatenate({"readonly ", a_str, "*"}, fu.allocator)
+			}
+			if fs.storage == .Push_Ptr {
+				b_str = strings.concatenate({"readonly ", b_str, "*"}, fu.allocator)
+			}
+			append(errors, Error{pos = fs.pos, code = .Push_Stage_Field_Type, name = fs.name, a = a_str, b = b_str})
 			continue
 		}
 		if vs.index != fs.index {

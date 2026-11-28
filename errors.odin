@@ -248,6 +248,10 @@ Error_Code :: enum u8 {
 	Push_Stage_Field_Name,
 	Push_Stage_Field_Type,
 	Push_Stage_Field_Offset,
+	Push_Pointer_Readonly,
+	Push_Pointer_Element,
+	Oplat_Record_Type,
+	Oplat_Num_Work_Groups,
 }
 
 // A diagnostic at `pos` (the user's line and column: macro expansions keep
@@ -483,6 +487,10 @@ ERROR_TEXT := [Error_Code]string {
 	.Push_Stage_Field_Name      = "push block field {n} is named {a} in the vertex shader and {b} in the fragment shader",
 	.Push_Stage_Field_Type      = "push block field {name} is {a} in the vertex shader and {b} in the fragment shader",
 	.Push_Stage_Field_Offset    = "push block field {name} is at offset {n} in the vertex shader and {m} in the fragment shader",
+	.Push_Pointer_Readonly      = "push block pointer field {name} must be declared readonly",
+	.Push_Pointer_Element       = "push block pointer field {name} can not point to {a}",
+	.Oplat_Record_Type          = "uniform {name} of type {a} is not yet supported under the oplat layout",
+	.Oplat_Num_Work_Groups      = "num_work_groups_uniform is not supported under the oplat layout; gl_NumWorkGroups is built in",
 }
 
 // The text of a diagnostic (without its position).

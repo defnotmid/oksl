@@ -60,6 +60,22 @@ OFFSET_CHANNEL_RESOLUTION :: 64
 OFFSET_CHANNEL_TIME :: 128
 // User uniforms start here.
 OFFSET_USER :: 192
+// Odin uniform record header size under Layout.Oplat fixed rule.
+ODIN_OFFSET_USER :: 128
+
+@(rodata)
+ODIN_INPUT_OFFSETS := #partial [Input]int {
+	.Resolution         = 0,
+	.Time               = 12,
+	.Time_Delta         = 16,
+	.Frame              = 20,
+	.Frame_Rate         = 24,
+	.Sample_Rate        = 28,
+	.Mouse              = 32,
+	.Date               = 48,
+	.Channel_Resolution = 64,
+	.Channel_Time       = 112,
+}
 
 @(rodata)
 INPUTS := [Input]Input_Info {
@@ -79,10 +95,28 @@ INPUTS := [Input]Input_Info {
 	.Channel3           = {"iChannel3", T_SAMPLER, 3},
 }
 
+// Byte offset of uniform input `in_` in the uniform block (`std140`) or
+// `Oksl_Uniforms` record (`Oplat`).
+input_offset :: proc "contextless" (in_: Input, layout := Layout.Sdl_Gpu) -> int {
+	return ODIN_INPUT_OFFSETS[in_] if layout == .Oplat else INPUTS[in_].offset
+}
+
+// Byte stride of an array uniform input (`std140` or Odin layout).
+input_stride :: proc(in_: Input, layout := Layout.Sdl_Gpu) -> int {
+	t := INPUTS[in_].type
+	if t.array <= 0 {
+		return 0
+	}
+	if layout == .Oplat {
+		return 4 * int(t.rows)
+	}
+	return std140_array_stride(t)
+}
+
 // The uniform input at block offset `offset`.
-input_at_offset :: proc "contextless" (offset: int) -> (Input, bool) {
+input_at_offset :: proc "contextless" (offset: int, layout := Layout.Sdl_Gpu) -> (Input, bool) {
 	for in_ in UNIFORM_INPUTS {
-		if INPUTS[in_].offset == offset {
+		if input_offset(in_, layout) == offset {
 			return in_, true
 		}
 	}
@@ -99,18 +133,18 @@ write_input :: proc {
 }
 
 write_module_input :: proc(m: ^Module, block: []u8, in_: Input, values: []f32, index := 0) {
-	if PROFILE_RULES[m.profile].header {
-		write_input_block(block, in_, values, index)
+	if module_has_builtins_record(m) {
+		write_input_block(block, in_, values, index, m.layout)
 	}
 }
 
-write_input_block :: proc(block: []u8, in_: Input, values: []f32, index := 0) {
+write_input_block :: proc(block: []u8, in_: Input, values: []f32, index := 0, layout := Layout.Sdl_Gpu) {
 	if in_ not_in UNIFORM_INPUTS {
 		return
 	}
 	info := INPUTS[in_]
-	stride := std140_array_stride(info.type) if info.type.array > 0 else 0
-	write_values(block, info.offset + index * stride, elem_type(info.type), values)
+	stride := input_stride(in_, layout)
+	write_values(block, input_offset(in_, layout) + index * stride, elem_type(info.type), values)
 }
 
 // Built-in uniform values, written by `write_builtins`.
@@ -135,25 +169,30 @@ write_builtins :: proc {
 	write_module_builtins,
 }
 
+@(private = "file")
+module_has_builtins_record :: proc "contextless" (m: ^Module) -> bool {
+	return PROFILE_RULES[m.profile].header
+}
+
 write_module_builtins :: proc(m: ^Module, block: []u8, b: Builtins) {
-	if PROFILE_RULES[m.profile].header {
-		write_builtins_block(block, b)
+	if module_has_builtins_record(m) {
+		write_builtins_block(block, b, m.layout)
 	}
 }
 
-write_builtins_block :: proc(block: []u8, b: Builtins) {
+write_builtins_block :: proc(block: []u8, b: Builtins, layout := Layout.Sdl_Gpu) {
 	b := b
-	write_input_block(block, .Resolution, b.resolution[:])
-	write_input_block(block, .Time, {b.time})
-	write_input_block(block, .Time_Delta, {b.time_delta})
-	write_input_block(block, .Frame, {f32(b.frame)})
-	write_input_block(block, .Frame_Rate, {b.frame_rate})
-	write_input_block(block, .Sample_Rate, {b.sample_rate})
-	write_input_block(block, .Mouse, b.mouse[:])
-	write_input_block(block, .Date, b.date[:])
+	write_input_block(block, .Resolution, b.resolution[:], 0, layout)
+	write_input_block(block, .Time, {b.time}, 0, layout)
+	write_input_block(block, .Time_Delta, {b.time_delta}, 0, layout)
+	write_input_block(block, .Frame, {f32(b.frame)}, 0, layout)
+	write_input_block(block, .Frame_Rate, {b.frame_rate}, 0, layout)
+	write_input_block(block, .Sample_Rate, {b.sample_rate}, 0, layout)
+	write_input_block(block, .Mouse, b.mouse[:], 0, layout)
+	write_input_block(block, .Date, b.date[:], 0, layout)
 	for ch in 0 ..< CHANNEL_COUNT {
-		write_input_block(block, .Channel_Resolution, b.channel_resolution[ch][:], ch)
-		write_input_block(block, .Channel_Time, {b.channel_time[ch]}, ch)
+		write_input_block(block, .Channel_Resolution, b.channel_resolution[ch][:], ch, layout)
+		write_input_block(block, .Channel_Time, {b.channel_time[ch]}, ch, layout)
 	}
 }
 

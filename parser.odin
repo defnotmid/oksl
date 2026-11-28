@@ -502,6 +502,9 @@ parse_push_block :: proc(p: ^Parser, pos: Pos) {
 	fields := make([dynamic]Push_Field_Decl, context.temp_allocator)
 	for peek(p) != .R_Brace && peek(p) != .EOF {
 		lay := Layout_Qual{location = -1}
+		readonly := false
+		writeonly := false
+		other_qual := false
 		for {
 			skip_precision(p)
 			if is_ident(p, "layout") && peek(p, 1) == .L_Paren {
@@ -509,7 +512,14 @@ parse_push_block :: proc(p: ^Parser, pos: Pos) {
 				if p.panicking {
 					return
 				}
-			} else if is_ident(p, "readonly") || is_ident(p, "writeonly") || is_ident(p, "coherent") || is_ident(p, "volatile") || is_ident(p, "restrict") {
+			} else if is_ident(p, "readonly") {
+				readonly = true
+				p.i += 1
+			} else if is_ident(p, "writeonly") {
+				writeonly = true
+				p.i += 1
+			} else if is_ident(p, "coherent") || is_ident(p, "volatile") || is_ident(p, "restrict") {
+				other_qual = true
 				p.i += 1
 			} else {
 				break
@@ -528,6 +538,10 @@ parse_push_block :: proc(p: ^Parser, pos: Pos) {
 			}
 		}
 		is_pointer := accept(p, .Star)
+		double_ptr := false
+		for is_pointer && accept(p, .Star) {
+			double_ptr = true
+		}
 		for {
 			ft := tok(p)
 			if !expect(p, .Ident, .Expected_Field) {
@@ -538,6 +552,10 @@ parse_push_block :: proc(p: ^Parser, pos: Pos) {
 				name        = ft.text,
 				spec        = spec,
 				is_pointer  = is_pointer,
+				double_ptr  = double_ptr,
+				readonly    = readonly,
+				writeonly   = writeonly,
+				other_qual  = other_qual,
 				handle_kind = handle_kind,
 			}
 			if accept(p, .L_Bracket) {

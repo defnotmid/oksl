@@ -525,5 +525,380 @@ main :: proc() {
 	if !render_and_check_discard_terminate(device, queue, dm) {
 		os.exit(1)
 	}
+	if !render_and_check_indexed_depth(device, queue) {
+		os.exit(1)
+	}
+	if !render_and_check_fixed_rule(device, queue) {
+		os.exit(1)
+	}
 	fmt.println("metal_push: all checks passed")
+}
+
+Vertex_R2 :: struct {
+	pos: [3]f32,
+	uv:  [2]f32,
+}
+
+#assert(size_of(Vertex_R2) == 20)
+#assert(align_of(Vertex_R2) == 4)
+#assert(offset_of(Vertex_R2, pos) == 0)
+#assert(offset_of(Vertex_R2, uv) == 12)
+
+Draw_R2 :: struct {
+	view_proj: matrix[4, 4]f32,
+	verts:     u64,
+	tint:      [4]f32,
+}
+
+#assert(size_of(Draw_R2) == 96)
+#assert(align_of(Draw_R2) == 16)
+#assert(offset_of(Draw_R2, view_proj) == 0)
+#assert(offset_of(Draw_R2, verts) == 64)
+#assert(offset_of(Draw_R2, tint) == 72)
+
+R2_VS_SRC :: `#version 300 es
+struct Vertex { vec3 pos; vec2 uv; };
+push Draw { mat4 view_proj; readonly Vertex* verts; vec4 tint; } draw;
+layout(location = 0) out vec2 v_uv;
+void main() {
+	Vertex v = draw.verts[gl_VertexID];
+	gl_Position = draw.view_proj * vec4(v.pos, 1.0);
+	v_uv = v.uv;
+}
+`
+
+R2_FS_SRC :: `#version 300 es
+precision highp float;
+struct Vertex { vec3 pos; vec2 uv; };
+push Draw { mat4 view_proj; readonly Vertex* verts; vec4 tint; } draw;
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 out_color;
+void main() {
+	out_color = vec4(v_uv.x * draw.tint.x, v_uv.y * draw.tint.y, draw.tint.z, draw.tint.w);
+}
+`
+
+render_and_check_indexed_depth :: proc(device: ^MTL.Device, queue: ^MTL.CommandQueue) -> bool {
+	p, errs, ok := oksl.compile_pipeline({vertex = R2_VS_SRC, fragment = R2_FS_SRC}, {layout = .Oplat})
+	defer oksl.destroy_pipeline(p)
+	if !ok {
+		fmt.eprint(oksl.format_errors(errs))
+		return false
+	}
+	vlib, vok := compile_msl_lib(device, "r2_draw.vert", p.vertex.msl)
+	if !vok {
+		return false
+	}
+	defer vlib->release()
+	flib, fok := compile_msl_lib(device, "r2_draw.frag", p.fragment.msl)
+	if !fok {
+		return false
+	}
+	defer flib->release()
+
+	entry_ns := NS.to_ns_string(oksl.MSL_ENTRY)
+	defer entry_ns->release()
+	vfn := vlib->newFunctionWithName(entry_ns)
+	ffn := flib->newFunctionWithName(entry_ns)
+	if vfn == nil || ffn == nil {
+		fmt.eprintln("r2_draw: missing oksl_main in Metal library")
+		return false
+	}
+	defer vfn->release()
+	defer ffn->release()
+
+	// Two overlapping axis-aligned quads: quad 0 covers left half at z=0.25, quad 1 covers full screen at z=0.75.
+	verts := [8]Vertex_R2{
+		// Quad 0 (x in [-1, 0], y in [-1, 1], z = 0.25)
+		{pos = {-1, -1, 0.25}, uv = {0.9, 0.2}},
+		{pos = {0, -1, 0.25}, uv = {0.9, 0.2}},
+		{pos = {0, 1, 0.25}, uv = {0.9, 0.2}},
+		{pos = {-1, 1, 0.25}, uv = {0.9, 0.2}},
+		// Quad 1 (x in [-1, 1], y in [-1, 1], z = 0.75)
+		{pos = {-1, -1, 0.75}, uv = {0.2, 0.85}},
+		{pos = {1, -1, 0.75}, uv = {0.2, 0.85}},
+		{pos = {1, 1, 0.75}, uv = {0.2, 0.85}},
+		{pos = {-1, 1, 0.75}, uv = {0.2, 0.85}},
+	}
+	// Drawn back-to-front so depth testing decides the left half (z=0.25 beats z=0.75).
+	indices := [12]u16{
+		4, 5, 6, 4, 6, 7,
+		0, 1, 2, 0, 2, 3,
+	}
+	vb := device->newBufferWithBytes(slice.bytes_from_ptr(raw_data(verts[:]), size_of(verts)), {})
+	ib := device->newBufferWithBytes(slice.bytes_from_ptr(raw_data(indices[:]), size_of(indices)), {})
+	if vb == nil || ib == nil {
+		fmt.eprintln("r2_draw: failed to create Metal buffers")
+		return false
+	}
+	defer vb->release()
+	defer ib->release()
+
+	W :: 16
+	H :: 16
+	ctd := MTL.TextureDescriptor.texture2DDescriptorWithPixelFormat(.RGBA8Unorm, W, H, false)
+	ctd->setUsage({.RenderTarget})
+	ctd->setStorageMode(.Shared)
+	ctex := device->newTextureWithDescriptor(ctd)
+	dtd := MTL.TextureDescriptor.texture2DDescriptorWithPixelFormat(.Depth32Float, W, H, false)
+	dtd->setUsage({.RenderTarget})
+	dtd->setStorageMode(.Private)
+	dtex := device->newTextureWithDescriptor(dtd)
+	if ctex == nil || dtex == nil {
+		fmt.eprintln("r2_draw: failed to create textures")
+		return false
+	}
+	defer ctex->release()
+	defer dtex->release()
+
+	dsd := MTL.new(MTL.DepthStencilDescriptor)
+	defer dsd->release()
+	dsd->setDepthCompareFunction(.Less)
+	dsd->setDepthWriteEnabled(true)
+	dss := device->newDepthStencilStateWithDescriptor(dsd)
+	if dss == nil {
+		fmt.eprintln("r2_draw: failed to create depth stencil state")
+		return false
+	}
+	defer dss->release()
+
+	rpd := MTL.new(MTL.RenderPipelineDescriptor)
+	defer rpd->release()
+	rpd->setVertexFunction(vfn)
+	rpd->setFragmentFunction(ffn)
+	rpd->colorAttachments()->object(0)->setPixelFormat(.RGBA8Unorm)
+	rpd->setDepthAttachmentPixelFormat(.Depth32Float)
+	pso, perr := device->newRenderPipelineStateWithDescriptor(rpd)
+	if pso == nil {
+		msg := NS.to_odin_string(perr->localizedDescription(), context.temp_allocator) if perr != nil else "unknown PSO error"
+		fmt.eprintfln("r2_draw: PSO failed: %s", msg)
+		return false
+	}
+	defer pso->release()
+
+	pass := MTL.RenderPassDescriptor.renderPassDescriptor()
+	ca := pass->colorAttachments()->object(0)
+	ca->setTexture(ctex)
+	ca->setLoadAction(.Clear)
+	ca->setStoreAction(.Store)
+	ca->setClearColor(MTL.ClearColor{0, 0, 0, 1})
+	da := pass->depthAttachment()
+	da->setTexture(dtex)
+	da->setLoadAction(.Clear)
+	da->setStoreAction(.DontCare)
+	da->setClearDepth(1.0)
+
+	gpu_addr := u64(vb->gpuAddress())
+	draw := Draw_R2{
+		view_proj = {
+			1, 0, 0, 0,
+			0, 1, 0, 0,
+			0, 0, 1, 0,
+			0, 0, 0, 1,
+		},
+		verts = gpu_addr,
+		tint  = {0.8, 0.9, 0.5, 1.0},
+	}
+	push_bytes := slice.bytes_from_ptr(&draw, size_of(draw))
+
+	cb := queue->commandBuffer()
+	enc := cb->renderCommandEncoderWithDescriptor(pass)
+	enc->setRenderPipelineState(pso)
+	enc->setDepthStencilState(dss)
+	enc->useResource(cast(^MTL.Resource)vb, {.Read})
+	enc->setVertexBytes(push_bytes, 0)
+	enc->setFragmentBytes(push_bytes, 0)
+	enc->drawIndexedPrimitives(.Triangle, len(indices), .UInt16, ib, 0)
+	enc->endEncoding()
+	cb->commit()
+	cb->waitUntilCompleted()
+
+	gpu_px := make([]u8, W * H * 4)
+	defer delete(gpu_px)
+	ctex->getBytes(raw_data(gpu_px), W * 4, MTL.Region{origin = {0, 0, 0}, size = {W, H, 1}}, 0)
+
+	// Reference on CPU VM: pull every indexed vertex and rasterize with depth < compare.
+	v_bytes := slice.bytes_from_ptr(raw_data(verts[:]), size_of(verts))
+	spans := []oksl.Gpu_Span{{base = gpu_addr, bytes = v_bytes}}
+	scratch: oksl.Scratch
+	defer oksl.scratch_destroy(&scratch)
+
+	vert_pos := make([][4]f32, len(verts))
+	defer delete(vert_pos)
+	vert_var := make([]f32, len(verts) * p.vertex.varying_floats)
+	defer delete(vert_var)
+	for vtx in 0 ..< len(verts) {
+		vp: [1][4]f32
+		vv := make([]f32, p.vertex.varying_floats)
+		defer delete(vv)
+		oksl.run_vertex(&p.vertex.program, push_bytes, nil, 1, vp[:], vv, &scratch, {first_vertex = vtx, spans = spans})
+		vert_pos[vtx] = vp[0]
+		copy(vert_var[vtx * p.vertex.varying_floats:], vv)
+	}
+
+	cpu_px := make([][4]f32, W * H)
+	cpu_depth := make([]f32, W * H)
+	defer delete(cpu_px)
+	defer delete(cpu_depth)
+	for i in 0 ..< W * H {
+		cpu_depth[i] = 1.0
+	}
+	for t := 0; t < len(indices); t += 3 {
+		i0, i1, i2 := indices[t], indices[t + 1], indices[t + 2]
+		z := vert_pos[i0].z
+		v0 := [4]f32{vert_var[int(i0) * 2 + 0], vert_var[int(i0) * 2 + 1], 0, 0}
+		xmin := min(vert_pos[i0].x, min(vert_pos[i1].x, vert_pos[i2].x))
+		xmax := max(vert_pos[i0].x, max(vert_pos[i1].x, vert_pos[i2].x))
+		for py in 0 ..< H {
+			for px in 0 ..< W {
+				ndcx := (f32(px) + 0.5) / f32(W) * 2.0 - 1.0
+				if ndcx >= xmin && ndcx <= xmax && z < cpu_depth[py * W + px] {
+					q_out: [4][4]f32
+					q_sh: [1]oksl.Quad_Lanes
+					q_orig := [1][2]i32{{i32(px), i32(py)}}
+					v_rec := [8]f32{v0.x, v0.x, v0.x, v0.x, v0.y, v0.y, v0.y, v0.y}
+					tgts := [1][][4]f32{q_out[:]}
+					oksl.run_fragment(&p.fragment.program, push_bytes, {count = 1, origin = q_orig[:], varyings = v_rec[:]}, tgts[:], q_sh[:], &scratch, {spans = spans})
+					cpu_px[py * W + px] = q_out[0]
+					cpu_depth[py * W + px] = z
+				}
+			}
+		}
+	}
+
+	max_diff := 0
+	for i in 0 ..< W * H {
+		for ch in 0 ..< 4 {
+			cb := u8(clamp(int(cpu_px[i][ch] * 255.0 + 0.5), 0, 255))
+			max_diff = max(max_diff, abs(int(gpu_px[i * 4 + ch]) - int(cb)))
+		}
+	}
+	fmt.printfln("r2 indexed depth parity: max channel diff = %d (expected <= 1)", max_diff)
+	return max_diff <= 1
+}
+
+render_and_check_fixed_rule :: proc(device: ^MTL.Device, queue: ^MTL.CommandQueue) -> bool {
+	vs_src := `#version 300 es
+layout(location = 0) out vec2 v_uv;
+void main() {
+	vec2 pos = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
+	v_uv = vec2(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+	gl_Position = vec4(pos, 0.0, 1.0);
+}
+`
+	fs_src := `uniform float uScale;
+uniform vec2 uShift;
+void mainImage(out vec4 c, in vec2 p) {
+	vec2 uv = (p + uShift) / iResolution.xy;
+	c = vec4(uv.x * uScale, uv.y, iTime * 0.25, 1.0);
+}
+`
+	vm, verrs, vok := oksl.compile(vs_src, {profile = .Glsl, stage = .Vertex, layout = .Oplat})
+	defer oksl.destroy(vm)
+	if !vok {
+		fmt.eprint(oksl.format_errors(verrs))
+		return false
+	}
+	fm, ferrs, fok := oksl.compile(fs_src, {profile = .Shadertoy, stage = .Fragment, layout = .Oplat})
+	defer oksl.destroy(fm)
+	if !fok {
+		fmt.eprint(oksl.format_errors(ferrs))
+		return false
+	}
+	vlib, vlok := compile_msl_lib(device, "fixed_rule.vert", vm.msl)
+	if !vlok {
+		return false
+	}
+	defer vlib->release()
+	flib, flok := compile_msl_lib(device, "fixed_rule.frag", fm.msl)
+	if !flok {
+		return false
+	}
+	defer flib->release()
+
+	entry_ns := NS.to_ns_string(oksl.MSL_ENTRY)
+	defer entry_ns->release()
+	vfn := vlib->newFunctionWithName(entry_ns)
+	ffn := flib->newFunctionWithName(entry_ns)
+	if vfn == nil || ffn == nil {
+		fmt.eprintln("fixed_rule: missing oksl_main")
+		return false
+	}
+	defer vfn->release()
+	defer ffn->release()
+
+	W :: 16
+	H :: 16
+	td := MTL.TextureDescriptor.texture2DDescriptorWithPixelFormat(.RGBA8Unorm, W, H, false)
+	td->setUsage({.RenderTarget})
+	td->setStorageMode(.Shared)
+	tex := device->newTextureWithDescriptor(td)
+	if tex == nil {
+		fmt.eprintln("fixed_rule: failed to create texture")
+		return false
+	}
+	defer tex->release()
+
+	rpd := MTL.new(MTL.RenderPipelineDescriptor)
+	defer rpd->release()
+	rpd->setVertexFunction(vfn)
+	rpd->setFragmentFunction(ffn)
+	rpd->colorAttachments()->object(0)->setPixelFormat(.RGBA8Unorm)
+	pso, perr := device->newRenderPipelineStateWithDescriptor(rpd)
+	if pso == nil {
+		msg := NS.to_odin_string(perr->localizedDescription(), context.temp_allocator) if perr != nil else "unknown PSO error"
+		fmt.eprintfln("fixed_rule: PSO failed: %s", msg)
+		return false
+	}
+	defer pso->release()
+
+	rec_words := make([]u32, (fm.block_size + 3) / 4)
+	defer delete(rec_words)
+	rec := slice.to_bytes(rec_words)[:fm.block_size]
+	oksl.write_builtins(fm, rec, {resolution = {W, H, 1}, time = 2.0})
+	oksl.set_uniform(fm, rec, "uScale", {0.75})
+	oksl.set_uniform(fm, rec, "uShift", {1.5, 2.5})
+
+	ub := device->newBufferWithBytes(rec, {})
+	if ub == nil {
+		fmt.eprintln("fixed_rule: failed to create uniform buffer")
+		return false
+	}
+	defer ub->release()
+	gpu_addr := u64(ub->gpuAddress())
+	push_bytes := slice.bytes_from_ptr(&gpu_addr, size_of(gpu_addr))
+
+	pass := MTL.RenderPassDescriptor.renderPassDescriptor()
+	ca := pass->colorAttachments()->object(0)
+	ca->setTexture(tex)
+	ca->setLoadAction(.Clear)
+	ca->setStoreAction(.Store)
+	ca->setClearColor(MTL.ClearColor{0, 0, 0, 1})
+
+	cb := queue->commandBuffer()
+	enc := cb->renderCommandEncoderWithDescriptor(pass)
+	enc->setRenderPipelineState(pso)
+	enc->useResource(cast(^MTL.Resource)ub, {.Read})
+	enc->setFragmentBytes(push_bytes, 0)
+	enc->drawPrimitives(.Triangle, 0, 3)
+	enc->endEncoding()
+	cb->commit()
+	cb->waitUntilCompleted()
+
+	gpu_px := make([]u8, W * H * 4)
+	defer delete(gpu_px)
+	tex->getBytes(raw_data(gpu_px), W * 4, MTL.Region{origin = {0, 0, 0}, size = {W, H, 1}}, 0)
+
+	scratch: oksl.Scratch
+	defer oksl.scratch_destroy(&scratch)
+	cpu_px := make([]u8, W * H * 4)
+	defer delete(cpu_px)
+	oksl.run(&fm.program, push_bytes, W, H, cpu_px, W * 4, &scratch, {spans = {{base = gpu_addr, bytes = rec}}})
+
+	max_diff := 0
+	for i in 0 ..< len(cpu_px) {
+		max_diff = max(max_diff, abs(int(gpu_px[i]) - int(cpu_px[i])))
+	}
+	fmt.printfln("r2 fixed_rule parity: max channel diff = %d (expected <= 1)", max_diff)
+	return max_diff <= 1
 }

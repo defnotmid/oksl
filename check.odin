@@ -52,13 +52,15 @@ Checked :: struct {
 }
 
 Push_Checked :: struct {
-	present:  bool,
-	name:     string,
-	instance: string,
-	pos:      Pos,
-	size:     int,
-	align:    int,
-	fields:   []Sym_Id,
+	present:       bool,
+	fixed_rule:    bool,
+	record_struct: i32,
+	name:          string,
+	instance:      string,
+	pos:           Pos,
+	size:          int,
+	align:         int,
+	fields:        []Sym_Id,
 }
 
 @(private)
@@ -146,6 +148,7 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 	push_fields  = make([dynamic]Sym_Id),
 	local_size   = {1, 1, 1},
 	next_offset  = OFFSET_USER if PROFILE_RULES[u.profile].header else 0,
+	push         = {record_struct = -1},
 	}
 	error_count := len(u.errors)
 	push_scope(&c)
@@ -222,9 +225,11 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 			for id in c.uniforms {
 				add_error(&c, u.syms[id].pos, .Push_Mixed_Decl, u.syms[id].name, a = "uniform")
 			}
-		} else if c.rules.header || len(c.uniforms) > 0 || (c.u.num_groups_uniform && c.gl_num_groups != 0) {
-			pos := u.syms[c.uniforms[0]].pos if len(c.uniforms) > 0 else Pos{line = 1, col = 1}
-			add_error(&c, pos, .Oplat_No_Push)
+		} else {
+			diagnose_oplat_channels(&c)
+			if c.rules.header || len(c.uniforms) > 0 {
+				layout_oplat_fixed_rule(&c)
+			}
 		}
 	}
 	if main != 0 && len(u.errors) == error_count {
@@ -252,9 +257,14 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 	if c.u.num_groups_uniform {
 		out.num_groups_uniform = c.gl_num_groups
 	}
-	out.block_stride = round_up(c.next_offset, 16)
-	out.taps = len(u.taps)
-	out.block_size = out.block_stride * (1 + out.taps)
+	if c.push.fixed_rule {
+		out.block_stride = c.next_offset
+		out.block_size = c.next_offset
+	} else {
+		out.block_stride = round_up(c.next_offset, 16)
+		out.taps = len(u.taps)
+		out.block_size = out.block_stride * (1 + out.taps)
+	}
 	out.header = c.rules.header
 	out.varying_floats = c.varying_floats
 	out.push = c.push
@@ -301,7 +311,7 @@ declare_inputs :: proc(c: ^Checker) {
 	u := c.u
 	for in_ in c.rules.inputs {
 		info := INPUTS[in_]
-		s := Symbol{name = info.name, type = intern(u, info.type), index = info.offset, is_const = true}
+		s := Symbol{name = info.name, type = intern(u, info.type), index = input_offset(in_, u.layout), is_const = true}
 		s.storage = .Channel if in_ in CHANNEL_INPUTS else .Builtin_Uniform
 		c.input_syms[in_] = add_sym(c, s)
 		declare(c, c.input_syms[in_])
@@ -325,7 +335,7 @@ use_input :: proc(c: ^Checker, s: Sym_Id) {
 	sym := c.u.syms[s]
 	#partial switch sym.storage {
 	case .Builtin_Uniform:
-		if in_, ok := input_at_offset(sym.index); ok {
+		if in_, ok := input_at_offset(sym.index, c.u.layout); ok {
 			c.inputs_used += {in_}
 		}
 	case .Channel:
@@ -721,6 +731,52 @@ validate_push_field_type :: proc(c: ^Checker, pos: Pos, field_name: string, t: T
 	return false
 }
 
+// Validates a pointer pointee type under Odin layout: scalars/vectors of
+// 32-bit float/int/uint, and structs of those (and fixed arrays inside structs).
+@(private)
+validate_pointer_pointee :: proc(c: ^Checker, pos: Pos, field_name: string, t: Type, allow_array := false) -> bool {
+	u := c.u
+	if t.array < 0 {
+		add_error(c, pos, .Push_Pointer_Element, field_name, a = tn(c, t))
+		return false
+	}
+	if t.array > 0 {
+		if !allow_array {
+			add_error(c, pos, .Push_Pointer_Element, field_name, a = tn(c, t))
+			return false
+		}
+		return validate_pointer_pointee(c, pos, field_name, elem_type(t), true)
+	}
+	if is_matrix(t) {
+		add_error(c, pos, .Push_Pointer_Element, field_name, a = tn(c, t))
+		return false
+	}
+	switch t.base {
+	case .Float, .Int, .Uint:
+		return true
+	case .Struct:
+		fields := struct_fields(u, t.strukt)
+		if len(fields) == 0 {
+			add_error(c, pos, .Push_Pointer_Element, field_name, a = u.structs[t.strukt].name)
+			return false
+		}
+		ok := true
+		for f in fields {
+			if !validate_pointer_pointee(c, pos, field_name, ty(u, f.type), true) {
+				ok = false
+			}
+		}
+		return ok
+	case .Bool, .Sampler, .Void:
+		add_error(c, pos, .Push_Pointer_Element, field_name, a = tn(c, t))
+		return false
+	case .Image:
+		add_error(c, pos, .Push_Pointer_Element, field_name, a = image_base_name(t))
+		return false
+	}
+	return false
+}
+
 // `push Name { fields } inst;` (Layout.Oplat, GLSL profile).
 @(private)
 declare_push :: proc(c: ^Checker, id: Push_Decl_Id) {
@@ -759,8 +815,57 @@ declare_push :: proc(c: ^Checker, id: Push_Decl_Id) {
 		}
 		seen_fields[f.name] = f.pos
 		if f.is_pointer {
-			add_error(c, f.pos, .Push_Unsupported_Field, f.name, a = "pointer")
-			layout_ok = false
+			if !f.readonly || f.writeonly || f.other_qual {
+				add_error(c, f.pos, .Push_Pointer_Readonly, f.name)
+				layout_ok = false
+				continue
+			}
+			if f.double_ptr {
+				add_error(c, f.pos, .Push_Pointer_Element, f.name, a = "pointer")
+				layout_ok = false
+				continue
+			}
+			if f.handle_kind != "" {
+				add_error(c, f.pos, .Push_Pointer_Element, f.name, a = f.handle_kind)
+				layout_ok = false
+				continue
+			}
+			pt := resolve_type(c, f.spec, 0, false)
+			if is_error(pt) {
+				layout_ok = false
+				continue
+			}
+			if f.array_size != 0 || f.unsized {
+				at := resolve_type(c, f.spec, f.array_size, f.unsized)
+				add_error(c, f.pos, .Push_Pointer_Element, f.name, a = tn(c, at) if !is_error(at) else "array")
+				layout_ok = false
+				continue
+			}
+			if !validate_pointer_pointee(c, f.pos, f.name, pt) {
+				layout_ok = false
+				continue
+			}
+			if _, _, ok := odin_layout(u, pt); !ok {
+				layout_ok = false
+				continue
+			}
+			off = round_up(off, GPU_PTR_ALIGN)
+			sym := Symbol {
+				name     = f.name,
+				type     = intern(u, pt),
+				storage  = .Push_Ptr,
+				is_const = true,
+				pos      = f.pos,
+				index    = off,
+			}
+			sid := add_sym(c, sym)
+			f.sym = sid
+			append(&c.push_fields, sid)
+			if pd.instance == "" {
+				declare(c, sid)
+			}
+			off += GPU_PTR_SIZE
+			max_align = max(max_align, GPU_PTR_ALIGN)
 			continue
 		}
 		if f.handle_kind != "" {
@@ -1004,7 +1109,7 @@ order_compute_resources :: proc(c: ^Checker) {
 	}
 }
 
-// The buffer `id` reads when it is indexed (`words` or `inst.words`), or 0.
+// The buffer or oplat push pointer `id` reads when indexed (`words` or `inst.words`), or 0.
 @(private)
 buffer_ref :: proc(c: ^Checker, id: Expr_Id) -> Sym_Id {
 	u := c.u
@@ -1016,7 +1121,21 @@ buffer_ref :: proc(c: ^Checker, id: Expr_Id) -> Sym_Id {
 		return 0
 	}
 	s := lookup(c, name)
-	if s == 0 || u.syms[s].storage != .Buffer {
+	if s == 0 {
+		return 0
+	}
+	if u.syms[s].storage == .Push_Block && member != "" {
+		for fs in c.push_fields {
+			if u.syms[fs].name == member && u.syms[fs].storage == .Push_Ptr {
+				return fs
+			}
+		}
+		return 0
+	}
+	if u.syms[s].storage == .Push_Ptr && member == "" && c.push.instance == "" {
+		return s
+	}
+	if u.syms[s].storage != .Buffer {
 		return 0
 	}
 	instance := u.buffer_decls[c.buffer_decls[u.syms[s].index]].instance
@@ -1076,11 +1195,11 @@ declare_global :: proc(c: ^Checker, v: Var_Id) {
 					return
 				}
 			} else {
-				if t.base == .Sampler && !c.rules.header {
+				if t.base == .Sampler {
 					add_error(c, d.pos, .Oplat_Unsupported_Resource, a = "sampler")
 					return
 				}
-				if t.base == .Image && !c.rules.header {
+				if t.base == .Image {
 					add_error(c, d.pos, .Oplat_Unsupported_Resource, a = "image")
 					return
 				}
@@ -1164,7 +1283,7 @@ declare_global :: proc(c: ^Checker, v: Var_Id) {
 			}
 			s.type = intern(u, t)
 			s.storage = .Builtin_Uniform
-			s.index = INPUTS[in_].offset
+			s.index = input_offset(in_, u.layout)
 			s.is_const = true
 			id := add_sym(c, s)
 			c.input_syms[in_] = id
@@ -2017,6 +2136,10 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 			add_error(c, e.pos, .Buffer_Use, fmt.tprintf("%s.%s", instance, member) if instance != "" else member)
 			return T_ERROR
 		}
+		if u.syms[s].storage == .Push_Ptr {
+			add_error(c, e.pos, .Buffer_Use, fmt.tprintf("%s.%s", c.push.instance, u.syms[s].name) if c.push.instance != "" else u.syms[s].name)
+			return T_ERROR
+		}
 		if u.syms[s].storage == .Push_Block {
 			add_error(c, e.pos, .Push_Block_Use, u.syms[s].name)
 			return T_ERROR
@@ -2195,6 +2318,10 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 			if ps != 0 && u.syms[ps].storage == .Push_Block {
 				for fs in c.push_fields {
 					if u.syms[fs].name == e.name {
+						if u.syms[fs].storage == .Push_Ptr {
+							add_error(c, e.pos, .Buffer_Use, fmt.tprintf("%s.%s", c.push.instance, u.syms[fs].name))
+							return T_ERROR
+						}
 						u.exprs[id].kind = .Ident
 						u.exprs[id].name = u.syms[fs].name
 						u.exprs[id].sym = fs
@@ -2491,7 +2618,7 @@ check_lvalue :: proc(c: ^Checker, id: Expr_Id) -> bool {
 		}
 		s := u.syms[e.sym]
 		switch s.storage {
-		case .Uniform, .Builtin_Uniform, .Channel, .Storage_Image, .Stage_In, .Buffer, .Push_Field, .Push_Block:
+		case .Uniform, .Builtin_Uniform, .Channel, .Storage_Image, .Stage_In, .Buffer, .Push_Field, .Push_Block, .Push_Ptr:
 			add_error(c, e.pos, .Read_Only, s.name)
 			return false
 		case .Work_Group_Size:
@@ -2514,6 +2641,10 @@ check_lvalue :: proc(c: ^Checker, id: Expr_Id) -> bool {
 	case .Index:
 		return check_lvalue(c, e.a)
 	case .Buffer_Load:
+		if u.syms[e.sym].storage == .Push_Ptr {
+			add_error(c, e.pos, .Read_Only, u.syms[e.sym].name)
+			return false
+		}
 		bd := u.buffer_decls[c.buffer_decls[u.syms[e.sym].index]]
 		if bd.readonly {
 			add_error(c, e.pos, .Read_Only, u.syms[e.sym].name)
@@ -3290,6 +3421,98 @@ layout_used_uniforms :: proc(c: ^Checker) {
 		append(&used, id)
 	}
 	c.uniforms = used
+}
+
+// Diagnoses any Shadertoy iChannel use under Layout.Oplat (rung 2 rejects channels).
+@(private)
+diagnose_oplat_channels :: proc(c: ^Checker) {
+	u := c.u
+	for ch in 0 ..< CHANNEL_COUNT {
+		in_ch := Input(int(Input.Channel0) + ch)
+		if in_ch not_in c.inputs_used || c.channels[ch] == 0 {
+			continue
+		}
+		sid := c.channels[ch]
+		pos := u.syms[sid].pos
+		for e in u.exprs {
+			if e.kind == .Ident && e.sym == sid {
+				pos = e.pos
+				break
+			}
+		}
+		add_error(c, pos, .Oplat_Unsupported_Resource, a = u.syms[sid].name)
+	}
+}
+
+// Lays out loose uniforms under Layout.Oplat as `push Oksl_Push { readonly Oksl_Uniforms* u; }`.
+@(private)
+layout_oplat_fixed_rule :: proc(c: ^Checker) {
+	u := c.u
+	off := ODIN_OFFSET_USER if c.rules.header else 0
+	max_align := 4
+	record_ok := true
+	for id in c.uniforms {
+		sym := u.syms[id]
+		t := ty(u, sym.type)
+		et := elem_type(t)
+		if et.base == .Bool {
+			add_error(c, sym.pos, .Push_Bool, sym.name, a = tn(c, t))
+			record_ok = false
+			continue
+		}
+		if is_matrix(et) || (et.base != .Float && et.base != .Int && et.base != .Uint) {
+			add_error(c, sym.pos, .Oplat_Record_Type, sym.name, a = tn(c, t))
+			record_ok = false
+			continue
+		}
+		fsize, falign, fok := odin_layout(u, t)
+		if !fok {
+			record_ok = false
+			continue
+		}
+		off = round_up(off, falign)
+		u.syms[id].index = off
+		off += fsize
+		max_align = max(max_align, falign)
+	}
+	if !record_ok {
+		return
+	}
+	fstart := u32(len(u.fields))
+	if c.rules.header {
+		for in_ in UNIFORM_INPUTS {
+			info := INPUTS[in_]
+			append(&u.fields, Struct_Field{name = info.name, type = intern(u, info.type)})
+		}
+	}
+	for id in c.uniforms {
+		sym := u.syms[id]
+		append(&u.fields, Struct_Field{name = sym.name, type = sym.type})
+	}
+	st_id := i32(len(u.structs))
+	append(&u.structs, Struct_Info{name = "Oksl_Uniforms", fields = {start = fstart, count = u32(len(u.fields)) - fstart}})
+	rec_size := round_up(off, max_align)
+	c.next_offset = rec_size
+
+	u_sym := add_sym(c, Symbol{
+		name     = "u",
+		type     = intern(u, Type{base = .Struct, strukt = st_id}),
+		storage  = .Push_Ptr,
+		is_const = true,
+		pos      = {line = 1, col = 1},
+		index    = 0,
+	})
+	c.push = {
+		present       = true,
+		fixed_rule    = true,
+		record_struct = st_id,
+		name          = "Oksl_Push",
+		pos           = {line = 1, col = 1},
+		size          = GPU_PTR_SIZE,
+		align         = GPU_PTR_ALIGN,
+	}
+	append(&c.push_fields, u_sym)
+	bit_array.set(&c.used, int(u_sym))
 }
 
 // "no overload of f takes (types)", with the arguments' current types.

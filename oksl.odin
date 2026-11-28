@@ -268,6 +268,10 @@ module_front :: proc(source: string, options: Options, src, prelude_src: Source)
 		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Oplat_Taps})
 		return u, nil, false
 	}
+	if options.num_work_groups_uniform && options.layout == .Oplat {
+		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Oplat_Num_Work_Groups})
+		return u, nil, false
+	}
 	pp: Preprocessor
 	preprocess_init(&pp, options.profile, &u.errors, context.allocator)
 	defer preprocess_destroy(&pp)
@@ -359,11 +363,16 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 			continue
 		}
 		t := ty(u, s.type)
-		_, size := std140(t)
+		size := 0
+		if u.layout == .Oplat {
+			size, _, _ = odin_layout(u, t)
+		} else {
+			_, size = std140(t)
+		}
 		info := Uniform_Info{name = s.name, type = t, offset = s.index, size = size}
 		if t.array > 0 {
 			info.count = int(t.array)
-			info.stride = std140_array_stride(t)
+			info.stride = odin_array_stride(u, t) if u.layout == .Oplat else std140_array_stride(t)
 		}
 		append(&uniforms, info)
 	}
@@ -400,10 +409,14 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 		for sid, i in c.push.fields {
 			sym := u.syms[sid]
 			t := ty(u, sym.type)
-			fsize, _, _ := odin_layout(u, t)
+			kind := Push_Field_Kind.Pointer if sym.storage == .Push_Ptr else .Value
+			fsize := GPU_PTR_SIZE
+			if kind == .Value {
+				fsize, _, _ = odin_layout(u, t)
+			}
 			fields[i] = {
 				name   = strings.clone(sym.name),
-				kind   = .Value,
+				kind   = kind,
 				type   = t,
 				offset = sym.index,
 				size   = fsize,
@@ -415,7 +428,9 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 			align  = c.push.align,
 			fields = fields,
 		}
-		m.block_size = c.push.size
+		if !c.push.fixed_rule {
+			m.block_size = c.push.size
+		}
 		if len(u.structs) > 0 {
 			structs := make([]Buffer_Struct_Info, len(u.structs))
 			for sd, st_idx in u.structs {

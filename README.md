@@ -296,27 +296,46 @@ offset, type, found := oksl.uniform_offset(p.vertex, "modelViewMatrix")
   order since every buffer is `readonly`. Word addresses are 32-bit (they
   wrap) on every backend; a read past the buffer gives 0 on the CPU and is
   undefined on the GPU (Metal reads past it).
-- **Oplat layout (rung 1):** `Options.layout = .Oplat` targets Vulkan 1.3
-  (`SPIR-V 1.6`, `PushConstant` block, `OpTerminateInvocation` for `discard`)
-  and Metal 3.0 (`[[buffer(0)]]` with `packed_*` types, `static_assert`
-  offset/size checks, and early return on `discard_fragment()` so nothing
-  runs after `discard`). Derivatives after a non-uniform `discard` are
-  undefined on the GPU, matching GLSL. Vertex-stage `in` attributes
-  (use `gl_VertexID` / `gl_InstanceID`) and `Options.taps` are rejected under
-  `.Oplat` in rung 1. GLSL shaders declare `push Name {
-  ... } inst;` (optional instance name) with value fields only (32-bit
+- **Oplat layout (rung 2):** `Options.layout = .Oplat` targets Vulkan 1.3
+  (`SPIR-V 1.6`, `PhysicalStorageBuffer64` addressing model with
+  `PhysicalStorageBufferAddresses`, `PushConstant` block, `OpTerminateInvocation`
+  for `discard`) and Metal 3.0 (`[[buffer(0)]]` with `packed_*` types,
+  `static_assert` offset/size checks, `const device uint*` pointers, and early
+  return on `discard_fragment()` so nothing runs after `discard`). Derivatives
+  after a non-uniform `discard` are undefined on the GPU, matching GLSL.
+  Vertex-stage `in` attributes (use `gl_VertexID` / `gl_InstanceID`), `Options.taps`,
+  `Options.num_work_groups_uniform` (`gl_NumWorkGroups` is built in natively on
+  Vulkan 1.3 and Metal 3.0), and DXBC are rejected under `.Oplat`. GLSL shaders declare `push Name {
+  ... } inst;` (optional instance name) with value fields (32-bit
   scalars/vectors, `mat2`, `mat3`, `mat4`, structs of those, and fixed
-  arrays of non-matrix values), laid out to match Odin's `offset_of` /
-  `size_of` / `align_of` up to 128 bytes. `Module.push` reports the block's
-  reflection and `Module.structs` its structs' Odin sizes, alignments and
-  offsets (`okslc --oplat --odin-asserts` prints Odin `#assert` lines).
-  `compile_pipeline` checks that the vertex and fragment stages declare
-  identical push blocks. In rung 1, pointers, texture/sampler handles and
-  storage images are not yet supported (diagnosed), DXBC is rejected under
-  `.Oplat`, and sources without a push block (SkSL, Shadertoy, or plain GLSL
-  with loose uniforms) are diagnosed if they use uniforms, while plain GLSL
-  with no uniforms gets an empty block (size 0, no push range). On the CPU,
-  pass the push block's bytes as `uniforms`.
+  arrays of non-matrix values) and `readonly T* name;` buffer pointer fields
+  (8 bytes, align 8; `T` is any 32-bit float/int/uint scalar, vector, or
+  struct of those and their fixed arrays; indexed only via `p[i]` with
+  `int`/`uint`, no pointer arithmetic/assignment/passing), laid out to match
+  Odin's `offset_of` / `size_of` / `align_of` up to 128 bytes. `Module.push`
+  reports each field (`Value` or `Pointer`) and `Module.structs` reports pointee
+  and value structs with Odin offsets (`okslc --oplat --odin-asserts` prints
+  Odin `#assert` lines). `compile_pipeline` checks that the vertex and fragment
+  stages declare identical push blocks and pointer pointee types.
+  Sources without a push block that use uniforms (Shadertoy, SkSL, or plain
+  GLSL with loose uniforms) follow the **fixed rule without channels**: oksl
+  synthesizes `push Oksl_Push { u: Gpu_Ptr }` (8 B, align 8) pointing at an
+  Odin-layout `Oksl_Uniforms` record—for Shadertoy and SkSL, built-ins in
+  `INPUTS` order (`ODIN_OFFSET_USER = 128` bytes) followed by user uniforms in
+  declaration order; for plain GLSL, user uniforms only starting at offset `0`—
+  reflected in `Module.uniforms` and `--odin-asserts` and filled via
+  `write_builtins(m, ...)` / `write_input(m, ...)` / `set_uniform(m, ...)`.
+  A fixed-rule Shadertoy or SkSL draw pairs the fragment shader with a vertex
+  shader writing `uv` at location 0 from `gl_VertexID` with `(0, 0)` at the
+  top left (for clip `pos`, `vec2(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5)`).
+  Channel uses (`iChannel0`..`3`, SkSL child shaders, `uniform sampler2D` /
+  `image2D`), `bool` or matrix uniforms in fixed-rule records, `writeonly`/rw
+  pointers, and explicit push handle/image fields remain diagnosed until later
+  rungs; plain GLSL with no uniforms gets an empty block.
+  On the CPU under `.Oplat`, pass the push block's bytes as `uniforms` and
+  GPU memory mappings as `Run_Options.spans` (`Gpu_Span{base, bytes}`, where
+  `bytes` must be 4-byte aligned; null, unaligned, unresolved, and out-of-bounds
+  pointer reads return 0); do not pass `Run_Options.buffers` under `.Oplat`.
 - **Taps:** `Options.taps` (in a pipeline, the vertex stage's) runs what
   a vertex shader's `main` does toward `gl_Position` again for other
   environments, such as a motion blur's shutter opening, once per tap and
