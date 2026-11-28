@@ -71,10 +71,12 @@ Interface_Kind :: enum u8 {
 	// InstanceIndex and Metal's instance_id count it (D3D's SV_InstanceID
 	// counts from 0).
 	Instance_ID,
+	// Layout.Oplat push constant block (`push Name { ... }`).
+	Push_Block,
 }
 
 // The kinds a host binds as resources.
-RESOURCE_KINDS :: bit_set[Interface_Kind]{.Uniform_Block, .Channel, .Buffer, .Storage_Image}
+RESOURCE_KINDS :: bit_set[Interface_Kind]{.Uniform_Block, .Push_Block, .Channel, .Buffer, .Storage_Image}
 
 Interface_Var :: struct {
 	kind:    Interface_Kind,
@@ -176,6 +178,10 @@ declare_stage_var :: proc(c: ^Checker, v: Var_Id, t: Type) {
 	what := "input" if d.io == .In else "output"
 	if d.init != 0 {
 		add_error(c, d.pos, .Stage_Var_Initializer, d.name, a = what)
+	}
+	if d.io == .In && u.layout == .Oplat && u.stage == .Vertex && !is_prelude_src(d.pos.src) {
+		add_error(c, d.pos, .Oplat_Vertex_Input, d.name)
+		return
 	}
 	if !is_sv(t) || t.base == .Bool {
 		add_error(c, d.pos, .Stage_Var_Type, d.name, a = what, b = tn(c, t))
@@ -281,6 +287,13 @@ stage_var_rows :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
 	for s in c.stage_vars {
 		if u.syms[s].storage == .Stage_Out || bit_array.get(&c.used, int(s)) {
 			append(&vars, s)
+		}
+	}
+	if u.layout == .Oplat && u.stage == .Vertex {
+		for s in vars {
+			if u.syms[s].storage == .Stage_In {
+				add_error(c, u.syms[s].pos, .Oplat_Vertex_Input, u.syms[s].name)
+			}
 		}
 	}
 	// Explicit locations first, so implicit ones fill around them.
@@ -435,6 +448,12 @@ stage_entry :: proc(c: ^Checker, main: Func_Id, funcs: ^[dynamic]Func_Id) -> (en
 // read-write, set 2 uniform block).
 @(private)
 append_resources :: proc(c: ^Checker, rows: ^[dynamic]Interface_Var) {
+	if c.u.layout == .Oplat {
+		if c.push.present {
+			append(rows, Interface_Var{kind = .Push_Block, binding = 0})
+		}
+		return
+	}
 	stage := STAGE_RULES[c.u.stage]
 	if c.u.stage == .Compute {
 		samplers := 0

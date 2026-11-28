@@ -138,6 +138,80 @@ link_stages :: proc(vu: ^Unit, vc: ^Checked, fu: ^Unit, fc: ^Checked, errors: ^[
 	}
 	// The fragment reads the vertex shader's record.
 	fc.varying_floats = vc.varying_floats
+	if vu.layout == .Oplat || fu.layout == .Oplat {
+		link_push_blocks(vu, vc, fu, fc, errors)
+	}
+}
+
+@(private)
+push_types_equal :: proc(au: ^Unit, at: Type, bu: ^Unit, bt: Type) -> bool {
+	if at.base != bt.base || at.rows != bt.rows || at.cols != bt.cols || at.array != bt.array {
+		return false
+	}
+	if at.base != .Struct {
+		return true
+	}
+	as := au.structs[at.strukt]
+	bs := bu.structs[bt.strukt]
+	if as.name != bs.name {
+		return false
+	}
+	af := struct_fields(au, at.strukt)
+	bf := struct_fields(bu, bt.strukt)
+	if len(af) != len(bf) {
+		return false
+	}
+	for i in 0 ..< len(af) {
+		if af[i].name != bf[i].name {
+			return false
+		}
+		if odin_field_offset(au, at.strukt, i32(i)) != odin_field_offset(bu, bt.strukt, i32(i)) {
+			return false
+		}
+		if !push_types_equal(au, ty(au, af[i].type), bu, ty(bu, bf[i].type)) {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+link_push_blocks :: proc(vu: ^Unit, vc: ^Checked, fu: ^Unit, fc: ^Checked, errors: ^[dynamic]Error) {
+	if !vc.push.present && !fc.push.present {
+		return
+	}
+	if vc.push.present != fc.push.present {
+		pos := vc.push.pos if vc.push.present else fc.push.pos
+		name := vc.push.name if vc.push.present else fc.push.name
+		a := "vertex" if vc.push.present else "fragment"
+		b := "fragment" if vc.push.present else "vertex"
+		append(errors, Error{pos = pos, code = .Push_Stage_Missing, name = name, a = a, b = b})
+		return
+	}
+	if vc.push.name != fc.push.name {
+		append(errors, Error{pos = fc.push.pos, code = .Push_Stage_Name, a = vc.push.name, b = fc.push.name})
+		return
+	}
+	if len(vc.push.fields) != len(fc.push.fields) {
+		append(errors, Error{pos = fc.push.pos, code = .Push_Stage_Count, name = vc.push.name, n = i64(len(vc.push.fields)), m = i64(len(fc.push.fields))})
+		return
+	}
+	for i in 0 ..< len(vc.push.fields) {
+		vs := vu.syms[vc.push.fields[i]]
+		fs := fu.syms[fc.push.fields[i]]
+		if vs.name != fs.name {
+			append(errors, Error{pos = fs.pos, code = .Push_Stage_Field_Name, n = i64(i), a = vs.name, b = fs.name})
+			continue
+		}
+		vt, ft := ty(vu, vs.type), ty(fu, fs.type)
+		if !push_types_equal(vu, vt, fu, ft) {
+			append(errors, Error{pos = fs.pos, code = .Push_Stage_Field_Type, name = fs.name, a = type_name(vu, vt, fu.allocator), b = type_name(fu, ft, fu.allocator)})
+			continue
+		}
+		if vs.index != fs.index {
+			append(errors, Error{pos = fs.pos, code = .Push_Stage_Field_Offset, name = fs.name, n = i64(vs.index), m = i64(fs.index)})
+		}
+	}
 }
 
 // Where uniform `name` is in the module's block, and its type: for hosts

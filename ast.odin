@@ -16,6 +16,7 @@ Spec_Id :: distinct u32
 Func_Decl_Id :: distinct u32
 Struct_Decl_Id :: distinct u32
 Buffer_Decl_Id :: distinct u32
+Push_Decl_Id :: distinct u32
 Sym_Id :: distinct u32
 Func_Id :: distinct u32
 Type_Id :: distinct u32
@@ -219,6 +220,26 @@ Buffer_Decl :: struct {
 	members:    Range,
 }
 
+// `push Name { fields } instance;`: its fields are in `Unit.push_fields`.
+Push_Field_Decl :: struct {
+	pos:         Pos,
+	name:        string,
+	spec:        Spec_Id,
+	array_size:  Expr_Id,
+	unsized:     bool,
+	is_pointer:  bool,
+	handle_kind: string,
+	sym:         Sym_Id,
+}
+
+Push_Decl :: struct {
+	pos:      Pos,
+	name:     string,
+	instance: string,
+	// Into `Unit.push_fields`.
+	fields:   Range,
+}
+
 // One item of `layout(local_size_x = X, ...) in;` (`axis` 0..2 for x..z).
 Workgroup_Item :: struct {
 	pos:   Pos,
@@ -232,6 +253,7 @@ Top_Kind :: enum u8 {
 	Struct,
 	Buffer,
 	Workgroup,
+	Push,
 }
 
 Top :: struct {
@@ -239,7 +261,7 @@ Top :: struct {
 	fn:     Func_Decl_Id,
 	strukt: Struct_Decl_Id,
 	buffer: Buffer_Decl_Id,
-	// Vars: declarators (Var_Ids in Unit.ids). Workgroup: into Unit.workgroups.
+	// Vars: declarators (Var_Ids in Unit.ids). Workgroup: into Unit.workgroups. Push: start is Push_Decl_Id.
 	vars:   Range,
 }
 
@@ -273,6 +295,9 @@ Storage :: enum u8 {
 	Work_Group_Size,
 	// Compute workgroup `shared` variable.
 	Shared,
+	// Layout.Oplat push block instance (`push Name { ... } inst;`) and its fields.
+	Push_Block,
+	Push_Field,
 }
 
 Symbol :: struct {
@@ -323,6 +348,7 @@ Unit :: struct {
 	allocator:    Allocator,
 	profile:      Profile,
 	stage:        Stage,
+	layout:       Layout,
 	// The profile's dialect and the features its source can use.
 	dialect:      Dialect,
 	features:     Features,
@@ -343,6 +369,8 @@ Unit :: struct {
 	func_decls:   [dynamic]Func_Decl,
 	struct_decls: [dynamic]Struct_Decl,
 	buffer_decls: [dynamic]Buffer_Decl,
+	push_decls:   [dynamic]Push_Decl,
+	push_fields:  [dynamic]Push_Field_Decl,
 	workgroups:   [dynamic]Workgroup_Item,
 	tops:         [dynamic]Top,
 	ids:          [dynamic]u32,
@@ -358,12 +386,13 @@ Unit :: struct {
 	calls:        [dynamic][2]Func_Id,
 }
 
-unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass := false, stage := Stage.Fragment, taps: []Tap = nil, num_groups_uniform := false) {
+unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass := false, stage := Stage.Fragment, taps: []Tap = nil, num_groups_uniform := false, layout := Layout.Sdl_Gpu) {
 	context.allocator = allocator
 	u.allocator = allocator
 	u.profile = profile
 	u.dialect = PROFILE_RULES[profile].dialect
 	u.stage = stage
+	u.layout = layout
 	u.features = profile_features(profile, stage)
 	u.buffer_pass = buffer_pass
 	u.num_groups_uniform = num_groups_uniform
@@ -377,6 +406,8 @@ unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass 
 	u.func_decls = make([dynamic]Func_Decl)
 	u.struct_decls = make([dynamic]Struct_Decl)
 	u.buffer_decls = make([dynamic]Buffer_Decl)
+	u.push_decls = make([dynamic]Push_Decl)
+	u.push_fields = make([dynamic]Push_Field_Decl)
 	u.workgroups = make([dynamic]Workgroup_Item)
 	u.tops = make([dynamic]Top)
 	u.ids = make([dynamic]u32)
@@ -395,6 +426,7 @@ unit_init :: proc(u: ^Unit, profile: Profile, allocator: Allocator, buffer_pass 
 	append(&u.specs, Type_Spec{})
 	append(&u.func_decls, Func_Decl{})
 	append(&u.struct_decls, Struct_Decl{})
+	append(&u.push_decls, Push_Decl{})
 	append(&u.syms, Symbol{})
 	append(&u.funcs, Func{})
 	// Type 0 is the error type.
@@ -417,6 +449,8 @@ unit_copy_syntax :: proc(dst, src: ^Unit) {
 	copy_array(&dst.func_decls, src.func_decls)
 	copy_array(&dst.struct_decls, src.struct_decls)
 	copy_array(&dst.buffer_decls, src.buffer_decls)
+	copy_array(&dst.push_decls, src.push_decls)
+	copy_array(&dst.push_fields, src.push_fields)
 	copy_array(&dst.workgroups, src.workgroups)
 	copy_array(&dst.tops, src.tops)
 	copy_array(&dst.ids, src.ids)

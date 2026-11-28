@@ -380,8 +380,19 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	p.varying_floats = c.varying_floats
 	// Uniform slots, filled from the block before each run.
 	for sym, i in u.syms {
+		if i == 0 {
+			continue
+		}
+		if sym.storage == .Push_Field {
+			t := ty(u, sym.type)
+			slot := alloc_slots(&l, component_count(u, t))
+			l.sym_slot[i] = slot
+			k := slot
+			append_push_fills(&l, u, t, &k, sym.index)
+			continue
+		}
 		// Uniforms left out of the block (unused, index -1) have no slots.
-		if i == 0 || (sym.storage != .Uniform && sym.storage != .Builtin_Uniform) || sym.index < 0 || Sym_Id(i) == c.num_groups_uniform {
+		if (sym.storage != .Uniform && sym.storage != .Builtin_Uniform) || sym.index < 0 || Sym_Id(i) == c.num_groups_uniform {
 			continue
 		}
 		t := ty(u, sym.type)
@@ -439,6 +450,44 @@ build_program :: proc(u: ^Unit, c: ^Checked) -> Program {
 	pack_slots(&p, l.blocks[:])
 	jit_compile(&p)
 	return p
+}
+
+// Emits Uniform_Fill entries for a push-block value at `base_off` under Odin
+// layout: scalars/vectors at 4-byte components, square matrices at Odin column
+// stride (8 / 12 / 16), structs at field offsets, arrays at element size.
+@(private)
+append_push_fills :: proc(l: ^Lower, u: ^Unit, t: Type, slot: ^i32, base_off: int) {
+	if t.array > 0 {
+		e := elem_type(t)
+		stride := odin_array_stride(u, t)
+		for i in 0 ..< int(t.array) {
+			append_push_fills(l, u, e, slot, base_off + i * stride)
+		}
+		return
+	}
+	if t.base == .Struct {
+		for f, fi in struct_fields(u, t.strukt) {
+			off := odin_field_offset(u, t.strukt, i32(fi))
+			append_push_fills(l, u, ty(u, f.type), slot, base_off + off)
+		}
+		return
+	}
+	if is_matrix(t) {
+		col_stride := odin_matrix_stride(t)
+		for col in 0 ..< int(t.cols) {
+			for row in 0 ..< int(t.rows) {
+				off := i32(base_off + col * col_stride + row * 4)
+				append(&l.fills, Uniform_Fill{slot^, off, t.base})
+				slot^ += 1
+			}
+		}
+		return
+	}
+	for row in 0 ..< int(t.rows) {
+		off := i32(base_off + row * 4)
+		append(&l.fills, Uniform_Fill{slot^, off, t.base})
+		slot^ += 1
+	}
 }
 
 // The symbols some expression writes: the targets of assignments and

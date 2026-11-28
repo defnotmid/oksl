@@ -7,8 +7,14 @@
 // README.md.
 package oksl
 
+import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
+
+Layout :: enum u8 {
+	Sdl_Gpu,
+	Oplat,
+}
 
 Options :: struct {
 	// The kind of source (dialect.odin): Skia's SkSL effects, Shadertoy's
@@ -16,6 +22,8 @@ Options :: struct {
 	profile:  Profile,
 	// The pipeline stage (the profile's PROFILE_RULES stages).
 	stage:    Stage,
+	// Target ABI/layout (.Sdl_Gpu by default, or .Oplat for Vulkan 1.3 / Metal 3).
+	layout:   Layout,
 	// Source preprocessed and checked ahead of the shader's own, whose
 	// macros apply to it: a host's built-in declarations and #defines.
 	// Its errors are the Prelude's; uniforms and inputs it declares that
@@ -115,7 +123,32 @@ Struct_Field_Info :: struct {
 // A declared struct (`Type.strukt` into `Module.structs`).
 Buffer_Struct_Info :: struct {
 	name:   string,
+	size:   int,
+	align:  int,
 	fields: []Struct_Field_Info,
+}
+
+Push_Field_Kind :: enum u8 {
+	Value,
+	Pointer,
+	Texture,
+	Sampler,
+	Image,
+}
+
+Push_Field_Info :: struct {
+	name:   string,
+	kind:   Push_Field_Kind,
+	type:   Type,
+	offset: int,
+	size:   int,
+}
+
+Push_Info :: struct {
+	name:   string,
+	size:   int,
+	align:  int,
+	fields: []Push_Field_Info,
 }
 
 // A 2D storage image (`uniform layout(<format>) image2D/uimage2D/iimage2D`).
@@ -181,7 +214,10 @@ Module :: struct {
 	// graphics stages.
 	threadcount:     [3]u32,
 	profile:         Profile,
-	stage:         Stage,
+	stage:           Stage,
+	layout:          Layout,
+	// Push block reflection under Layout.Oplat (zero when absent).
+	push:            Push_Info,
 	// Floats per vertex in the varyings' record (Stage_Var_Info.offset).
 	varying_floats: int,
 	stage_inputs:  []Stage_Var_Info,
@@ -215,13 +251,21 @@ compile :: proc(source: string, options := Options{}) -> (m: ^Module, errors: []
 @(private)
 module_front :: proc(source: string, options: Options, src, prelude_src: Source) -> (u: ^Unit, toks: []Token, ok: bool) {
 	u = new(Unit)
-	unit_init(u, options.profile, context.allocator, buffer_pass = options.unclamped, stage = options.stage, taps = options.taps, num_groups_uniform = options.num_work_groups_uniform)
+	unit_init(u, options.profile, context.allocator, buffer_pass = options.unclamped, stage = options.stage, taps = options.taps, num_groups_uniform = options.num_work_groups_uniform, layout = options.layout)
 	if options.stage not_in PROFILE_RULES[options.profile].stages {
 		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Stage_Unsupported, a = PROFILE_NAMES[options.profile], b = STAGE_NAMES[options.stage]})
 		return u, nil, false
 	}
+	if options.dxbc && options.layout == .Oplat {
+		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Oplat_Dxbc})
+		return u, nil, false
+	}
 	if len(options.taps) > 0 && options.stage != .Vertex {
 		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Tap_Stage, a = STAGE_NAMES[options.stage]})
+		return u, nil, false
+	}
+	if len(options.taps) > 0 && options.layout == .Oplat {
+		append(&u.errors, Error{pos = {line = 1, col = 1, src = src}, code = .Oplat_Taps})
 		return u, nil, false
 	}
 	pp: Preprocessor
@@ -351,15 +395,51 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 		buffers[i] = {strings.clone(bd.block), t, stride, bd.readonly, bd.writeonly}
 	}
 	m.storage_buffers = buffers
-	if len(c.buffers) > 0 && len(u.structs) > 0 {
+	if c.push.present {
+		fields := make([]Push_Field_Info, len(c.push.fields))
+		for sid, i in c.push.fields {
+			sym := u.syms[sid]
+			t := ty(u, sym.type)
+			fsize, _, _ := odin_layout(u, t)
+			fields[i] = {
+				name   = strings.clone(sym.name),
+				kind   = .Value,
+				type   = t,
+				offset = sym.index,
+				size   = fsize,
+			}
+		}
+		m.push = {
+			name   = strings.clone(c.push.name),
+			size   = c.push.size,
+			align  = c.push.align,
+			fields = fields,
+		}
+		m.block_size = c.push.size
+		if len(u.structs) > 0 {
+			structs := make([]Buffer_Struct_Info, len(u.structs))
+			for sd, st_idx in u.structs {
+				sf := struct_fields(u, i32(st_idx))
+				sfields := make([]Struct_Field_Info, len(sf))
+				sz, al, sok := odin_layout(u, Type{base = .Struct, strukt = i32(st_idx)})
+				for f, fi in sf {
+					off := odin_field_offset(u, i32(st_idx), i32(fi)) if sok else 0
+					sfields[fi] = {strings.clone(f.name), ty(u, f.type), off}
+				}
+				structs[st_idx] = {strings.clone(sd.name), sz if sok else 0, al if sok else 0, sfields}
+			}
+			m.structs = structs
+		}
+	} else if len(c.buffers) > 0 && len(u.structs) > 0 {
 		structs := make([]Buffer_Struct_Info, len(u.structs))
 		for sd, st_idx in u.structs {
 			sf := struct_fields(u, i32(st_idx))
 			fields := make([]Struct_Field_Info, len(sf))
+			sz, al, sok := std430(u, Type{base = .Struct, strukt = i32(st_idx)})
 			for f, fi in sf {
 				fields[fi] = {strings.clone(f.name), ty(u, f.type), std430_field_offset(u, i32(st_idx), i32(fi))}
 			}
-			structs[st_idx] = {strings.clone(sd.name), fields}
+			structs[st_idx] = {strings.clone(sd.name), sz if sok else 0, al if sok else 0, fields}
 		}
 		m.structs = structs
 	}
@@ -402,7 +482,53 @@ module_emit :: proc(m: ^Module, u: ^Unit, c: ^Checked, options: Options) {
 	}
 	m.profile = u.profile
 	m.stage = u.stage
+	m.layout = u.layout
 	m.varying_floats = c.varying_floats
+}
+
+// Emits Odin `#assert(size_of(...))`, `#assert(align_of(...))`, and
+// `#assert(offset_of(...))` checks for the module's push block and every
+// struct it uses.
+format_odin_asserts :: proc(m: ^Module, allocator := context.allocator) -> string {
+	if m == nil || m.push.name == "" {
+		return ""
+	}
+	b := strings.builder_make(allocator)
+	seen := make([]bool, len(m.structs), context.temp_allocator)
+	collect :: proc(m: ^Module, t: Type, seen: []bool) {
+		if t.array > 0 {
+			collect(m, elem_type(t), seen)
+			return
+		}
+		if t.base == .Struct && t.strukt >= 0 && int(t.strukt) < len(m.structs) {
+			if seen[t.strukt] {
+				return
+			}
+			seen[t.strukt] = true
+			for f in m.structs[t.strukt].fields {
+				collect(m, f.type, seen)
+			}
+		}
+	}
+	for f in m.push.fields {
+		collect(m, f.type, seen)
+	}
+	for st, idx in m.structs {
+		if !seen[idx] {
+			continue
+		}
+		fmt.sbprintf(&b, "#assert(size_of(%s) == %d)\n", st.name, st.size)
+		fmt.sbprintf(&b, "#assert(align_of(%s) == %d)\n", st.name, st.align)
+		for f in st.fields {
+			fmt.sbprintf(&b, "#assert(offset_of(%s, %s) == %d)\n", st.name, f.name, f.offset)
+		}
+	}
+	fmt.sbprintf(&b, "#assert(size_of(%s) == %d)\n", m.push.name, m.push.size)
+	fmt.sbprintf(&b, "#assert(align_of(%s) == %d)\n", m.push.name, m.push.align)
+	for f in m.push.fields {
+		fmt.sbprintf(&b, "#assert(offset_of(%s, %s) == %d)\n", m.push.name, f.name, f.offset)
+	}
+	return strings.to_string(b)
 }
 
 destroy :: proc(m: ^Module) {

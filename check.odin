@@ -48,6 +48,22 @@ Checked :: struct {
 	header:         bool,
 	// Floats in the varyings' record (Interface_Var.offset).
 	varying_floats: int,
+	push:           Push_Checked,
+}
+
+Push_Checked :: struct {
+	present:  bool,
+	name:     string,
+	instance: string,
+	pos:      Pos,
+	size:     int,
+	align:    int,
+	fields:   []Sym_Id,
+}
+
+@(private)
+is_prelude_src :: proc "contextless" (src: Source) -> bool {
+	return src == .Prelude || src == .Vertex_Prelude || src == .Fragment_Prelude
 }
 
 @(private)
@@ -107,6 +123,11 @@ Checker :: struct {
 	// Set while checking a synthesized entry, which writes gl_FragCoord or
 	// sk_FragCoord.
 	entry_writes:  bool,
+	// Layout.Oplat push block tracking.
+	has_push_top: bool,
+	push:         Push_Checked,
+	push_sym:     Sym_Id,
+	push_fields:  [dynamic]Sym_Id,
 }
 
 check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
@@ -119,16 +140,20 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 		pending        = make(map[string][dynamic]Func_Decl_Id),
 		resolved_decls = make([]i32, len(u.func_decls)),
 		by_name        = make(map[string][dynamic]Func_Id),
-		globals      = make([dynamic]Sym_Id),
-		shared_vars  = make([dynamic]Sym_Id),
-		uniforms     = make([dynamic]Sym_Id),
-		local_size   = {1, 1, 1},
-		next_offset  = OFFSET_USER if PROFILE_RULES[u.profile].header else 0,
+	globals      = make([dynamic]Sym_Id),
+	shared_vars  = make([dynamic]Sym_Id),
+	uniforms     = make([dynamic]Sym_Id),
+	push_fields  = make([dynamic]Sym_Id),
+	local_size   = {1, 1, 1},
+	next_offset  = OFFSET_USER if PROFILE_RULES[u.profile].header else 0,
 	}
 	error_count := len(u.errors)
 	push_scope(&c)
 	declare_inputs(&c)
 	for t in u.tops {
+		if t.kind == .Push {
+			c.has_push_top = true
+		}
 		if t.kind == .Func {
 			name := u.func_decls[t.fn].name
 			l := c.pending[name]
@@ -142,6 +167,8 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 			declare_struct(&c, t.strukt)
 		case .Buffer:
 			declare_buffer(&c, t.buffer)
+		case .Push:
+			declare_push(&c, Push_Decl_Id(t.vars.start))
 		case .Workgroup:
 			check_workgroup(&c, t.vars)
 		case .Vars:
@@ -190,6 +217,16 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 	if !c.rules.header {
 		layout_used_uniforms(&c)
 	}
+	if u.layout == .Oplat {
+		if c.has_push_top {
+			for id in c.uniforms {
+				add_error(&c, u.syms[id].pos, .Push_Mixed_Decl, u.syms[id].name, a = "uniform")
+			}
+		} else if c.rules.header || len(c.uniforms) > 0 || (c.u.num_groups_uniform && c.gl_num_groups != 0) {
+			pos := u.syms[c.uniforms[0]].pos if len(c.uniforms) > 0 else Pos{line = 1, col = 1}
+			add_error(&c, pos, .Oplat_No_Push)
+		}
+	}
 	if main != 0 && len(u.errors) == error_count {
 		// What main and the globals' initializers reach, callees first: the
 		// taps copy it (when it is sound), the entry comes last.
@@ -220,6 +257,8 @@ check :: proc(u: ^Unit) -> (out: Checked, ok: bool) {
 	out.block_size = out.block_stride * (1 + out.taps)
 	out.header = c.rules.header
 	out.varying_floats = c.varying_floats
+	out.push = c.push
+	out.push.fields = c.push_fields[:]
 	return out, len(u.errors) == error_count
 }
 
@@ -586,6 +625,14 @@ check_init :: proc(c: ^Checker, v: Var_Id, t: ^Type) {
 declare_buffer :: proc(c: ^Checker, b: Buffer_Decl_Id) {
 	u := c.u
 	bd := u.buffer_decls[b]
+	if u.layout == .Oplat {
+		if c.has_push_top {
+			add_error(c, bd.pos, .Push_Mixed_Decl, bd.block, a = "buffer")
+		} else {
+			add_error(c, bd.pos, .Oplat_Unsupported_Resource, a = "buffer")
+		}
+		return
+	}
 	v := Var_Id(bd.members.start)
 	if bd.members.count != 1 || !u.vars[v].unsized {
 		add_error(c, bd.pos, .Buffer_Member, bd.block)
@@ -619,6 +666,172 @@ declare_buffer :: proc(c: ^Checker, b: Buffer_Decl_Id) {
 	append(&c.buffer_decls, b)
 	u.vars[v].sym = id
 	declare(c, id)
+}
+
+// Validates a push field type recursively for Odin layout compatibility (no
+// bools, no non-square matrices, no matrix arrays, no empty structs or
+// opaque handles).
+@(private)
+validate_push_field_type :: proc(c: ^Checker, pos: Pos, field_name: string, t: Type) -> bool {
+	u := c.u
+	if t.array > 0 {
+		e := elem_type(t)
+		if is_matrix(e) {
+			add_error(c, pos, .Push_Matrix_Array, field_name, a = tn(c, t))
+			return false
+		}
+		return validate_push_field_type(c, pos, field_name, e)
+	}
+	if is_matrix(t) {
+		if t.cols != t.rows {
+			add_error(c, pos, .Push_Matrix_Shape, field_name, a = tn(c, t))
+			return false
+		}
+		return true
+	}
+	switch t.base {
+	case .Float, .Int, .Uint:
+		return true
+	case .Bool:
+		add_error(c, pos, .Push_Bool, field_name, a = tn(c, t))
+		return false
+	case .Struct:
+		fields := struct_fields(u, t.strukt)
+		if len(fields) == 0 {
+			add_error(c, pos, .Push_Empty, u.structs[t.strukt].name)
+			return false
+		}
+		ok := true
+		for f in fields {
+			if !validate_push_field_type(c, pos, field_name, ty(u, f.type)) {
+				ok = false
+			}
+		}
+		return ok
+	case .Sampler:
+		add_error(c, pos, .Push_Unsupported_Field, field_name, a = tn(c, t))
+		return false
+	case .Image:
+		add_error(c, pos, .Push_Unsupported_Field, field_name, a = image_base_name(t))
+		return false
+	case .Void:
+		add_error(c, pos, .Push_Unsupported_Field, field_name, a = tn(c, t))
+		return false
+	}
+	return false
+}
+
+// `push Name { fields } inst;` (Layout.Oplat, GLSL profile).
+@(private)
+declare_push :: proc(c: ^Checker, id: Push_Decl_Id) {
+	u := c.u
+	pd := u.push_decls[id]
+	if u.layout != .Oplat {
+		add_error(c, pd.pos, .Push_Layout, pd.name)
+		return
+	}
+	if u.profile != .Glsl {
+		add_error(c, pd.pos, .Push_Profile, pd.name)
+		return
+	}
+	if c.push.present {
+		add_error(c, pd.pos, .Push_Duplicate, pd.name, n = i64(c.push.pos.line), m = i64(c.push.pos.col))
+		return
+	}
+	c.push.present = true
+	c.push.name = pd.name
+	c.push.instance = pd.instance
+	c.push.pos = pd.pos
+	if pd.fields.count == 0 {
+		add_error(c, pd.pos, .Push_Empty, pd.name)
+		return
+	}
+	seen_fields := make(map[string]Pos, context.temp_allocator)
+	off := 0
+	max_align := 1
+	layout_ok := true
+	for fi in pd.fields.start ..< pd.fields.start + pd.fields.count {
+		f := &u.push_fields[fi]
+		if prev, dup := seen_fields[f.name]; dup {
+			add_error(c, f.pos, .Already_Declared_At, f.name, n = i64(prev.line), m = i64(prev.col))
+			layout_ok = false
+			continue
+		}
+		seen_fields[f.name] = f.pos
+		if f.is_pointer {
+			add_error(c, f.pos, .Push_Unsupported_Field, f.name, a = "pointer")
+			layout_ok = false
+			continue
+		}
+		if f.handle_kind != "" {
+			add_error(c, f.pos, .Push_Unsupported_Field, f.name, a = f.handle_kind)
+			layout_ok = false
+			continue
+		}
+		ft := resolve_type(c, f.spec, f.array_size, f.unsized)
+		if is_error(ft) {
+			layout_ok = false
+			continue
+		}
+		if ft.base == .Sampler {
+			add_error(c, f.pos, .Push_Unsupported_Field, f.name, a = tn(c, ft))
+			layout_ok = false
+			continue
+		}
+		if ft.base == .Image {
+			add_error(c, f.pos, .Push_Unsupported_Field, f.name, a = image_base_name(ft))
+			layout_ok = false
+			continue
+		}
+		if ft.array < 0 {
+			add_error(c, f.pos, .Push_Unsupported_Field, f.name, a = "unsized array")
+			layout_ok = false
+			continue
+		}
+		if !validate_push_field_type(c, f.pos, f.name, ft) {
+			layout_ok = false
+			continue
+		}
+		fsize, falign, ok := odin_layout(u, ft)
+		if !ok {
+			layout_ok = false
+			continue
+		}
+		off = round_up(off, falign)
+		sym := Symbol {
+			name     = f.name,
+			type     = intern(u, ft),
+			storage  = .Push_Field,
+			is_const = true,
+			pos      = f.pos,
+			index    = off,
+		}
+		sid := add_sym(c, sym)
+		f.sym = sid
+		append(&c.push_fields, sid)
+		if pd.instance == "" {
+			declare(c, sid)
+		}
+		off += fsize
+		max_align = max(max_align, falign)
+	}
+	if pd.instance != "" {
+		c.push_sym = add_sym(c, Symbol{
+			name     = pd.instance,
+			type     = 0,
+			storage  = .Push_Block,
+			is_const = true,
+			pos      = pd.pos,
+		})
+		declare(c, c.push_sym)
+	}
+	if layout_ok {
+		c.push.align = max_align
+		c.push.size = round_up(off, max_align)
+		if c.push.size > PUSH_MAX_BYTES {
+			add_error(c, pd.pos, .Push_Too_Large, pd.name, n = i64(c.push.size), m = PUSH_MAX_BYTES)
+		}
+	}
 }
 
 @(private)
@@ -855,6 +1068,24 @@ declare_global :: proc(c: ^Checker, v: Var_Id) {
 		return
 	}
 	if d.is_uniform {
+		if u.layout == .Oplat {
+			if c.has_push_top {
+				if t.base == .Sampler || t.base == .Image || !is_prelude_src(d.pos.src) {
+					what := "sampler" if t.base == .Sampler else ("image" if t.base == .Image else "uniform")
+					add_error(c, d.pos, .Push_Mixed_Decl, d.name, a = what)
+					return
+				}
+			} else {
+				if t.base == .Sampler && !c.rules.header {
+					add_error(c, d.pos, .Oplat_Unsupported_Resource, a = "sampler")
+					return
+				}
+				if t.base == .Image && !c.rules.header {
+					add_error(c, d.pos, .Oplat_Unsupported_Resource, a = "image")
+					return
+				}
+			}
+		}
 		if d.init != 0 {
 			add_error(c, d.pos, .Uniform_Initializer)
 		}
@@ -1786,6 +2017,10 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 			add_error(c, e.pos, .Buffer_Use, fmt.tprintf("%s.%s", instance, member) if instance != "" else member)
 			return T_ERROR
 		}
+		if u.syms[s].storage == .Push_Block {
+			add_error(c, e.pos, .Push_Block_Use, u.syms[s].name)
+			return T_ERROR
+		}
 		u.exprs[id].sym = s
 		use_input(c, s)
 		bit_array.set(&c.used, int(s))
@@ -1955,6 +2190,24 @@ check_expr_inner :: proc(c: ^Checker, id: Expr_Id) -> Type {
 		}
 		return T_INT
 	case .Field:
+		if u.exprs[e.a].kind == .Ident {
+			ps := lookup(c, u.exprs[e.a].name)
+			if ps != 0 && u.syms[ps].storage == .Push_Block {
+				for fs in c.push_fields {
+					if u.syms[fs].name == e.name {
+						u.exprs[id].kind = .Ident
+						u.exprs[id].name = u.syms[fs].name
+						u.exprs[id].sym = fs
+						u.exprs[id].a = 0
+						u.exprs[id].type = u.syms[fs].type
+						bit_array.set(&c.used, int(fs))
+						return ty(u, u.syms[fs].type)
+					}
+				}
+				add_error(c, e.pos, .No_Field, e.name, a = c.push.name)
+				return T_ERROR
+			}
+		}
 		t := check_expr(c, e.a)
 		if is_error(t) {
 			return t
@@ -2238,7 +2491,7 @@ check_lvalue :: proc(c: ^Checker, id: Expr_Id) -> bool {
 		}
 		s := u.syms[e.sym]
 		switch s.storage {
-		case .Uniform, .Builtin_Uniform, .Channel, .Storage_Image, .Stage_In, .Buffer:
+		case .Uniform, .Builtin_Uniform, .Channel, .Storage_Image, .Stage_In, .Buffer, .Push_Field, .Push_Block:
 			add_error(c, e.pos, .Read_Only, s.name)
 			return false
 		case .Work_Group_Size:

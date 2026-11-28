@@ -255,7 +255,7 @@ compile_program :: proc(desc: Program_Desc, options := Options{}) -> (g: ^Pass_G
 	preprocess_init(&pp, .Shadertoy, &errs, allocator)
 	defer preprocess_destroy(&pp)
 	common := new(Unit)
-	unit_init(common, .Shadertoy, allocator)
+	unit_init(common, .Shadertoy, allocator, layout = options.layout)
 	if desc.common != "" {
 		toks := tokenize_source(strings.clone(desc.common), .Common)
 		preprocess_unit(&pp, toks)
@@ -295,7 +295,7 @@ compile_program :: proc(desc: Program_Desc, options := Options{}) -> (g: ^Pass_G
 		passes[pi].module = m
 		u := new(Unit, virtual.arena_allocator(&m.arena))
 		// Buffers keep mainImage's colour as it is, for float targets.
-		unit_init(u, .Shadertoy, virtual.arena_allocator(&m.arena), buffer_pass = kind != .Image)
+		unit_init(u, .Shadertoy, virtual.arena_allocator(&m.arena), buffer_pass = kind != .Image, layout = options.layout)
 		unit_copy_syntax(u, common)
 		built := module_build(m, u, pass_toks, o)
 		// Common's errors show up in every pass; keep the first. The text

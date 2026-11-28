@@ -36,6 +36,11 @@ Msl :: struct {
 	has_cas:       bool,
 	// oksl_powi, pow(x, n)'s helper for a literal whole n (pow_int_exponent), written to `helpers`.
 	has_powi:      bool,
+	// Layout.Oplat terminating discard tracking (`g._discarded`).
+	may_discard:   []bool,
+	has_discard:   bool,
+	cur_ret:       Type,
+	in_entry:      bool,
 }
 
 // A sampler's Metal texture type.
@@ -127,11 +132,17 @@ emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
 	// Without a uniform block (a GLSL shader using no uniforms) there is no
 	// `u` to pass.
 	has_block := false
+	has_push := c.push.present
 	for row in c.interface {
 		has_block ||= row.kind == .Uniform_Block
 	}
-	strings.write_string(&pb, "constant Oksl_Uniforms& u, thread Oksl_Globals& g" if has_block else "thread Oksl_Globals& g")
-	strings.write_string(&ab, "u, g" if has_block else "g")
+	if has_push {
+		fmt.sbprintf(&pb, "constant ok_%s& u, thread Oksl_Globals& g", c.push.name)
+		strings.write_string(&ab, "u, g")
+	} else {
+		strings.write_string(&pb, "constant Oksl_Uniforms& u, thread Oksl_Globals& g" if has_block else "thread Oksl_Globals& g")
+		strings.write_string(&ab, "u, g" if has_block else "g")
+	}
 	for row in c.interface {
 		#partial switch row.kind {
 		case .Channel:
@@ -167,17 +178,32 @@ emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
 		strings.write_string(&m.helpers, "template<typename T> inline void oksl_fence(texture2d<T, access::read_write> t) { t.fence(); }\n")
 		strings.write_string(&m.helpers, "template<typename T> inline void oksl_fence(texture2d<T, access::write> t) {}\n")
 	}
+	if u.layout == .Oplat {
+		m.may_discard = make([]bool, len(u.funcs), context.temp_allocator)
+		for f in c.funcs {
+			body_id := u.func_decls[u.funcs[f].decl].body
+			if body_id != 0 && stmt_may_discard(u, m.may_discard, body_id) {
+				m.may_discard[f] = true
+			}
+		}
+		m.has_discard = c.entry != 0 && m.may_discard[c.entry]
+	}
 
 	body := strings.builder_make()
 	m.b = body
-	for t in u.structs {
-		w(&m, "struct ok_%s {{\n", t.name)
-		for f in u.fields[t.fields.start:][:t.fields.count] {
-			w(&m, "\t%s ok_%s;\n", msl_type(&m, ty(u, f.type)), f.name)
+	if !has_push {
+		for t in u.structs {
+			w(&m, "struct ok_%s {{\n", t.name)
+			for f in u.fields[t.fields.start:][:t.fields.count] {
+				w(&m, "\t%s ok_%s;\n", msl_type(&m, ty(u, f.type)), f.name)
+			}
+			w(&m, "};\n\n")
 		}
-		w(&m, "};\n\n")
 	}
 	w(&m, "struct Oksl_Globals {{\n")
+	if u.layout == .Oplat && m.has_discard {
+		w(&m, "\tbool _discarded;\n")
+	}
 	for g in c.globals {
 		w(&m, "\t%s ok_%s;\n", msl_type(&m, sym_type(u, g)), u.syms[g].name)
 	}
@@ -205,7 +231,13 @@ emit_msl :: proc(u: ^Unit, c: ^Checked) -> string {
 
 	out := strings.builder_make()
 	strings.write_string(&out, MSL_PRELUDE)
-	emit_uniform_struct(&m, &out)
+	if u.layout == .Oplat {
+		if has_push {
+			emit_push_struct(&m, &out)
+		}
+	} else {
+		emit_uniform_struct(&m, &out)
+	}
 	strings.write_string(&out, strings.to_string(m.helpers))
 	strings.write_string(&out, strings.to_string(m.b))
 	return strings.to_string(out)
@@ -399,6 +431,195 @@ emit_uniform_struct :: proc(m: ^Msl, out: ^strings.Builder) {
 	strings.write_string(out, "};\n\n")
 }
 
+// ---- push block (Layout.Oplat) ---------------------------------------------------------
+
+@(private)
+msl_push_field_decl :: proc(out: ^strings.Builder, u: ^Unit, name: string, t: Type) {
+	if t.array > 0 {
+		e := elem_type(t)
+		if e.base == .Struct {
+			fmt.sbprintf(out, "\toksl_push_%s ok_%s[%d];\n", u.structs[e.strukt].name, name, t.array)
+			return
+		}
+		sb := msl_scalar(e.base)
+		if e.rows > 1 {
+			fmt.sbprintf(out, "\tpacked_%s%d ok_%s[%d];\n", sb, e.rows, name, t.array)
+		} else {
+			fmt.sbprintf(out, "\t%s ok_%s[%d];\n", sb, name, t.array)
+		}
+		return
+	}
+	if t.base == .Struct {
+		fmt.sbprintf(out, "\toksl_push_%s ok_%s;\n", u.structs[t.strukt].name, name)
+		return
+	}
+	if is_matrix(t) {
+		if t.cols == 3 && t.rows == 3 {
+			fmt.sbprintf(out, "\tpacked_float3 ok_%s[3];\n", name)
+		} else {
+			fmt.sbprintf(out, "\tfloat%dx%d ok_%s;\n", t.cols, t.rows, name)
+		}
+		return
+	}
+	sb := msl_scalar(t.base)
+	if t.rows > 1 {
+		fmt.sbprintf(out, "\tpacked_%s%d ok_%s;\n", sb, t.rows, name)
+	} else {
+		fmt.sbprintf(out, "\t%s ok_%s;\n", sb, name)
+	}
+}
+
+@(private)
+msl_push_unpack :: proc(m: ^Msl, ref: string, t: Type) -> string {
+	u := m.u
+	if t.array > 0 {
+		e := elem_type(t)
+		elems := make([dynamic]string, 0, int(t.array), context.temp_allocator)
+		for i in 0 ..< int(t.array) {
+			append(&elems, msl_push_unpack(m, fmt.aprintf("%s[%d]", ref, i), e))
+		}
+		return fmt.aprintf("%s{{%s}}", msl_type(m, t), strings.join(elems[:], ", "))
+	}
+	if t.base == .Struct {
+		return fmt.aprintf("oksl_unpack_%s(%s)", u.structs[t.strukt].name, ref)
+	}
+	if is_matrix(t) {
+		if t.cols == 3 && t.rows == 3 {
+			return fmt.aprintf("oksl_unpack_mat3(%s)", ref)
+		}
+		return ref
+	}
+	if t.rows > 1 {
+		return fmt.aprintf("%s(%s)", msl_type(m, t), ref)
+	}
+	return ref
+}
+
+@(private)
+msl_push_read :: proc(m: ^Msl, sym: Symbol) -> string {
+	t := ty(m.u, sym.type)
+	if t.array > 0 {
+		return fmt.aprintf("oksl_push_arr_%s(u)", sym.name)
+	}
+	return msl_push_unpack(m, fmt.aprintf("u.ok_%s", sym.name), t)
+}
+
+@(private)
+emit_push_struct :: proc(m: ^Msl, out: ^strings.Builder) {
+	u := m.u
+	c := m.c
+	for sd in u.structs {
+		fmt.sbprintf(out, "struct ok_%s {{\n", sd.name)
+		for f in u.fields[sd.fields.start:][:sd.fields.count] {
+			fmt.sbprintf(out, "\t%s ok_%s;\n", msl_type(m, ty(u, f.type)), f.name)
+		}
+		strings.write_string(out, "};\n\n")
+	}
+
+	seen_structs := make([]bool, len(u.structs), context.temp_allocator)
+	has_mat3 := false
+	scan_push :: proc(u: ^Unit, t: Type, seen: []bool, has_mat3: ^bool) {
+		if t.array > 0 {
+			scan_push(u, elem_type(t), seen, has_mat3)
+			return
+		}
+		if is_matrix(t) {
+			if t.cols == 3 && t.rows == 3 {
+				has_mat3^ = true
+			}
+			return
+		}
+		if t.base == .Struct {
+			if seen[t.strukt] {
+				return
+			}
+			seen[t.strukt] = true
+			for f in struct_fields(u, t.strukt) {
+				scan_push(u, ty(u, f.type), seen, has_mat3)
+			}
+		}
+	}
+	for sid in c.push.fields {
+		scan_push(u, sym_type(u, sid), seen_structs, &has_mat3)
+	}
+	if has_mat3 {
+		strings.write_string(out, "inline float3x3 oksl_unpack_mat3(constant packed_float3* m) {\n\treturn float3x3(float3(m[0]), float3(m[1]), float3(m[2]));\n}\n\n")
+	}
+
+	for sd, st_idx in u.structs {
+		if !seen_structs[st_idx] {
+			continue
+		}
+		pname := fmt.tprintf("oksl_push_%s", sd.name)
+		st_size, st_align, _ := odin_layout(u, Type{base = .Struct, strukt = i32(st_idx)})
+		fields := struct_fields(u, i32(st_idx))
+		fmt.sbprintf(out, "struct %s {{\n", pname)
+		cur := 0
+		pad := 0
+		for f, fi in fields {
+			ft := ty(u, f.type)
+			off := odin_field_offset(u, i32(st_idx), i32(fi))
+			fsize, _, _ := odin_layout(u, ft)
+			if off > cur {
+				fmt.sbprintf(out, "\tchar _pad%d[%d];\n", pad, off - cur)
+				pad += 1
+			}
+			msl_push_field_decl(out, u, f.name, ft)
+			cur = off + fsize
+		}
+		if cur < st_size {
+			fmt.sbprintf(out, "\tchar _pad%d[%d];\n", pad, st_size - cur)
+		}
+		strings.write_string(out, "};\n")
+		fmt.sbprintf(out, "static_assert(sizeof(%s) == %d, \"\");\n", pname, st_size)
+		fmt.sbprintf(out, "static_assert(alignof(%s) == %d, \"\");\n", pname, st_align)
+		for f, fi in fields {
+			off := odin_field_offset(u, i32(st_idx), i32(fi))
+			fmt.sbprintf(out, "static_assert(__builtin_offsetof(%s, ok_%s) == %d, \"\");\n", pname, f.name, off)
+		}
+		parts := make([dynamic]string, 0, len(fields), context.temp_allocator)
+		for f in fields {
+			append(&parts, msl_push_unpack(m, fmt.aprintf("p.ok_%s", f.name), ty(u, f.type)))
+		}
+		fmt.sbprintf(out, "inline ok_%s oksl_unpack_%s(constant %s& p) {{\n\treturn ok_%s{{%s}};\n}}\n\n", sd.name, sd.name, pname, sd.name, strings.join(parts[:], ", "))
+	}
+
+	fmt.sbprintf(out, "struct ok_%s {{\n", c.push.name)
+	cur := 0
+	pad := 0
+	for sid in c.push.fields {
+		sym := u.syms[sid]
+		t := ty(u, sym.type)
+		fsize, _, _ := odin_layout(u, t)
+		if sym.index > cur {
+			fmt.sbprintf(out, "\tchar _pad%d[%d];\n", pad, sym.index - cur)
+			pad += 1
+		}
+		msl_push_field_decl(out, u, sym.name, t)
+		cur = sym.index + fsize
+	}
+	if cur < c.push.size {
+		fmt.sbprintf(out, "\tchar _pad%d[%d];\n", pad, c.push.size - cur)
+	}
+	strings.write_string(out, "};\n")
+	fmt.sbprintf(out, "static_assert(sizeof(ok_%s) == %d, \"\");\n", c.push.name, c.push.size)
+	fmt.sbprintf(out, "static_assert(alignof(ok_%s) == %d, \"\");\n", c.push.name, c.push.align)
+	for sid in c.push.fields {
+		sym := u.syms[sid]
+		fmt.sbprintf(out, "static_assert(__builtin_offsetof(ok_%s, ok_%s) == %d, \"\");\n", c.push.name, sym.name, sym.index)
+	}
+	strings.write_string(out, "\n")
+
+	for sid in c.push.fields {
+		sym := u.syms[sid]
+		t := ty(u, sym.type)
+		if t.array > 0 {
+			body := msl_push_unpack(m, fmt.aprintf("u.ok_%s", sym.name), t)
+			fmt.sbprintf(out, "inline %s oksl_push_arr_%s(constant ok_%s& u) {{\n\treturn %s;\n}}\n\n", msl_type(m, t), sym.name, c.push.name, body)
+		}
+	}
+}
+
 // The uniform struct member `sym` reads. Built-ins go by their block
 // offset: the checker's internal alias ($channel_resolution, used by
 // child.eval) names the iChannelResolution member.
@@ -510,6 +731,8 @@ emit_msl_function :: proc(m: ^Msl, f: Func_Id) {
 	fn := u.funcs[f]
 	ps := fparams(u, f)
 	m.temp_id = 0
+	m.in_entry = true
+	m.cur_ret = T_VOID
 	strings.builder_reset(&m.fn_vars)
 	img_params := 0
 	for p in ps {
@@ -555,6 +778,11 @@ emit_msl_function :: proc(m: ^Msl, f: Func_Id) {
 	outer := m.b
 	m.b = strings.builder_make()
 	m.indent = 1
+	m.in_entry = false
+	m.cur_ret = ty(u, fn.ret)
+	if u.layout == .Oplat && m.has_discard {
+		w(m, "\tif (g._discarded) %s\n", msl_discard_return(m))
+	}
 	body := u.func_decls[fn.decl].body
 	for st in list(u, body != 0 ? u.stmts[body].body : {}) {
 		msl_stmt(m, Stmt_Id(st))
@@ -706,6 +934,9 @@ emit_msl_entry :: proc(m: ^Msl) {
 		case .Uniform_Block:
 			w(m, "%sconstant Oksl_Uniforms& u [[buffer(%d)]]", sep, row.binding)
 			sep = ", "
+		case .Push_Block:
+			w(m, "%sconstant ok_%s& u [[buffer(%d)]]", sep, c.push.name, row.binding)
+			sep = ", "
 		case .Channel:
 			n := u.syms[row.sym].name
 			w(m, "%s%s ok_%s_tex [[texture(%d)]], sampler ok_%s_smp [[sampler(%d)]]", sep, msl_texture_type(sym_type(u, row.sym)), n, row.binding, n, row.binding)
@@ -753,6 +984,8 @@ emit_msl_entry :: proc(m: ^Msl) {
 		}
 	}
 	m.temp_id = 0
+	m.in_entry = true
+	m.cur_ret = T_VOID
 	strings.builder_reset(&m.fn_vars)
 	outer := m.b
 	m.b = strings.builder_make()
@@ -784,6 +1017,88 @@ emit_msl_entry :: proc(m: ^Msl) {
 // ---- statements -------------------------------------------------------------------------
 
 @(private)
+expr_may_discard :: proc(u: ^Unit, may_discard: []bool, id: Expr_Id) -> bool {
+	if id == 0 {
+		return false
+	}
+	e := u.exprs[id]
+	if e.kind == .Call && e.call == .User && e.func != 0 && int(e.func) < len(may_discard) && may_discard[e.func] {
+		return true
+	}
+	if expr_may_discard(u, may_discard, e.a) || expr_may_discard(u, may_discard, e.b) || expr_may_discard(u, may_discard, e.c) {
+		return true
+	}
+	for a in list(u, e.args) {
+		if expr_may_discard(u, may_discard, Expr_Id(a)) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+stmt_may_discard :: proc(u: ^Unit, may_discard: []bool, id: Stmt_Id) -> bool {
+	if id == 0 {
+		return false
+	}
+	st := u.stmts[id]
+	#partial switch st.kind {
+	case .Discard:
+		return true
+	case .Block, .Switch:
+		for b in list(u, st.body) {
+			if stmt_may_discard(u, may_discard, Stmt_Id(b)) {
+				return true
+			}
+		}
+	case .Decl:
+		for d in list(u, st.decls) {
+			if expr_may_discard(u, may_discard, u.vars[d].init) {
+				return true
+			}
+		}
+	case .Expr, .Return:
+		return expr_may_discard(u, may_discard, st.expr)
+	case .If:
+		return expr_may_discard(u, may_discard, st.expr) || stmt_may_discard(u, may_discard, st.then_) || stmt_may_discard(u, may_discard, st.else_)
+	case .For, .While, .Do_While:
+		return stmt_may_discard(u, may_discard, st.init) || expr_may_discard(u, may_discard, st.expr) || expr_may_discard(u, may_discard, st.step) || stmt_may_discard(u, may_discard, st.then_)
+	}
+	return false
+}
+
+@(private)
+msl_discard_return :: proc(m: ^Msl) -> string {
+	if m.in_entry {
+		return "return;" if m.u.stage == .Compute else "return Oksl_Out{};"
+	}
+	return "return;" if m.cur_ret == T_VOID else "return {};"
+}
+
+@(private)
+msl_discard_loop_body :: proc(m: ^Msl, id: Stmt_Id, guard: bool) {
+	if !guard {
+		msl_sub(m, id)
+		return
+	}
+	tabs(m)
+	w(m, "{{\n")
+	m.indent += 1
+	tabs(m)
+	w(m, "if (g._discarded) %s\n", msl_discard_return(m))
+	if m.u.stmts[id].kind == .Block {
+		for b in list(m.u, m.u.stmts[id].body) {
+			msl_stmt(m, Stmt_Id(b))
+		}
+	} else {
+		msl_stmt(m, id)
+	}
+	m.indent -= 1
+	tabs(m)
+	w(m, "}\n")
+}
+
+@(private)
 msl_stmt :: proc(m: ^Msl, id: Stmt_Id) {
 	u := m.u
 	if id == 0 {
@@ -807,9 +1122,22 @@ msl_stmt :: proc(m: ^Msl, id: Stmt_Id) {
 	case .Expr:
 		tabs(m)
 		w(m, "%s;\n", msl_expr(m, st.expr, true))
+		if u.layout == .Oplat && m.has_discard && expr_may_discard(u, m.may_discard, st.expr) {
+			tabs(m)
+			w(m, "if (g._discarded) %s\n", msl_discard_return(m))
+		}
 	case .If:
+		cond := msl_expr(m, st.expr)
+		if u.layout == .Oplat && m.has_discard && expr_may_discard(u, m.may_discard, st.expr) {
+			tmp := msl_temp(m, expr_type(u, st.expr))
+			tabs(m)
+			w(m, "%s = %s;\n", tmp, cond)
+			tabs(m)
+			w(m, "if (g._discarded) %s\n", msl_discard_return(m))
+			cond = tmp
+		}
 		tabs(m)
-		w(m, "if (%s)\n", msl_expr(m, st.expr))
+		w(m, "if (%s)\n", cond)
 		msl_sub(m, st.then_)
 		if st.else_ != 0 {
 			tabs(m)
@@ -821,22 +1149,49 @@ msl_stmt :: proc(m: ^Msl, id: Stmt_Id) {
 		w(m, "{{\n")
 		m.indent += 1
 		msl_stmt(m, st.init)
+		guard := u.layout == .Oplat && m.has_discard && (stmt_may_discard(u, m.may_discard, st.then_) || expr_may_discard(u, m.may_discard, st.expr) || expr_may_discard(u, m.may_discard, st.step))
+		cond := msl_expr(m, st.expr) if st.expr != 0 else ""
+		if guard {
+			cond = fmt.aprintf("!g._discarded && (%s)", cond) if cond != "" else "!g._discarded"
+		}
 		tabs(m)
-		w(m, "for (; %s; %s)\n", msl_expr(m, st.expr) if st.expr != 0 else "", msl_expr(m, st.step, true) if st.step != 0 else "")
-		msl_sub(m, st.then_)
+		w(m, "for (; %s; %s)\n", cond, msl_expr(m, st.step, true) if st.step != 0 else "")
+		msl_discard_loop_body(m, st.then_, guard)
+		if guard {
+			tabs(m)
+			w(m, "if (g._discarded) %s\n", msl_discard_return(m))
+		}
 		m.indent -= 1
 		tabs(m)
 		w(m, "}\n")
 	case .While:
+		guard := u.layout == .Oplat && m.has_discard && (stmt_may_discard(u, m.may_discard, st.then_) || expr_may_discard(u, m.may_discard, st.expr))
+		cond := msl_expr(m, st.expr)
+		if guard {
+			cond = fmt.aprintf("!g._discarded && (%s)", cond)
+		}
 		tabs(m)
-		w(m, "while (%s)\n", msl_expr(m, st.expr))
-		msl_sub(m, st.then_)
+		w(m, "while (%s)\n", cond)
+		msl_discard_loop_body(m, st.then_, guard)
+		if guard {
+			tabs(m)
+			w(m, "if (g._discarded) %s\n", msl_discard_return(m))
+		}
 	case .Do_While:
+		guard := u.layout == .Oplat && m.has_discard && (stmt_may_discard(u, m.may_discard, st.then_) || expr_may_discard(u, m.may_discard, st.expr))
 		tabs(m)
 		w(m, "do\n")
-		msl_sub(m, st.then_)
+		msl_discard_loop_body(m, st.then_, guard)
+		cond := msl_expr(m, st.expr)
+		if guard {
+			cond = fmt.aprintf("!g._discarded && (%s)", cond)
+		}
 		tabs(m)
-		w(m, "while (%s);\n", msl_expr(m, st.expr))
+		w(m, "while (%s);\n", cond)
+		if guard {
+			tabs(m)
+			w(m, "if (g._discarded) %s\n", msl_discard_return(m))
+		}
 	case .Break:
 		tabs(m)
 		w(m, "break;\n")
@@ -845,10 +1200,23 @@ msl_stmt :: proc(m: ^Msl, id: Stmt_Id) {
 		w(m, "continue;\n")
 	case .Discard:
 		tabs(m)
-		w(m, "discard_fragment();\n")
+		if u.layout == .Oplat {
+			w(m, "{{ g._discarded = true; discard_fragment(); %s }}\n", msl_discard_return(m))
+		} else {
+			w(m, "discard_fragment();\n")
+		}
 	case .Switch:
+		sel := msl_expr(m, st.expr)
+		if u.layout == .Oplat && m.has_discard && expr_may_discard(u, m.may_discard, st.expr) {
+			tmp := msl_temp(m, expr_type(u, st.expr))
+			tabs(m)
+			w(m, "%s = %s;\n", tmp, sel)
+			tabs(m)
+			w(m, "if (g._discarded) %s\n", msl_discard_return(m))
+			sel = tmp
+		}
 		tabs(m)
-		w(m, "switch (%s) {{\n", msl_expr(m, st.expr))
+		w(m, "switch (%s) {{\n", sel)
 		for b in list(u, st.body) {
 			sub := u.stmts[b]
 			#partial switch sub.kind {
@@ -903,6 +1271,10 @@ msl_decl :: proc(m: ^Msl, st: Stmt, split: bool) {
 			w(m, "%s ok_%s; ok_%s = %s;\n", t, v.name, v.name, init)
 		} else {
 			w(m, "%s ok_%s = %s;\n", t, v.name, init)
+		}
+		if u.layout == .Oplat && m.has_discard && v.init != 0 && expr_may_discard(u, m.may_discard, v.init) {
+			tabs(m)
+			w(m, "if (g._discarded) %s\n", msl_discard_return(m))
 		}
 	}
 }
@@ -1365,6 +1737,8 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 		switch sym.storage {
 		case .Uniform, .Builtin_Uniform:
 			return uniform_read(m, sym)
+		case .Push_Field:
+			return msl_push_read(m, sym)
 		case .Global:
 			return fmt.aprintf("g.ok_%s", sym.name)
 		case .Stage_In:
@@ -1377,7 +1751,7 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 		case .Shared:
 			sp, _ := msl_sh_path(m, id)
 			return msl_sh_read(m, sp, "")
-		case .Local, .Param, .Channel, .Buffer, .Storage_Image:
+		case .Local, .Param, .Channel, .Buffer, .Storage_Image, .Push_Block:
 		}
 		return fmt.aprintf("ok_%s", sym.name)
 	case .Convert:
@@ -1531,6 +1905,9 @@ msl_expr :: proc(m: ^Msl, id: Expr_Id, discard := false) -> string {
 			if (sym.storage == .Uniform || sym.storage == .Builtin_Uniform) && ty(u, sym.type).array > 0 {
 				return uniform_read(m, sym, msl_expr(m, e.b))
 			}
+			if sym.storage == .Push_Field && ty(u, sym.type).array > 0 {
+				return msl_push_unpack(m, fmt.aprintf("u.ok_%s[%s]", sym.name, msl_expr(m, e.b)), elem_type(ty(u, sym.type)))
+			}
 		}
 		if may_write(u, e.a) || may_write(u, e.b) {
 			if addressable(u, e.a) {
@@ -1658,6 +2035,15 @@ msl_lvalue :: proc(m: ^Msl, id: Expr_Id, pre: ^[dynamic]string) -> string {
 				idx := msl_temp(m, expr_type(u, e.b))
 				append(pre, fmt.aprintf("(%s = %s)", idx, msl_expr(m, e.b)))
 				return uniform_read(m, sym, idx)
+			}
+			if sym.storage == .Push_Field && ty(u, sym.type).array > 0 {
+				ix := u.exprs[e.b]
+				if ix.kind == .Int_Lit || ix.kind == .Uint_Lit {
+					return msl_push_unpack(m, fmt.aprintf("u.ok_%s[%s]", sym.name, msl_expr(m, e.b)), elem_type(ty(u, sym.type)))
+				}
+				idx := msl_temp(m, expr_type(u, e.b))
+				append(pre, fmt.aprintf("(%s = %s)", idx, msl_expr(m, e.b)))
+				return msl_push_unpack(m, fmt.aprintf("u.ok_%s[%s]", sym.name, idx), elem_type(ty(u, sym.type)))
 			}
 		}
 		base := msl_lvalue(m, e.a, pre)

@@ -474,3 +474,87 @@ shared_type_layout :: proc(u: ^Unit, t: Type) -> (size, align: int, ok: bool) {
 	}
 	return 0, 0, false
 }
+
+// ---- Odin layout (Layout.Oplat) --------------------------------------------------------
+
+PUSH_MAX_BYTES :: 128
+
+// Size and alignment in bytes of a value type under Odin's struct layout:
+// 32-bit scalars and vectors align to 4, mat2 to 8, mat3 to 4 (36 B), mat4
+// to 16; arrays of non-matrix values repeat at element size; structs round
+// up to their largest field alignment.
+odin_layout :: proc(u: ^Unit, t: Type) -> (size, align: int, ok: bool) {
+	if t.array < 0 {
+		return 0, 0, false
+	}
+	if t.array > 0 {
+		e := elem_type(t)
+		if is_matrix(e) {
+			return 0, 0, false
+		}
+		es, ea := odin_layout(u, e) or_return
+		return es * int(t.array), ea, true
+	}
+	if is_matrix(t) {
+		if t.cols != t.rows {
+			return 0, 0, false
+		}
+		switch t.cols {
+		case 2:
+			return 16, 8, true
+		case 3:
+			return 36, 4, true
+		case 4:
+			return 64, 16, true
+		}
+		return 0, 0, false
+	}
+	#partial switch t.base {
+	case .Float, .Int, .Uint:
+		if t.rows >= 1 && t.rows <= 4 {
+			return 4 * int(t.rows), 4, true
+		}
+	case .Struct:
+		fields := struct_fields(u, t.strukt)
+		if len(fields) == 0 {
+			return 0, 0, false
+		}
+		for f in fields {
+			fs, fa := odin_layout(u, ty(u, f.type)) or_return
+			size = round_up(size, fa) + fs
+			align = max(align, fa)
+		}
+		return round_up(size, align), align, align > 0
+	}
+	return 0, 0, false
+}
+
+// Byte stride between elements of an array under Odin layout.
+odin_array_stride :: proc(u: ^Unit, t: Type) -> int {
+	es, _, ok := odin_layout(u, elem_type(t))
+	return es if ok else 0
+}
+
+// Byte stride between columns of a square matrix under Odin layout (8 for
+// mat2, 12 for mat3, 16 for mat4).
+odin_matrix_stride :: proc "contextless" (t: Type) -> int {
+	return 4 * int(t.rows)
+}
+
+// Byte offset of field `field` inside struct `st` under Odin layout (0 when
+// `st` is not a valid Odin struct).
+odin_field_offset :: proc(u: ^Unit, st: i32, field: i32) -> int {
+	off := 0
+	for f, i in struct_fields(u, st) {
+		size, align, ok := odin_layout(u, ty(u, f.type))
+		if !ok {
+			return 0
+		}
+		off = round_up(off, align)
+		if i32(i) == field {
+			return off
+		}
+		off += size
+	}
+	return off
+}

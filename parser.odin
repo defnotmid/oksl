@@ -285,6 +285,12 @@ parse_top :: proc(p: ^Parser) {
 		accept(p, .Semicolon)
 		return
 	}
+	if is_ident(p, "push") && !p.struct_names["push"] {
+		push_pos := tok(p).pos
+		p.i += 1
+		parse_push_block(p, push_pos)
+		return
+	}
 	lay := Layout_Qual{location = -1}
 	stage_vars := .Stage_Variables in p.u.features
 	buffers := .Storage_Buffers in p.u.features
@@ -483,6 +489,86 @@ parse_buffer_block :: proc(p: ^Parser, readonly, writeonly: bool, lay: ^Layout_Q
 	id := Buffer_Decl_Id(len(u.buffer_decls))
 	append(&u.buffer_decls, bd)
 	append(&u.tops, Top{kind = .Buffer, buffer = id})
+}
+
+// `push Name { fields } instance;` after the `push` keyword.
+@(private = "file")
+parse_push_block :: proc(p: ^Parser, pos: Pos) {
+	u := p.u
+	block := tok(p)
+	if !expect(p, .Ident, .Expected_Name) || !expect(p, .L_Brace) {
+		return
+	}
+	fields := make([dynamic]Push_Field_Decl, context.temp_allocator)
+	for peek(p) != .R_Brace && peek(p) != .EOF {
+		lay := Layout_Qual{location = -1}
+		for {
+			skip_precision(p)
+			if is_ident(p, "layout") && peek(p, 1) == .L_Paren {
+				parse_layout(p, &lay)
+				if p.panicking {
+					return
+				}
+			} else if is_ident(p, "readonly") || is_ident(p, "writeonly") || is_ident(p, "coherent") || is_ident(p, "volatile") || is_ident(p, "restrict") {
+				p.i += 1
+			} else {
+				break
+			}
+		}
+		spec: Spec_Id
+		handle_kind := ""
+		t := tok(p)
+		if t.kind == .Ident && (t.text == "texture2D" || t.text == "texture2DArray" || t.text == "itexture2D" || t.text == "utexture2D" || t.text == "sampler" || t.text == "image2DArray" || t.text == "uimage2DArray" || t.text == "iimage2DArray") {
+			handle_kind = t.text
+			p.i += 1
+		} else {
+			spec = parse_type_spec(p)
+			if spec == 0 {
+				return
+			}
+		}
+		is_pointer := accept(p, .Star)
+		for {
+			ft := tok(p)
+			if !expect(p, .Ident, .Expected_Field) {
+				return
+			}
+			f := Push_Field_Decl {
+				pos         = ft.pos,
+				name        = ft.text,
+				spec        = spec,
+				is_pointer  = is_pointer,
+				handle_kind = handle_kind,
+			}
+			if accept(p, .L_Bracket) {
+				if accept(p, .R_Bracket) {
+					f.unsized = true
+				} else {
+					f.array_size = parse_expr(p)
+					expect(p, .R_Bracket)
+				}
+			}
+			append(&fields, f)
+			if !accept(p, .Comma) {
+				break
+			}
+		}
+		if !expect(p, .Semicolon) {
+			return
+		}
+	}
+	expect(p, .R_Brace)
+	pd := Push_Decl{pos = pos, name = block.text}
+	if peek(p) == .Ident {
+		pd.instance = tok(p).text
+		p.i += 1
+	}
+	expect(p, .Semicolon)
+	pd.fields = {u32(len(u.push_fields)), u32(len(fields))}
+	append(&u.push_fields, ..fields[:])
+	id := Push_Decl_Id(len(u.push_decls))
+	append(&u.push_decls, pd)
+	append(&u.tops, Top{kind = .Push, vars = {u32(id), 0}})
 }
 
 @(private = "file")

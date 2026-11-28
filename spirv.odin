@@ -145,6 +145,7 @@ Op :: enum u32 {
 	Return                   = 253,
 	Return_Value             = 254,
 	Unreachable              = 255,
+	Terminate_Invocation     = 4416,
 }
 
 // GLSL.std.450 extended instructions.
@@ -219,6 +220,8 @@ SC_WORKGROUP :: 4
 SC_PRIVATE :: 6
 @(private)
 SC_FUNCTION :: 7
+@(private)
+SC_PUSH_CONSTANT :: 9
 
 @(private)
 DEC_BLOCK :: 2
@@ -316,6 +319,7 @@ Spv :: struct {
 	image_query: bool,
 	// The DerivativeControl capability is declared (fine derivatives).
 	derivative_control: bool,
+	push_types:  map[Type]u32,
 	block_var:   u32,
 	block_type:  u32,
 	// Storage buffer block types: read-only, read-write and write-only.
@@ -359,6 +363,7 @@ emit_spirv :: proc(u: ^Unit, c: ^Checked) -> []u32 {
 	s.consts = make(map[[3]u32]u32)
 	s.nulls = make(map[u32]u32)
 	s.members = make(map[Sym_Id]u32)
+	s.push_types = make(map[Type]u32)
 	s.loops = make([dynamic]Loop_Target)
 
 	inst(&s.caps, .Capability, 1) // Shader
@@ -391,7 +396,8 @@ emit_spirv :: proc(u: ^Unit, c: ^Checked) -> []u32 {
 	}
 
 	out := make([dynamic]u32)
-	append(&out, 0x07230203, 0x00010000, 0, s.next_id, 0)
+	version := u32(0x00010600) if u.layout == .Oplat else u32(0x00010000)
+	append(&out, 0x07230203, version, 0, s.next_id, 0)
 	append(&out, ..s.caps[:])
 	append(&out, ..s.imports[:])
 	append(&out, ..header[:])
@@ -750,6 +756,8 @@ declare_interface :: proc(s: ^Spv) {
 			s.sym_ids[row.sym] = v
 		case .Uniform_Block:
 			declare_uniform_block(s, row)
+		case .Push_Block:
+			declare_push_block(s)
 		case .Channel:
 			v := new_id(s)
 			inst(&s.globals, .Variable, ptr_type(s, SC_UNIFORM_CONSTANT, type_id(s, sym_type(s.u, row.sym))), v, SC_UNIFORM_CONSTANT)
@@ -789,6 +797,9 @@ declare_interface :: proc(s: ^Spv) {
 		v := new_id(s)
 		inst(&s.globals, .Variable, ptr_type(s, SC_PRIVATE, t), v, SC_PRIVATE, const_null(s, t))
 		name(s, v, s.u.syms[g].name)
+		if s.u.layout == .Oplat {
+			append(&s.header, v)
+		}
 		s.sym_ids[g] = v
 	}
 	for sh in c.shared_vars {
@@ -796,6 +807,9 @@ declare_interface :: proc(s: ^Spv) {
 		v := new_id(s)
 		inst(&s.globals, .Variable, ptr_type(s, SC_WORKGROUP, t), v, SC_WORKGROUP)
 		name(s, v, s.u.syms[sh].name)
+		if s.u.layout == .Oplat {
+			append(&s.header, v)
+		}
 		s.sym_ids[sh] = v
 	}
 }
@@ -956,6 +970,87 @@ declare_uniform_block :: proc(s: ^Spv, row: Interface_Var) {
 	inst(&s.annotations, .Decorate, s.block_var, DEC_DESCRIPTOR_SET, u32(row.set))
 	inst(&s.annotations, .Decorate, s.block_var, DEC_BINDING, u32(row.binding))
 	name(s, s.block_var, "u")
+}
+
+// Decorated SPIR-V type for a push block member or nested aggregate under Odin
+// layout (arrays get ArrayStride, structs get MemberDecorate Offset and
+// ColMajor/MatrixStride on matrices).
+@(private)
+push_type_id :: proc(s: ^Spv, t: Type) -> u32 {
+	if t.array > 0 {
+		if id, ok := s.push_types[t]; ok {
+			return id
+		}
+		elem := push_type_id(s, elem_type(t))
+		id := new_id(s)
+		inst(&s.globals, .Type_Array, id, elem, const_u32(s, u32(t.array)))
+		inst(&s.annotations, .Decorate, id, DEC_ARRAY_STRIDE, u32(odin_array_stride(s.u, t)))
+		s.push_types[t] = id
+		return id
+	}
+	if t.base == .Struct {
+		if id, ok := s.push_types[t]; ok {
+			return id
+		}
+		fields := struct_fields(s.u, t.strukt)
+		members := make([dynamic]u32, context.temp_allocator)
+		for f in fields {
+			append(&members, push_type_id(s, ty(s.u, f.type)))
+		}
+		id := new_id(s)
+		words := make([dynamic]u32, context.temp_allocator)
+		append(&words, id)
+		append(&words, ..members[:])
+		inst_words(&s.globals, .Type_Struct, words[:])
+		name(s, id, fmt.tprintf("%s_Push", s.u.structs[t.strukt].name))
+		for f, fi in fields {
+			ft := ty(s.u, f.type)
+			off := odin_field_offset(s.u, t.strukt, i32(fi))
+			inst(&s.annotations, .Member_Decorate, id, u32(fi), DEC_OFFSET, u32(off))
+			if is_matrix(ft) {
+				inst(&s.annotations, .Member_Decorate, id, u32(fi), DEC_COL_MAJOR)
+				inst(&s.annotations, .Member_Decorate, id, u32(fi), DEC_MATRIX_STRIDE, u32(odin_matrix_stride(ft)))
+			}
+			inst_str(&s.debug, .Member_Name, {id, u32(fi)}, f.name)
+		}
+		s.push_types[t] = id
+		return id
+	}
+	return type_id(s, t)
+}
+
+// Layout.Oplat PushConstant Block variable and interface entry.
+@(private)
+declare_push_block :: proc(s: ^Spv) {
+	c := s.checked
+	member_types := make([dynamic]u32)
+	for id in c.push.fields {
+		sym := s.u.syms[id]
+		append(&member_types, push_type_id(s, ty(s.u, sym.type)))
+	}
+	s.member_types = member_types[:]
+	s.block_type = new_id(s)
+	words := make([dynamic]u32, context.temp_allocator)
+	append(&words, s.block_type)
+	append(&words, ..member_types[:])
+	inst_words(&s.globals, .Type_Struct, words[:])
+	inst(&s.annotations, .Decorate, s.block_type, DEC_BLOCK)
+	name(s, s.block_type, c.push.name)
+	for id, i in c.push.fields {
+		sym := s.u.syms[id]
+		ft := ty(s.u, sym.type)
+		inst(&s.annotations, .Member_Decorate, s.block_type, u32(i), DEC_OFFSET, u32(sym.index))
+		if is_matrix(ft) {
+			inst(&s.annotations, .Member_Decorate, s.block_type, u32(i), DEC_COL_MAJOR)
+			inst(&s.annotations, .Member_Decorate, s.block_type, u32(i), DEC_MATRIX_STRIDE, u32(odin_matrix_stride(ft)))
+		}
+		inst_str(&s.debug, .Member_Name, {s.block_type, u32(i)}, sym.name)
+		s.members[id] = u32(i)
+	}
+	s.block_var = new_id(s)
+	inst(&s.globals, .Variable, ptr_type(s, SC_PUSH_CONSTANT, s.block_type), s.block_var, SC_PUSH_CONSTANT)
+	name(s, s.block_var, c.push.instance if c.push.instance != "" else "push_block")
+	append(&s.header, s.block_var)
 }
 
 // ---- functions -------------------------------------------------------------------------

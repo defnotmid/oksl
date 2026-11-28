@@ -141,7 +141,7 @@ emit_stmt :: proc(s: ^Spv, id: Stmt_Id) {
 		l.continued = true
 		terminate(s, .Branch, l.cont)
 	case .Discard:
-		terminate(s, .Kill)
+		terminate(s, .Terminate_Invocation if u.layout == .Oplat else .Kill)
 	case .Switch:
 		emit_switch(s, st)
 	case .Case, .Default:
@@ -267,6 +267,11 @@ emit_lvalue :: proc(s: ^Spv, id: Expr_Id) -> LValue {
 			ptr := new_id(s)
 			inst(&s.body, .Access_Chain, ptr_type(s, SC_UNIFORM, s.member_types[idx]), ptr, s.block_var, const_u32(s, idx))
 			return {ptr = ptr, type = t, storage = SC_UNIFORM, as_uint = as_uint}
+		case .Push_Field:
+			idx := s.members[e.sym]
+			ptr := new_id(s)
+			inst(&s.body, .Access_Chain, ptr_type(s, SC_PUSH_CONSTANT, s.member_types[idx]), ptr, s.block_var, const_u32(s, idx))
+			return {ptr = ptr, type = t, storage = SC_PUSH_CONSTANT}
 		case .Global:
 			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_PRIVATE}
 		case .Shared:
@@ -277,7 +282,7 @@ emit_lvalue :: proc(s: ^Spv, id: Expr_Id) -> LValue {
 			return {ptr = s.sym_ids[e.sym], type = t, storage = SC_OUTPUT}
 		case .Local, .Param:
 			return {ptr = local_sym(s, e.sym), type = t, storage = SC_FUNCTION}
-		case .Channel, .Buffer, .Storage_Image, .Work_Group_Size:
+		case .Channel, .Buffer, .Storage_Image, .Work_Group_Size, .Push_Block:
 		}
 	case .Index:
 		base := emit_lvalue(s, e.a)
@@ -325,21 +330,30 @@ chain :: proc(s: ^Spv, base: LValue, index: u32, result: Type) -> LValue {
 	if base.as_uint {
 		rt.base = .Uint
 	}
+	pt := push_type_id(s, rt) if base.storage == SC_PUSH_CONSTANT else type_id(s, rt)
 	ptr := new_id(s)
-	inst(&s.body, .Access_Chain, ptr_type(s, base.storage, type_id(s, rt)), ptr, base.ptr, index)
+	inst(&s.body, .Access_Chain, ptr_type(s, base.storage, pt), ptr, base.ptr, index)
 	return {ptr = ptr, type = result, storage = base.storage, as_uint = base.as_uint}
 }
 
 @(private)
 load_lvalue :: proc(s: ^Spv, lv: LValue) -> u32 {
 	t := lv.type
-	if lv.storage == SC_UNIFORM && t.array > 0 {
-		// A whole std140 array becomes a plain array value.
+	if (lv.storage == SC_UNIFORM || lv.storage == SC_PUSH_CONSTANT) && t.array > 0 {
+		// A whole std140 or push array becomes a plain array value.
 		elems := make([]u32, int(t.array), context.temp_allocator)
 		for &el, i in elems {
 			el = load_lvalue(s, chain(s, lv, const_i32(s, i32(i)), elem_type(t)))
 		}
 		return construct(s, type_id(s, t), ..elems)
+	}
+	if lv.storage == SC_PUSH_CONSTANT && t.base == .Struct {
+		fields := struct_fields(s.u, t.strukt)
+		parts := make([]u32, len(fields), context.temp_allocator)
+		for f, i in fields {
+			parts[i] = load_lvalue(s, chain(s, lv, const_i32(s, i32(i)), ty(s.u, f.type)))
+		}
+		return construct(s, type_id(s, t), ..parts)
 	}
 	v: u32
 	if lv.as_uint {

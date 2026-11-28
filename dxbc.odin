@@ -1212,6 +1212,10 @@ dx_declare_compute :: proc(d: ^Dx) {
 // over D3D12's 64.
 @(private)
 dxbc_supported :: proc(u: ^Unit, c: ^Checked) -> bool {
+	if u.layout == .Oplat {
+		append(&u.errors, Error{pos = {line = 1, col = 1}, code = .Oplat_Dxbc})
+		return false
+	}
 	ok := true
 	for row in c.interface {
 		if row.kind != .Num_Work_Groups {
